@@ -359,6 +359,17 @@ mod tests {
 
         let plain: RelayExternalAddress = "/ip4/127.0.0.1/tcp/443".parse().unwrap();
         client.validate_server_for(&plain).unwrap();
+
+        let secure: RelayExternalAddress = "/dns4/localhost/tcp/443/tls/ws".parse().unwrap();
+        assert!(matches!(
+            client.validate_server_for(&secure),
+            Err(NetworkBuildError::InvalidTlsMaterial)
+        ));
+        let invalid_server = WssTransportConfig::server(vec![1], SecretDocument::new(vec![1]));
+        assert!(matches!(
+            invalid_server.validate_server_for(&secure),
+            Err(NetworkBuildError::InvalidTlsMaterial)
+        ));
     }
 
     #[test]

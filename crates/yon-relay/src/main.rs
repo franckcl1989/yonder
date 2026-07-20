@@ -406,6 +406,7 @@ mod tests {
         AppError, Cli, Command, IdentityCommand, LogLevel, RELAY_SCHEMA, TlsDocumentKind,
         execute_command, initialize_identity, initialize_identity_with, read_tls_document,
         read_tls_document_from, relay_runtime, report_peer_id_to, run, serve_config_with,
+        serve_relay,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -421,6 +422,8 @@ mod tests {
         include_bytes!("../../yon/tests/fixtures/localhost-test-cert.der");
     const TEST_WSS_PRIVATE_KEY_DER: &[u8] =
         include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
+    const TEST_WSS_MISMATCHED_PRIVATE_KEY_DER: &[u8] =
+        include_bytes!("../../yon/tests/fixtures/localhost-self-signed-key.der");
 
     struct FailingOutput;
 
@@ -750,6 +753,29 @@ mod tests {
 
         let runtime = relay_runtime().unwrap();
         assert_eq!(runtime.block_on(async { 7_u8 }), 7);
+    }
+
+    #[test]
+    fn mismatched_wss_key_is_rejected_by_the_real_relay_transport() {
+        let config = yon_relay::RelayServeConfig::new(
+            yonder_net::Keypair::generate_ed25519(),
+            vec!["/ip4/127.0.0.1/tcp/0/tls/ws".parse().unwrap()],
+            vec!["/dns4/localhost/tcp/443/tls/ws".parse().unwrap()],
+            yonder_net::WssTransportConfig::server(
+                TEST_WSS_CERTIFICATE_DER.to_vec(),
+                yonder_core::SecretDocument::new(TEST_WSS_MISMATCHED_PRIVATE_KEY_DER.to_vec()),
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            serve_relay(config),
+            Err(AppError::Service(
+                yon_relay::RelayServiceError::NetworkBuild(
+                    yonder_net::NetworkBuildError::InvalidTlsMaterial
+                )
+            ))
+        ));
     }
 
     #[test]

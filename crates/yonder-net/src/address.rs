@@ -457,6 +457,14 @@ mod tests {
             .parse::<RelayExternalAddress>()
             .unwrap();
         assert_eq!(external.transport(), TransportKind::Quic);
+        for address in [
+            "/dns6/relay.example/tcp/443/tls/ws",
+            "/ip6/2001:db8::1/tcp/443/tls/ws",
+        ] {
+            let secure = address.parse::<RelayExternalAddress>().unwrap();
+            assert_eq!(secure.transport(), TransportKind::SecureWebSocket);
+            assert!(secure.wss_server_name().is_some());
+        }
         assert!(
             "/ip4/127.0.0.1/tcp/1"
                 .parse::<RelayExternalAddress>()

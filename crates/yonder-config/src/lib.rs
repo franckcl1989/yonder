@@ -822,7 +822,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn relative_program_data_is_rejected() {
+    fn invalid_program_data_is_rejected_without_lossy_conversion() {
+        assert!(matches!(
+            super::system_directory(None),
+            Err(ConfigurationLocationError::MissingProgramData)
+        ));
+        assert!(matches!(
+            super::system_directory(Some(non_unicode_os_string())),
+            Err(ConfigurationLocationError::ProgramDataEncoding)
+        ));
         assert!(matches!(
             super::system_directory(Some("relative".into())),
             Err(ConfigurationLocationError::InvalidProgramData)

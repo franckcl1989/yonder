@@ -25,7 +25,7 @@ const RELAY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Endpoint lifecycle failures before an application protocol begins.
 #[derive(Debug, Error)]
 pub enum EndpointError {
-    #[error("failed to construct the endpoint network")]
+    #[error("failed to construct the endpoint network: {0}")]
     Build(#[from] NetworkBuildError),
     #[error("an endpoint network operation failed")]
     Node(#[from] NetworkNodeError),
