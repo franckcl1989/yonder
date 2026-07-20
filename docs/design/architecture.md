@@ -58,8 +58,8 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 4. Ping 在每条连接建立后立即开始，单次超时 `750ms`；endpoint 后续间隔 `1s`，relay 后续间隔 `15s`，避免 128 个空闲 endpoint 对 relay 形成高频永久轮询。`1.5s` 选择窗口最多取前三个成功结果；没有成功结果的候选不可用，一个结果足以保留已建立链路，两个或三个结果因稳定性证据更多而优先排序。这样质量采样不会把高 RTT 但可用的链路误判为断开。
 5. 排序键固定为：成功样本数降序、RTT 中位数升序、RTT 极差升序、直连优先于 relay、QUIC 优先于 TCP、TCP 优先于 WS/WSS、建立时刻升序。没有主动带宽探测，避免额外流量、延迟和攻击面。
 6. DCUtR 成功事件必须对应一个已进入本地名册的精确 `ConnectionId`。选出 winner 后按 `ConnectionId` 关闭全部 loser，并等待本地 `ConnectionClosed`；两端都在 OPAQUE 前等待各自 DCUtR 终态与唯一名册。
-7. DCUtR 明确失败或 `30s` 截止时，controller 销毁整个全能力 Swarm，生成新临时 PeerId，以 `Toggle<dcutr::Behaviour>` 禁用 DCUtR 构建新 Swarm，经同一 relay 重新查询并建立 relay-only circuit。旧 Swarm drop 是取消旧拨号的所有权边界；fallback 恰好一次，不循环。
-8. v1 不热迁移。进入认证后任何迟到的同 PeerId 额外连接都会触发安全处理，而不是成为备用路径。
+7. DCUtR 明确失败、`30s` 截止，或全能力连接在 OPAQUE 认证及两条 terminal 子流打开的预提交阶段丢失唯一绑定时，controller 销毁整个全能力 Swarm，生成新临时 PeerId，以 `Toggle<dcutr::Behaviour>` 禁用 DCUtR 构建新 Swarm，经同一 relay 重新查询并建立 relay-only circuit。额外同 PeerId 连接仍先触发 fail-closed 并关闭相关连接，旧 Swarm drop 是取消残余拨号的所有权边界；fallback 恰好一次，不循环，OPAQUE、协议和业务错误不触发降级。
+8. v1 不热迁移。relay-only 尝试或 terminal 预提交准备完成后出现任何迟到的同 PeerId 额外连接仍按唯一连接屏障终止当前操作，而不是成为备用路径。
 
 该规则让连通性和稳定性先于 RTT，让 RTT 和抖动先于路径/transport 偏好；只有质量相同或不可区分时才偏向直连和 QUIC。
 
@@ -96,6 +96,7 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 - libp2p futures I/O 通过 `tokio-util::compat` 适配；不手写 AsyncRead/AsyncWrite 协议桥。
 - PTY 同步两端与异步网络之间使用两个 `tokio::io::duplex(64 KiB)` 和 `SyncIoBridge`。每个复制方向使用一次创建的 `16 KiB` 缓冲区；稳定转发循环不得逐块分配。
 - 网络写入慢时，固定 duplex 容量自然反压 PTY/标准输入；不丢终端字节、不无限缓存。控制消息入口容量 `8`，重复 resize 在入队前合并为最新尺寸。
+- controller 为避免跨平台线程栈承载完整 libp2p 预提交 async 状态，只在启动阶段把该 future 固定到堆上；每次全能力或 relay-only 尝试各分配一次，严格最多两次，并在进入终端数据热路径前释放。
 - 主控端每 `250ms` 用 `crossterm::terminal::size()` 检查尺寸，只在变化时发送，避免同时读取按键事件再手写终端按键编码。
 - 本地 stdin/stdout 使用 Tokio `io-std`。stdin 的底层阻塞读取不能被所有平台可靠强制取消；raw mode guard 必须先恢复，随后 runtime 最多等待 `1s` 关闭并退出进程。这是进程边界内的有界清理，不允许形成常驻后台任务。
 

@@ -23,8 +23,9 @@ use yonder_core::{
     SecureRandom, TerminalSize, TerminalValue,
 };
 use yonder_net::{
-    ApplicationStream, ApplicationStreams, DirectUpgradePolicy, EndpointRelaySet, Keypair,
-    Libp2pApplicationStreams, PeerId, WssTransportConfig, generate_identity, peer_id_bytes,
+    ApplicationStream, ApplicationStreams, DirectUpgradePolicy, EndpointRelayAddress,
+    EndpointRelaySet, Keypair, Libp2pApplicationStreams, PeerId, WssTransportConfig,
+    generate_identity, peer_id_bytes,
 };
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -186,52 +187,94 @@ async fn run_controller_session<F: TerminalFrontend>(
     #[cfg(yonder_e2e_rebuild)]
     let initial_peer_id = driver.peer_id();
     let target = resolve_peer(&mut driver, &mut streams, &relay, code.locator()).await?;
-    let (mut driver, mut streams, binding) =
-        match connect_target(&mut driver, relay.address(), target).await {
-            Ok(binding) => (driver, streams, binding),
-            Err(error) if direct_fallback_required(&error) => {
-                tracing::debug!(%error, "rebuilding the endpoint for strict relay-only fallback");
-                drop((driver, streams));
-                let mut random = OsSecureRandom;
-                let identity = generate_identity(&mut random).map_err(EndpointError::from)?;
-                let (mut fallback_driver, mut fallback_streams, fallback_relay) =
-                    connect_relay_with_policy(
-                        identity,
-                        &relays,
-                        fallback_wss,
-                        DirectUpgradePolicy::Disabled,
-                    )
-                    .await?;
-                let target = resolve_peer(
-                    &mut fallback_driver,
-                    &mut fallback_streams,
-                    &fallback_relay,
-                    code.locator(),
+    let initial = Box::pin(prepare_controller(
+        driver,
+        streams,
+        relay.address(),
+        target,
+        &code,
+        DirectUpgradePolicy::Enabled,
+    ))
+    .await;
+    let prepared = match initial {
+        Ok(prepared) => prepared,
+        Err(error) if controller_fallback_required(&error) => {
+            tracing::debug!(%error, "rebuilding the endpoint for strict relay-only fallback");
+            let mut random = OsSecureRandom;
+            let identity = generate_identity(&mut random).map_err(EndpointError::from)?;
+            let (mut fallback_driver, mut fallback_streams, fallback_relay) =
+                connect_relay_with_policy(
+                    identity,
+                    &relays,
+                    fallback_wss,
+                    DirectUpgradePolicy::Disabled,
                 )
                 .await?;
-                let binding = connect_target_via_relay(
-                    &mut fallback_driver,
-                    fallback_relay.address(),
-                    target,
-                )
-                .await?;
-                #[cfg(yonder_e2e_rebuild)]
-                {
-                    let fallback_peer_id = fallback_driver.peer_id();
-                    let relayed = fallback_driver.binding_is_relayed(binding)?;
-                    tracing::debug!(
-                        %initial_peer_id,
-                        %fallback_peer_id,
-                        relayed,
-                        "strict relay-only fallback established"
-                    );
-                }
-                (fallback_driver, fallback_streams, binding)
+            let target = resolve_peer(
+                &mut fallback_driver,
+                &mut fallback_streams,
+                &fallback_relay,
+                code.locator(),
+            )
+            .await?;
+            let prepared = Box::pin(prepare_controller(
+                fallback_driver,
+                fallback_streams,
+                fallback_relay.address(),
+                target,
+                &code,
+                DirectUpgradePolicy::Disabled,
+            ))
+            .await?;
+            #[cfg(yonder_e2e_rebuild)]
+            {
+                let fallback_peer_id = prepared.driver.peer_id();
+                let relayed = prepared.driver.binding_is_relayed(prepared.binding)?;
+                tracing::debug!(
+                    %initial_peer_id,
+                    %fallback_peer_id,
+                    relayed,
+                    "strict relay-only fallback established"
+                );
             }
-            Err(error) => return Err(error.into()),
-        };
-    authenticate_controller(&mut driver, &mut streams, binding, &code).await?;
+            prepared
+        }
+        Err(error) => return Err(error),
+    };
     drop(code);
+    let PreparedController {
+        mut driver,
+        _streams,
+        binding,
+        control,
+        data,
+    } = prepared;
+    run_terminal(&mut driver, binding, data, control, terminal, frontend).await
+}
+
+struct PreparedController {
+    driver: EndpointDriver,
+    _streams: Libp2pApplicationStreams,
+    binding: ConnectionBinding,
+    control: ApplicationStream,
+    data: ApplicationStream,
+}
+
+async fn prepare_controller(
+    mut driver: EndpointDriver,
+    mut streams: Libp2pApplicationStreams,
+    relay: &EndpointRelayAddress,
+    target: PeerId,
+    code: &ConnectionCode,
+    direct_upgrade: DirectUpgradePolicy,
+) -> Result<PreparedController, ControllerError> {
+    let binding = match direct_upgrade {
+        DirectUpgradePolicy::Enabled => connect_target(&mut driver, relay, target).await?,
+        DirectUpgradePolicy::Disabled => {
+            connect_target_via_relay(&mut driver, relay, target).await?
+        }
+    };
+    authenticate_controller(&mut driver, &mut streams, binding, code).await?;
 
     let terminal_stream_deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
     let control = open_until(
@@ -250,13 +293,26 @@ async fn run_controller_session<F: TerminalFrontend>(
         terminal_stream_deadline,
     )
     .await?;
-    run_terminal(&mut driver, binding, data, control, terminal, frontend).await
+    Ok(PreparedController {
+        driver,
+        _streams: streams,
+        binding,
+        control,
+        data,
+    })
+}
+
+fn controller_fallback_required(error: &ControllerError) -> bool {
+    matches!(error, ControllerError::Endpoint(error) if direct_fallback_required(error))
 }
 
 fn direct_fallback_required(error: &EndpointError) -> bool {
     matches!(
         error,
-        EndpointError::DirectUpgradeFailed | EndpointError::TargetUpgradeDidNotSettle
+        EndpointError::DirectUpgradeFailed
+            | EndpointError::TargetUpgradeDidNotSettle
+            | EndpointError::AdditionalBoundConnection
+            | EndpointError::BoundConnectionLost
     )
 }
 
@@ -782,11 +838,11 @@ mod tests {
         ControllerConfig, ControllerError, CrosstermFrontend, EndpointError,
         REMOTE_COMPLETION_TIMEOUT, RawModeGuard, RemoteCompletion, TerminalFrontend,
         await_remote_completion, await_until, changed_terminal_size, complete_after_output_eof,
-        decode_terminal_exit, direct_fallback_required, enter_raw_mode_before,
-        exchange_terminal_ready, exchange_terminal_ready_timed, fallback_transport,
-        local_terminal_hello, local_terminal_hello_with, next_retry_delay, read_auth_response,
-        read_local_input, run_controller, run_until_interrupted, terminal_environment,
-        terminal_environment_from, wait_for_remote_completion_deadline,
+        controller_fallback_required, decode_terminal_exit, direct_fallback_required,
+        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
+        fallback_transport, local_terminal_hello, local_terminal_hello_with, next_retry_delay,
+        read_auth_response, read_local_input, run_controller, run_until_interrupted,
+        terminal_environment, terminal_environment_from, wait_for_remote_completion_deadline,
     };
     use std::cell::Cell;
     use std::io;
@@ -814,12 +870,21 @@ mod tests {
         assert!(direct_fallback_required(
             &EndpointError::TargetUpgradeDidNotSettle
         ));
+        assert!(controller_fallback_required(&ControllerError::Endpoint(
+            EndpointError::AdditionalBoundConnection
+        )));
+        assert!(controller_fallback_required(&ControllerError::Endpoint(
+            EndpointError::BoundConnectionLost
+        )));
         for error in [
             EndpointError::RelayUnavailable,
-            EndpointError::AdditionalBoundConnection,
-            EndpointError::BoundConnectionLost,
+            EndpointError::SelectedConnectionLost,
+            EndpointError::ConnectionCloseDidNotConverge,
         ] {
             assert!(!direct_fallback_required(&error));
+            assert!(!controller_fallback_required(&ControllerError::Endpoint(
+                error
+            )));
         }
 
         assert!(fallback_transport(&WssTransportConfig::client(None)).is_ok());
