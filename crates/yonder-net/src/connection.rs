@@ -371,6 +371,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-candidate stress gate"]
+    fn stress_10000_connection_event_interleavings_preserve_unique_ownership() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let first = ConnectionId::new_unchecked(1);
+        let second = ConnectionId::new_unchecked(2);
+
+        for schedule in 0_u16..10_000 {
+            let mut book = ConnectionBook::new();
+            let first_endpoint = dialer("/ip4/192.0.2.1/tcp/1");
+            let second_endpoint = dialer("/ip4/192.0.2.2/tcp/2");
+            if schedule & 1 == 0 {
+                book.established(peer, first, first_endpoint).unwrap();
+                book.established(peer, second, second_endpoint).unwrap();
+            } else {
+                book.established(peer, second, second_endpoint).unwrap();
+                book.established(peer, first, first_endpoint).unwrap();
+            }
+            assert_eq!(book.count(&peer), 2);
+            assert!(book.unique(&peer).is_none());
+
+            let (winner, loser) = if schedule & 2 == 0 {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            assert!(book.closed(&peer, &loser));
+            assert_eq!(book.unique(&peer).map(|entry| entry.id()), Some(winner));
+            assert!(book.closed(&peer, &winner));
+            assert_eq!(book.count(&peer), 0);
+            assert!(!book.closed(&peer, &winner));
+        }
+    }
+
+    #[test]
     fn selection_tracks_exact_connections_and_losers() {
         let fast = ConnectionId::new_unchecked(1);
         let slow = ConnectionId::new_unchecked(2);

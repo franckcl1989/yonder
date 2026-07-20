@@ -53,6 +53,8 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-targets --all-features
+      - name: Run 10,000-iteration lifecycle stress gates
+        run: cargo test --locked --release --workspace stress_10000 -- --ignored --nocapture
       - name: Lint strict relay-only controller rebuild
         env:
           RUSTFLAGS: --cfg yonder_e2e_rebuild

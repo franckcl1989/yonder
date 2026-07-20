@@ -1216,6 +1216,39 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "release-candidate stress gate"]
+    async fn stress_10000_terminal_cancel_resize_and_child_exit_interleavings_are_bounded() {
+        let size = TerminalSize::new(120, 40).unwrap();
+        for schedule in 0_u16..10_000 {
+            let (mut session, controls) = synthetic_session();
+            let cancellation = session.shutdown.clone();
+            if schedule & 1 == 0 {
+                cancellation.cancel();
+            }
+            assert!(matches!(
+                session.resize(size).await,
+                Err(TerminalError::TaskStopped)
+            ));
+
+            if schedule & 2 == 0 {
+                controls
+                    .exit
+                    .send(Ok(child_exit(u32::from(schedule))))
+                    .unwrap();
+                assert_eq!(session.wait().await.unwrap(), u32::from(schedule));
+            } else {
+                drop(controls.exit);
+                assert!(matches!(
+                    session.wait().await,
+                    Err(TerminalError::TaskPanicked)
+                ));
+            }
+            drop(session);
+            assert!(cancellation.is_cancelled());
+        }
+    }
+
     struct SyntheticControls {
         input: DuplexStream,
         output: DuplexStream,

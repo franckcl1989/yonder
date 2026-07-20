@@ -38,8 +38,9 @@
 - release-candidate workflow 已接入 `cargo-cyclonedx 0.5.9`，候选产物按每个 `.tar.gz`/`.zip` 恰好一个规范名称二进制设计，并统一生成 CycloneDX 1.5 SBOM、checksum 与 provenance。完整压力、网络和固定 runner 性能门禁闭环前 workflow 只上传候选 artifact，不自动创建正式 GitHub Release；本轮依赖变化后的 SBOM 可复现性仍等待 tag workflow 真正执行，不沿用旧锁文件的哈希作为证据。
 - Criterion 使用真实生产类型测量 OPAQUE、固定缓冲区、连接码、wire decoder、governor 和路径排序。本机本轮中值包括 OPAQUE 登录往返 `14.389 ms`、16 KiB 固定缓冲复制 `183.57 ns`、连接码编码 `130.14 ns`、解码 `29.855 ns`、128 次限速检查 `3.455 us`、8 候选路径选择 `63.711 ns`；原始数据保存在 `target/criterion`。当前不是隔离固定 runner，因此这些值是可复现观测而非发布回归基线。
 - Windows x64、Rust `1.97.0` 实测 controller 预提交 future 的 backing storage 为 `14,240 B`。正常全能力连接分配一次，只有预提交唯一绑定失效并触发严格 relay-only 重建时累计第二次；每次 allocation 在 OPAQUE 和两条 terminal 子流准备完成后释放，不进入终端数据热路径。该固定堆边界消除了同一 future 直接承载于 Windows 测试/运行线程时的栈溢出。
+- Windows x64 release profile 已执行三项 deterministic 单所有者压力门禁：`TargetSession` 的认证/提交/退出事件乱序、`ConnectionBook` 的建立/关闭事件乱序，以及 synthetic PTY 的取消/resize/child-exit 乱序各 `10,000` 轮，全部通过。release workflow 已显式使用 `--release --ignored` 重跑这些门禁；普通开发测试只编译而不执行长轮次。
 - Windows nightly 在保持 Miri 默认隔离的情况下完整通过 `yonder-core` 的 `41` 项单元/属性测试和 `3` 项 rustdoc compile-fail。属性测试显式关闭仅服务于失败样本落盘的 Proptest persistence，因此没有为通过 Miri 放宽文件系统隔离。
-- Linux nightly 对前一审计快照完整执行 ASan 与 TSan。专用 `yonder_sanitizer` cfg 只把插桩构建的 endpoint/relay memory connection limit 提高到 `512 MiB`，普通 dev/test/release 仍固定为 `96 MiB`/`64 MiB`；两种 sanitizer 均通过全部 `216` 项单元/集成/E2E 测试、`10` 个 benchmark smoke 和 `7/7` 真进程 E2E/真实 PTY，没有内存错误、泄漏或数据竞争报告。当前源码等待新 CI 复验。
+- Linux nightly 对当前提交 `e322246` 完整执行 ASan 与 TSan。专用 `yonder_sanitizer` cfg 只把插桩构建的 endpoint/relay memory connection limit 提高到 `512 MiB`，普通 dev/test/release 仍固定为 `96 MiB`/`64 MiB`；两种 sanitizer 均通过当前 workspace 的单元、集成、benchmark smoke、真进程 E2E 与真实 PTY，没有内存错误、泄漏或数据竞争报告。
 - Rocky Linux 真机使用三个独立 network namespace 建立 relay 公网段以及 host/controller 两套互不直通的私网 MASQUERADE，真实 TCP relay-only 终端会话成功；同一双 NAT 拓扑改用 QUIC 并在两个 endpoint 出口各随机丢弃 `2%` 数据包后，真实终端会话仍成功。两次测试均验证 namespace、veth、iptables 规则、进程和临时秘密文件全部清理。
 - Rocky Linux 真机进一步使用 `128` 个独立 network namespace 和来源 `/32`，在不关闭 rust-libp2p 原生 reservation 限速的情况下真实建立 `128/128` 个 reservation/registration。最初共享的 `250ms` 永久 Ping 使 relay 单核 CPU 达 `6.4637%`；修正为 endpoint `1s`、relay `15s` 且一个成功样本即可保留已建立候选后，复测 relay RSS `15,724 KiB`、峰值 `15,724 KiB`、`138` FD、30 秒空闲单核 CPU `0.8998%`，全部通过绝对上限。host 稳态 RSS 最小/中位/p95/最大为 `7,388/7,792/8,224/10,092 KiB`，启动 HWM 为 `26,600/27,184/27,672/29,552 KiB`，最大附加峰值 `22,164 KiB`；测试后 namespace、bridge、进程和临时秘密文件残留均为 `0`。
 
@@ -53,12 +54,12 @@
 
 ## 明确未完成
 
-- 五个原生目标各自的完整覆盖率尚未从 CI 取得结果；Windows x86_64 本机 nightly 已超过全部门槛，但不能替代其余目标或远端发布证据。
-- Linux arm64 musl、Windows arm64 MSVC、macOS Intel/Apple Silicon 的本轮原生构建、静态链接检查和 smoke 尚未从 CI 取得结果；Linux x86_64 musl 已由本轮 Rocky 真机构建、ELF 静态链接检查和 smoke 覆盖，但仍需 tag workflow 验证正式打包路径。
-- 每 target `24h` release fuzz、至少 `10,000` 次连接/取消/resize/child-exit 竞态迭代、恶意 relay/代理以及完整 Linux namespace 公网、单 NAT、端口受限或对称 NAT、IPv6、延迟、抖动和乱序矩阵仍未完成。当前 Rocky 内核缺少 `sch_netem`，因此延迟/抖动/乱序不能在该机伪装为已验证。
+- CI `29728930494` 对当前提交 `e322246` 的 Linux x64/arm64 musl、macOS Intel/Apple Silicon 与 Windows x64 五个可工作原生目标分别生成 LLVM JSON 并通过 line/function `>=95%`、region `>=90%`、branch `>=75%` 和每文件 line `>=75%` 门禁。Windows x64 精确结果为 line `95.105310% (6412/6742)`、function `98.297389% (866/881)`、region `90.073340% (8720/9681)`、branch `80.586592% (577/716)`；报告保存在 `target/coverage-ci-e322246/coverage.json`。Windows arm64 继续遵守已批准的 Rust 上游 coverage 例外。
+- 同一 CI 的 Rust `1.88.0` MSRV job 已在六个原生发布目标完成生产 workspace all-target/all-feature build/link 和 fuzz workspace check；当前 stable 的 Windows/Linux/macOS 测试、Clippy、文档测试、Miri、ASan、TSan、四项短 fuzz、供应链审计和 Windows strict relay-only E2E 共 `24/24` job 全绿。六目标 release profile 打包、静态链接检查和空目录 smoke 仍需 tag workflow 验证。
+- 每 target `24h` release fuzz、恶意 relay/代理以及完整 Linux namespace 公网、单 NAT、端口受限或对称 NAT、IPv6、延迟、抖动和乱序矩阵仍未完成。`10,000` 次连接/取消/resize/child-exit 单所有者乱序门禁已有本机 release 证据并已接入候选 workflow，仍等待 Linux runner 的候选复验。当前 Rocky 内核缺少 `sch_netem`，因此延迟/抖动/乱序不能在该机伪装为已验证。
 - 128 endpoint 下的 Linux RSS、CPU 与 FD 绝对上限已有上述真机证据；启动、OPAQUE、直连/relay 延迟、吞吐、Windows handle、分配以及全部指标的固定 runner 相对回归基线仍未建立。
-- 新的五 target coverage、六 target build/package、SBOM artifact 合并和 provenance/release 流程尚未在 GitHub tag workflow 取得真实成功结果；本机 actionlint 与可复现 SBOM 证据不能替代远端发布矩阵。
+- 六 target release package、SBOM artifact 合并和 provenance/release 流程尚未在 GitHub tag workflow 取得真实成功结果；CI coverage/MSRV 和本机可复现 SBOM 证据不能替代远端候选发布矩阵。
 
 ## 当前结论
 
-本轮完成了配置/CLI 重构、可工作的主控/被控/relay 全主路径、真实终端、四种 relay transport、自签 IP WSS、严格 DCUtR 收敛与一次性 relay-only 重建、relay restart/Reclaim/Conflict、容量拒绝连接绑定、上游 per-peer 限额补偿、任务与 PTY 有界关闭、秘密与文件资源边界、Windows x64 release、MSRV、供应链和基准验证；前一审计快照还取得 Windows nightly 覆盖率、默认隔离 Miri、完整 ASan/TSan、四 fuzz target 短时运行、Linux x64 musl、双 NAT TCP/有损 QUIC及 128 endpoint 资源证据。当前源码的本地 Windows 主功能和质量门禁已通过；新的原生平台矩阵、覆盖率、sanitizer、release candidate 打包、长时 fuzz、完整网络故障矩阵和固定 runner 相对回归基线仍需取得真实结果，未取得前不得创建正式 release。
+本轮完成了配置/CLI 重构、可工作的主控/被控/relay 全主路径、真实终端、四种 relay transport、自签 IP WSS、严格 DCUtR 收敛与预提交绑定抖动的一次性 relay-only 重建、relay restart/Reclaim/Conflict、容量拒绝连接绑定、上游 per-peer 限额补偿、任务与 PTY 有界关闭、秘密与文件资源边界、六目标 MSRV、五目标覆盖率、当前源码 Miri/ASan/TSan、供应链、短 fuzz、基准和 10,000 轮单所有者压力验证；前一审计快照还取得 Linux x64 musl、双 NAT TCP/有损 QUIC及 128 endpoint 资源证据。当前提交 CI `24/24` 全绿；release candidate 打包与长时 fuzz、恶意 relay/代理、完整网络故障矩阵和固定 runner 相对回归基线仍需取得真实结果，未取得前不得创建正式 release。

@@ -220,6 +220,40 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "release-candidate stress gate"]
+    fn stress_10000_session_event_interleavings_preserve_commit_monotonicity() {
+        const EVENTS: [SessionEvent; 9] = [
+            SessionEvent::BeginAuthentication,
+            SessionEvent::AuthenticationSucceeded,
+            SessionEvent::AuthenticationFailed,
+            SessionEvent::TerminalStreamsReady,
+            SessionEvent::TerminalStartFailed,
+            SessionEvent::TerminalReadyFlushed,
+            SessionEvent::ConnectionLost,
+            SessionEvent::ExtraConnection,
+            SessionEvent::ShellExited,
+        ];
+
+        for seed in 0_u64..10_000 {
+            let mut schedule = seed.wrapping_add(1);
+            let mut session = TargetSession::new();
+            let mut consumed = false;
+            for _ in 0..64 {
+                schedule = schedule
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let event = EVENTS[(schedule as usize) % EVENTS.len()];
+                let before = session.state();
+                if session.apply(event).is_err() {
+                    assert_eq!(session.state(), before);
+                }
+                consumed |= session.is_consumed();
+                assert!(!consumed || session.is_consumed());
+            }
+        }
+    }
+
     fn active_session() -> TargetSession {
         let mut session = TargetSession::new();
         for event in [
