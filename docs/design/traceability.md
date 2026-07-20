@@ -8,7 +8,7 @@
 | R-004 | 不造网络/密码/PTY/CLI/限速轮子 | dependency adapters | 全部协议 | 依赖锁、trait 边界测试、依赖审计 |
 | R-005 | 三角色复用统一 libp2p 基础栈 | `yonder-net` transport builder | endpoint Identify/DCUtR/UPnP/relay client；relay AutoNAT/relay server | behaviour 组合 unit + 三角色互操作 E2E |
 | R-006 | QUIC/TCP/WS/WSS 自适应 | path candidate actor | 路径选择状态 | transport E2E、阻断/降级 namespace 测试 |
-| R-007 | 连通性/质量优先并自动 relay | `PathPolicy` + 单次 Swarm 重建 fallback | relay 10s；端到端 30s/1.5s/Ping 排序 | 属性测试、故障入口与真实 relay-only E2E、benchmark |
+| R-007 | 连通性/质量优先并自动 relay | `PathPolicy` + 单次 Swarm 重建 fallback | relay 10s；无候选 30s；有 relay 候选后 DCUtR 3s/质量采样 1.5s/Ping 排序 | 属性测试、故障入口与真实 relay-only E2E、分阶段时延、benchmark |
 | R-008 | 子流绑定唯一物理连接 | roster + `ApplicationStreams` | 唯一连接屏障 | 双连接可行性回归、迟到连接全状态测试 |
 | R-009 | 专业短连接码且 relay 不知 secret | `ConnectionCode`/`Locator`/`PakeSecret` | 20+60 bit Crockford | golden/property/fuzz、日志脱敏测试 |
 | R-010 | 一次性认证、失败不消费 | target session actor | Advertised..Spent | 全转换 unit/property、断点 E2E |
@@ -24,5 +24,6 @@
 | R-020 | 全面测试和风险分级覆盖 | CI/release | 全部 | 五原生 target 独立 llvm-cov JSON 阈值、fuzz corpus、平台与性能报告 |
 | R-021 | 依赖最新、feature 最小且受审 | workspace dependencies | 无 | metadata/feature tree、audit/deny、MSRV builds |
 | R-022 | 无公共默认 relay，必须自建 | CLI validation | relay PeerId pin | 缺省参数失败、身份生成和自建 E2E |
+| R-023 | 0.1.0 实际体验可感知、终端零污染 | `OperationProgress<Stage>` + CLI renderer | 首反馈同步；心跳 <=1s；单行宽度；Active tracing 隔离；网络矩阵 <=20s | renderer/unit、Unix PTY + Windows ConPTY E2E、strict fallback、真实 namespace 时延门禁、错误/恢复回归 |
 
 实现任务只有同时关联至少一个需求 ID、一个责任 package 和一个验证项才能进入开发。发现无法为变更找到需求 ID 时视为范围扩大，必须先审批；发现需求没有可执行证据时视为设计缺口，不能用人工目测关闭。

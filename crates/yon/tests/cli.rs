@@ -23,6 +23,11 @@ fn invalid_connection_code_is_rejected_without_echoing_the_secret() {
 #[test]
 fn configuration_failures_retain_a_safe_actionable_cause() {
     let directory = tempdir().unwrap();
+    fs::write(
+        directory.path().join("yon.toml"),
+        "unsupported_setting = true\n",
+    )
+    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_yon"))
         .arg("host")
         .current_dir(directory.path())
@@ -63,6 +68,7 @@ fn invalid_wss_ca_fails_closed_for_both_endpoint_roles() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("the WSS certificate or private key is invalid"));
+        assert!(stderr.contains("failed to configure WSS TLS"));
+        assert!(stderr.contains("invalid peer certificate"));
     }
 }

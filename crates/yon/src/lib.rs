@@ -7,5 +7,6 @@ pub mod controller;
 pub mod host;
 pub mod network;
 pub mod pake;
+pub mod progress;
 pub mod protocol;
 pub mod terminal;

@@ -15,6 +15,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TARGET_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SELECTION_WINDOW: Duration = Duration::from_millis(1_500);
 const TARGET_SELECTION_WINDOW: Duration = Duration::from_millis(1_500);
+const DIRECT_UPGRADE_WINDOW: Duration = Duration::from_secs(3);
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTION_CAPACITY: usize = 8;
 const RELAY_DIAL_WINDOW: Duration = Duration::from_millis(1_500);
@@ -1055,10 +1056,11 @@ async fn connect_target_until(
     let mut selection = ConnectionSelection::new();
     let mut has_candidate = false;
     let mut selection_elapsed = false;
+    let mut direct_upgrade_deadline = None;
     let mut direct_upgrade_outcome = None;
     loop {
         let deadline = if selection_elapsed {
-            connect_deadline
+            direct_upgrade_deadline.unwrap_or(connect_deadline)
         } else {
             selection_deadline.unwrap_or(connect_deadline)
         };
@@ -1099,8 +1101,11 @@ async fn connect_target_until(
             has_candidate = true;
         }
         if has_candidate && selection_deadline.is_none() {
-            selection_deadline =
-                Some((tokio::time::Instant::now() + TARGET_SELECTION_WINDOW).min(connect_deadline));
+            let now = tokio::time::Instant::now();
+            selection_deadline = Some((now + TARGET_SELECTION_WINDOW).min(connect_deadline));
+            if direct_upgrade.is_enabled() {
+                direct_upgrade_deadline = Some((now + DIRECT_UPGRADE_WINDOW).min(connect_deadline));
+            }
         }
         if target_selection_is_settled(
             &selection,
@@ -1275,11 +1280,11 @@ fn finish_bound_output<T>(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        CONNECT_TIMEOUT, CONVERGENCE_TIMEOUT, ConnectionBinding, DirectUpgradeOutcome,
-        DirectUpgradeTracker, EndpointDriver, EndpointError, EndpointEvent, PendingRelayDials,
-        RELAY_DIAL_WINDOW, RELAY_DRAIN_WINDOW, RelayConnection, ReservationDecision,
-        ReservationLease, ReservationListenerId, ReservationSlot, SELECTION_WINDOW,
-        TARGET_SELECTION_WINDOW, TARGET_SETTLE_TIMEOUT, connect_relay_attempt,
+        CONNECT_TIMEOUT, CONVERGENCE_TIMEOUT, ConnectionBinding, DIRECT_UPGRADE_WINDOW,
+        DirectUpgradeOutcome, DirectUpgradeTracker, EndpointDriver, EndpointError, EndpointEvent,
+        PendingRelayDials, RELAY_DIAL_WINDOW, RELAY_DRAIN_WINDOW, RelayConnection,
+        ReservationDecision, ReservationLease, ReservationListenerId, ReservationSlot,
+        SELECTION_WINDOW, TARGET_SELECTION_WINDOW, TARGET_SETTLE_TIMEOUT, connect_relay_attempt,
         connect_target_until, converge_to_binding, dial_relay_set, drain_relay_state, drive,
         drive_bound, enforce_binding_after_event, finish_bound_output, finish_relay_selection,
         next_relay_dial, open_stream, process_relay_selection_event,
@@ -1300,7 +1305,9 @@ mod tests {
         assert!(CONVERGENCE_TIMEOUT < CONNECT_TIMEOUT);
         assert_eq!(SELECTION_WINDOW, TARGET_SELECTION_WINDOW);
         assert!(TARGET_SELECTION_WINDOW < CONVERGENCE_TIMEOUT);
-        assert!(Duration::from_secs(3 * 8) + TARGET_SELECTION_WINDOW < TARGET_SETTLE_TIMEOUT);
+        assert_eq!(DIRECT_UPGRADE_WINDOW, Duration::from_secs(3));
+        assert!(TARGET_SELECTION_WINDOW < DIRECT_UPGRADE_WINDOW);
+        assert!(DIRECT_UPGRADE_WINDOW < TARGET_SETTLE_TIMEOUT);
         assert_eq!(RELAY_DIAL_WINDOW, SELECTION_WINDOW);
         assert_eq!(RELAY_DRAIN_WINDOW, Duration::from_millis(500));
         assert!(RELAY_DIAL_WINDOW + Duration::from_secs(8) + RELAY_DRAIN_WINDOW <= CONNECT_TIMEOUT);

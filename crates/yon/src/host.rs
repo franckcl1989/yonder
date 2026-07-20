@@ -4,6 +4,7 @@ use crate::network::{
     relay_backoff, wait_for_reservation, wait_for_target_quiescence,
 };
 use crate::pake::{OpaquePake, OpaquePakeError, OpaqueRegistration};
+use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
 use crate::protocol::{
     ReclaimResponse, RelayProtocolError, allocate_locator, reclaim_locator, release_locator,
     release_locator_bound,
@@ -53,6 +54,19 @@ impl HostConfig {
             wss,
         }
     }
+}
+
+/// User-visible milestones emitted while a host advertises and serves one terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostStage {
+    ConnectingRelay,
+    ReservingRelay,
+    RegisteringHost,
+    WaitingForController,
+    ReconnectingRelay,
+    AuthenticatingController,
+    StartingTerminal,
+    TerminalActive,
 }
 
 #[cfg(test)]
@@ -473,13 +487,31 @@ pub enum HostError {
 
 /// Runs one advertised code through at most one committed terminal session.
 pub async fn run_host(config: HostConfig) -> Result<u32, HostError> {
-    run_host_with(config, PortablePtyBackend).await
+    let mut progress = NoopProgress;
+    run_host_session(config, PortablePtyBackend, &mut progress).await
+}
+
+/// Runs one host session while reporting bounded, non-secret lifecycle milestones.
+pub async fn run_host_with_progress(
+    config: HostConfig,
+    progress: &mut impl OperationProgress<HostStage>,
+) -> Result<u32, HostError> {
+    run_host_session(config, PortablePtyBackend, progress).await
 }
 
 /// Runs the host state machine with a statically dispatched terminal backend.
 pub async fn run_host_with<B: TerminalBackend>(
     config: HostConfig,
     backend: B,
+) -> Result<u32, HostError> {
+    let mut progress = NoopProgress;
+    run_host_session(config, backend, &mut progress).await
+}
+
+async fn run_host_session<B: TerminalBackend>(
+    config: HostConfig,
+    backend: B,
+    progress: &mut impl OperationProgress<HostStage>,
 ) -> Result<u32, HostError> {
     let HostConfig {
         identity,
@@ -492,8 +524,15 @@ pub async fn run_host_with<B: TerminalBackend>(
     let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL)?;
     let target = peer_id_bytes(driver.peer_id()).map_err(|_| HostError::PeerIdentity)?;
     let mut pake = OpaquePake;
-    let (relay_lease, advertised) =
-        initialize_host_relay(&mut driver, &mut streams, &relays, &target, &mut pake).await?;
+    let (relay_lease, advertised) = initialize_host_relay(
+        &mut driver,
+        &mut streams,
+        &relays,
+        &target,
+        &mut pake,
+        progress,
+    )
+    .await?;
 
     let mut session = HostSession {
         driver: &mut driver,
@@ -508,7 +547,7 @@ pub async fn run_host_with<B: TerminalBackend>(
         pake: &mut pake,
         backend: &backend,
     };
-    let result = session.run().await;
+    let result = session.run(progress).await;
     let relay = session.relay_lease.relay().peer();
     let locator = session.advertised.locator;
     let listener = session.relay_lease.listener();
@@ -528,14 +567,20 @@ async fn establish_host_relay(
     driver: &mut EndpointDriver,
     relays: &EndpointRelaySet,
     backoff: &mut impl Iterator<Item = Duration>,
+    stage: HostStage,
+    progress: &mut impl OperationProgress<HostStage>,
 ) -> Result<ReservationLease, HostError> {
     loop {
         let relay = tokio::select! {
-            result = connect_configured_relay(driver, relays) => match result {
+            result = wait_with_progress(
+                progress,
+                stage,
+                connect_configured_relay(driver, relays),
+            ) => match result {
                 Ok(relay) => relay,
                 Err(error) => {
                     tracing::debug!(%error, "host relay connection attempt failed");
-                    wait_for_host_retry(backoff).await?;
+                    wait_for_host_retry(backoff, stage, progress).await?;
                     continue;
                 }
             },
@@ -548,12 +593,16 @@ async fn establish_host_relay(
             Ok(listener) => listener,
             Err(error) => {
                 tracing::debug!(%error, "host relay reservation listener failed");
-                wait_for_host_retry(backoff).await?;
+                wait_for_host_retry(backoff, stage, progress).await?;
                 continue;
             }
         };
         let reservation = tokio::select! {
-            result = wait_for_reservation(driver, relay, listener) => result,
+            result = wait_with_progress(
+                progress,
+                HostStage::ReservingRelay,
+                wait_for_reservation(driver, relay, listener),
+            ) => result,
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 driver.remove_reservation(listener);
@@ -565,7 +614,7 @@ async fn establish_host_relay(
             Err(error) => {
                 driver.remove_reservation(listener);
                 tracing::debug!(%error, "host relay reservation attempt failed");
-                wait_for_host_retry(backoff).await?;
+                wait_for_host_retry(backoff, stage, progress).await?;
             }
         }
     }
@@ -577,10 +626,18 @@ async fn initialize_host_relay(
     relays: &EndpointRelaySet,
     target: &PeerIdBytes,
     pake: &mut OpaquePake,
+    progress: &mut impl OperationProgress<HostStage>,
 ) -> Result<(ReservationLease, AdvertisedLease), HostError> {
     let mut backoff = relay_backoff();
     loop {
-        let candidate = establish_host_relay(driver, relays, &mut backoff).await?;
+        let candidate = establish_host_relay(
+            driver,
+            relays,
+            &mut backoff,
+            HostStage::ConnectingRelay,
+            progress,
+        )
+        .await?;
         let allocation = tokio::select! {
             result = allocate_advertisement(
                 driver,
@@ -588,6 +645,7 @@ async fn initialize_host_relay(
                 candidate.relay(),
                 target,
                 pake,
+                progress,
             ) => Some(result),
             signal = tokio::signal::ctrl_c() => {
                 signal?;
@@ -603,7 +661,7 @@ async fn initialize_host_relay(
             Err(HostError::Relay(error)) if retryable_relay_error(&error) => {
                 tracing::debug!(%error, "initial locator allocation will be retried after reconnect");
                 driver.remove_reservation(candidate.listener());
-                wait_for_host_retry(&mut backoff).await?;
+                wait_for_host_retry(&mut backoff, HostStage::ConnectingRelay, progress).await?;
             }
             Err(error) => {
                 driver.remove_reservation(candidate.listener());
@@ -615,12 +673,14 @@ async fn initialize_host_relay(
 
 async fn wait_for_host_retry(
     backoff: &mut impl Iterator<Item = Duration>,
+    stage: HostStage,
+    progress: &mut impl OperationProgress<HostStage>,
 ) -> Result<(), HostError> {
     let delay = backoff
         .next()
         .expect("the frozen host relay backoff is unbounded");
     tokio::select! {
-        () = tokio::time::sleep(delay) => Ok(()),
+        () = wait_with_progress(progress, stage, tokio::time::sleep(delay)) => Ok(()),
         signal = tokio::signal::ctrl_c() => {
             signal?;
             Err(HostError::Interrupted)
@@ -634,8 +694,14 @@ async fn allocate_advertisement(
     relay: &RelayConnection,
     target: &PeerIdBytes,
     pake: &mut OpaquePake,
+    progress: &mut impl OperationProgress<HostStage>,
 ) -> Result<AdvertisedLease, HostError> {
-    let locator = allocate_locator(driver, streams, relay).await?;
+    let locator = wait_with_progress(
+        progress,
+        HostStage::RegisteringHost,
+        allocate_locator(driver, streams, relay),
+    )
+    .await?;
     let created = create_advertisement(locator, target, pake);
     let (advertised, code) = match created {
         Ok(created) => created,
@@ -644,6 +710,7 @@ async fn allocate_advertisement(
             return Err(error);
         }
     };
+    progress.clear();
     if let Err(error) = report_connection_code(&code) {
         release_failed_advertisement(driver, streams, relay, locator).await;
         return Err(HostError::Output(error));
@@ -694,86 +761,105 @@ fn report_connection_code_to(
     output.flush()
 }
 
-async fn recover_host_relay(
-    driver: &mut EndpointDriver,
-    streams: &mut Libp2pApplicationStreams,
-    relays: &EndpointRelaySet,
-    relay_lease: &mut ReservationLease,
-    advertised: &mut AdvertisedLease,
-    target: &PeerIdBytes,
-    pake: &mut OpaquePake,
-) -> Result<(), HostError> {
-    driver.remove_reservation(relay_lease.listener());
-    let mut backoff = relay_backoff();
-    loop {
-        let candidate = establish_host_relay(driver, relays, &mut backoff).await?;
-        let reclaim = tokio::select! {
-            result = reclaim_locator(
-                driver,
-                streams,
-                candidate.relay(),
-                advertised.locator,
-            ) => Some(result),
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                None
-            }
-        };
-        let Some(reclaim) = reclaim else {
-            driver.remove_reservation(candidate.listener());
-            return Err(HostError::Interrupted);
-        };
-        match reclaim {
-            Ok(ReclaimResponse::Reclaimed) => {
-                tracing::debug!("host relay locator was reclaimed");
-                *relay_lease = candidate;
-                return Ok(());
-            }
-            Ok(ReclaimResponse::Conflict) => {
-                tracing::debug!("host relay locator reclaim conflicted");
-                let allocation = tokio::select! {
-                    result = allocate_advertisement(
-                        driver,
-                        streams,
+struct RelayRecovery<'a> {
+    driver: &'a mut EndpointDriver,
+    streams: &'a mut Libp2pApplicationStreams,
+    relays: &'a EndpointRelaySet,
+    relay_lease: &'a mut ReservationLease,
+    advertised: &'a mut AdvertisedLease,
+    target: &'a PeerIdBytes,
+    pake: &'a mut OpaquePake,
+}
+
+impl RelayRecovery<'_> {
+    async fn run(
+        &mut self,
+        progress: &mut impl OperationProgress<HostStage>,
+    ) -> Result<(), HostError> {
+        self.driver.remove_reservation(self.relay_lease.listener());
+        let mut backoff = relay_backoff();
+        loop {
+            let candidate = establish_host_relay(
+                self.driver,
+                self.relays,
+                &mut backoff,
+                HostStage::ReconnectingRelay,
+                progress,
+            )
+            .await?;
+            let reclaim = tokio::select! {
+                result = wait_with_progress(
+                    progress,
+                    HostStage::ReconnectingRelay,
+                    reclaim_locator(
+                        self.driver,
+                        self.streams,
                         candidate.relay(),
-                        target,
-                        pake,
-                    ) => Some(result),
-                    signal = tokio::signal::ctrl_c() => {
-                        signal?;
-                        None
-                    }
-                };
-                let Some(allocation) = allocation else {
-                    driver.remove_reservation(candidate.listener());
-                    return Err(HostError::Interrupted);
-                };
-                match allocation {
-                    Ok(replacement) => {
-                        tracing::debug!("host replacement locator was allocated");
-                        *advertised = replacement;
-                        *relay_lease = candidate;
-                        return Ok(());
-                    }
-                    Err(HostError::Relay(error)) if retryable_relay_error(&error) => {
-                        tracing::debug!(%error, "replacement locator allocation will be retried");
-                    }
-                    Err(error) => {
-                        driver.remove_reservation(candidate.listener());
-                        return Err(error);
+                        self.advertised.locator,
+                    ),
+                ) => Some(result),
+                signal = tokio::signal::ctrl_c() => {
+                    signal?;
+                    None
+                }
+            };
+            let Some(reclaim) = reclaim else {
+                self.driver.remove_reservation(candidate.listener());
+                return Err(HostError::Interrupted);
+            };
+            match reclaim {
+                Ok(ReclaimResponse::Reclaimed) => {
+                    tracing::debug!("host relay locator was reclaimed");
+                    *self.relay_lease = candidate;
+                    return Ok(());
+                }
+                Ok(ReclaimResponse::Conflict) => {
+                    tracing::debug!("host relay locator reclaim conflicted");
+                    let allocation = tokio::select! {
+                        result = allocate_advertisement(
+                            self.driver,
+                            self.streams,
+                            candidate.relay(),
+                            self.target,
+                            self.pake,
+                            progress,
+                        ) => Some(result),
+                        signal = tokio::signal::ctrl_c() => {
+                            signal?;
+                            None
+                        }
+                    };
+                    let Some(allocation) = allocation else {
+                        self.driver.remove_reservation(candidate.listener());
+                        return Err(HostError::Interrupted);
+                    };
+                    match allocation {
+                        Ok(replacement) => {
+                            tracing::debug!("host replacement locator was allocated");
+                            *self.advertised = replacement;
+                            *self.relay_lease = candidate;
+                            return Ok(());
+                        }
+                        Err(HostError::Relay(error)) if retryable_relay_error(&error) => {
+                            tracing::debug!(%error, "replacement locator allocation will be retried");
+                        }
+                        Err(error) => {
+                            self.driver.remove_reservation(candidate.listener());
+                            return Err(error);
+                        }
                     }
                 }
+                Err(error) if retryable_relay_error(&error) => {
+                    tracing::debug!(%error, "host locator reclaim will be retried after reconnect");
+                }
+                Err(error) => {
+                    self.driver.remove_reservation(candidate.listener());
+                    return Err(error.into());
+                }
             }
-            Err(error) if retryable_relay_error(&error) => {
-                tracing::debug!(%error, "host locator reclaim will be retried after reconnect");
-            }
-            Err(error) => {
-                driver.remove_reservation(candidate.listener());
-                return Err(error.into());
-            }
+            self.driver.remove_reservation(candidate.listener());
+            wait_for_host_retry(&mut backoff, HostStage::ReconnectingRelay, progress).await?;
         }
-        driver.remove_reservation(candidate.listener());
-        wait_for_host_retry(&mut backoff).await?;
     }
 }
 
@@ -810,7 +896,10 @@ struct InboundProtocols<'a> {
 }
 
 impl<B: TerminalBackend> HostSession<'_, B> {
-    async fn run(&mut self) -> Result<u32, HostError> {
+    async fn run(
+        &mut self,
+        progress: &mut impl OperationProgress<HostStage>,
+    ) -> Result<u32, HostError> {
         let Self {
             driver,
             streams,
@@ -832,9 +921,10 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             control: control_incoming,
         };
         loop {
+            progress.update(HostStage::WaitingForController);
             if !relay_lease.is_usable(driver) {
                 tracing::debug!("host relay lease became unusable");
-                recover_host_relay(
+                RelayRecovery {
                     driver,
                     streams,
                     relays,
@@ -842,14 +932,17 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                     advertised,
                     target,
                     pake,
-                )
+                }
+                .run(progress)
                 .await?;
+                progress.update(HostStage::WaitingForController);
             }
             let (controller, mut auth_stream) =
                 match wait_for_auth(driver, &mut incoming, relay_lease).await? {
                     Some(incoming) => incoming,
                     None => continue,
                 };
+            progress.update(HostStage::AuthenticatingController);
             let binding = match wait_for_target_quiescence(driver, controller).await {
                 Ok(binding) => binding,
                 Err(error) => {
@@ -914,7 +1007,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             )
             .await;
             match authenticated {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => progress.update(HostStage::StartingTerminal),
                 Ok(Err(error)) => {
                     session.apply(SessionEvent::AuthenticationFailed)?;
                     tracing::debug!(%error, "controller authentication was rejected");
@@ -983,6 +1076,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                 }
             };
             session.apply(SessionEvent::TerminalReadyFlushed)?;
+            progress.update(HostStage::TerminalActive);
             if let Err(error) = release_locator_bound(
                 driver,
                 streams,

@@ -4,6 +4,7 @@
 //! Type-safe domain and wire protocol primitives shared by Yonder processes.
 
 pub mod code;
+pub mod diagnostic;
 pub mod domain;
 pub mod error;
 pub mod pake;
@@ -17,6 +18,7 @@ pub mod time;
 pub mod wire;
 
 pub use code::{ConnectionCode, Locator, PakeSecret};
+pub use diagnostic::write_error_report;
 pub use domain::{PeerIdBytes, RetryAfter, TerminalSize, TerminalValue};
 pub use error::{CodeError, DomainError, ProtocolError};
 pub use pake::Pake;

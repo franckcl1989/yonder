@@ -4,6 +4,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::convert::Infallible;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{IsTerminal as _, Read, Write as _};
 use std::path::{Path, PathBuf};
@@ -12,13 +13,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing_subscriber::filter::LevelFilter;
-use yon::controller::{ControllerConfig, ControllerError, local_terminal_hello, run_controller};
-use yon::host::{HostConfig, HostError, run_host};
+use yon::controller::{
+    ControllerConfig, ControllerError, ControllerStage, local_terminal_hello,
+    run_controller_with_progress,
+};
+use yon::host::{HostConfig, HostError, HostStage, run_host_with_progress};
+use yon::progress::OperationProgress;
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
     LayeredConfigLoader,
 };
-use yonder_core::{CodeError, ConnectionCode, OsSecureRandom};
+use yonder_core::{CodeError, ConnectionCode, OsSecureRandom, write_error_report};
 use yonder_net::{
     AddressError, EndpointRelayAddress, EndpointRelaySet, NetworkBuildError, WssTransportConfig,
     generate_identity,
@@ -37,7 +42,7 @@ const ENDPOINT_SCHEMA: ConfigurationSchema =
 #[derive(Debug, Parser)]
 #[command(name = "yon", version, about)]
 struct Cli {
-    #[arg(long, value_enum, default_value_t = LogLevel::Warn, global = true)]
+    #[arg(long, value_enum, default_value_t = LogLevel::Error, global = true)]
     log_level: LogLevel,
     #[command(subcommand)]
     command: Command,
@@ -51,6 +56,12 @@ enum Command {
     Connect {
         code: Option<ConnectionCodeArgument>,
     },
+}
+
+impl Command {
+    const fn is_connect(&self) -> bool {
+        matches!(self, Self::Connect { .. })
+    }
 }
 
 #[derive(Clone)]
@@ -107,12 +118,20 @@ impl LogLevel {
             Self::Trace => LevelFilter::TRACE,
         }
     }
+
+    const fn requires_redirect_for_terminal(self) -> bool {
+        matches!(self, Self::Warn | Self::Info | Self::Debug | Self::Trace)
+    }
 }
 
 #[derive(Debug, Error)]
 enum AppError {
     #[error("failed to initialize diagnostics")]
     Diagnostics,
+    #[error(
+        "--log-level warn/info/debug/trace requires stderr redirection when connect writes to a terminal (for example: yon --log-level debug connect 2> yon-debug.log)"
+    )]
+    InteractiveDiagnostics,
     #[error("the relay address set is invalid: {0}")]
     RelaySet(#[from] AddressError),
     #[error("failed to load endpoint configuration: {0}")]
@@ -152,9 +171,15 @@ fn main() -> ExitCode {
 fn process_result(result: Result<u32, AppError>) -> ExitCode {
     match result {
         Ok(code) => process_exit(code),
-        Err(AppError::Controller(ControllerError::Interrupted)) => ExitCode::from(130),
+        Err(AppError::Controller(ControllerError::Interrupted)) => {
+            begin_terminal_report_line();
+            ExitCode::from(130)
+        }
         Err(error) => {
-            let _ = writeln!(std::io::stderr().lock(), "error: {error}");
+            if matches!(&error, AppError::Controller(_) | AppError::Host(_)) {
+                begin_terminal_report_line();
+            }
+            let _ = write_error_report(&mut std::io::stderr().lock(), &error);
             if matches!(
                 error,
                 AppError::Code(_) | AppError::CodeTooLong | AppError::CodeEncoding
@@ -168,12 +193,18 @@ fn process_result(result: Result<u32, AppError>) -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<u32, AppError> {
-    let ansi = std::io::stderr().is_terminal();
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    let terminal_output = controller_uses_terminal(
+        &cli.command,
+        std::io::stdout().is_terminal(),
+        stderr_is_terminal,
+    );
+    validate_diagnostic_output(cli.log_level, terminal_output)?;
     tracing_subscriber::fmt()
-        .with_max_level(cli.log_level.filter())
+        .with_max_level(diagnostic_filter(cli.log_level, terminal_output))
         .with_target(false)
         .with_writer(std::io::stderr)
-        .with_ansi(ansi)
+        .with_ansi(stderr_is_terminal)
         .compact()
         .try_init()
         .map_err(|_| AppError::Diagnostics)?;
@@ -185,6 +216,29 @@ fn run(cli: Cli) -> Result<u32, AppError> {
         .map_err(AppError::RuntimeThread)?
         .join()
         .map_err(|_| AppError::RuntimePanicked)?
+}
+
+fn validate_diagnostic_output(level: LogLevel, terminal_output: bool) -> Result<(), AppError> {
+    if terminal_output && level.requires_redirect_for_terminal() {
+        return Err(AppError::InteractiveDiagnostics);
+    }
+    Ok(())
+}
+
+fn controller_uses_terminal(
+    command: &Command,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    command.is_connect() && stdout_is_terminal && stderr_is_terminal
+}
+
+fn diagnostic_filter(level: LogLevel, terminal_output: bool) -> LevelFilter {
+    if terminal_output {
+        LevelFilter::OFF
+    } else {
+        level.filter()
+    }
 }
 
 fn run_command(command: Command) -> Result<u32, AppError> {
@@ -203,8 +257,15 @@ fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Resul
         Command::Host => {
             let (relays, wss) = endpoint_config()?;
             let identity = generate_identity(&mut OsSecureRandom)?;
+            let terminal_output = std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal()
+                && terminal_supports_progress(std::env::var_os("TERM").as_deref());
+            let mut progress = TerminalProgress::new(std::io::stderr(), terminal_output);
             runtime
-                .block_on(run_host(HostConfig::new(identity, relays, wss)))
+                .block_on(run_host_with_progress(
+                    HostConfig::new(identity, relays, wss),
+                    &mut progress,
+                ))
                 .map_err(AppError::from)
         }
         Command::Connect { code } => {
@@ -212,13 +273,145 @@ fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Resul
             let terminal = local_terminal_hello()?;
             let (relays, wss) = endpoint_config()?;
             let identity = generate_identity(&mut OsSecureRandom)?;
+            let terminal_output = std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal()
+                && terminal_supports_progress(std::env::var_os("TERM").as_deref());
+            let mut progress = TerminalProgress::new(std::io::stderr(), terminal_output);
             runtime
-                .block_on(run_controller(ControllerConfig::new(
-                    identity, relays, wss, code, terminal,
-                )))
+                .block_on(run_controller_with_progress(
+                    ControllerConfig::new(identity, relays, wss, code, terminal),
+                    &mut progress,
+                ))
                 .map_err(AppError::from)
         }
     }
+}
+
+struct TerminalProgress<W: std::io::Write> {
+    writer: W,
+    enabled: bool,
+    visible: bool,
+    line_capacity: usize,
+    frame: usize,
+}
+
+impl<W: std::io::Write> TerminalProgress<W> {
+    fn new(writer: W, enabled: bool) -> Self {
+        let columns = enabled
+            .then(crossterm::terminal::size)
+            .and_then(Result::ok)
+            .map_or(0, |(columns, _)| usize::from(columns));
+        Self::with_columns(writer, enabled, columns)
+    }
+
+    const fn with_columns(writer: W, enabled: bool, columns: usize) -> Self {
+        let line_capacity = columns.saturating_sub(1);
+        Self {
+            writer,
+            enabled: enabled && line_capacity >= 8,
+            visible: false,
+            line_capacity,
+            frame: 0,
+        }
+    }
+
+    fn render(&mut self, message: &str) {
+        if !self.enabled {
+            return;
+        }
+        debug_assert!(message.is_ascii());
+        let result = (|| {
+            crossterm::queue!(
+                &mut self.writer,
+                crossterm::cursor::MoveToColumn(0),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+            )?;
+            const FRAMES: &[u8; 4] = b"|/-\\";
+            write!(
+                self.writer,
+                "{} ",
+                char::from(FRAMES[self.frame % FRAMES.len()])
+            )?;
+            let message_capacity = self.line_capacity.saturating_sub(2);
+            self.writer
+                .write_all(&message.as_bytes()[..message.len().min(message_capacity)])?;
+            self.writer.flush()
+        })();
+        if result.is_ok() {
+            self.visible = true;
+            self.frame = self.frame.wrapping_add(1);
+        } else {
+            self.enabled = false;
+            self.visible = false;
+        }
+    }
+
+    fn clear_line(&mut self) {
+        if !self.enabled || !self.visible {
+            return;
+        }
+        let result = (|| {
+            crossterm::queue!(
+                &mut self.writer,
+                crossterm::cursor::MoveToColumn(0),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+            )?;
+            self.writer.flush()
+        })();
+        self.visible = false;
+        if result.is_err() {
+            self.enabled = false;
+        }
+    }
+}
+
+impl<W: std::io::Write> OperationProgress<ControllerStage> for TerminalProgress<W> {
+    fn update(&mut self, stage: ControllerStage) {
+        let message = match stage {
+            ControllerStage::ConnectingRelay => "Connecting to relay...",
+            ControllerStage::ResolvingHost => "Finding remote host...",
+            ControllerStage::EstablishingPath => "Establishing the best available path...",
+            ControllerStage::RelayFallback => "Direct path unavailable; switching to relay...",
+            ControllerStage::Authenticating => "Authenticating remote host...",
+            ControllerStage::StartingTerminal => "Starting remote terminal...",
+        };
+        self.render(message);
+    }
+
+    fn clear(&mut self) {
+        self.clear_line();
+    }
+}
+
+impl<W: std::io::Write> OperationProgress<HostStage> for TerminalProgress<W> {
+    fn update(&mut self, stage: HostStage) {
+        let message = match stage {
+            HostStage::ConnectingRelay => "Connecting to relay...",
+            HostStage::ReservingRelay => "Reserving relay capacity...",
+            HostStage::RegisteringHost => "Registering remote host...",
+            HostStage::WaitingForController => "Waiting for controller...",
+            HostStage::ReconnectingRelay => "Relay unavailable; reconnecting...",
+            HostStage::AuthenticatingController => "Authenticating controller...",
+            HostStage::StartingTerminal => "Starting remote terminal...",
+            HostStage::TerminalActive => "Remote terminal active.",
+        };
+        self.render(message);
+    }
+
+    fn clear(&mut self) {
+        self.clear_line();
+    }
+}
+
+impl<W: std::io::Write> Drop for TerminalProgress<W> {
+    fn drop(&mut self) {
+        self.clear_line();
+    }
+}
+
+fn terminal_supports_progress(term: Option<&OsStr>) -> bool {
+    term.and_then(OsStr::to_str)
+        .is_none_or(|value| !value.eq_ignore_ascii_case("dumb"))
 }
 
 fn read_connection_code() -> Result<ConnectionCode, AppError> {
@@ -311,30 +504,46 @@ fn process_exit(code: u32) -> ExitCode {
     match portable_process_exit(code) {
         Ok(exit) => exit,
         Err(remote_exit_code) => {
-            tracing::warn!(
-                remote_exit_code,
-                "remote exit code exceeds the portable process range; returning 1"
-            );
+            begin_terminal_report_line();
+            let _ = write_remote_exit_warning(&mut std::io::stderr().lock(), remote_exit_code);
             ExitCode::FAILURE
         }
     }
+}
+
+fn begin_terminal_report_line() {
+    if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+        let _ = write!(std::io::stderr().lock(), "\r\n");
+    }
+}
+
+fn write_remote_exit_warning(output: &mut impl std::io::Write, code: u32) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "warning: remote exit code {code} exceeds the portable process range; returning 1"
+    )
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppError, Cli, Command, ConnectionCodeArgument, ENDPOINT_SCHEMA, LogLevel,
-        RUNTIME_SHUTDOWN_TIMEOUT, endpoint_config_with, portable_process_exit, process_result,
-        read_ca, read_ca_document, read_connection_code_from, run, run_command,
+        AppError, Cli, Command, ConnectionCodeArgument, ENDPOINT_SCHEMA, LevelFilter, LogLevel,
+        RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress, controller_uses_terminal, diagnostic_filter,
+        endpoint_config_with, portable_process_exit, process_result, read_ca, read_ca_document,
+        read_connection_code_from, run, run_command, terminal_supports_progress,
+        validate_diagnostic_output, write_remote_exit_warning,
     };
     use clap::Parser;
     use std::ffi::OsString;
     use std::fs;
-    use std::io::{self, Cursor, Read};
+    use std::io::{self, Cursor, Read, Write};
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use yon::controller::ControllerStage;
+    use yon::host::HostStage;
+    use yon::progress::OperationProgress as _;
     use yonder_config::{ConfigurationLocationError, ConfigurationSources, LayeredConfigLoader};
     use yonder_net::Keypair;
 
@@ -342,6 +551,7 @@ mod tests {
     fn configuration_driven_cli_shape_parses() {
         let host = Cli::try_parse_from(["yon", "host"]).unwrap();
         assert!(matches!(host.command, Command::Host));
+        assert!(matches!(host.log_level, LogLevel::Error));
 
         let connect = Cli::try_parse_from(["yon", "connect", "0000-0000-0000-0000"]).unwrap();
         assert!(matches!(connect.command, Command::Connect { .. }));
@@ -352,11 +562,126 @@ mod tests {
     }
 
     #[test]
+    fn terminal_connect_diagnostics_require_explicit_stderr_redirection() {
+        for level in [
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            assert!(matches!(
+                validate_diagnostic_output(level, true),
+                Err(AppError::InteractiveDiagnostics)
+            ));
+            assert!(validate_diagnostic_output(level, false).is_ok());
+        }
+        for level in [LogLevel::Off, LogLevel::Error] {
+            assert!(validate_diagnostic_output(level, true).is_ok());
+        }
+        assert_eq!(diagnostic_filter(LogLevel::Error, true), LevelFilter::OFF);
+        assert_eq!(
+            diagnostic_filter(LogLevel::Debug, false),
+            LevelFilter::DEBUG
+        );
+
+        let connect = Command::Connect { code: None };
+        assert!(controller_uses_terminal(&connect, true, true));
+        assert!(!controller_uses_terminal(&connect, false, true));
+        assert!(!controller_uses_terminal(&connect, true, false));
+        assert!(!controller_uses_terminal(&Command::Host, true, true));
+    }
+
+    #[test]
+    fn controller_progress_reuses_and_clears_one_terminal_line() {
+        let mut progress = TerminalProgress::with_columns(Vec::new(), true, 80);
+        for (stage, expected) in [
+            (ControllerStage::ConnectingRelay, "Connecting to relay..."),
+            (ControllerStage::ResolvingHost, "Finding remote host..."),
+            (
+                ControllerStage::EstablishingPath,
+                "Establishing the best available path...",
+            ),
+            (
+                ControllerStage::RelayFallback,
+                "Direct path unavailable; switching to relay...",
+            ),
+            (
+                ControllerStage::Authenticating,
+                "Authenticating remote host...",
+            ),
+            (
+                ControllerStage::StartingTerminal,
+                "Starting remote terminal...",
+            ),
+        ] {
+            progress.update(stage);
+            assert!(String::from_utf8_lossy(&progress.writer).contains(expected));
+            assert!(progress.visible);
+        }
+        progress.clear_line();
+        assert!(!progress.visible);
+
+        let mut disabled = TerminalProgress::with_columns(Vec::new(), false, 80);
+        disabled.update(ControllerStage::ConnectingRelay);
+        disabled.clear_line();
+        assert!(disabled.writer.is_empty());
+
+        let mut failing = TerminalProgress::with_columns(FailingWriter, true, 80);
+        failing.update(ControllerStage::ConnectingRelay);
+        assert!(!failing.enabled);
+        assert!(!failing.visible);
+
+        let mut narrow = TerminalProgress::with_columns(Vec::new(), true, 12);
+        narrow.update(ControllerStage::ConnectingRelay);
+        assert!(narrow.writer.ends_with(b"| Connectin"));
+        assert!(!String::from_utf8_lossy(&narrow.writer).contains("Connecting to relay..."));
+    }
+
+    #[test]
+    fn host_progress_and_terminal_capabilities_are_explicit() {
+        let mut progress = TerminalProgress::with_columns(Vec::new(), true, 80);
+        for stage in [
+            HostStage::ConnectingRelay,
+            HostStage::ReservingRelay,
+            HostStage::RegisteringHost,
+            HostStage::WaitingForController,
+            HostStage::ReconnectingRelay,
+            HostStage::AuthenticatingController,
+            HostStage::StartingTerminal,
+            HostStage::TerminalActive,
+        ] {
+            progress.update(stage);
+        }
+        let rendered = String::from_utf8(progress.writer.clone()).unwrap();
+        assert!(rendered.contains("Connecting to relay..."));
+        assert!(rendered.contains("Waiting for controller..."));
+        assert!(rendered.contains("Relay unavailable; reconnecting..."));
+        assert!(rendered.contains("Remote terminal active."));
+
+        assert!(terminal_supports_progress(None));
+        assert!(terminal_supports_progress(Some(std::ffi::OsStr::new(
+            "xterm-256color"
+        ))));
+        assert!(!terminal_supports_progress(Some(std::ffi::OsStr::new(
+            "dumb"
+        ))));
+        assert!(!terminal_supports_progress(Some(std::ffi::OsStr::new(
+            "DUMB"
+        ))));
+    }
+
+    #[test]
     fn portable_process_exit_preserves_out_of_range_remote_values() {
         assert_eq!(portable_process_exit(0), Ok(ExitCode::SUCCESS));
         assert_eq!(portable_process_exit(255), Ok(ExitCode::from(255)));
         assert_eq!(portable_process_exit(256), Err(256));
         assert_eq!(process_result(Ok(256)), ExitCode::FAILURE);
+        let mut warning = Vec::new();
+        write_remote_exit_warning(&mut warning, 256).unwrap();
+        assert_eq!(
+            String::from_utf8(warning).unwrap(),
+            "warning: remote exit code 256 exceeds the portable process range; returning 1\n"
+        );
     }
 
     #[test]
@@ -410,6 +735,7 @@ mod tests {
 
         for error in [
             AppError::CaTooLarge,
+            AppError::InteractiveDiagnostics,
             AppError::RuntimePanicked,
             AppError::CodeRead(io::Error::other("connection code read failed")),
             AppError::CaRead(io::Error::other("CA read failed")),
@@ -649,6 +975,18 @@ mod tests {
     impl Read for FailingReader {
         fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::other("read failed"))
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
         }
     }
 }

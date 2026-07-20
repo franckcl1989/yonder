@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::fmt;
 use std::fs::File;
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use thiserror::Error;
@@ -22,7 +22,7 @@ use yonder_core::{
     OsSecureRandom, RegistrationCapacity, RegistrationLimits, RelayResourceConfig,
     RelayResourceError, ReservationDuration, ResolveConcurrency, ResolveLimits, ResolveRate,
     RetryAfter, SecretDocument, SecureRandom, SourceLimiterCapacity, SourceLimiterIdle,
-    SourceRegistrationCapacity,
+    SourceRegistrationCapacity, write_error_report,
 };
 use yonder_net::{
     AddressError, NetworkBuildError, RelayExternalAddress, RelayListenAddress, WssTransportConfig,
@@ -227,7 +227,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(std::io::stderr().lock(), "error: {error}");
+            let _ = write_error_report(&mut std::io::stderr().lock(), &error);
             ExitCode::FAILURE
         }
     }
@@ -406,7 +406,7 @@ mod tests {
         AppError, Cli, Command, IdentityCommand, LogLevel, RELAY_SCHEMA, TlsDocumentKind,
         execute_command, initialize_identity, initialize_identity_with, read_tls_document,
         read_tls_document_from, relay_runtime, report_peer_id_to, run, serve_config_with,
-        serve_relay,
+        serve_relay, write_error_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -768,14 +768,19 @@ mod tests {
         )
         .unwrap();
 
+        let error = serve_relay(config).unwrap_err();
         assert!(matches!(
-            serve_relay(config),
-            Err(AppError::Service(
-                yon_relay::RelayServiceError::NetworkBuild(
-                    yonder_net::NetworkBuildError::InvalidTlsMaterial
-                )
+            &error,
+            AppError::Service(yon_relay::RelayServiceError::NetworkBuild(
+                yonder_net::NetworkBuildError::WssTls(_)
             ))
         ));
+        let mut report = Vec::new();
+        write_error_report(&mut report, &error).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.starts_with("error: failed to construct the relay network\n"));
+        assert!(report.contains("caused by: failed to configure WSS TLS\n"));
+        assert!(report.lines().count() >= 3);
     }
 
     #[test]

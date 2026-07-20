@@ -42,6 +42,12 @@ pub enum NetworkBuildError {
     Dns(#[source] std::io::Error),
     #[error("the WSS certificate or private key is invalid")]
     InvalidTlsMaterial,
+    #[error("the WSS private key is not a supported DER encoding")]
+    InvalidWssPrivateKey,
+    #[error("the WSS certificate is not a valid end-entity certificate")]
+    InvalidWssCertificate(#[source] webpki::Error),
+    #[error("failed to configure WSS TLS")]
+    WssTls(#[source] libp2p::websocket::tls::Error),
     #[error("the WSS certificate does not cover the advertised server name")]
     WssCertificateNameMismatch,
 }

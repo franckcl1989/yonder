@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
@@ -331,7 +331,7 @@ fn interactive_pty_preserves_bytes_resize_interrupt_environment_and_exit()
         .map_err(std::io::Error::other)?;
     let mut writer = pair.master.take_writer().map_err(std::io::Error::other)?;
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_yon"));
-    command.args(["--log-level", "off", "connect", code.as_str()]);
+    command.args(["connect", code.as_str()]);
     command.cwd(config.path());
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -447,7 +447,185 @@ fn interactive_pty_preserves_bytes_resize_interrupt_environment_and_exit()
     assert_bytes_contain(&output, b"YON_SIZE_INITIAL=33 91", "initial PTY size")?;
     assert_bytes_contain(&output, b"YON_SIZE_RESIZED=41 117", "resized PTY size")?;
     assert_bytes_contain(&output, b"YON_AFTER_INTERRUPT", "Ctrl+C recovery")?;
+    assert_progress_precedes_terminal_output(&output, b"\x1b[31mYON_ANSI\x1b[0m")?;
 
+    host.finish_with_exit(23)?;
+    relay_process.stop()
+}
+
+#[cfg(any(unix, windows))]
+fn assert_progress_precedes_terminal_output(
+    output: &[u8],
+    terminal_marker: &[u8],
+) -> Result<(), std::io::Error> {
+    const STAGES: [&[u8]; 6] = [
+        b"Connecting to relay...",
+        b"Finding remote host...",
+        b"Establishing the best available path...",
+        b"Direct path unavailable; switching to relay...",
+        b"Authenticating remote host...",
+        b"Starting remote terminal...",
+    ];
+    let terminal = output
+        .windows(terminal_marker.len())
+        .rposition(|window| window == terminal_marker)
+        .ok_or_else(|| std::io::Error::other("remote terminal marker was absent"))?;
+    let before_terminal = &output[..terminal];
+    for stage in [
+        b"Connecting to relay...".as_slice(),
+        b"Establishing the best available path...".as_slice(),
+    ] {
+        if !before_terminal
+            .windows(stage.len())
+            .any(|window| window == stage)
+        {
+            return Err(std::io::Error::other(format!(
+                "controller progress stage was absent: {}; output: {:?}",
+                String::from_utf8_lossy(stage),
+                String::from_utf8_lossy(output)
+            )));
+        }
+    }
+    if STAGES.iter().any(|stage| {
+        output[terminal..]
+            .windows(stage.len())
+            .any(|window| window == *stage)
+    }) {
+        return Err(std::io::Error::other(
+            "controller progress was written after terminal output began",
+        ));
+    }
+    let last_progress = STAGES
+        .iter()
+        .filter_map(|stage| {
+            before_terminal
+                .windows(stage.len())
+                .rposition(|window| window == *stage)
+                .map(|position| position + stage.len())
+        })
+        .max()
+        .ok_or_else(|| std::io::Error::other("controller progress was absent"))?;
+    let after_progress = &before_terminal[last_progress..];
+    let line_was_cleared = [
+        b"\x1b[1G\x1b[2K".as_slice(),
+        b"\x1b[H\x1b[K".as_slice(),
+        b"\r\x1b[K".as_slice(),
+    ]
+    .into_iter()
+    .any(|sequence| {
+        after_progress
+            .windows(sequence.len())
+            .any(|window| window == sequence)
+    });
+    if !line_was_cleared {
+        return Err(std::io::Error::other(format!(
+            "controller progress line was not cleared before terminal output: {:?}",
+            String::from_utf8_lossy(output)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_conpty_keeps_progress_separate_from_remote_output() -> Result<(), std::io::Error> {
+    const OUTPUT_MARKER: &[u8] = b"YON_WINDOWS_CONPTY_OUTPUT";
+    let port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let relay_process = RelayProcess::start(identity, port)?;
+    wait_for_tcp_listener(port)?;
+    let relay = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}");
+    let config = EndpointConfigDirectory::new(&relay)?;
+    let mut host = HostProcess::start(&config)?;
+    let code = receive_code(&host.lines)?;
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(std::io::Error::other)?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(std::io::Error::other)?;
+    let mut writer = pair.master.take_writer().map_err(std::io::Error::other)?;
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_yon"));
+    command.arg("connect");
+    command.cwd(config.path());
+    command.env_remove("YON_RELAYS");
+    command.env_remove("YON_WSS_CA_DER");
+    let mut controller = pair
+        .slave
+        .spawn_command(command)
+        .map_err(std::io::Error::other)?;
+    drop(pair.slave);
+
+    let (output_tx, output_rx) = mpsc::channel();
+    let mut output_reader = Some(thread::spawn(move || {
+        let mut reader = reader;
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let length = reader.read(&mut chunk)?;
+            if length == 0 {
+                return Ok(());
+            }
+            if output_tx.send(chunk[..length].to_vec()).is_err() {
+                return Ok(());
+            }
+        }
+    }));
+    let mut output = Vec::new();
+    let outcome = (|| -> Result<u32, std::io::Error> {
+        writer.write_all(
+            format!("{code}\r\n\x1b[1;1R\r\necho YON_WINDOWS_CONPTY_OUTPUT\r\nexit 23\r\n")
+                .as_bytes(),
+        )?;
+        writer.flush()?;
+        if let Err(error) = wait_for_bytes(
+            &output_rx,
+            &mut output,
+            OUTPUT_MARKER,
+            Duration::from_secs(30),
+        ) {
+            output.extend(output_rx.try_iter().flatten());
+            return Err(std::io::Error::other(format!(
+                "{error}; controller ConPTY output: {:?}",
+                String::from_utf8_lossy(&output)
+            )));
+        }
+        wait_for_pty_exit(controller.as_mut(), SESSION_TIMEOUT)
+    })();
+    if outcome.is_err() {
+        let _ = controller.kill();
+        let _ = controller.wait();
+    }
+    drop(writer);
+    drop(pair.master);
+    finish_thread(
+        &mut output_reader,
+        START_TIMEOUT,
+        "Windows controller PTY output",
+    )??;
+    output.extend(output_rx.try_iter().flatten());
+    let controller_exit = outcome?;
+
+    assert_eq!(controller_exit, 23);
+    assert_bytes_contain(&output, b"Connection code:", "connection code prompt")?;
+    if output
+        .windows(code.len())
+        .any(|window| window == code.as_bytes())
+    {
+        return Err(std::io::Error::other(
+            "the hidden connection code was echoed by the Windows terminal",
+        ));
+    }
+    assert_bytes_contain(&output, OUTPUT_MARKER, "Windows ConPTY output")?;
+    assert_progress_precedes_terminal_output(&output, OUTPUT_MARKER)?;
     host.finish_with_exit(23)?;
     relay_process.stop()
 }
@@ -1119,7 +1297,7 @@ fn wait_for_tcp_listener(port: u16) -> Result<(), std::io::Error> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn wait_for_bytes(
     chunks: &mpsc::Receiver<Vec<u8>>,
     output: &mut Vec<u8>,
@@ -1137,7 +1315,7 @@ fn wait_for_bytes(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn wait_for_pty_exit(
     child: &mut dyn portable_pty::Child,
     timeout: Duration,
@@ -1154,7 +1332,7 @@ fn wait_for_pty_exit(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn assert_bytes_contain(
     output: &[u8],
     expected: &[u8],
@@ -1170,7 +1348,7 @@ fn assert_bytes_contain(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())

@@ -3,6 +3,7 @@ use crate::network::{
     connect_relay_with_policy, connect_target, connect_target_via_relay, drive_bound,
 };
 use crate::pake::{OpaquePake, OpaquePakeError};
+use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
 use crate::protocol::{RelayProtocolError, resolve_peer};
 use crate::terminal::TerminalChunk;
 use backon::{BackoffBuilder as _, ConstantBuilder};
@@ -42,6 +43,10 @@ trait TerminalFrontend {
     fn output_is_terminal(&self) -> bool;
     fn size(&self) -> Result<(u16, u16), std::io::Error>;
     fn enter_raw_mode(&self) -> Result<Option<Self::RawModeGuard>, std::io::Error>;
+    fn restore_raw_mode(&self, guard: Option<Self::RawModeGuard>) -> Result<(), std::io::Error> {
+        drop(guard);
+        Ok(())
+    }
     fn input(&mut self) -> Self::Input;
     fn output(&mut self) -> Self::Output;
 }
@@ -71,7 +76,11 @@ impl TerminalFrontend for CrosstermFrontend {
             return Ok(None);
         }
         crossterm::terminal::enable_raw_mode()?;
-        Ok(Some(RawModeGuard))
+        Ok(Some(RawModeGuard { armed: true }))
+    }
+
+    fn restore_raw_mode(&self, guard: Option<Self::RawModeGuard>) -> Result<(), std::io::Error> {
+        guard.map_or(Ok(()), RawModeGuard::restore)
     }
 
     fn input(&mut self) -> Self::Input {
@@ -146,15 +155,45 @@ pub enum ControllerError {
     Interrupted,
     #[error("the remote terminal did not finish within the shutdown deadline")]
     RemoteCompletionTimeout,
+    #[error("failed to restore the local terminal mode")]
+    TerminalRestore(#[source] std::io::Error),
+    #[error("the session failed and the local terminal mode could not be restored: {restore}")]
+    SessionAndTerminalRestore {
+        #[source]
+        session: Box<ControllerError>,
+        restore: std::io::Error,
+    },
+}
+
+/// User-visible milestones emitted while a controller session is being prepared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerStage {
+    ConnectingRelay,
+    ResolvingHost,
+    EstablishingPath,
+    RelayFallback,
+    Authenticating,
+    StartingTerminal,
 }
 
 /// Connects, authenticates, and returns the remote shell exit code.
 pub async fn run_controller(config: ControllerConfig) -> Result<u32, ControllerError> {
-    run_until_interrupted(
-        run_controller_session(config, CrosstermFrontend),
-        tokio::signal::ctrl_c(),
-    )
-    .await
+    let mut progress = NoopProgress;
+    let session = Box::pin(run_controller_session(
+        config,
+        CrosstermFrontend,
+        &mut progress,
+    ));
+    run_until_interrupted(session, tokio::signal::ctrl_c()).await
+}
+
+/// Connects while reporting bounded, non-secret controller preparation milestones.
+pub async fn run_controller_with_progress(
+    config: ControllerConfig,
+    progress: &mut impl OperationProgress<ControllerStage>,
+) -> Result<u32, ControllerError> {
+    let session = Box::pin(run_controller_session(config, CrosstermFrontend, progress));
+    run_until_interrupted(session, tokio::signal::ctrl_c()).await
 }
 
 async fn run_until_interrupted<T>(
@@ -174,6 +213,7 @@ async fn run_until_interrupted<T>(
 async fn run_controller_session<F: TerminalFrontend>(
     config: ControllerConfig,
     frontend: F,
+    progress: &mut impl OperationProgress<ControllerStage>,
 ) -> Result<u32, ControllerError> {
     let ControllerConfig {
         identity,
@@ -183,10 +223,20 @@ async fn run_controller_session<F: TerminalFrontend>(
         terminal,
     } = config;
     let fallback_wss = fallback_transport(&wss)?;
-    let (mut driver, mut streams, relay) = connect_relay(identity, &relays, wss).await?;
+    let (mut driver, mut streams, relay) = wait_with_progress(
+        progress,
+        ControllerStage::ConnectingRelay,
+        connect_relay(identity, &relays, wss),
+    )
+    .await?;
     #[cfg(yonder_e2e_rebuild)]
     let initial_peer_id = driver.peer_id();
-    let target = resolve_peer(&mut driver, &mut streams, &relay, code.locator()).await?;
+    let target = wait_with_progress(
+        progress,
+        ControllerStage::ResolvingHost,
+        resolve_peer(&mut driver, &mut streams, &relay, code.locator()),
+    )
+    .await?;
     let initial = Box::pin(prepare_controller(
         driver,
         streams,
@@ -194,6 +244,7 @@ async fn run_controller_session<F: TerminalFrontend>(
         target,
         &code,
         DirectUpgradePolicy::Enabled,
+        progress,
     ))
     .await;
     let prepared = match initial {
@@ -202,19 +253,26 @@ async fn run_controller_session<F: TerminalFrontend>(
             tracing::debug!(%error, "rebuilding the endpoint for strict relay-only fallback");
             let mut random = OsSecureRandom;
             let identity = generate_identity(&mut random).map_err(EndpointError::from)?;
-            let (mut fallback_driver, mut fallback_streams, fallback_relay) =
+            let (mut fallback_driver, mut fallback_streams, fallback_relay) = wait_with_progress(
+                progress,
+                ControllerStage::RelayFallback,
                 connect_relay_with_policy(
                     identity,
                     &relays,
                     fallback_wss,
                     DirectUpgradePolicy::Disabled,
-                )
-                .await?;
-            let target = resolve_peer(
-                &mut fallback_driver,
-                &mut fallback_streams,
-                &fallback_relay,
-                code.locator(),
+                ),
+            )
+            .await?;
+            let target = wait_with_progress(
+                progress,
+                ControllerStage::ResolvingHost,
+                resolve_peer(
+                    &mut fallback_driver,
+                    &mut fallback_streams,
+                    &fallback_relay,
+                    code.locator(),
+                ),
             )
             .await?;
             let prepared = Box::pin(prepare_controller(
@@ -224,6 +282,7 @@ async fn run_controller_session<F: TerminalFrontend>(
                 target,
                 &code,
                 DirectUpgradePolicy::Disabled,
+                progress,
             ))
             .await?;
             #[cfg(yonder_e2e_rebuild)]
@@ -249,7 +308,16 @@ async fn run_controller_session<F: TerminalFrontend>(
         control,
         data,
     } = prepared;
-    run_terminal(&mut driver, binding, data, control, terminal, frontend).await
+    run_terminal(
+        &mut driver,
+        binding,
+        data,
+        control,
+        terminal,
+        frontend,
+        progress,
+    )
+    .await
 }
 
 struct PreparedController {
@@ -267,31 +335,44 @@ async fn prepare_controller(
     target: PeerId,
     code: &ConnectionCode,
     direct_upgrade: DirectUpgradePolicy,
+    progress: &mut impl OperationProgress<ControllerStage>,
 ) -> Result<PreparedController, ControllerError> {
-    let binding = match direct_upgrade {
-        DirectUpgradePolicy::Enabled => connect_target(&mut driver, relay, target).await?,
-        DirectUpgradePolicy::Disabled => {
-            connect_target_via_relay(&mut driver, relay, target).await?
+    let binding = wait_with_progress(progress, ControllerStage::EstablishingPath, async {
+        match direct_upgrade {
+            DirectUpgradePolicy::Enabled => connect_target(&mut driver, relay, target).await,
+            DirectUpgradePolicy::Disabled => {
+                connect_target_via_relay(&mut driver, relay, target).await
+            }
         }
-    };
-    authenticate_controller(&mut driver, &mut streams, binding, code).await?;
-
-    let terminal_stream_deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
-    let control = open_until(
-        &mut driver,
-        &mut streams,
-        binding,
-        TERMINAL_CONTROL_PROTOCOL,
-        terminal_stream_deadline,
+    })
+    .await?;
+    wait_with_progress(
+        progress,
+        ControllerStage::Authenticating,
+        authenticate_controller(&mut driver, &mut streams, binding, code),
     )
     .await?;
-    let data = open_until(
-        &mut driver,
-        &mut streams,
-        binding,
-        TERMINAL_DATA_PROTOCOL,
-        terminal_stream_deadline,
-    )
+
+    let (control, data) = wait_with_progress(progress, ControllerStage::StartingTerminal, async {
+        let terminal_stream_deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+        let control = open_until(
+            &mut driver,
+            &mut streams,
+            binding,
+            TERMINAL_CONTROL_PROTOCOL,
+            terminal_stream_deadline,
+        )
+        .await?;
+        let data = open_until(
+            &mut driver,
+            &mut streams,
+            binding,
+            TERMINAL_DATA_PROTOCOL,
+            terminal_stream_deadline,
+        )
+        .await?;
+        Ok::<_, ControllerError>((control, data))
+    })
     .await?;
     Ok(PreparedController {
         driver,
@@ -520,6 +601,7 @@ async fn run_terminal(
     control: ApplicationStream,
     hello: TerminalHello,
     mut frontend: impl TerminalFrontend,
+    progress: &mut impl OperationProgress<ControllerStage>,
 ) -> Result<u32, ControllerError> {
     let (mut data_read, mut data_write) = tokio::io::split(data.into_tokio());
     let (mut control_read, mut control_write) = tokio::io::split(control.into_tokio());
@@ -537,7 +619,13 @@ async fn run_terminal(
         .await??;
         Ok(())
     };
-    let (_raw_mode, ()) = enter_raw_mode_before(&frontend, handshake).await?;
+    let (raw_mode, ()) = wait_with_progress(
+        progress,
+        ControllerStage::StartingTerminal,
+        enter_raw_mode_before(&frontend, handshake),
+    )
+    .await?;
+    progress.clear();
 
     let interactive = frontend.is_interactive();
     let mut input = frontend.input();
@@ -548,11 +636,12 @@ async fn run_terminal(
     let mut size_poll = tokio::time::interval(SIZE_POLL_INTERVAL);
     size_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
-        let mut remote_output = TerminalChunk::new();
-        let mut exit = [0_u8; 5];
-        let completion_deadline = remote.deadline();
-        tokio::select! {
+    let session = async {
+        loop {
+            let mut remote_output = TerminalChunk::new();
+            let mut exit = [0_u8; 5];
+            let completion_deadline = remote.deadline();
+            tokio::select! {
             biased;
             () = wait_for_remote_completion_deadline(completion_deadline) => {
                 return Err(ControllerError::RemoteCompletionTimeout);
@@ -639,7 +728,25 @@ async fn run_terminal(
                     last_size = size;
                 }
             }
+            }
         }
+    }
+    .await;
+    finish_terminal(session, frontend.restore_raw_mode(raw_mode))
+}
+
+fn finish_terminal<T>(
+    session: Result<T, ControllerError>,
+    restore: Result<(), std::io::Error>,
+) -> Result<T, ControllerError> {
+    match (session, restore) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(ControllerError::TerminalRestore(error)),
+        (Err(session), Err(restore)) => Err(ControllerError::SessionAndTerminalRestore {
+            session: Box::new(session),
+            restore,
+        }),
     }
 }
 
@@ -821,12 +928,21 @@ impl RemoteCompletion {
     }
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    armed: bool,
+}
+
+impl RawModeGuard {
+    fn restore(mut self) -> Result<(), std::io::Error> {
+        self.armed = false;
+        crossterm::terminal::disable_raw_mode()
+    }
+}
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        if let Err(error) = crossterm::terminal::disable_raw_mode() {
-            tracing::warn!(%error, "failed to restore local terminal mode");
+        if self.armed {
+            let _ = crossterm::terminal::disable_raw_mode();
         }
     }
 }
@@ -840,10 +956,12 @@ mod tests {
         await_remote_completion, await_until, changed_terminal_size, complete_after_output_eof,
         controller_fallback_required, decode_terminal_exit, direct_fallback_required,
         enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
-        fallback_transport, local_terminal_hello, local_terminal_hello_with, next_retry_delay,
-        read_auth_response, read_local_input, run_controller, run_until_interrupted,
-        terminal_environment, terminal_environment_from, wait_for_remote_completion_deadline,
+        fallback_transport, finish_terminal, local_terminal_hello, local_terminal_hello_with,
+        next_retry_delay, read_auth_response, read_local_input, run_controller,
+        run_controller_session, run_until_interrupted, terminal_environment,
+        terminal_environment_from, wait_for_remote_completion_deadline,
     };
+    use crate::progress::NoopProgress;
     use std::cell::Cell;
     use std::io;
     use std::pin::Pin;
@@ -861,6 +979,29 @@ mod tests {
     use yonder_net::{
         EndpointRelayAddress, EndpointRelaySet, Keypair, NetworkBuildError, WssTransportConfig,
     };
+
+    const CONTROLLER_SESSION_HEAP_LIMIT: usize = 128 * 1024;
+
+    fn invalid_wss_controller_config() -> ControllerConfig {
+        let relay_identity = Keypair::generate_ed25519();
+        let relay: EndpointRelayAddress = format!(
+            "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
+            relay_identity.public().to_peer_id()
+        )
+        .parse()
+        .unwrap();
+        ControllerConfig::new(
+            Keypair::generate_ed25519(),
+            EndpointRelaySet::new(vec![relay]).unwrap(),
+            WssTransportConfig::client(Some(vec![1])),
+            ConnectionCode::new(Locator::new(0).unwrap(), PakeSecret::from_u64(0).unwrap()),
+            TerminalHello::new(
+                TerminalSize::new(80, 24).unwrap(),
+                TerminalValue::new("xterm").unwrap(),
+                TerminalValue::new("truecolor").unwrap(),
+            ),
+        )
+    }
 
     #[test]
     fn relay_only_fallback_is_narrowly_classified_and_requires_client_tls() {
@@ -899,31 +1040,27 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_wss_ca_is_rejected_before_controller_network_activity() {
-        let relay_identity = Keypair::generate_ed25519();
-        let relay: EndpointRelayAddress = format!(
-            "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
-            relay_identity.public().to_peer_id()
-        )
-        .parse()
-        .unwrap();
-        let config = ControllerConfig::new(
-            Keypair::generate_ed25519(),
-            EndpointRelaySet::new(vec![relay]).unwrap(),
-            WssTransportConfig::client(Some(vec![1])),
-            ConnectionCode::new(Locator::new(0).unwrap(), PakeSecret::from_u64(0).unwrap()),
-            TerminalHello::new(
-                TerminalSize::new(80, 24).unwrap(),
-                TerminalValue::new("xterm").unwrap(),
-                TerminalValue::new("truecolor").unwrap(),
-            ),
-        );
-
         assert!(matches!(
-            run_controller(config).await,
+            run_controller(invalid_wss_controller_config()).await,
             Err(ControllerError::Endpoint(EndpointError::Build(
-                NetworkBuildError::InvalidTlsMaterial
+                NetworkBuildError::WssTls(_)
             )))
         ));
+    }
+
+    #[test]
+    fn controller_session_heap_state_has_a_fixed_upper_bound() {
+        let mut progress = NoopProgress;
+        let session = run_controller_session(
+            invalid_wss_controller_config(),
+            CrosstermFrontend,
+            &mut progress,
+        );
+        let size = std::mem::size_of_val(&session);
+        assert!(
+            size <= CONTROLLER_SESSION_HEAP_LIMIT,
+            "session size: {size}"
+        );
     }
 
     #[test]
@@ -964,8 +1101,28 @@ mod tests {
         let _ = frontend.size();
         if !frontend.is_interactive() {
             assert!(frontend.enter_raw_mode().unwrap().is_none());
-            drop(RawModeGuard);
+            drop(RawModeGuard { armed: false });
         }
+    }
+
+    #[test]
+    fn terminal_restore_failures_are_never_hidden() {
+        assert_eq!(finish_terminal(Ok(7), Ok(())).unwrap(), 7);
+        assert!(matches!(
+            finish_terminal::<()>(Err(ControllerError::ConnectionLost), Ok(())),
+            Err(ControllerError::ConnectionLost)
+        ));
+        assert!(matches!(
+            finish_terminal(Ok(()), Err(io::Error::other("restore failed"))),
+            Err(ControllerError::TerminalRestore(_))
+        ));
+        assert!(matches!(
+            finish_terminal::<()>(
+                Err(ControllerError::ConnectionLost),
+                Err(io::Error::other("restore failed"))
+            ),
+            Err(ControllerError::SessionAndTerminalRestore { .. })
+        ));
     }
 
     #[test]

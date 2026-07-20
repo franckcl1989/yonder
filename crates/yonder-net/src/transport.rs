@@ -51,11 +51,11 @@ impl WssTransportConfig {
             return Err(NetworkBuildError::InvalidTlsMaterial);
         };
         PrivateKeyDer::try_from(private_key_der.as_bytes())
-            .map_err(|_| NetworkBuildError::InvalidTlsMaterial)?;
+            .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
         let certificate = CertificateDer::from(certificate_der.as_slice());
         webpki::EndEntityCert::try_from(&certificate)
             .map(|_| ())
-            .map_err(|_| NetworkBuildError::InvalidTlsMaterial)
+            .map_err(NetworkBuildError::InvalidWssCertificate)
     }
 
     /// Checks a WSS external address against the certificate's DNS/IP SANs.
@@ -74,7 +74,7 @@ impl WssTransportConfig {
         };
         let certificate = CertificateDer::from(certificate_der.as_slice());
         webpki::EndEntityCert::try_from(&certificate)
-            .map_err(|_| NetworkBuildError::InvalidTlsMaterial)?
+            .map_err(NetworkBuildError::InvalidWssCertificate)?
             .verify_is_valid_for_subject_name(server_name)
             .map_err(|_| NetworkBuildError::WssCertificateNameMismatch)
     }
@@ -193,7 +193,7 @@ fn websocket_tls(config: WssTransportConfig) -> Result<websocket::tls::Config, N
             if let Some(certificate) = additional_ca_der {
                 builder
                     .add_trust(&websocket::tls::Certificate::new(certificate))
-                    .map_err(|_| NetworkBuildError::InvalidTlsMaterial)?;
+                    .map_err(NetworkBuildError::WssTls)?;
             }
         }
         WssTransportConfig::Server {
@@ -201,12 +201,12 @@ fn websocket_tls(config: WssTransportConfig) -> Result<websocket::tls::Config, N
             private_key_der,
         } => {
             PrivateKeyDer::try_from(private_key_der.as_bytes())
-                .map_err(|_| NetworkBuildError::InvalidTlsMaterial)?;
+                .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
             let key = websocket::tls::PrivateKey::new(private_key_der.into_upstream_bytes());
             let certificate = websocket::tls::Certificate::new(certificate_der);
             builder
                 .server(key, [certificate])
-                .map_err(|_| NetworkBuildError::InvalidTlsMaterial)?;
+                .map_err(NetworkBuildError::WssTls)?;
         }
     }
     Ok(builder.finish())
@@ -368,7 +368,24 @@ mod tests {
         let invalid_server = WssTransportConfig::server(vec![1], SecretDocument::new(vec![1]));
         assert!(matches!(
             invalid_server.validate_server_for(&secure),
-            Err(NetworkBuildError::InvalidTlsMaterial)
+            Err(NetworkBuildError::InvalidWssCertificate(_))
+        ));
+
+        let invalid_key = WssTransportConfig::server(
+            TEST_SAN_CERTIFICATE_DER.to_vec(),
+            SecretDocument::new(vec![1]),
+        );
+        assert!(matches!(
+            invalid_key.validate_server_material(),
+            Err(NetworkBuildError::InvalidWssPrivateKey)
+        ));
+        let invalid_certificate = WssTransportConfig::server(
+            vec![1],
+            SecretDocument::new(TEST_SAN_PRIVATE_KEY_DER.to_vec()),
+        );
+        assert!(matches!(
+            invalid_certificate.validate_server_material(),
+            Err(NetworkBuildError::InvalidWssCertificate(_))
         ));
     }
 

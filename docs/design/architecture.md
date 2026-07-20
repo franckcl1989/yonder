@@ -54,11 +54,11 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 
 1. 两个 endpoint 先通过配置的 relay 建立 circuit，保证存在保底候选。
 2. Identify、UPnP 和 DCUtR 提供直接候选；QUIC、TCP、WS 地址并发拨号，单个地址只允许一个在途拨号。
-3. relay 入口建立继续使用绝对 `10s` 期限；endpoint-to-endpoint 全能力建立使用 `30s`，覆盖 DCUtR 三轮和每个底层 transport `8s` timeout，并为采样与关闭收敛保留余量。第一条端到端连接建立后质量窗口固定为 `1.5s`。
+3. relay 入口建立继续使用绝对 `10s` 期限；尚无任何 endpoint-to-endpoint 候选时，全能力建立保留 `30s` 总期限。第一条 relay 候选建立后质量窗口固定为 `1.5s`，DCUtR 另有 `3s` 优先窗口；底层 transport 的单次 `8s` timeout 仍约束独立拨号，但不可达直连不再串行占满三轮 timeout 后才使用已经可用的 relay。
 4. Ping 在每条连接建立后立即开始，单次超时 `750ms`；endpoint 后续间隔 `1s`，relay 后续间隔 `15s`，避免 128 个空闲 endpoint 对 relay 形成高频永久轮询。`1.5s` 选择窗口最多取前三个成功结果；没有成功结果的候选不可用，一个结果足以保留已建立链路，两个或三个结果因稳定性证据更多而优先排序。这样质量采样不会把高 RTT 但可用的链路误判为断开。
 5. 排序键固定为：成功样本数降序、RTT 中位数升序、RTT 极差升序、直连优先于 relay、QUIC 优先于 TCP、TCP 优先于 WS/WSS、建立时刻升序。没有主动带宽探测，避免额外流量、延迟和攻击面。
 6. DCUtR 成功事件必须对应一个已进入本地名册的精确 `ConnectionId`。选出 winner 后按 `ConnectionId` 关闭全部 loser，并等待本地 `ConnectionClosed`；两端都在 OPAQUE 前等待各自 DCUtR 终态与唯一名册。
-7. DCUtR 明确失败、`30s` 截止，或全能力连接在 OPAQUE 认证及两条 terminal 子流打开的预提交阶段丢失唯一绑定时，controller 销毁整个全能力 Swarm，生成新临时 PeerId，以 `Toggle<dcutr::Behaviour>` 禁用 DCUtR 构建新 Swarm，经同一 relay 重新查询并建立 relay-only circuit。额外同 PeerId 连接仍先触发 fail-closed 并关闭相关连接，旧 Swarm drop 是取消残余拨号的所有权边界；fallback 恰好一次，不循环，OPAQUE、协议和业务错误不触发降级。
+7. DCUtR 明确失败、首条 relay 候选后的 `3s` 优先窗口截止、无候选时 `30s` 总期限截止，或全能力连接在 OPAQUE 认证及两条 terminal 子流打开的预提交阶段丢失唯一绑定时，controller 销毁整个全能力 Swarm，生成新临时 PeerId，以 `Toggle<dcutr::Behaviour>` 禁用 DCUtR 构建新 Swarm，经同一 relay 重新查询并建立 relay-only circuit。额外同 PeerId 连接仍先触发 fail-closed 并关闭相关连接，旧 Swarm drop 是取消残余拨号的所有权边界；fallback 恰好一次，不循环，OPAQUE、协议和业务错误不触发降级。
 8. v1 不热迁移。relay-only 尝试或 terminal 预提交准备完成后出现任何迟到的同 PeerId 额外连接仍按唯一连接屏障终止当前操作，而不是成为备用路径。
 
 该规则让连通性和稳定性先于 RTT，让 RTT 和抖动先于路径/transport 偏好；只有质量相同或不可区分时才偏向直连和 QUIC。
