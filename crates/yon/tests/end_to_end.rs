@@ -107,6 +107,48 @@ fn three_process_terminal_session_executes_a_real_shell() -> Result<(), std::io:
     relay_result
 }
 
+#[test]
+fn pinned_relay_identity_rejects_an_impersonator_before_code_publication()
+-> Result<(), std::io::Error> {
+    let port = available_port()?;
+    let impersonator = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let expected = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let relay_process = RelayProcess::start(impersonator, port)?;
+    wait_for_tcp_listener(port)?;
+    let relay = format!(
+        "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+        expected.public().to_peer_id()
+    );
+    let config = EndpointConfigDirectory::new(&relay)?;
+
+    let outcome = run_rejected_host(&config);
+    let relay_result = relay_process.stop();
+    outcome?;
+    relay_result
+}
+
+#[test]
+fn tampering_transport_proxy_fails_closed_before_code_publication() -> Result<(), std::io::Error> {
+    let relay_port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let relay_process = RelayProcess::start(identity, relay_port)?;
+    wait_for_tcp_listener(relay_port)?;
+    let proxy = TamperingTcpProxy::start(relay_port)?;
+    let relay = format!("/ip4/127.0.0.1/tcp/{}/p2p/{peer}", proxy.listen_port());
+    let config = EndpointConfigDirectory::new(&relay)?;
+
+    let outcome = run_rejected_host(&config);
+    let proxy_result = proxy.stop();
+    let relay_result = relay_process.stop();
+    outcome?;
+    proxy_result?;
+    relay_result
+}
+
 #[cfg(yonder_e2e_rebuild)]
 #[test]
 fn strict_relay_only_fallback_rebuilds_the_controller_swarm() -> Result<(), std::io::Error> {
@@ -677,8 +719,18 @@ struct GateConnection {
     thread: JoinHandle<()>,
 }
 
+#[derive(Clone, Copy)]
+enum GateTraffic {
+    PassThrough,
+    CorruptFirstUploadByte,
+}
+
 impl GateConnection {
-    fn start(client: TcpStream, target_port: u16) -> Result<Self, std::io::Error> {
+    fn start(
+        client: TcpStream,
+        target_port: u16,
+        traffic: GateTraffic,
+    ) -> Result<Self, std::io::Error> {
         client.set_nonblocking(false)?;
         client.set_nodelay(true)?;
         let upstream = TcpStream::connect(("127.0.0.1", target_port))?;
@@ -689,6 +741,13 @@ impl GateConnection {
         let mut upstream_write = upstream.try_clone()?;
         let thread = thread::spawn(move || {
             let upload = thread::spawn(move || {
+                if matches!(traffic, GateTraffic::CorruptFirstUploadByte) {
+                    let mut byte = [0_u8; 1];
+                    if client_read.read_exact(&mut byte).is_ok() {
+                        byte[0] ^= 1;
+                        let _ = upstream_write.write_all(&byte);
+                    }
+                }
                 let _ = std::io::copy(&mut client_read, &mut upstream_write);
                 let _ = upstream_write.shutdown(Shutdown::Write);
             });
@@ -772,12 +831,83 @@ fn run_tcp_gate(
         loop {
             match listener.accept() {
                 Ok((client, _)) => {
-                    let connection = GateConnection::start(client, target_port)?;
+                    let connection =
+                        GateConnection::start(client, target_port, GateTraffic::PassThrough)?;
                     active.push(connection);
                     if let Some(ack) = resume_ack.take() {
                         let _ = ack.send(Ok(()));
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+struct TamperingTcpProxy {
+    port: u16,
+    shutdown: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<Result<(), std::io::Error>>>,
+}
+
+impl TamperingTcpProxy {
+    fn start(target_port: u16) -> Result<Self, std::io::Error> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let thread = thread::spawn(move || run_tampering_proxy(listener, target_port, shutdown_rx));
+        Ok(Self {
+            port,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    const fn listen_port(&self) -> u16 {
+        self.port
+    }
+
+    fn stop(mut self) -> Result<(), std::io::Error> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> Result<(), std::io::Error> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        finish_thread(&mut self.thread, START_TIMEOUT, "tampering TCP proxy")?
+    }
+}
+
+impl Drop for TamperingTcpProxy {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
+    }
+}
+
+fn run_tampering_proxy(
+    listener: TcpListener,
+    target_port: u16,
+    shutdown: mpsc::Receiver<()>,
+) -> Result<(), std::io::Error> {
+    let mut active = Vec::new();
+    loop {
+        match shutdown.recv_timeout(Duration::from_millis(5)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return close_gate_connections(&mut active, Instant::now() + START_TIMEOUT);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        reap_gate_connections(&mut active);
+        loop {
+            match listener.accept() {
+                Ok((client, _)) => active.push(GateConnection::start(
+                    client,
+                    target_port,
+                    GateTraffic::CorruptFirstUploadByte,
+                )?),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error),
             }
@@ -1327,6 +1457,72 @@ fn run_controller_session(
         #[cfg(yonder_e2e_rebuild)]
         diagnostics,
     })
+}
+
+fn run_rejected_host(config: &EndpointConfigDirectory) -> Result<(), std::io::Error> {
+    let mut host = Command::new(env!("CARGO_BIN_EXE_yon"))
+        .args(["--log-level", "debug", "host"])
+        .current_dir(config.path())
+        .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA_DER")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = host
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("rejected host stdout was not piped"))?;
+    let stderr = host
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("rejected host stderr was not piped"))?;
+    let output_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stdout)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let diagnostic_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    thread::sleep(Duration::from_secs(12));
+    let mut status = host.try_wait()?;
+    if status.is_none() {
+        match host.kill() {
+            Ok(()) => status = Some(host.wait()?),
+            Err(error) => {
+                status = host.try_wait()?;
+                if status.is_none() {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    let output = output_reader
+        .join()
+        .map_err(|_| std::io::Error::other("rejected host output reader panicked"))??;
+    let diagnostics = diagnostic_reader
+        .join()
+        .map_err(|_| std::io::Error::other("rejected host diagnostic reader panicked"))??;
+    if status.is_some_and(|status| status.success()) {
+        return Err(std::io::Error::other(
+            "host accepted an untrusted or tampered relay transport",
+        ));
+    }
+    if !output.is_empty() {
+        return Err(std::io::Error::other(
+            "host published a connection code before relay authentication",
+        ));
+    }
+    if diagnostics.is_empty() {
+        return Err(std::io::Error::other(
+            "rejected host did not emit safe diagnostics",
+        ));
+    }
+    Ok(())
 }
 
 struct ControllerEvidence {
