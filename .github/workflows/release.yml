@@ -356,7 +356,7 @@ jobs:
           --workspace --all-targets --all-features
 
   release-fuzz:
-    needs: quality
+    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, build]
     timeout-minutes: 330
     strategy:
       fail-fast: false
