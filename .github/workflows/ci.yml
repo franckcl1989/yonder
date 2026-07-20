@@ -103,32 +103,40 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Enforce risk-based first-party coverage
+      - name: Generate first-party coverage report
         shell: bash
         run: |
           cargo +nightly llvm-cov \
             --locked --workspace --all-targets --all-features \
             --target "${{ matrix.target }}" \
-            --branch --json --output-path coverage.json \
-            --fail-under-lines 95 \
-            --fail-under-functions 95 \
-            --fail-under-regions 90 \
-            --fail-under-file-lines 75
-          jq --exit-status '
-            [.data[].totals.branches] as $branches
-            | ($branches | length) > 0
-            and ([$branches[].count] | add) > 0
-            and all($branches[];
-              .count > 0
-              and ((.count - .notcovered) * 100 >= .count * 75)
-            )
-          ' coverage.json >/dev/null
+            --branch --json --output-path coverage.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-${{ matrix.target }}
           path: coverage.json
           if-no-files-found: error
           overwrite: true
+      - name: Enforce risk-based first-party coverage
+        shell: bash
+        run: |
+          jq --exit-status '
+            .data as $data
+            | ($data | length) > 0
+            and all($data[];
+              .totals.lines.count > 0
+              and (.totals.lines.covered * 100 >= .totals.lines.count * 95)
+              and .totals.functions.count > 0
+              and (.totals.functions.covered * 100 >= .totals.functions.count * 95)
+              and .totals.regions.count > 0
+              and (.totals.regions.covered * 100 >= .totals.regions.count * 90)
+              and .totals.branches.count > 0
+              and (.totals.branches.covered * 100 >= .totals.branches.count * 75)
+              and all(.files[];
+                .summary.lines.count == 0
+                or (.summary.lines.covered * 100 >= .summary.lines.count * 75)
+              )
+            )
+          ' coverage.json >/dev/null
 
   msrv:
     name: MSRV ${{ matrix.target }}
