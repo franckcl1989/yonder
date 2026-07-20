@@ -387,7 +387,6 @@ jobs:
           fi
 
   build:
-    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, release-fuzz]
     name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -632,7 +631,7 @@ jobs:
           overwrite: true
 
   release-candidate:
-    needs: build
+    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, release-fuzz, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
