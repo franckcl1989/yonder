@@ -518,7 +518,9 @@ jobs:
             if readelf -d "$binary" | grep -q "NEEDED"; then
               exit 1
             fi
-            if ldd "$binary"; then
+            ldd_output="$(ldd "$binary" 2>&1 || true)"
+            if ! grep -Eq "statically linked|not a dynamic executable" <<<"$ldd_output"; then
+              printf '%s\n' "$ldd_output" >&2
               exit 1
             fi
           done
