@@ -17,8 +17,8 @@ use yon::protocol::{ReclaimResponse, reclaim_locator};
 use yon_relay::{RelayServeConfig, run_relay_until};
 use yonder_core::{ConnectionCode, Locator, OsSecureRandom, SecretDocument};
 use yonder_net::{
-    EndpointRelayAddress, EndpointRelaySet, Keypair, PeerId, RelayExternalAddress,
-    RelayListenAddress, WssTransportConfig, generate_identity,
+    EndpointRelayAddress, EndpointRelaySet, Keypair, RelayExternalAddress, RelayListenAddress,
+    WssTransportConfig, generate_identity,
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(45);
@@ -28,6 +28,10 @@ const HOST_ENVIRONMENT_VALUE: &str = "inherited-by-remote-shell";
 const TEST_WSS_CA_DER: &[u8] = include_bytes!("fixtures/localhost-test-ca.der");
 const TEST_WSS_CERT_DER: &[u8] = include_bytes!("fixtures/localhost-test-cert.der");
 const TEST_WSS_KEY_DER: &[u8] = include_bytes!("fixtures/localhost-test-key.der");
+const TEST_WSS_SELF_SIGNED_CERT_DER: &[u8] =
+    include_bytes!("fixtures/localhost-self-signed-cert.der");
+const TEST_WSS_SELF_SIGNED_KEY_DER: &[u8] =
+    include_bytes!("fixtures/localhost-self-signed-key.der");
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -103,6 +107,24 @@ fn three_process_terminal_session_executes_a_real_shell() -> Result<(), std::io:
     relay_result
 }
 
+#[cfg(yonder_e2e_rebuild)]
+#[test]
+fn strict_relay_only_fallback_rebuilds_the_controller_swarm() -> Result<(), std::io::Error> {
+    let port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let relay_process = RelayProcess::start(identity, port)?;
+    thread::sleep(Duration::from_millis(500));
+    let config = EndpointConfigDirectory::new(&format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}"))?;
+
+    let outcome = run_host_controller_with_evidence(&config, CodeInput::Stdin);
+    let relay_result = relay_process.stop();
+    let evidence = outcome?;
+    relay_result?;
+    validate_required_controller_rebuild(&evidence.diagnostics)
+}
+
 #[test]
 fn quic_and_websocket_relay_transports_run_real_terminal_sessions() -> Result<(), std::io::Error> {
     for transport in [RelayTransport::Quic, RelayTransport::WebSocket] {
@@ -125,26 +147,50 @@ fn quic_and_websocket_relay_transports_run_real_terminal_sessions() -> Result<()
 
 #[test]
 fn secure_websocket_runs_a_real_tls_terminal_session() -> Result<(), std::io::Error> {
+    run_secure_websocket_session(
+        "dns4/localhost",
+        TEST_WSS_CERT_DER,
+        TEST_WSS_KEY_DER,
+        TEST_WSS_CA_DER,
+    )
+}
+
+#[test]
+fn secure_websocket_accepts_an_explicitly_trusted_self_signed_ip_certificate()
+-> Result<(), std::io::Error> {
+    run_secure_websocket_session(
+        "ip4/127.0.0.1",
+        TEST_WSS_SELF_SIGNED_CERT_DER,
+        TEST_WSS_SELF_SIGNED_KEY_DER,
+        TEST_WSS_SELF_SIGNED_CERT_DER,
+    )
+}
+
+fn run_secure_websocket_session(
+    external_host: &str,
+    certificate_der: &[u8],
+    private_key_der: &[u8],
+    trust_anchor_der: &[u8],
+) -> Result<(), std::io::Error> {
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let peer = identity.public().to_peer_id();
     let listen = format!("/ip4/127.0.0.1/tcp/{port}/tls/ws");
-    let external = format!("/dns4/localhost/tcp/{port}/tls/ws");
+    let external = format!("/{external_host}/tcp/{port}/tls/ws");
     let relay_process = RelayProcess::start_addresses_with_wss(
         identity,
         vec![listen],
         vec![external.clone()],
         WssTransportConfig::server(
-            TEST_WSS_CERT_DER.to_vec(),
-            SecretDocument::new(TEST_WSS_KEY_DER.to_vec()),
+            certificate_der.to_vec(),
+            SecretDocument::new(private_key_der.to_vec()),
         ),
-        true,
     )?;
     thread::sleep(Duration::from_millis(500));
     let config = EndpointConfigDirectory::new_many_with_ca(
         &[format!("{external}/p2p/{peer}")],
-        Some(TEST_WSS_CA_DER),
+        Some(trust_anchor_der),
     )?;
     let outcome = run_host_controller_in_config(&config, CodeInput::Stdin);
     let relay_result = relay_process.stop();
@@ -340,9 +386,10 @@ fn interactive_pty_preserves_bytes_resize_interrupt_environment_and_exit()
         "controller did not preserve remote exit"
     );
     assert_bytes_contain(&output, b"\x1b[31mYON_ANSI\x1b[0m", "ANSI bytes")?;
+    let expected_working_directory = config.path().canonicalize()?;
     assert_bytes_contain(
         &output,
-        format!("YON_CWD={}", config.path().display()).as_bytes(),
+        format!("YON_CWD={}", expected_working_directory.display()).as_bytes(),
         "remote working directory",
     )?;
     assert_bytes_contain(
@@ -491,13 +538,7 @@ impl RelayProcess {
         listen: Vec<String>,
         external: Vec<String>,
     ) -> Result<Self, std::io::Error> {
-        Self::start_addresses_with_wss(
-            identity,
-            listen,
-            external,
-            WssTransportConfig::client(None),
-            false,
-        )
+        Self::start_addresses_with_wss(identity, listen, external, WssTransportConfig::client(None))
     }
 
     fn start_addresses_with_wss(
@@ -505,7 +546,6 @@ impl RelayProcess {
         listen: Vec<String>,
         external: Vec<String>,
         wss: WssTransportConfig,
-        has_wss_server: bool,
     ) -> Result<Self, std::io::Error> {
         let listen =
             listen
@@ -524,7 +564,7 @@ impl RelayProcess {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let config = RelayServeConfig::new(identity, listen, external, wss, has_wss_server)
+        let config = RelayServeConfig::new(identity, listen, external, wss)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let (shutdown, shutdown_rx) = oneshot::channel();
         let thread = thread::spawn(move || {
@@ -1035,6 +1075,13 @@ fn run_host_controller_in_config(
     config: &EndpointConfigDirectory,
     code_input: CodeInput,
 ) -> Result<(), std::io::Error> {
+    run_host_controller_with_evidence(config, code_input).map(drop)
+}
+
+fn run_host_controller_with_evidence(
+    config: &EndpointConfigDirectory,
+    code_input: CodeInput,
+) -> Result<ControllerEvidence, std::io::Error> {
     let host = HostProcess::start(config)?;
     let outcome = (|| {
         let code = receive_code(&host.lines)?;
@@ -1050,8 +1097,9 @@ fn run_host_controller_in_config(
         Ok(())
     };
 
-    outcome?;
-    host_result
+    let evidence = outcome?;
+    host_result?;
+    Ok(evidence)
 }
 
 struct HostProcess {
@@ -1182,7 +1230,7 @@ fn run_controller_session(
     config: &EndpointConfigDirectory,
     code: &str,
     code_input: CodeInput,
-) -> Result<(), std::io::Error> {
+) -> Result<ControllerEvidence, std::io::Error> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_yon"));
     command
         .args(["--log-level", "debug", "connect"])
@@ -1260,7 +1308,6 @@ fn run_controller_session(
             "debug diagnostics were not emitted on controller stderr",
         ));
     }
-    validate_controller_rebuild_if_present(&diagnostics)?;
     for diagnostic in [
         b"local terminal input read completed".as_slice(),
         b"terminal output".as_slice(),
@@ -1276,33 +1323,57 @@ fn run_controller_session(
             ));
         }
     }
+    Ok(ControllerEvidence {
+        #[cfg(yonder_e2e_rebuild)]
+        diagnostics,
+    })
+}
+
+struct ControllerEvidence {
+    #[cfg(yonder_e2e_rebuild)]
+    diagnostics: Vec<u8>,
+}
+
+#[cfg(yonder_e2e_rebuild)]
+fn validate_required_controller_rebuild(diagnostics: &[u8]) -> Result<(), std::io::Error> {
+    const FALLBACK_MARKER: &str = "strict relay-only fallback established";
+    let diagnostics = std::str::from_utf8(diagnostics).map_err(std::io::Error::other)?;
+    let mut markers = diagnostics
+        .lines()
+        .filter(|line| line.contains(FALLBACK_MARKER));
+    let marker = markers.next().ok_or_else(|| {
+        std::io::Error::other("strict relay-only fallback evidence was not emitted")
+    })?;
+    if markers.next().is_some() {
+        return Err(std::io::Error::other(
+            "strict relay-only fallback evidence was emitted more than once",
+        ));
+    }
+
+    let initial = diagnostic_field(marker, "initial_peer_id")?
+        .parse::<yonder_net::PeerId>()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let fallback = diagnostic_field(marker, "fallback_peer_id")?
+        .parse::<yonder_net::PeerId>()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if initial == fallback {
+        return Err(std::io::Error::other(
+            "strict relay-only fallback reused the initial controller PeerId",
+        ));
+    }
+    if diagnostic_field(marker, "relayed")? != "true" {
+        return Err(std::io::Error::other(
+            "strict relay-only fallback did not bind a relay circuit",
+        ));
+    }
     Ok(())
 }
 
-fn validate_controller_rebuild_if_present(diagnostics: &[u8]) -> Result<(), std::io::Error> {
-    const FALLBACK_MARKER: &str = "rebuilding the endpoint for strict relay-only fallback";
-    let diagnostics = std::str::from_utf8(diagnostics).map_err(std::io::Error::other)?;
-    if !diagnostics.contains(FALLBACK_MARKER) {
-        return Ok(());
-    }
-
-    let mut first_peer = None;
-    for field in diagnostics.split_whitespace() {
-        let Some(value) = field.strip_prefix("local_peer_id=") else {
-            continue;
-        };
-        let peer = value
-            .parse::<PeerId>()
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        match first_peer {
-            Some(first) if first != peer => return Ok(()),
-            Some(_) => {}
-            None => first_peer = Some(peer),
-        }
-    }
-    Err(std::io::Error::other(
-        "strict relay-only fallback did not rebuild with a distinct local PeerId",
-    ))
+#[cfg(yonder_e2e_rebuild)]
+fn diagnostic_field<'a>(line: &'a str, name: &str) -> Result<&'a str, std::io::Error> {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+        .ok_or_else(|| std::io::Error::other(format!("missing fallback field {name}")))
 }
 
 fn run_rejected_controller(

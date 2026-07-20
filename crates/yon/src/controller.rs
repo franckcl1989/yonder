@@ -183,6 +183,8 @@ async fn run_controller_session<F: TerminalFrontend>(
     } = config;
     let fallback_wss = fallback_transport(&wss)?;
     let (mut driver, mut streams, relay) = connect_relay(identity, &relays, wss).await?;
+    #[cfg(yonder_e2e_rebuild)]
+    let initial_peer_id = driver.peer_id();
     let target = resolve_peer(&mut driver, &mut streams, &relay, code.locator()).await?;
     let (mut driver, mut streams, binding) =
         match connect_target(&mut driver, relay.address(), target).await {
@@ -213,6 +215,17 @@ async fn run_controller_session<F: TerminalFrontend>(
                     target,
                 )
                 .await?;
+                #[cfg(yonder_e2e_rebuild)]
+                {
+                    let fallback_peer_id = fallback_driver.peer_id();
+                    let relayed = fallback_driver.binding_is_relayed(binding)?;
+                    tracing::debug!(
+                        %initial_peer_id,
+                        %fallback_peer_id,
+                        relayed,
+                        "strict relay-only fallback established"
+                    );
+                }
                 (fallback_driver, fallback_streams, binding)
             }
             Err(error) => return Err(error.into()),

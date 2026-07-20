@@ -21,6 +21,8 @@ pub enum AddressError {
     UnexpectedPeerId,
     #[error("a relay listen address must use an IP host")]
     ListenRequiresIp,
+    #[error("a WSS address must use a valid DNS name or IP address")]
+    InvalidWssServerName,
     #[error("all relay entry addresses must identify the same relay")]
     MixedRelayPeerIds,
     #[error("between one and eight relay entry addresses are required")]
@@ -40,4 +42,6 @@ pub enum NetworkBuildError {
     Dns(#[source] std::io::Error),
     #[error("the WSS certificate or private key is invalid")]
     InvalidTlsMaterial,
+    #[error("the WSS certificate does not cover the advertised server name")]
+    WssCertificateNameMismatch,
 }

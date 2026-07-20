@@ -3738,6 +3738,7 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "rustls-pki-types",
+ "rustls-webpki",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",

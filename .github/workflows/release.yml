@@ -4,11 +4,18 @@ on:
   push:
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Candidate version in vMAJOR.MINOR.PATCH form
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
+  CANDIDATE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -26,7 +33,7 @@ jobs:
         shell: bash
         run: bash .github/scripts/install-actionlint.sh
       - run: actionlint
-      - name: Verify tag matches the workspace version
+      - name: Verify candidate version matches the workspace version
         shell: bash
         run: |
           mapfile -t versions < <(
@@ -40,12 +47,22 @@ jobs:
               | sort -u
           )
           test "${#versions[@]}" -eq 1
-          test "$GITHUB_REF_NAME" = "v${versions[0]}"
+          test "$CANDIDATE_VERSION" = "v${versions[0]}"
       - run: cargo fmt --all --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-targets --all-features
+      - name: Lint strict relay-only controller rebuild
+        env:
+          RUSTFLAGS: --cfg yonder_e2e_rebuild
+        run: cargo clippy --locked -p yon --tests -- -D warnings
+      - name: Prove strict relay-only controller rebuild
+        env:
+          RUSTFLAGS: --cfg yonder_e2e_rebuild
+        run: >-
+          cargo test --locked -p yon --test end_to_end
+          strict_relay_only_fallback_rebuilds_the_controller_swarm -- --exact
       - run: cargo test --locked --workspace --doc
       - name: Reject unsafe first-party Rust
         shell: bash
@@ -138,6 +155,7 @@ jobs:
           name: coverage-${{ matrix.target }}
           path: coverage.json
           if-no-files-found: error
+          overwrite: true
 
   sbom:
     needs: quality
@@ -156,7 +174,8 @@ jobs:
       - name: Generate reproducible CycloneDX SBOMs
         shell: bash
         run: |
-          export SOURCE_DATE_EPOCH="$(git show --no-patch --format=%ct HEAD)"
+          SOURCE_DATE_EPOCH="$(git show --no-patch --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
           cargo metadata --locked --format-version 1 >/dev/null
           lockfile_sha256="$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
           cargo cyclonedx \
@@ -166,6 +185,30 @@ jobs:
             --target all \
             --spec-version 1.5
           test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "$lockfile_sha256"
+
+          while IFS= read -r -d '' sbom; do
+            normalized="$(mktemp)"
+            jq --sort-keys '
+              ([.metadata.component, .components[]]
+                | map(select(."bom-ref" | startswith("path+file://")))
+                | map({key: ."bom-ref", value: .purl})
+                | from_entries) as $refs
+              | .metadata.component."bom-ref" =
+                  ($refs[.metadata.component."bom-ref"] // .metadata.component."bom-ref")
+              | .components |= map(
+                  ."bom-ref" = ($refs[."bom-ref"] // ."bom-ref")
+                )
+              | .dependencies |= map(
+                  .ref = ($refs[.ref] // .ref)
+                  | if has("dependsOn") then
+                      .dependsOn |= map($refs[.] // .)
+                    else
+                      .
+                    end
+                )
+            ' "$sbom" > "$normalized"
+            mv "$normalized" "$sbom"
+          done < <(find crates -type f -name '*.cdx.json' -print0)
 
           mkdir dist
           mapfile -d '' sboms < <(find crates -type f -name '*.cdx.json' -print0)
@@ -192,6 +235,7 @@ jobs:
           name: yonder-sbom
           path: dist/*.cdx.json
           if-no-files-found: error
+          overwrite: true
 
   licenses:
     needs: quality
@@ -218,6 +262,7 @@ jobs:
           name: yonder-licenses
           path: dist/*
           if-no-files-found: error
+          overwrite: true
 
   msrv:
     needs: quality
@@ -254,7 +299,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
       - run: cargo build --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
-      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
+      - name: Check fuzz workspace for Linux musl
+        if: runner.os == 'Linux'
+        env:
+          CXX: clang++
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
+      - name: Check fuzz workspace
+        if: runner.os != 'Linux'
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
 
   miri:
     needs: quality
@@ -319,9 +371,9 @@ jobs:
           FUZZ_SEED: ${{ matrix.shard }}
         run: |
           if [[ "$FUZZ_TARGET" == "network_address" ]]; then
-            cargo +nightly fuzz run "$FUZZ_TARGET" --features network-address -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
           else
-            cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
           fi
 
   build:
@@ -451,9 +503,15 @@ jobs:
         run: |
           for binary in stage/*; do
             file "$binary" | grep -Eq "statically linked|static-pie linked"
-            ! readelf -l "$binary" | grep -q "INTERP"
-            ! readelf -d "$binary" | grep -q "NEEDED"
-            ! ldd "$binary"
+            if readelf -l "$binary" | grep -q "INTERP"; then
+              exit 1
+            fi
+            if readelf -d "$binary" | grep -q "NEEDED"; then
+              exit 1
+            fi
+            if ldd "$binary"; then
+              exit 1
+            fi
           done
       - name: Verify Windows imports
         if: runner.os == 'Windows'
@@ -561,6 +619,7 @@ jobs:
           name: yonder-${{ matrix.suffix }}
           path: dist/*
           if-no-files-found: error
+          overwrite: true
 
   release-candidate:
     needs: build
@@ -582,15 +641,20 @@ jobs:
         shell: bash
         run: |
           cp Cargo.lock dist/Cargo.lock
-          cd dist
-          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
-            | sort --zero-terminated \
-            | xargs --null sha256sum > SHA256SUMS
+          checksum_file="$RUNNER_TEMP/yonder-SHA256SUMS"
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | sort --zero-terminated \
+              | xargs --null sha256sum
+          ) > "$checksum_file"
+          mv "$checksum_file" dist/SHA256SUMS
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: yonder-release-candidate
+          name: release-candidate-${{ env.CANDIDATE_VERSION }}
           path: dist/*
           if-no-files-found: error
+          overwrite: true

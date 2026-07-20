@@ -52,6 +52,7 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | `rand` | `0.8.7`; `getrandom` | `yonder-core`; OPAQUE 兼容 CSPRNG | MIT/Apache-2.0；0.8 最新修复补丁，因 opaque-ke Rand 0.8 约束不能用全局 0.10。系统熵路径无额外运行时 |
 | `rpassword` | `7.5.4`; 无 feature | `yon`; 隐藏 code 输入 | Apache-2.0，成熟跨平台；替代平台 console 手写。仅启动冷路径 |
 | `rustls-pki-types` | `1.15.0`; `alloc` | `yonder-net`; DER key/cert 边界校验 | MIT/Apache-2.0，rustls 官方类型；先校验再调用 libp2p websocket 避免无效 key 触发其 panic API |
+| `rustls-webpki` (`webpki`) | `0.103.13`; 无 feature | `yonder-net`; WSS external DNS/IP SAN 启动校验 | ISC，rustls 官方 Web PKI 实现，维护活跃、MSRV 1.71；替代自研 X.509/SAN 解析和名称匹配。已存在于锁定的 rustls 传递树，本次只增加直接依赖边，不增加包、原生库或运行时热路径成本 |
 | `serde` | `1.0.229`; `derive,std` | 两个 binary；类型安全配置 schema | MIT/Apache-2.0，事实标准；只为启动配置反序列化启用 derive/std，不进入终端数据热路径 |
 | `sha2` | `0.10.9`; 无 feature | `yon`; OPAQUE SHA-512 | MIT/Apache-2.0；因 opaque-ke Digest 0.10 公开约束使用兼容主版本最新补丁，不让 relay 编译该依赖 |
 | `tempfile` | `3.27.0`; `getrandom` | `yon-relay` 身份原子写入、`yon` CLI 集成测试 | MIT/Apache-2.0，成熟；替代跨平台临时文件/rename 竞态手写。只在 init 冷路径或测试构建 |

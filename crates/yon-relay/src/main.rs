@@ -333,19 +333,16 @@ fn serve_config_with(
         .collect::<Result<Vec<_>, _>>()?;
     let resources = relay_resources(loaded.value())?;
     let identity = FileIdentityStore.read(&identity_path)?;
-    let (wss, has_wss_server) = match (certificate_path, private_key_path) {
+    let wss = match (certificate_path, private_key_path) {
         (Some(certificate), Some(private_key)) => {
             let certificate = read_tls_document(&certificate, TlsDocumentKind::Certificate)?;
             let private_key = read_tls_document(&private_key, TlsDocumentKind::PrivateKey)?;
-            (
-                WssTransportConfig::server(certificate.into_upstream_bytes(), private_key),
-                true,
-            )
+            WssTransportConfig::server(certificate.into_upstream_bytes(), private_key)
         }
-        (None, None) => (WssTransportConfig::client(None), false),
+        (None, None) => WssTransportConfig::client(None),
         _ => return Err(RelayServiceError::MissingWssCertificate.into()),
     };
-    RelayServeConfig::with_resources(identity, listen, external, wss, has_wss_server, resources)
+    RelayServeConfig::with_resources(identity, listen, external, wss, resources)
         .map_err(AppError::from)
 }
 
@@ -409,7 +406,6 @@ mod tests {
         AppError, Cli, Command, IdentityCommand, LogLevel, RELAY_SCHEMA, TlsDocumentKind,
         execute_command, initialize_identity, initialize_identity_with, read_tls_document,
         read_tls_document_from, relay_runtime, report_peer_id_to, run, serve_config_with,
-        serve_relay,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -420,6 +416,11 @@ mod tests {
     use tempfile::tempdir;
     use tracing_subscriber::filter::LevelFilter;
     use yonder_config::{ConfigurationLocationError, ConfigurationSources, LayeredConfigLoader};
+
+    const TEST_WSS_CERTIFICATE_DER: &[u8] =
+        include_bytes!("../../yon/tests/fixtures/localhost-test-cert.der");
+    const TEST_WSS_PRIVATE_KEY_DER: &[u8] =
+        include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
 
     struct FailingOutput;
 
@@ -543,6 +544,15 @@ mod tests {
             directory.path(),
             "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\nwss_certificate_der='certificate.der'\nwss_private_key_der='private-key.der'\n",
         );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::Service(
+                yon_relay::RelayServiceError::NetworkBuild(_)
+            ))
+        ));
+
+        fs::write(&certificate, TEST_WSS_CERTIFICATE_DER).unwrap();
+        fs::write(&private_key, TEST_WSS_PRIVATE_KEY_DER).unwrap();
         assert!(serve_config_with(&loader).is_ok());
     }
 
@@ -688,7 +698,6 @@ mod tests {
                     vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
                     vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
                     yonder_net::WssTransportConfig::client(None),
-                    false,
                 )
                 .map_err(AppError::from)
             },
@@ -731,7 +740,6 @@ mod tests {
                     vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
                     Vec::new(),
                     yonder_net::WssTransportConfig::client(None),
-                    false,
                 )
                 .map_err(AppError::from)
             },
@@ -799,7 +807,6 @@ mod tests {
             vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
             yonder_net::WssTransportConfig::client(None),
-            false,
         )
         .unwrap()
     }
@@ -832,20 +839,19 @@ mod tests {
     }
 
     #[test]
-    fn relay_runner_reports_invalid_tls_before_waiting_for_a_signal() {
-        let config = yon_relay::RelayServeConfig::new(
-            yonder_net::Keypair::generate_ed25519(),
-            vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
-            vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
-            yonder_net::WssTransportConfig::server(
-                vec![1, 2, 3],
-                yonder_core::SecretDocument::new(vec![4, 5, 6]),
+    fn relay_configuration_rejects_invalid_tls_before_startup() {
+        assert!(matches!(
+            yon_relay::RelayServeConfig::new(
+                yonder_net::Keypair::generate_ed25519(),
+                vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
+                yonder_net::WssTransportConfig::server(
+                    vec![1, 2, 3],
+                    yonder_core::SecretDocument::new(vec![4, 5, 6]),
+                ),
             ),
-            false,
-        )
-        .unwrap();
-
-        assert!(matches!(serve_relay(config), Err(AppError::Service(_))));
+            Err(yon_relay::RelayServiceError::NetworkBuild(_))
+        ));
 
         let directory = tempdir().unwrap();
         assert!(matches!(

@@ -22,7 +22,8 @@ yon-relay [--log-level <LEVEL>] serve
 - `wss_ca_der` 向系统信任根之外增加一个 DER 编码 CA，仅用于 WSS。中继地址中的 PeerId 仍必须与完成 libp2p 身份认证后的 PeerId 一致。
 - `yon-relay.toml` 必须提供 `identity`、`1..=8` 个 `listen` 和 `1..=8` 个 `external`，可提供 WSS DER 路径及 `[registry]`、`[resolve]`、`[circuit]` 资源覆盖。Circuit Relay v2 reservation 必须携带至少一个可拨号的 relay 地址，因此程序不从 wildcard、私网或 NAT 后的 listen 地址猜测公网入口，缺失 `external` 时必须在启动边界失败。地址各不超过 `512` 字节；listen 只允许可绑定的 `/ip4`/`/ip6` transport 地址且不带 `/p2p`，并允许 wildcard/端口 `0`；external 允许 IP/DNS transport 地址且不带 `/p2p`，但拒绝未指定 IP 和端口 `0`。程序展示拨号地址时追加持久 relay PeerId。
 - 配置文件最大 `64 KiB`，严格拒绝未知字段、非法 TOML、非 UTF-8、目录冒充文件和无效领域值。相对路径按字段来源解析：文件字段相对于该文件目录，环境字段相对于当前目录。缺失的低优先级文件可忽略，已存在但无效的高低任一层都必须失败。
-- WSS 服务端证书和私钥必须同时提供且是 DER；普通 WS 不要求证书。WSS external 的 DNS 名必须通过证书 SAN 验证。证书、私钥或 CA 文件非法时启动失败，不降级到明文入口；配置 `/tls/ws` listen 却未提供证书对也失败。
+- 只有 WSS 需要运维侧 TLS 证书。relay 的服务端证书和私钥必须同时提供且是 DER；普通 WS、TCP 和 QUIC 不使用这组证书。每个 WSS external 的 DNS 名或 IP 必须分别匹配证书中的 DNS SAN 或 IP SAN，`CN` 不参与匹配；任意 WSS listen 或 external 存在而未提供证书对时必须在启动边界失败。
+- 自签证书和私有 CA 均受支持。单证书自签部署中，relay 使用带 `CA:FALSE`、`serverAuth` 和正确 SAN 的自签叶证书，两个 endpoint 将同一证书配置为 `wss_ca_der`；私有 CA 部署中，relay 使用该 CA 直接签发的叶证书，endpoint 的 `wss_ca_der` 指向 CA 证书。启动边界负责有界读取、DER/密钥编码解析及 WSS external 的 DNS/IP SAN 匹配；有效期、`CA`/`serverAuth` 用途、证书链、信任关系及证书与私钥的密码学匹配由真实客户端 TLS 握手最终验证，失败时关闭连接且不降级到明文。当前服务端只发送一个叶证书 DER，不支持需要发送 intermediate chain 的部署。
 - `identity init` 使用 Ed25519 生成持久中继身份，在目标目录内原子写入且拒绝覆盖。Unix 创建后权限必须为 `0600`。Windows 标准库不能可靠读取或收紧任意 ACL，文件继承目标目录 ACL；操作员必须选择只允许 relay 服务账户访问的目录，这是明确的部署责任，不虚假声称由 Yonder 验证。
 - Clap 负责帮助、用法、参数冲突、数量和非秘密类型校验。连接码是唯一例外：Clap 只接收并立即包裹原始参数，领域解析必须在不会回显秘密的应用边界完成。
 

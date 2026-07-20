@@ -13,13 +13,15 @@ use yonder_core::{OsSecureRandom, ProtocolError, RelayResourceConfig, RetryAfter
 use yonder_net::behaviour::RelayBehaviourEvent;
 use yonder_net::swarm::SwarmEvent;
 use yonder_net::{
-    ApplicationStream, ApplicationStreamError, ApplicationStreams, ConnectionBook, Keypair,
-    ListenerId, Multiaddr, NetworkBuildError, NetworkNodeError, PeerId, RelayExternalAddress,
-    RelayListenAddress, RelayNode, TaskFailure, TaskGroup, TransportKind, WssTransportConfig,
+    ApplicationStream, ApplicationStreamError, ApplicationStreams, ConnectionBook, ConnectionId,
+    Keypair, ListenerId, Multiaddr, NetworkBuildError, NetworkNodeError, PeerId,
+    RelayExternalAddress, RelayListenAddress, RelayNode, TaskFailure, TaskGroup, TransportKind,
+    WssTransportConfig,
 };
 
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const REJECTED_CONNECTION_DRAIN: Duration = Duration::from_secs(1);
 const REGISTRY_READERS: usize = 16;
 
 /// Fully validated inputs required to run a relay process.
@@ -38,14 +40,12 @@ impl RelayServeConfig {
         listen: Vec<RelayListenAddress>,
         external: Vec<RelayExternalAddress>,
         wss: WssTransportConfig,
-        has_wss_server: bool,
     ) -> Result<Self, RelayServiceError> {
         Self::with_resources(
             identity,
             listen,
             external,
             wss,
-            has_wss_server,
             RelayResourceConfig::default(),
         )
     }
@@ -56,18 +56,30 @@ impl RelayServeConfig {
         listen: Vec<RelayListenAddress>,
         external: Vec<RelayExternalAddress>,
         wss: WssTransportConfig,
-        has_wss_server: bool,
         resources: RelayResourceConfig,
     ) -> Result<Self, RelayServiceError> {
         if listen.is_empty() || listen.len() > 8 || external.is_empty() || external.len() > 8 {
             return Err(RelayServiceError::InvalidConfiguration);
         }
-        if listen
+        let requires_wss = listen
             .iter()
             .any(|address| address.transport() == TransportKind::SecureWebSocket)
-            && !has_wss_server
-        {
+            || external
+                .iter()
+                .any(|address| address.transport() == TransportKind::SecureWebSocket);
+        if requires_wss && !wss.is_server() {
             return Err(RelayServiceError::MissingWssCertificate);
+        }
+        if wss.is_server() {
+            wss.validate_server_material()?;
+        }
+        for address in &external {
+            wss.validate_server_for(address).map_err(|source| {
+                RelayServiceError::WssCertificateExternal {
+                    address: address.as_multiaddr().clone(),
+                    source,
+                }
+            })?;
         }
         Ok(Self {
             identity,
@@ -84,8 +96,16 @@ impl RelayServeConfig {
 pub enum RelayServiceError {
     #[error("relay configuration is invalid")]
     InvalidConfiguration,
-    #[error("a TLS WebSocket listener requires both certificate and private key")]
+    #[error(
+        "a TLS WebSocket listener or external address requires both certificate and private key"
+    )]
     MissingWssCertificate,
+    #[error("the WSS certificate SAN does not match external address {address}")]
+    WssCertificateExternal {
+        address: Multiaddr,
+        #[source]
+        source: NetworkBuildError,
+    },
     #[error("failed to construct the relay network")]
     NetworkBuild(#[from] NetworkBuildError),
     #[error("failed to start a relay listener")]
@@ -169,8 +189,21 @@ impl RequiredListeners {
 #[derive(Debug)]
 struct RegistryCall {
     peer: PeerId,
+    admitted_connection: ConnectionId,
     request: RegistryRequest,
-    response: oneshot::Sender<Result<RegistryResponse, RegistryError>>,
+    response: oneshot::Sender<Result<RegistryDecision, RegistryError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegistryDecision {
+    response: RegistryResponse,
+    rejected_connection: Option<ConnectionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegistryTaskDone {
+    peer: PeerId,
+    rejected_connection: Option<ConnectionId>,
 }
 
 #[derive(Debug)]
@@ -234,6 +267,7 @@ pub async fn run_relay_until(
     let registry_permits = Arc::new(Semaphore::new(REGISTRY_READERS));
     let resolve_permits = Arc::new(Semaphore::new(resolve_concurrency));
     let mut registry_active = HashSet::with_capacity(REGISTRY_READERS);
+    let mut rejected_peers = HashSet::with_capacity(REGISTRY_READERS);
     let mut resolve_active = HashSet::with_capacity(resolve_concurrency);
     let mut tasks = TaskGroup::new();
 
@@ -254,6 +288,18 @@ pub async fn run_relay_until(
                 break signal.map_err(RelayServiceError::Signal);
             }
             event = node.next_event() => {
+                let rejected_connection = match &event {
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id,
+                        connection_id,
+                        ..
+                    } if rejected_peers.contains(peer_id) => Some(*connection_id),
+                    _ => None,
+                };
+                let closed_peer = match &event {
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => Some(*peer_id),
+                    _ => None,
+                };
                 if let Err(error) = handle_swarm_event(
                     event,
                     &mut node,
@@ -264,6 +310,15 @@ pub async fn run_relay_until(
                 ) {
                     break Err(error);
                 }
+                if let Some(connection_id) = rejected_connection {
+                    node.swarm_mut().close_connection(connection_id);
+                }
+                if let Some(peer) = closed_peer
+                    && !registry_active.contains(&peer)
+                    && connections.count(&peer) == 0
+                {
+                    rejected_peers.remove(&peer);
+                }
             }
             incoming = registry_incoming.next() => {
                 let Some((peer, stream)) = incoming else {
@@ -272,7 +327,11 @@ pub async fn run_relay_until(
                 let Ok(permit) = Arc::clone(&registry_permits).try_acquire_owned() else {
                     continue;
                 };
-                if registry_active.contains(&peer) || connections.unique(&peer).is_none() {
+                let admitted_connection = connections.unique(&peer).map(|connection| connection.id());
+                if registry_active.contains(&peer)
+                    || rejected_peers.contains(&peer)
+                    || admitted_connection.is_none()
+                {
                     let cancellation = tasks.cancellation();
                     tasks.spawn(async move {
                         let exchange = registry_immediate_retry(stream, retry_after);
@@ -284,17 +343,41 @@ pub async fn run_relay_until(
                     });
                     continue;
                 }
+                let Some(admitted_connection) = admitted_connection else {
+                    continue;
+                };
                 registry_active.insert(peer);
                 let calls = registry_calls_tx.clone();
                 let done = registry_done_tx.clone();
                 let cancellation = tasks.cancellation();
                 tasks.spawn(async move {
-                    let exchange = registry_exchange(peer, stream, calls);
-                    tokio::select! {
-                        result = exchange => log_protocol_result(peer, result),
-                        () = cancellation.cancelled() => {}
+                    let mut rejected_connection = None;
+                    let exchange = registry_exchange(
+                        peer,
+                        admitted_connection,
+                        stream,
+                        calls,
+                        &mut rejected_connection,
+                    );
+                    let completed = tokio::select! {
+                        result = exchange => Some(result),
+                        () = cancellation.cancelled() => None,
+                    };
+                    if rejected_connection.is_some()
+                        && completed.as_ref().is_some_and(Result::is_ok)
+                    {
+                        tokio::select! {
+                            () = tokio::time::sleep(REJECTED_CONNECTION_DRAIN) => {}
+                            () = cancellation.cancelled() => {}
+                        }
                     }
-                    let _ = done.send(peer).await;
+                    if let Some(result) = completed {
+                        log_protocol_result(peer, result);
+                    }
+                    let _ = done.send(RegistryTaskDone {
+                        peer,
+                        rejected_connection,
+                    }).await;
                     drop(permit);
                 });
             }
@@ -332,7 +415,7 @@ pub async fn run_relay_until(
                 });
             }
             Some(call) = registry_calls_rx.recv() => {
-                let response = match handle_registry_call(
+                let decision = match handle_registry_call(
                     &call,
                     &connections,
                     &mut registry,
@@ -341,7 +424,14 @@ pub async fn run_relay_until(
                     Ok(response) => response,
                     Err(error) => break Err(RelayServiceError::Registry(error)),
                 };
-                let _ = call.response.send(Ok(response));
+                if decision.rejected_connection.is_some() {
+                    rejected_peers.insert(call.peer);
+                }
+                if let Err(Ok(decision)) = call.response.send(Ok(decision))
+                    && decision.rejected_connection.is_some()
+                {
+                    close_peer_connections(&mut node, &connections, call.peer);
+                }
             }
             Some(call) = resolve_calls_rx.recv() => {
                 let response = match handle_resolve_call(
@@ -359,8 +449,14 @@ pub async fn run_relay_until(
                 };
                 let _ = call.response.send(response);
             }
-            Some(peer) = registry_done_rx.recv() => {
-                registry_active.remove(&peer);
+            Some(done) = registry_done_rx.recv() => {
+                registry_active.remove(&done.peer);
+                if done.rejected_connection.is_some() {
+                    close_peer_connections(&mut node, &connections, done.peer);
+                }
+                if connections.count(&done.peer) == 0 {
+                    rejected_peers.remove(&done.peer);
+                }
             }
             Some(peer) = resolve_done_rx.recv() => {
                 resolve_active.remove(&peer);
@@ -517,21 +613,47 @@ fn handle_registry_call<C: yonder_core::MonotonicClock>(
     connections: &ConnectionBook,
     registry: &mut Registry<C>,
     random: &mut OsSecureRandom,
-) -> Result<RegistryResponse, RegistryError> {
-    let Some(connection) = connections.unique(&call.peer) else {
-        return Ok(RegistryResponse::Retry(registry.retry_after()));
+) -> Result<RegistryDecision, RegistryError> {
+    let Some(connection) = connections
+        .unique(&call.peer)
+        .filter(|connection| connection.id() == call.admitted_connection)
+    else {
+        return Ok(RegistryDecision {
+            response: RegistryResponse::Retry(registry.retry_after()),
+            rejected_connection: None,
+        });
     };
     let reclaim = match call.request {
-        RegistryRequest::Release(locator) => return Ok(registry.release(call.peer, locator)),
+        RegistryRequest::Release(locator) => {
+            return Ok(RegistryDecision {
+                response: registry.release(call.peer, locator),
+                rejected_connection: None,
+            });
+        }
         RegistryRequest::Allocate => None,
         RegistryRequest::Reclaim(locator) => Some(locator),
     };
     let Some(source) = connection.source_prefix() else {
-        return Ok(RegistryResponse::Retry(registry.retry_after()));
+        return Ok(RegistryDecision {
+            response: RegistryResponse::Retry(registry.retry_after()),
+            rejected_connection: None,
+        });
     };
-    match reclaim {
+    let response = match reclaim {
         None => registry.allocate(call.peer, source, random),
         Some(locator) => Ok(registry.reclaim(call.peer, source, locator)),
+    }?;
+    let rejected_connection =
+        matches!(response, RegistryResponse::Capacity).then(|| connection.id());
+    Ok(RegistryDecision {
+        response,
+        rejected_connection,
+    })
+}
+
+fn close_peer_connections(node: &mut RelayNode, connections: &ConnectionBook, peer: PeerId) {
+    for connection_id in connections.connections(&peer) {
+        node.swarm_mut().close_connection(connection_id);
     }
 }
 
@@ -572,8 +694,10 @@ impl ProtocolIo for ApplicationStream {
 
 async fn registry_exchange<S: ProtocolIo>(
     peer: PeerId,
+    admitted_connection: ConnectionId,
     stream: S,
     calls: mpsc::Sender<RegistryCall>,
+    rejected_connection: &mut Option<ConnectionId>,
 ) -> Result<(), ProtocolTaskError> {
     with_timeout(async move {
         let mut stream = stream.into_protocol_io();
@@ -582,15 +706,17 @@ async fn registry_exchange<S: ProtocolIo>(
         calls
             .send(RegistryCall {
                 peer,
+                admitted_connection,
                 request,
                 response: response_tx,
             })
             .await
             .map_err(|_| ProtocolTaskError::OwnerStopped)?;
-        let response = response_rx
+        let decision = response_rx
             .await
             .map_err(|_| ProtocolTaskError::OwnerStopped)??;
-        write_close(&mut stream, &response.encode()).await
+        *rejected_connection = decision.rejected_connection;
+        write_close(&mut stream, &decision.response.encode()).await
     })
     .await
 }
@@ -685,12 +811,12 @@ fn log_protocol_result(peer: PeerId, result: Result<(), ProtocolTaskError>) {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        ProtocolIo, ProtocolTaskError, REGISTRY_READERS, RegistryCall, RelayServeConfig,
-        RelayServiceError, RequiredListeners, ResolveCall, completed_task_result, finish_relay_run,
-        finish_relay_run_with_timeout, handle_registry_call, handle_resolve_call,
+        ProtocolIo, ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision,
+        RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall, completed_task_result,
+        finish_relay_run, finish_relay_run_with_timeout, handle_registry_call, handle_resolve_call,
         handle_swarm_event as handle_swarm_event_inner, log_protocol_result, read_exact_eof,
         registry_exchange, registry_immediate_retry, report_ready_to, resolve_exchange,
-        resolve_immediate_retry, run_relay, run_relay_until, with_timeout, write_close,
+        resolve_immediate_retry, run_relay_until, with_timeout, write_close,
     };
     use crate::registry::{Registry, ResolveLimiters};
     use std::io;
@@ -701,8 +827,9 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::{mpsc, oneshot};
     use yonder_core::{
-        Locator, MonotonicClock, OsSecureRandom, ProtocolError, RelayResourceConfig,
-        ResolveConcurrency, ResolveLimits, RetryAfter, SystemClock,
+        Locator, MonotonicClock, OsSecureRandom, ProtocolError, RegistrationCapacity,
+        RegistrationLimits, RelayResourceConfig, ReservationDuration, ResolveConcurrency,
+        ResolveLimits, RetryAfter, SecretDocument, SourceRegistrationCapacity, SystemClock,
         wire::registry::{RegistryRequest, RegistryResponse},
         wire::resolve::{ResolveRequest, ResolveResponse},
     };
@@ -710,14 +837,45 @@ mod tests {
     use yonder_net::swarm::SwarmEvent;
     use yonder_net::{
         ApplicationStream, ApplicationStreams, ConnectedPoint, ConnectionBook, ConnectionId,
-        EndpointNode, Keypair, Libp2pApplicationStreams, PeerId, RelayExternalAddress,
-        RelayListenAddress, RelayNode, TaskGroup, WssTransportConfig,
+        EndpointNode, EndpointRelayAddress, Keypair, Libp2pApplicationStreams, ListenerId,
+        NetworkBuildError, PeerId, RelayExternalAddress, RelayListenAddress, RelayNode, TaskGroup,
+        WssTransportConfig,
     };
+
+    const TEST_WSS_CERTIFICATE_DER: &[u8] =
+        include_bytes!("../../yon/tests/fixtures/localhost-test-cert.der");
+    const TEST_WSS_PRIVATE_KEY_DER: &[u8] =
+        include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
 
     impl ProtocolIo for tokio::io::DuplexStream {
         fn into_protocol_io(self) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
             self
         }
+    }
+
+    fn registry_decision(response: RegistryResponse) -> RegistryDecision {
+        RegistryDecision {
+            response,
+            rejected_connection: None,
+        }
+    }
+
+    async fn registry_exchange_without_rejection<S: ProtocolIo>(
+        peer: PeerId,
+        stream: S,
+        calls: mpsc::Sender<RegistryCall>,
+    ) -> Result<(), ProtocolTaskError> {
+        let mut rejected_connection = None;
+        let result = registry_exchange(
+            peer,
+            ConnectionId::new_unchecked(1),
+            stream,
+            calls,
+            &mut rejected_connection,
+        )
+        .await;
+        assert!(rejected_connection.is_none());
+        result
     }
 
     struct FailingOutput;
@@ -762,7 +920,6 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 WssTransportConfig::client(None),
-                false,
             ),
             Err(RelayServiceError::InvalidConfiguration)
         ));
@@ -774,7 +931,6 @@ mod tests {
                 vec![listener.clone()],
                 Vec::new(),
                 WssTransportConfig::client(None),
-                false,
             ),
             Err(RelayServiceError::InvalidConfiguration)
         ));
@@ -784,7 +940,6 @@ mod tests {
                 vec![listener.clone(); 9],
                 vec![external.clone()],
                 WssTransportConfig::client(None),
-                false,
             ),
             Err(RelayServiceError::InvalidConfiguration)
         ));
@@ -794,7 +949,6 @@ mod tests {
                 vec![listener],
                 vec![external.clone(); 9],
                 WssTransportConfig::client(None),
-                false,
             ),
             Err(RelayServiceError::InvalidConfiguration)
         ));
@@ -804,7 +958,6 @@ mod tests {
             vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             vec![external.clone()],
             WssTransportConfig::client(None),
-            false,
             resources,
         )
         .unwrap();
@@ -816,10 +969,59 @@ mod tests {
                 vec![secure],
                 vec![external],
                 WssTransportConfig::client(None),
-                false,
             ),
             Err(RelayServiceError::MissingWssCertificate)
         ));
+    }
+
+    #[test]
+    fn relay_configuration_validates_every_wss_external_dns_and_ip_san() {
+        let server = || {
+            WssTransportConfig::server(
+                TEST_WSS_CERTIFICATE_DER.to_vec(),
+                SecretDocument::new(TEST_WSS_PRIVATE_KEY_DER.to_vec()),
+            )
+        };
+        let listen = || {
+            vec![
+                "/ip4/127.0.0.1/tcp/0/tls/ws"
+                    .parse::<RelayListenAddress>()
+                    .unwrap(),
+            ]
+        };
+
+        for external in [
+            "/dns4/localhost/tcp/443/tls/ws",
+            "/ip4/127.0.0.1/tcp/443/tls/ws",
+        ] {
+            assert!(
+                RelayServeConfig::new(
+                    Keypair::generate_ed25519(),
+                    listen(),
+                    vec![external.parse().unwrap()],
+                    server(),
+                )
+                .is_ok()
+            );
+        }
+
+        for external in [
+            "/dns4/relay.example/tcp/443/tls/ws",
+            "/ip4/127.0.0.2/tcp/443/tls/ws",
+        ] {
+            assert!(matches!(
+                RelayServeConfig::new(
+                    Keypair::generate_ed25519(),
+                    listen(),
+                    vec![external.parse().unwrap()],
+                    server(),
+                ),
+                Err(RelayServiceError::WssCertificateExternal {
+                    source: NetworkBuildError::WssCertificateNameMismatch,
+                    ..
+                })
+            ));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -851,7 +1053,6 @@ mod tests {
                 vec![listen],
                 vec![external],
                 WssTransportConfig::client(None),
-                false,
                 resources,
             )
             .unwrap();
@@ -961,20 +1162,149 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn public_relay_entry_reports_an_unusable_secure_listener() {
-        let secure: RelayListenAddress = "/ip4/127.0.0.1/tcp/0/tls/ws".parse().unwrap();
-        let config = RelayServeConfig::new(
-            Keypair::generate_ed25519(),
-            vec![secure],
-            vec!["/ip4/127.0.0.1/tcp/1/tls/ws".parse().unwrap()],
-            WssTransportConfig::client(None),
-            true,
-        )
-        .unwrap();
+    async fn live_capacity_response_precedes_bounded_same_peer_disconnect() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_address: EndpointRelayAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                    .parse()
+                    .unwrap();
+            let resources = resources_with_registration_capacity(1, 1);
+            let relay_config = RelayServeConfig::with_resources(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                resources,
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
 
+            tokio::task::yield_now().await;
+            let mut accepted = connected_reserved_endpoint(&relay_address, relay_peer).await;
+            let mut accepted_streams = accepted.streams().clone();
+            let stream = open_stream(
+                &mut accepted,
+                &mut accepted_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut accepted, stream, &RegistryRequest::Allocate.encode()).await;
+            assert!(matches!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Acquired(_)
+            ));
+
+            drop(accepted);
+            let rejected_identity = Keypair::generate_ed25519();
+            let mut replacement =
+                EndpointNode::new(rejected_identity.clone(), WssTransportConfig::client(None))
+                    .unwrap();
+            let mut rejected = connected_reserved_endpoint_with_identity(
+                &relay_address,
+                relay_peer,
+                rejected_identity,
+            )
+            .await;
+            let mut rejected_streams = rejected.streams().clone();
+            let stream = open_stream(
+                &mut rejected,
+                &mut rejected_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut rejected, stream, &RegistryRequest::Allocate.encode()).await;
+            assert_eq!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Capacity
+            );
+            replacement.dial_relay(&relay_address).unwrap();
+            wait_for_connection(&mut replacement, relay_peer).await;
+            let _replacement_reservation = replacement.reserve(&relay_address).unwrap();
+            tokio::join!(
+                wait_for_disconnection(&mut rejected, relay_peer),
+                wait_for_disconnection(&mut replacement, relay_peer),
+            );
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("capacity rejection must respond and disconnect every same-peer connection");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_relay_enforces_one_reservation_per_peer() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_address: EndpointRelayAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                    .parse()
+                    .unwrap();
+            let relay_config = RelayServeConfig::new(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let endpoint_identity = Keypair::generate_ed25519();
+            let _first = connected_reserved_endpoint_with_identity(
+                &relay_address,
+                relay_peer,
+                endpoint_identity.clone(),
+            )
+            .await;
+            let mut second =
+                EndpointNode::new(endpoint_identity, WssTransportConfig::client(None)).unwrap();
+            second.dial_relay(&relay_address).unwrap();
+            wait_for_connection(&mut second, relay_peer).await;
+            let second_listener = second.reserve(&relay_address).unwrap();
+            wait_for_reservation_denial(&mut second, second_listener).await;
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the relay must reject a second same-peer reservation");
+    }
+
+    #[test]
+    fn secure_external_address_requires_real_server_material() {
+        let secure: RelayListenAddress = "/ip4/127.0.0.1/tcp/0/tls/ws".parse().unwrap();
         assert!(matches!(
-            run_relay(config).await,
-            Err(RelayServiceError::NetworkNode(_))
+            RelayServeConfig::new(
+                Keypair::generate_ed25519(),
+                vec![secure],
+                vec!["/ip4/127.0.0.1/tcp/1/tls/ws".parse().unwrap()],
+                WssTransportConfig::client(None),
+            ),
+            Err(RelayServiceError::MissingWssCertificate)
         ));
     }
 
@@ -1151,19 +1481,55 @@ mod tests {
                 .await
                 .expect("registry call is delivered");
             assert_eq!(call.peer, peer);
+            assert_eq!(call.admitted_connection, ConnectionId::new_unchecked(1));
             assert_eq!(call.request, RegistryRequest::Reclaim(locator));
             call.response
-                .send(Ok(RegistryResponse::Acquired(locator)))
+                .send(Ok(registry_decision(RegistryResponse::Acquired(locator))))
                 .expect("exchange still waits for the actor");
         };
         let registry_request = RegistryRequest::Reclaim(locator).encode();
         let (exchange, response, ()) = tokio::join!(
-            registry_exchange(peer, registry_server, registry_tx),
+            registry_exchange_without_rejection(peer, registry_server, registry_tx),
             request_response(registry_client, &registry_request),
             registry_owner,
         );
         exchange.unwrap();
         assert_eq!(response, RegistryResponse::Acquired(locator).encode());
+
+        let rejected_id = ConnectionId::new_unchecked(44);
+        let (registry_client, registry_server) = tokio::io::duplex(32);
+        let (registry_tx, mut registry_rx) = mpsc::channel::<RegistryCall>(1);
+        let registry_owner = async {
+            let call = registry_rx
+                .recv()
+                .await
+                .expect("registry call is delivered");
+            call.response
+                .send(Ok(RegistryDecision {
+                    response: RegistryResponse::Capacity,
+                    rejected_connection: Some(rejected_id),
+                }))
+                .expect("exchange still waits for the actor");
+        };
+        let mut rejected_connection = None;
+        let allocate_request = RegistryRequest::Allocate.encode();
+        let (exchange, response, ()) = tokio::join!(
+            registry_exchange(
+                peer,
+                rejected_id,
+                registry_server,
+                registry_tx,
+                &mut rejected_connection,
+            ),
+            request_response(registry_client, &allocate_request),
+            registry_owner,
+        );
+        exchange.unwrap();
+        assert_eq!(
+            RegistryResponse::decode(&response).unwrap(),
+            RegistryResponse::Capacity
+        );
+        assert_eq!(rejected_connection, Some(rejected_id));
 
         let (resolve_client, resolve_server) = tokio::io::duplex(96);
         let (resolve_tx, mut resolve_rx) = mpsc::channel::<ResolveCall>(1);
@@ -1224,7 +1590,10 @@ mod tests {
                 .unwrap();
             client.shutdown().await.unwrap();
         };
-        let (result, ()) = tokio::join!(registry_exchange(peer, server, calls), send);
+        let (result, ()) = tokio::join!(
+            registry_exchange_without_rejection(peer, server, calls),
+            send
+        );
         assert!(matches!(result, Err(ProtocolTaskError::OwnerStopped)));
 
         let (client, server) = tokio::io::duplex(32);
@@ -1234,7 +1603,7 @@ mod tests {
         };
         let allocate = RegistryRequest::Allocate.encode();
         let (result, _response, ()) = tokio::join!(
-            registry_exchange(peer, server, calls),
+            registry_exchange_without_rejection(peer, server, calls),
             request_response(client, &allocate),
             drop_response,
         );
@@ -1272,7 +1641,7 @@ mod tests {
                 .expect("exchange still waits for the actor");
         };
         let (result, _response, ()) = tokio::join!(
-            registry_exchange(peer, server, calls),
+            registry_exchange_without_rejection(peer, server, calls),
             request_response(client, &allocate),
             reject,
         );
@@ -1296,7 +1665,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(32);
         let invalid_registry = [0xff, 0, 0, 0];
         let (result, response) = tokio::join!(
-            registry_exchange(peer, server, mpsc::channel(1).0),
+            registry_exchange_without_rejection(peer, server, mpsc::channel(1).0),
             request_response(client, &invalid_registry),
         );
         assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
@@ -1357,12 +1726,18 @@ mod tests {
         let mut random = OsSecureRandom;
 
         let RegistryResponse::Acquired(locator) = handle_registry_call(
-            &registry_call(peer, RegistryRequest::Allocate),
+            &registry_call(
+                peer,
+                ConnectionId::new_unchecked(1),
+                RegistryRequest::Allocate,
+            ),
             &connections,
             &mut registry,
             &mut random,
         )
-        .unwrap() else {
+        .unwrap()
+        .response
+        else {
             panic!("available peer receives a locator");
         };
         connections
@@ -1371,18 +1746,47 @@ mod tests {
 
         assert!(matches!(
             handle_registry_call(
-                &registry_call(peer, RegistryRequest::Release(locator)),
+                &registry_call(
+                    peer,
+                    ConnectionId::new_unchecked(1),
+                    RegistryRequest::Release(locator),
+                ),
                 &connections,
                 &mut registry,
                 &mut random,
             )
-            .unwrap(),
+            .unwrap()
+            .response,
             RegistryResponse::Retry(_)
         ));
         assert!(matches!(
             registry.resolve(locator).unwrap(),
             ResolveResponse::Resolved(_)
         ));
+    }
+
+    #[test]
+    fn registry_call_rejects_a_connection_replaced_after_stream_admission() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let admitted = ConnectionId::new_unchecked(1);
+        let replacement = ConnectionId::new_unchecked(2);
+        let mut connections = ConnectionBook::new();
+        connections.established(peer, admitted, endpoint()).unwrap();
+        let call = registry_call(peer, admitted, RegistryRequest::Allocate);
+        connections.closed(&peer, &admitted);
+        connections
+            .established(peer, replacement, endpoint())
+            .unwrap();
+        let clock = SystemClock::new();
+        let mut registry = Registry::new(clock);
+        registry.set_connection(peer, true);
+        registry.set_reservation(peer, true);
+
+        let decision =
+            handle_registry_call(&call, &connections, &mut registry, &mut OsSecureRandom).unwrap();
+
+        assert!(matches!(decision.response, RegistryResponse::Retry(_)));
+        assert_eq!(decision.rejected_connection, None);
     }
 
     #[test]
@@ -1399,44 +1803,63 @@ mod tests {
         let mut random = OsSecureRandom;
 
         let response = handle_registry_call(
-            &registry_call(peer, RegistryRequest::Allocate),
+            &registry_call(
+                peer,
+                ConnectionId::new_unchecked(1),
+                RegistryRequest::Allocate,
+            ),
             &connections,
             &mut registry,
             &mut random,
         )
         .unwrap();
-        let RegistryResponse::Acquired(locator) = response else {
+        let RegistryResponse::Acquired(locator) = response.response else {
             panic!("available peer receives a locator");
         };
         assert_eq!(
             handle_registry_call(
-                &registry_call(peer, RegistryRequest::Reclaim(locator)),
+                &registry_call(
+                    peer,
+                    ConnectionId::new_unchecked(1),
+                    RegistryRequest::Reclaim(locator),
+                ),
                 &connections,
                 &mut registry,
                 &mut random,
             )
-            .unwrap(),
+            .unwrap()
+            .response,
             RegistryResponse::Acquired(locator)
         );
         assert_eq!(
             handle_registry_call(
-                &registry_call(peer, RegistryRequest::Release(locator)),
+                &registry_call(
+                    peer,
+                    ConnectionId::new_unchecked(1),
+                    RegistryRequest::Release(locator),
+                ),
                 &connections,
                 &mut registry,
                 &mut random,
             )
-            .unwrap(),
+            .unwrap()
+            .response,
             RegistryResponse::Released
         );
         let other = Keypair::generate_ed25519().public().to_peer_id();
         assert!(matches!(
             handle_registry_call(
-                &registry_call(other, RegistryRequest::Allocate),
+                &registry_call(
+                    other,
+                    ConnectionId::new_unchecked(3),
+                    RegistryRequest::Allocate,
+                ),
                 &connections,
                 &mut registry,
                 &mut random,
             )
-            .unwrap(),
+            .unwrap()
+            .response,
             RegistryResponse::Retry(_)
         ));
 
@@ -1453,12 +1876,17 @@ mod tests {
             .unwrap();
         assert!(matches!(
             handle_registry_call(
-                &registry_call(no_source, RegistryRequest::Allocate),
+                &registry_call(
+                    no_source,
+                    ConnectionId::new_unchecked(2),
+                    RegistryRequest::Allocate,
+                ),
                 &connections,
                 &mut registry,
                 &mut random,
             )
-            .unwrap(),
+            .unwrap()
+            .response,
             RegistryResponse::Retry(_)
         ));
 
@@ -1532,6 +1960,56 @@ mod tests {
             .unwrap(),
             ResolveResponse::Resolved(_)
         ));
+    }
+
+    #[test]
+    fn capacity_rejection_carries_the_exact_unique_connection() {
+        let limits = RegistrationLimits::new(
+            RegistrationCapacity::new(2).unwrap(),
+            SourceRegistrationCapacity::new(1).unwrap(),
+            ReservationDuration::from_seconds(60).unwrap(),
+        )
+        .unwrap();
+        let clock = SystemClock::new();
+        let mut registry = Registry::with_limits(clock, limits, retry_after());
+        let mut connections = ConnectionBook::new();
+        let first = Keypair::generate_ed25519().public().to_peer_id();
+        connections
+            .established(first, ConnectionId::new_unchecked(1), endpoint())
+            .unwrap();
+        registry.set_connection(first, true);
+        registry.set_reservation(first, true);
+        let mut random = OsSecureRandom;
+        let accepted = handle_registry_call(
+            &registry_call(
+                first,
+                ConnectionId::new_unchecked(1),
+                RegistryRequest::Allocate,
+            ),
+            &connections,
+            &mut registry,
+            &mut random,
+        )
+        .unwrap();
+        assert!(matches!(accepted.response, RegistryResponse::Acquired(_)));
+        assert_eq!(accepted.rejected_connection, None);
+
+        let rejected = Keypair::generate_ed25519().public().to_peer_id();
+        let rejected_id = ConnectionId::new_unchecked(2);
+        connections
+            .established(rejected, rejected_id, endpoint())
+            .unwrap();
+        registry.set_connection(rejected, true);
+        registry.set_reservation(rejected, true);
+        let decision = handle_registry_call(
+            &registry_call(rejected, rejected_id, RegistryRequest::Allocate),
+            &connections,
+            &mut registry,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(decision.response, RegistryResponse::Capacity);
+        assert_eq!(decision.rejected_connection, Some(rejected_id));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1874,6 +2352,67 @@ mod tests {
         }
     }
 
+    async fn connected_reserved_endpoint(
+        relay: &EndpointRelayAddress,
+        relay_peer: PeerId,
+    ) -> EndpointNode {
+        connected_reserved_endpoint_with_identity(relay, relay_peer, Keypair::generate_ed25519())
+            .await
+    }
+
+    async fn connected_reserved_endpoint_with_identity(
+        relay: &EndpointRelayAddress,
+        relay_peer: PeerId,
+        identity: Keypair,
+    ) -> EndpointNode {
+        let mut endpoint = EndpointNode::new(identity, WssTransportConfig::client(None)).unwrap();
+        endpoint.dial_relay(relay).unwrap();
+        wait_for_connection(&mut endpoint, relay_peer).await;
+        let listener = endpoint.reserve(relay).unwrap();
+        wait_for_reservation(&mut endpoint, listener).await;
+        endpoint
+    }
+
+    async fn wait_for_reservation(endpoint: &mut EndpointNode, listener: ListenerId) {
+        loop {
+            match endpoint.next_event().await {
+                SwarmEvent::NewListenAddr { listener_id, .. } if listener_id == listener => return,
+                SwarmEvent::ListenerClosed {
+                    listener_id,
+                    reason,
+                    ..
+                } if listener_id == listener => {
+                    panic!("relay reservation closed before becoming ready: {reason:?}")
+                }
+                SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    panic!("relay reservation connection failed: {error}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn wait_for_reservation_denial(endpoint: &mut EndpointNode, listener: ListenerId) {
+        loop {
+            match endpoint.next_event().await {
+                SwarmEvent::ListenerClosed { listener_id, .. } if listener_id == listener => return,
+                SwarmEvent::NewListenAddr { listener_id, .. } if listener_id == listener => {
+                    panic!("the second same-peer reservation was accepted")
+                }
+                SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    panic!("relay reservation connection failed: {error}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn wait_for_disconnection(endpoint: &mut EndpointNode, relay: PeerId) {
+        while endpoint.swarm().is_connected(&relay) {
+            endpoint.next_event().await;
+        }
+    }
+
     async fn open_stream(
         endpoint: &mut EndpointNode,
         streams: &mut Libp2pApplicationStreams,
@@ -2023,6 +2562,20 @@ mod tests {
         RelayResourceConfig::new(defaults.registration(), configured, defaults.circuit())
     }
 
+    fn resources_with_registration_capacity(
+        capacity: usize,
+        per_source: usize,
+    ) -> RelayResourceConfig {
+        let defaults = RelayResourceConfig::default();
+        let registration = RegistrationLimits::new(
+            RegistrationCapacity::new(capacity).unwrap(),
+            SourceRegistrationCapacity::new(per_source).unwrap(),
+            ReservationDuration::from_seconds(60).unwrap(),
+        )
+        .unwrap();
+        RelayResourceConfig::new(registration, defaults.resolve(), defaults.circuit())
+    }
+
     fn handle_swarm_event<C: MonotonicClock>(
         event: SwarmEvent<RelayBehaviourEvent>,
         node: &mut RelayNode,
@@ -2033,10 +2586,15 @@ mod tests {
         handle_swarm_event_inner(event, node, connections, registry, &mut listeners, &[]).unwrap();
     }
 
-    fn registry_call(peer: yonder_net::PeerId, request: RegistryRequest) -> RegistryCall {
+    fn registry_call(
+        peer: yonder_net::PeerId,
+        admitted_connection: ConnectionId,
+        request: RegistryRequest,
+    ) -> RegistryCall {
         let (response, _receiver) = oneshot::channel();
         RegistryCall {
             peer,
+            admitted_connection,
             request,
             response,
         }
@@ -2097,7 +2655,6 @@ mod tests {
             vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
             WssTransportConfig::client(None),
-            false,
         )
         .unwrap()
     }

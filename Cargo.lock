@@ -4587,6 +4587,7 @@ dependencies = [
  "libp2p-swarm-test",
  "proptest",
  "rustls-pki-types",
+ "rustls-webpki",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",

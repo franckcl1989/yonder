@@ -6,12 +6,13 @@
 
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` 通过。
-- `cargo test --locked --workspace --all-targets --all-features` 通过：Windows 与 Linux x86_64 当前源码各自聚合 `216` 个单元/集成/E2E 测试全部成功；另有 `3` 个 rustdoc compile-fail 测试和 `10` 个真实 Criterion benchmark harness 场景全部成功。
+- `cargo test --locked --workspace --all-targets --all-features` 对当前源码在 Windows x86_64 聚合 `223` 个单元/集成/E2E 测试全部成功；另有 `3` 个 rustdoc compile-fail 测试和 `10` 个真实 Criterion benchmark harness 场景全部成功。Linux x86_64 的前一审计快照为 `216` 项全通过，本轮新增 WSS、容量拒绝和上游 per-peer 兼容修正后的当前源码等待新 CI 原生复验。
 - `cargo test --locked --workspace --doc` 通过，其中 `3` 个 compile-fail rustdoc 测试锁定 `RetryAfter`、`PakeSecret` 和连接码暴露生命周期的不变量。
 - `yonder-config` 已实现 endpoint/relay 严格类型配置，优先级固定为系统配置文件 < 当前目录配置文件 < 环境变量；列表按层替换、字段按层合并，未知字段、非 UTF-8、目录、超限文件和无效组合均在启动边界失败。最终审核发现 Circuit Relay v2 在没有可发布地址时虽然接受 reservation，却会让 endpoint 收到 `NoAddressesInReservation`；`external` 因此修正为配置和 `RelayServeConfig` 领域边界共同强制的 `1..=8` 项，不从 wildcard、私网或 NAT 后的 listen 地址猜公网入口。
-- 真实进程 E2E 覆盖 TCP、QUIC、WS、独立 CA 的 WSS、不可用 UDP/TCP 候选后的可用 transport、错码 OPAQUE 拒绝、真实 PTY/shell、relay 重启 Reclaim 和 locator Conflict 后完整换码。完整套件本轮在 Windows 为 `6/6`，在 Linux 为 `7/7`；Linux 额外执行真实 native PTY 的 ANSI 字节、工作目录、环境、初始/动态尺寸、Ctrl+C 与退出码验证。
+- 真实进程 E2E 覆盖 TCP、QUIC、WS、独立 CA 的 WSS、显式信任的自签 IP SAN WSS、不可用 UDP/TCP 候选后的可用 transport、错码 OPAQUE 拒绝、真实 PTY/shell、relay 重启 Reclaim 和 locator Conflict 后完整换码。当前默认套件在 Windows 为 `7/7`；专用 `yonder_e2e_rebuild` 构建另以 `1/1` 证明 controller 销毁旧 Swarm、更换 PeerId、禁用 DCUtR、实际绑定 relay circuit 后仍完成真实终端会话。Linux 前一审计快照为 `7/7` 并额外执行 native PTY 的 ANSI 字节、工作目录、环境、初始/动态尺寸、Ctrl+C 与退出码验证，当前源码等待新 CI 复验。
 - 最终重复执行纠正了两条与冻结语义矛盾的测试前提：PTY 语义用例不再在未证明已经直连时关闭承载 Active 会话的 relay，因为 v1 明确不承诺路径热迁移；relay dial 用例改用独立 relay PeerId，不再一边要求 libp2p 拒绝自连接、一边要求该 dial 进入 pending。后者修正后本机定向重复 `50/50` 通过，并随 Windows、Linux 完整套件再次通过。
-- controller 在 DCUtR 结果与连接名册收敛后才认证；直连升级失败或 `30s` 内未收敛时，至多一次销毁原 Swarm、生成新临时 PeerId，并以禁用 DCUtR 的新 Swarm 严格重走 relay-only 路径。host 同样等待本地 DCUtR 结果和唯一连接屏障；相关单元测试及真实 E2E 通过。
+- controller 在 DCUtR 结果与连接名册收敛后才认证；直连升级失败或 `30s` 内未收敛时，至多一次销毁原 Swarm、生成新临时 PeerId，并以禁用 DCUtR 的新 Swarm 严格重走 relay-only 路径。host 同样等待本地 DCUtR 结果和唯一连接屏障；专用故障入口只在 custom cfg 构建中存在，CI 与 release candidate 都执行 custom-cfg Clippy 及上述严格真实 E2E，默认 release 二进制已扫描确认不含诊断 marker。
+- 只有 WSS 使用运维侧证书；普通 TCP/WS/QUIC 不使用这组证书。relay 启动前有界读取并解析 DER/密钥编码，逐项校验 WSS external 的 DNS/IP SAN；有效期、`CA`/`serverAuth`、信任链和密钥匹配由真实 TLS 握手最终验证。私有根 CA 直接签发的 DNS 叶证书和 `CA:FALSE` 自签 IP 叶证书均已通过真实三进程终端 E2E；当前单 DER 服务端不支持 intermediate chain。
 - controller 使用最小 `TerminalFrontend` 静态替换边界；真实 Ctrl+C 与 raw `0x03` 语义分离，前者返回 `130`，后者原样转发。远端 exit/data EOF 使用统一绝对 `2s` 收敛截止，远端 `>255` 退出值先完整保留并记录再映射为 `1`；raw guard 析构后 runtime 在 `1s` 内有界关闭。
 - 最终审核修复了 host 在发送 `Authenticated` 后才提交授权状态导致 controller 立即打开的 terminal stream 可能被丢弃的竞态。host 现在先由单一所有者提交 `AuthenticationSucceeded`，再在同一绝对截止内并发刷新认证确认、驱动 Swarm 并以有界 `PendingPair` 接收两条 terminal stream；单元测试与 Windows/Linux 真实三进程 E2E 均通过。
 - host 使用静态分发的 `TerminalBackend`/`TerminalSession`；Unix 只继承绝对、存在、普通且至少有一个执行位的 `$SHELL`，否则回退 `/bin/sh`；Windows 只继承绝对且存在的 `%COMSPEC%`，否则回退 `cmd.exe`。Windows ConPTY 无法安全表达 stdin 半关闭，因此非交互脚本必须显式发送 `exit`；Unix 继续把半关闭映射为 PTY EOF。
@@ -19,7 +20,7 @@
 - relay 重连统一使用绝对 `10s` 连接预算、`8s` transport timeout、有界 pending `ConnectionId` 名册和单出口收敛；controller 的两条 terminal stream 共享认证后的绝对 `10s` 截止。
 - `yon` 与 `yon-relay` 产品路径不再使用可能在 broken pipe 上 panic 的打印宏。连接码和 relay identity 输出都显式写入并刷新可失败 writer；host 输出失败会 best-effort 释放 locator。relay serve 的 stdout 只包含带 PeerId 的可发布 external 地址和 PeerId 行，wildcard listen 地址只进入诊断日志；成功、失败 writer 和真实 CLI 测试均已覆盖。
 - `TaskGroup` 对不合作的异步任务在绝对截止后 abort 并等待 tracker 清空；PTY 使用唯一持有真实 `Child` 的 supervisor、直接 `kill`、`try_wait` 和统一清理截止。相关定向测试与本机 ConPTY 测试通过。
-- relay Resolve 忙碌路径在固定长度与 EOF 后统一返回 `Retry`，不会提前解析 locator；Registry Release 在执行点复查唯一连接屏障。相关回归测试及 `yon-relay` 的 `40` 项库、入口、CLI 与真实进程测试通过。
+- relay Resolve 忙碌路径在固定长度与 EOF 后统一返回 `Retry`，不会提前解析 locator；Registry 请求携带入站时唯一的 `ConnectionId`，owner 只在执行点仍是同一唯一连接时处理。容量拒绝成功写回后使用 `1s` 有界 muxer drain，期间拒绝同 Peer 替换连接，结束后关闭该 Peer 当前全部连接。锁定的 `libp2p-relay 0.21.1` 对 per-peer reservation/circuit 使用 `current > configured`，适配字段以 `0` 补偿得到产品有效上限 `1`；真实双连接 reservation、A→B 替换和容量排空回归均通过。`yon-relay` 当前 `45` 项库、入口、CLI 与真实进程测试通过。
 - 第二轮可测试性收口以私有纯决策函数、绝对 deadline seam 和静态 trait fake 覆盖了路径选择、relay/target 事件、连接名册收敛、认证定长错误、终端启动清理、PTY EOF/退出乱序和 relay 协议 I/O 错误；生产协议、公开 API 和运行时行为不变。真实 Swarm、PTY 和交互式 TTY 才能产生的路径没有通过伪造非法状态追求数字。
 - 第三轮使用真实 libp2p relay/endpoint 覆盖注册和查询 actor 往返、16/64 读取槽耗尽、额外子流关闭、连接名册满载、relay loser 清理、stale listener 及 drain 事件；controller 的 resize 变化判定和 exit-first/output-EOF 收敛、PTY 资源创建失败及 blocking task panic 也已由私有静态 seam 覆盖。外部 integration test 真实调用了 Endpoint/Relay `NetworkBehaviour` 的 pending/established 入站和出站回调。
 - 第一方 Rust 源码扫描未发现 `unsafe`、`todo!()` 或 `unimplemented!()`。
@@ -27,23 +28,23 @@
 - fuzz crate 的 fmt、全 target/all feature Clippy 零警告与 Rust `1.88.0` MSRV check 通过；wire fuzz 覆盖 `Authenticated::decode` 和真实 `PakeContext::new` 构造。`connection_code`、`wire_protocol`、`session_state` 在 Windows nightly 各运行 `61s`，分别执行 `19,810,105`、`13,082,742`、`18,014,450` 次；`network_address` 因 Windows libFuzzer 与 `if-watch` DLL 链接冲突改在 Linux nightly 以批准的 `network-address` feature 运行 `61s`、执行 `3,496,004` 次。四个 target 合计 `54,403,301` 次，均无 crash、hang、OOM 或 sanitizer 报告。
 - Rust `1.88.0` 对生产 workspace 的 Windows x86_64 `--locked --all-targets --all-features --target x86_64-pc-windows-msvc` 完整 build 通过，fuzz workspace 的同目标 check 通过；CI/release 已改为六个发布目标各自在原生 runner 上执行生产 build 与 fuzz check，尚待远端矩阵取得结果。
 - Windows x86_64 `cargo build --locked --release` 通过。真正不含项目资源的独立目录 smoke 中，两个程序的 version/help 和 `yon-relay identity init --output relay.identity` 均成功；identity 文件为 `68 B`。
-- 当前改动后重新构建的 release 体积：`yon.exe = 8,014,848 B`，`yon-relay.exe = 6,056,960 B`，分别低于 `20 MiB` 和 `16 MiB` 上限。
+- 当前改动后重新构建的 release 体积：`yon.exe = 8,014,336 B`，`yon-relay.exe = 6,065,664 B`，分别低于 `20 MiB` 和 `16 MiB` 上限；默认 `yon.exe` 不含 custom-cfg 的严格降级诊断 marker。
 - `dumpbin /DEPENDENTS` 只发现 Windows 系统或 API-set DLL，未发现 UCRT/VCRUNTIME/MSVC 等动态 CRT 或第三方 DLL。
-- Rocky Linux 8.10 x86_64 真机使用 `rustc 1.97.0` 对当前源码完整执行 workspace：聚合 `216` 个单元/集成/E2E 测试、`10` 个 benchmark harness 场景及 `3` 个 rustdoc compile-fail 测试全部通过；两份安全例外脚本返回 `true`，Linux Clippy 零警告，Linux 专属的 native PTY backend 单元测试和交互式 PTY E2E 均真实执行。
-- 同一 Linux 真机通过官方 `rust:1.97-alpine` musl 环境（`rustc 1.97.1`）以源码只读、registry 只读和禁网容器按冻结 release profile 重建当前源码的 `x86_64-unknown-linux-musl`。由于容器宿主与目标同为 musl，仓库的显式 target rustflags 会同时作用于宿主 proc-macro，容器命令因此清空该显式覆盖，并由 rustc 确认 musl 默认启用 `crt-static`；`yon = 10,331,648 B`、`yon-relay = 8,044,672 B`，均为 stripped static PIE，`readelf` 未发现 `INTERP` 或 `NEEDED`，独立目录 version/help 与 `68 B` identity smoke 通过。
+- Rocky Linux 8.10 x86_64 真机对前一审计快照使用 `rustc 1.97.0` 完整执行 workspace：聚合 `216` 个单元/集成/E2E 测试、`10` 个 benchmark harness 场景及 `3` 个 rustdoc compile-fail 测试全部通过；两份安全例外脚本返回 `true`，Linux Clippy 零警告，Linux 专属的 native PTY backend 单元测试和交互式 PTY E2E 均真实执行。
+- 同一 Linux 真机对前一审计快照通过官方 `rust:1.97-alpine` musl 环境（`rustc 1.97.1`）以源码只读、registry 只读和禁网容器按冻结 release profile 构建 `x86_64-unknown-linux-musl`。由于容器宿主与目标同为 musl，仓库的显式 target rustflags 会同时作用于宿主 proc-macro，容器命令因此清空该显式覆盖，并由 rustc 确认 musl 默认启用 `crt-static`；`yon = 10,331,648 B`、`yon-relay = 8,044,672 B`，均为 stripped static PIE，`readelf` 未发现 `INTERP` 或 `NEEDED`，独立目录 version/help 与 `68 B` identity smoke 通过。当前源码仍由新 CI/release candidate 重新建立对应证据。
 - CI/release workflow 已修正 static PIE 识别、真正空目录 smoke、每个 Windows 原生命令的退出码检查，并显式覆盖 fuzz crate 的 fmt/Clippy 与六原生 target MSRV；安全公告例外增加了精确依赖路径和 Hickory feature 前提断言。最终审核还修正了 `cargo-deny 0.20.2` 中 fuzz 配置参数的位置，当前生产与 fuzz 锁文件均由该精确版本通过 advisories、bans、licenses、sources 检查。fuzz workflow 包含四个 target，发布矩阵仍为每 target 五个五小时 shard。
 - 所有 GitHub Actions 已固定完整 commit SHA；两条 workflow 均通过本机 `actionlint 1.7.12`。`actionlint` 官方 Windows 资产及 CI 使用的 Linux 资产校验和均从官方 release 核验，CI 安装脚本固定 Linux x64 SHA-256。
 - 项目根目录包含 Apache-2.0 与 MIT 许可证正文；`cargo-about 0.9.1` 已按 `about.toml` 允许集生成 `588,735 B` 的 `THIRD-PARTY-LICENSES.html`。release workflow 会把项目许可证和第三方清单作为独立候选资产，不改变每个单二进制归档“恰好一个可执行文件”的约束。
 - release-candidate workflow 已接入 `cargo-cyclonedx 0.5.9`，候选产物按每个 `.tar.gz`/`.zip` 恰好一个规范名称二进制设计，并统一生成 CycloneDX 1.5 SBOM、checksum 与 provenance。完整压力、网络和固定 runner 性能门禁闭环前 workflow 只上传候选 artifact，不自动创建正式 GitHub Release；本轮依赖变化后的 SBOM 可复现性仍等待 tag workflow 真正执行，不沿用旧锁文件的哈希作为证据。
 - Criterion 使用真实生产类型测量 OPAQUE、固定缓冲区、连接码、wire decoder、governor 和路径排序。本机本轮中值包括 OPAQUE 登录往返 `14.389 ms`、16 KiB 固定缓冲复制 `183.57 ns`、连接码编码 `130.14 ns`、解码 `29.855 ns`、128 次限速检查 `3.455 us`、8 候选路径选择 `63.711 ns`；原始数据保存在 `target/criterion`。当前不是隔离固定 runner，因此这些值是可复现观测而非发布回归基线。
 - Windows nightly 在保持 Miri 默认隔离的情况下完整通过 `yonder-core` 的 `41` 项单元/属性测试和 `3` 项 rustdoc compile-fail。属性测试显式关闭仅服务于失败样本落盘的 Proptest persistence，因此没有为通过 Miri 放宽文件系统隔离。
-- Linux nightly 对当前源码完整执行 ASan 与 TSan。专用 `yonder_sanitizer` cfg 只把插桩构建的 endpoint/relay memory connection limit 提高到 `512 MiB`，普通 dev/test/release 仍固定为 `96 MiB`/`64 MiB`；两种 sanitizer 均通过全部 `216` 项单元/集成/E2E 测试、`10` 个 benchmark smoke 和 `7/7` 真进程 E2E/真实 PTY，没有内存错误、泄漏或数据竞争报告。
+- Linux nightly 对前一审计快照完整执行 ASan 与 TSan。专用 `yonder_sanitizer` cfg 只把插桩构建的 endpoint/relay memory connection limit 提高到 `512 MiB`，普通 dev/test/release 仍固定为 `96 MiB`/`64 MiB`；两种 sanitizer 均通过全部 `216` 项单元/集成/E2E 测试、`10` 个 benchmark smoke 和 `7/7` 真进程 E2E/真实 PTY，没有内存错误、泄漏或数据竞争报告。当前源码等待新 CI 复验。
 - Rocky Linux 真机使用三个独立 network namespace 建立 relay 公网段以及 host/controller 两套互不直通的私网 MASQUERADE，真实 TCP relay-only 终端会话成功；同一双 NAT 拓扑改用 QUIC 并在两个 endpoint 出口各随机丢弃 `2%` 数据包后，真实终端会话仍成功。两次测试均验证 namespace、veth、iptables 规则、进程和临时秘密文件全部清理。
 - Rocky Linux 真机进一步使用 `128` 个独立 network namespace 和来源 `/32`，在不关闭 rust-libp2p 原生 reservation 限速的情况下真实建立 `128/128` 个 reservation/registration。最初共享的 `250ms` 永久 Ping 使 relay 单核 CPU 达 `6.4637%`；修正为 endpoint `1s`、relay `15s` 且一个成功样本即可保留已建立候选后，复测 relay RSS `15,724 KiB`、峰值 `15,724 KiB`、`138` FD、30 秒空闲单核 CPU `0.8998%`，全部通过绝对上限。host 稳态 RSS 最小/中位/p95/最大为 `7,388/7,792/8,224/10,092 KiB`，启动 HWM 为 `26,600/27,184/27,672/29,552 KiB`，最大附加峰值 `22,164 KiB`；测试后 namespace、bridge、进程和临时秘密文件残留均为 `0`。
 
 ## 覆盖率现状
 
-- Windows nightly `cargo-llvm-cov 0.8.7` 对最终审核后的当前源码真实运行 workspace all-target/all-feature 测试与 benchmark smoke，并通过硬门禁：line `95.1822% (6243/6559)`、function `98.3834% (852/866)`、region `90.0455% (8503/9443)`、branch `81.7507% (551/674)`，同时通过每文件 line `>=75%` 检查；报告保存在 `target/coverage-windows-final.json`。
+- Windows nightly `cargo-llvm-cov 0.8.7` 对本轮新增 WSS/容量/strict-E2E 修正前的审计快照真实运行 workspace all-target/all-feature 测试与 benchmark smoke，并通过硬门禁：line `95.1822% (6243/6559)`、function `98.3834% (852/866)`、region `90.0455% (8503/9443)`、branch `81.7507% (551/674)`，同时通过每文件 line `>=75%` 检查；报告保存在 `target/coverage-windows-final.json`。当前源码不得沿用该百分比冒充新结果，等待新 CI 逐 target 报告。
 - 未覆盖内容仍集中在需要真实 TTY、精确网络故障时序、已认证连接替换和不可由 safe 公共 API 构造的上游错误状态。当前审核没有通过伪造非法状态、执行“若调用即失败”的保护闭包或排除生产模块来追求数字；认证、会话消费点、秘密边界、并发关闭和资源上限继续由定向、属性、模糊、sanitizer、真实进程与网络证据补充覆盖率百分比。
 - `NetworkBehaviour` 外部 integration test 已真实执行两个组合行为的八个连接生命周期回调，但 LLVM 仍会把 derive 宏源行及内联生成函数标为零；`libp2p-stream 0.4.0-alpha` 的 `OpenStreamError` 是 `#[non_exhaustive]` 且当前 safe 公共 API 只能构造已覆盖的两种 variant。项目所有者已确认不为追求形式 100% 而伪造不可构造状态，改用风险分级门禁且不排除生产模块。
 - nightly coverage 专用 cfg 与单元测试模块 `#[coverage(off)]` 已落地并由上述 Windows nightly 结果验证；stable/MSRV/Miri/sanitizer/正常 release 不启用。
@@ -53,10 +54,10 @@
 
 - 五个原生目标各自的完整覆盖率尚未从 CI 取得结果；Windows x86_64 本机 nightly 已超过全部门槛，但不能替代其余目标或远端发布证据。
 - Linux arm64 musl、Windows arm64 MSVC、macOS Intel/Apple Silicon 的本轮原生构建、静态链接检查和 smoke 尚未从 CI 取得结果；Linux x86_64 musl 已由本轮 Rocky 真机构建、ELF 静态链接检查和 smoke 覆盖，但仍需 tag workflow 验证正式打包路径。
-- 每 target `24h` release fuzz、`10,000` 次并发压力、恶意 relay/代理以及完整 Linux namespace 公网、单 NAT、端口受限或对称 NAT、IPv6、延迟、抖动和乱序矩阵仍未完成。当前 Rocky 内核缺少 `sch_netem`，因此延迟/抖动/乱序不能在该机伪装为已验证。
+- 每 target `24h` release fuzz、至少 `10,000` 次连接/取消/resize/child-exit 竞态迭代、恶意 relay/代理以及完整 Linux namespace 公网、单 NAT、端口受限或对称 NAT、IPv6、延迟、抖动和乱序矩阵仍未完成。当前 Rocky 内核缺少 `sch_netem`，因此延迟/抖动/乱序不能在该机伪装为已验证。
 - 128 endpoint 下的 Linux RSS、CPU 与 FD 绝对上限已有上述真机证据；启动、OPAQUE、直连/relay 延迟、吞吐、Windows handle、分配以及全部指标的固定 runner 相对回归基线仍未建立。
 - 新的五 target coverage、六 target build/package、SBOM artifact 合并和 provenance/release 流程尚未在 GitHub tag workflow 取得真实成功结果；本机 actionlint 与可复现 SBOM 证据不能替代远端发布矩阵。
 
 ## 当前结论
 
-本轮完成了配置/CLI 重构、可工作的主控/被控/relay 全主路径、真实终端、四种 relay transport、严格 DCUtR 收敛与一次性 relay-only 重建、relay restart/Reclaim/Conflict、任务与 PTY 有界关闭、秘密与文件资源边界、Windows x64 与 Linux x64 musl release、MSRV、供应链和基准验证，并取得 Windows nightly 覆盖率、默认隔离 Miri、完整 ASan/TSan、四 fuzz target 短时运行、Linux 双 NAT TCP/有损 QUIC 及 128 endpoint 资源证据。0.1.0 的本地 Windows 与 Linux x64 主功能和当前质量证据已通过；其余原生平台矩阵、长时 fuzz、完整网络故障矩阵和固定 runner 相对回归基线仍需取得真实结果，未取得前不得创建正式 release。
+本轮完成了配置/CLI 重构、可工作的主控/被控/relay 全主路径、真实终端、四种 relay transport、自签 IP WSS、严格 DCUtR 收敛与一次性 relay-only 重建、relay restart/Reclaim/Conflict、容量拒绝连接绑定、上游 per-peer 限额补偿、任务与 PTY 有界关闭、秘密与文件资源边界、Windows x64 release、MSRV、供应链和基准验证；前一审计快照还取得 Windows nightly 覆盖率、默认隔离 Miri、完整 ASan/TSan、四 fuzz target 短时运行、Linux x64 musl、双 NAT TCP/有损 QUIC及 128 endpoint 资源证据。当前源码的本地 Windows 主功能和质量门禁已通过；新的原生平台矩阵、覆盖率、sanitizer、release candidate 打包、长时 fuzz、完整网络故障矩阵和固定 runner 相对回归基线仍需取得真实结果，未取得前不得创建正式 release。

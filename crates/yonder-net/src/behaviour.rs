@@ -11,6 +11,9 @@ const IDENTIFY_PROTOCOL: &str = "/yonder/id/1.0.0";
 const ENDPOINT_PING_INTERVAL: Duration = Duration::from_secs(1);
 const RELAY_PING_INTERVAL: Duration = Duration::from_secs(15);
 const PING_TIMEOUT: Duration = Duration::from_millis(750);
+// libp2p-relay 0.21.1 rejects only when the current per-peer count is greater
+// than this field, so zero enforces Yonder's effective maximum of one.
+const LIBP2P_SINGLE_PER_PEER_LIMIT: usize = 0;
 #[cfg(not(yonder_sanitizer))]
 const ENDPOINT_MEMORY_LIMIT_BYTES: usize = 96 * 1024 * 1024;
 #[cfg(not(yonder_sanitizer))]
@@ -177,10 +180,10 @@ fn relay_connection_limits() -> connection_limits::ConnectionLimits {
 fn relay_config(registration: RegistrationLimits, circuit: CircuitRelayLimits) -> relay::Config {
     relay::Config {
         max_reservations: registration.capacity().get(),
-        max_reservations_per_peer: 1,
+        max_reservations_per_peer: LIBP2P_SINGLE_PER_PEER_LIMIT,
         reservation_duration: registration.reservation_duration().duration(),
         max_circuits: circuit.capacity().get(),
-        max_circuits_per_peer: 1,
+        max_circuits_per_peer: LIBP2P_SINGLE_PER_PEER_LIMIT,
         max_circuit_duration: circuit.duration().duration(),
         max_circuit_bytes: circuit.bytes().get(),
         ..relay::Config::default()
@@ -228,13 +231,13 @@ mod tests {
         let _configured = RelayBehaviour::with_limits(&identity, registration, circuit);
         let configured = relay_config(registration, circuit);
         assert_eq!(configured.max_reservations, 1);
-        assert_eq!(configured.max_reservations_per_peer, 1);
+        assert_eq!(configured.max_reservations_per_peer, 0);
         assert_eq!(
             configured.reservation_duration,
             std::time::Duration::from_secs(60)
         );
         assert_eq!(configured.max_circuits, 1);
-        assert_eq!(configured.max_circuits_per_peer, 1);
+        assert_eq!(configured.max_circuits_per_peer, 0);
         assert_eq!(
             configured.max_circuit_duration,
             std::time::Duration::from_secs(60)

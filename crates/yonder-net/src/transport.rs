@@ -1,10 +1,11 @@
+use crate::RelayExternalAddress;
 use crate::error::NetworkBuildError;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
 use libp2p::core::{Transport, upgrade};
 use libp2p::identity::Keypair;
 use libp2p::{PeerId, dns, noise, quic, relay, tcp, websocket, yamux};
-use rustls_pki_types::PrivateKeyDer;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::time::Duration;
 use yonder_core::{IdentitySeed, SecretDocument, SecureRandom};
 
@@ -33,6 +34,49 @@ impl WssTransportConfig {
             certificate_der,
             private_key_der,
         }
+    }
+
+    #[must_use]
+    pub const fn is_server(&self) -> bool {
+        matches!(self, Self::Server { .. })
+    }
+
+    /// Validates the server certificate/key encoding before the transport starts.
+    pub fn validate_server_material(&self) -> Result<(), NetworkBuildError> {
+        let Self::Server {
+            certificate_der,
+            private_key_der,
+        } = self
+        else {
+            return Err(NetworkBuildError::InvalidTlsMaterial);
+        };
+        PrivateKeyDer::try_from(private_key_der.as_bytes())
+            .map_err(|_| NetworkBuildError::InvalidTlsMaterial)?;
+        let certificate = CertificateDer::from(certificate_der.as_slice());
+        webpki::EndEntityCert::try_from(&certificate)
+            .map(|_| ())
+            .map_err(|_| NetworkBuildError::InvalidTlsMaterial)
+    }
+
+    /// Checks a WSS external address against the certificate's DNS/IP SANs.
+    pub fn validate_server_for(
+        &self,
+        address: &RelayExternalAddress,
+    ) -> Result<(), NetworkBuildError> {
+        let Some(server_name) = address.wss_server_name() else {
+            return Ok(());
+        };
+        let Self::Server {
+            certificate_der, ..
+        } = self
+        else {
+            return Err(NetworkBuildError::InvalidTlsMaterial);
+        };
+        let certificate = CertificateDer::from(certificate_der.as_slice());
+        webpki::EndEntityCert::try_from(&certificate)
+            .map_err(|_| NetworkBuildError::InvalidTlsMaterial)?
+            .verify_is_valid_for_subject_name(server_name)
+            .map_err(|_| NetworkBuildError::WssCertificateNameMismatch)
     }
 
     /// Duplicates public client trust while refusing to duplicate server private keys.
@@ -175,11 +219,17 @@ mod tests {
         TRANSPORT_TIMEOUT, WssTransportConfig, build_endpoint_transport, build_quic_transport,
         build_relay_transport, generate_identity,
     };
+    use crate::{NetworkBuildError, RelayExternalAddress};
     use libp2p::core::Endpoint;
     use libp2p::core::transport::{DialOpts, PortUse, Transport as _};
     use libp2p::identity::Keypair;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
     use yonder_core::{RandomError, SecretDocument, SecureRandom};
+
+    const TEST_SAN_CERTIFICATE_DER: &[u8] =
+        include_bytes!("../../yon/tests/fixtures/localhost-test-cert.der");
+    const TEST_SAN_PRIVATE_KEY_DER: &[u8] =
+        include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
 
     const TEST_CERTIFICATE_PEM: &[u8] = concat!(
         "-----BEGIN CERTIFICATE-----\n",
@@ -273,6 +323,42 @@ mod tests {
             build_endpoint_transport(&identity, WssTransportConfig::client(Some(certificate)))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn server_material_and_dns_ip_sans_are_validated_before_listening() {
+        let client = WssTransportConfig::client(None);
+        assert!(!client.is_server());
+        assert!(client.validate_server_material().is_err());
+
+        let server = WssTransportConfig::server(
+            TEST_SAN_CERTIFICATE_DER.to_vec(),
+            SecretDocument::new(TEST_SAN_PRIVATE_KEY_DER.to_vec()),
+        );
+        assert!(server.is_server());
+        server.validate_server_material().unwrap();
+
+        for address in [
+            "/dns4/localhost/tcp/443/tls/ws",
+            "/ip4/127.0.0.1/tcp/443/tls/ws",
+            "/ip4/127.0.0.1/tcp/443",
+        ] {
+            let address: RelayExternalAddress = address.parse().unwrap();
+            server.validate_server_for(&address).unwrap();
+        }
+        for address in [
+            "/dns4/relay.example/tcp/443/tls/ws",
+            "/ip4/127.0.0.2/tcp/443/tls/ws",
+        ] {
+            let address: RelayExternalAddress = address.parse().unwrap();
+            assert!(matches!(
+                server.validate_server_for(&address),
+                Err(NetworkBuildError::WssCertificateNameMismatch)
+            ));
+        }
+
+        let plain: RelayExternalAddress = "/ip4/127.0.0.1/tcp/443".parse().unwrap();
+        client.validate_server_for(&plain).unwrap();
     }
 
     #[test]

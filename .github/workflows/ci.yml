@@ -58,6 +58,16 @@ jobs:
           components: clippy
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-targets --all-features
+      - name: Lint strict relay-only controller rebuild
+        env:
+          RUSTFLAGS: --cfg yonder_e2e_rebuild
+        run: cargo clippy --locked -p yon --tests -- -D warnings
+      - name: Prove strict relay-only controller rebuild
+        env:
+          RUSTFLAGS: --cfg yonder_e2e_rebuild
+        run: >-
+          cargo test --locked -p yon --test end_to_end
+          strict_relay_only_fallback_rebuilds_the_controller_swarm -- --exact
 
   coverage:
     strategy:
@@ -118,6 +128,7 @@ jobs:
           name: coverage-${{ matrix.target }}
           path: coverage.json
           if-no-files-found: error
+          overwrite: true
 
   msrv:
     name: MSRV ${{ matrix.target }}
@@ -153,7 +164,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
       - run: cargo build --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
-      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
+      - name: Check fuzz workspace for Linux musl
+        if: runner.os == 'Linux'
+        env:
+          CXX: clang++
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
+      - name: Check fuzz workspace
+        if: runner.os != 'Linux'
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
 
   fuzz:
     timeout-minutes: 60
@@ -179,9 +197,9 @@ jobs:
           FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '60' }}
         run: |
           if [[ "$FUZZ_TARGET" == "network_address" ]]; then
-            cargo +nightly fuzz run "$FUZZ_TARGET" --features network-address -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time="$FUZZ_SECONDS" -timeout=10
           else
-            cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time="$FUZZ_SECONDS" -timeout=10
           fi
 
   miri:

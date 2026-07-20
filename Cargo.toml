@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yonder-rs/yonder"
+repository = "https://github.com/franckcl1989/yonder"
 publish = false
 
 [workspace.dependencies]
@@ -36,6 +36,7 @@ proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 rand = { version = "=0.8.7", default-features = false, features = ["getrandom"] }
 rpassword = { version = "=7.5.4", default-features = false }
 rustls-pki-types = { version = "=1.15.0", default-features = false, features = ["alloc"] }
+webpki = { package = "rustls-webpki", version = "=0.103.13", default-features = false, features = [] }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
 sha2 = { version = "=0.10.9", default-features = false }
 tempfile = { version = "=3.27.0", default-features = false, features = ["getrandom"] }
@@ -48,7 +49,7 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", "cfg(yonder_sanitizer)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", "cfg(yonder_e2e_rebuild)", "cfg(yonder_sanitizer)"] }
 
 [profile.dev]
 codegen-units = 256

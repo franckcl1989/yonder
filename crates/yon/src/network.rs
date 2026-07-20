@@ -272,6 +272,18 @@ impl EndpointDriver {
             .any(|connection| connection == binding.connection)
     }
 
+    #[cfg(yonder_e2e_rebuild)]
+    pub(crate) fn binding_is_relayed(
+        &self,
+        binding: ConnectionBinding,
+    ) -> Result<bool, EndpointError> {
+        self.validate_binding(binding)?;
+        Ok(self
+            .connections
+            .unique(&binding.peer)
+            .is_some_and(|connection| connection.endpoint().is_relayed()))
+    }
+
     fn validate_binding(&self, binding: ConnectionBinding) -> Result<(), EndpointError> {
         match self.binding_state(binding) {
             BindingState::Bound => Ok(()),
@@ -1054,6 +1066,10 @@ async fn connect_target_until(
             Ok(event) => event,
             Err(_) if selection_deadline.is_some() && !selection_elapsed => {
                 selection_elapsed = true;
+                #[cfg(yonder_e2e_rebuild)]
+                if direct_upgrade.is_enabled() && has_candidate {
+                    direct_upgrade_outcome = Some(DirectUpgradeOutcome::Failed);
+                }
                 if target_selection_is_settled(
                     &selection,
                     direct_upgrade_outcome,

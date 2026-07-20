@@ -1,6 +1,7 @@
 use crate::error::AddressError;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
+use rustls_pki_types::ServerName;
 use std::fmt;
 use std::str::FromStr;
 
@@ -177,6 +178,7 @@ impl FromStr for RelayListenAddress {
 pub struct RelayExternalAddress {
     address: Multiaddr,
     transport: TransportKind,
+    wss_server_name: Option<ServerName<'static>>,
 }
 
 impl RelayExternalAddress {
@@ -194,6 +196,10 @@ impl RelayExternalAddress {
     pub fn with_peer_id(&self, relay: RelayPeerId) -> Multiaddr {
         self.address.clone().with(Protocol::P2p(relay.get()))
     }
+
+    pub(crate) const fn wss_server_name(&self) -> Option<&ServerName<'static>> {
+        self.wss_server_name.as_ref()
+    }
 }
 
 impl FromStr for RelayExternalAddress {
@@ -204,7 +210,14 @@ impl FromStr for RelayExternalAddress {
         let protocols: Vec<_> = address.iter().collect();
         reject_peer_id(&protocols)?;
         let transport = validate_transport(&protocols, HostRule::IpOrDns)?;
-        Ok(Self { address, transport })
+        let wss_server_name = (transport == TransportKind::SecureWebSocket)
+            .then(|| server_name(&protocols[0]))
+            .transpose()?;
+        Ok(Self {
+            address,
+            transport,
+            wss_server_name,
+        })
     }
 }
 
@@ -229,6 +242,18 @@ fn reject_peer_id(protocols: &[Protocol<'_>]) -> Result<(), AddressError> {
         Err(AddressError::UnexpectedPeerId)
     } else {
         Ok(())
+    }
+}
+
+fn server_name(host: &Protocol<'_>) -> Result<ServerName<'static>, AddressError> {
+    match host {
+        Protocol::Ip4(address) => Ok((*address).into()),
+        Protocol::Ip6(address) => Ok((*address).into()),
+        Protocol::Dns4(address) | Protocol::Dns6(address) => {
+            ServerName::try_from(address.as_ref().to_owned())
+                .map_err(|_| AddressError::InvalidWssServerName)
+        }
+        _ => Err(AddressError::UnsupportedHost),
     }
 }
 
@@ -448,6 +473,10 @@ mod tests {
         assert_eq!(
             "/dns4/relay.example/tcp/0".parse::<RelayExternalAddress>(),
             Err(AddressError::ZeroDialPort)
+        );
+        assert_eq!(
+            format!("/dns4/{}/tcp/443/tls/ws", "a".repeat(254)).parse::<RelayExternalAddress>(),
+            Err(AddressError::InvalidWssServerName)
         );
         let relay = super::RelayPeerId::new(peer().parse().unwrap());
         assert_eq!(

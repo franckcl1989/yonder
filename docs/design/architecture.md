@@ -112,6 +112,6 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 - endpoint 每个目标 PeerId 最多 `8` 条正在选择的连接、每种 transport 最多 `2` 条；达到上限拒绝新候选。
 - endpoint 复用 `libp2p::connection_limits`：pending inbound/outbound 各 `16`、established inbound/outbound 各 `16`、established total `24`、per PeerId `8`；memory connection limit 为进程 RSS `96 MiB`。
 - relay 复用同一官方 behaviour：pending inbound `128`、pending outbound `64`、established inbound `320`、outbound `64`、total `320`、per PeerId `8`；该上限允许同一 endpoint 竞速最多 8 个入口及短暂 AutoNAT 连接，应用协议仍要求收敛到名册唯一。relay memory connection limit 为进程 RSS `64 MiB`。
-- relay 默认 `max_reservations=128`、`max_reservations_per_peer=1`、reservation `1h`。
+- relay 的产品语义固定为默认 `max_reservations=128`、每 PeerId 最多 `1` 个 reservation、reservation `1h`，并且每 PeerId 最多 `1` 条 circuit。锁定的 `libp2p-relay 0.21.1` 对两个 per-peer 字段使用 `current > configured` 判断，因此适配层把对应上游字段设为 `0` 才能得到有效上限 `1`；升级上游时必须用真实双连接 reservation 回归重新核对，不能机械保留该兼容值。
 - relay 默认 `max_circuits=128`、`max_circuits_per_peer=1`、单 circuit 最长 `24h`、双向合计最多 `8 GiB`。配置可以收紧或调整，但必须通过组合 newtype 校验且不能超过平台文件描述符和内存预算。
 - memory connection limits 触发时拒绝新连接，不驱逐 Active 会话。上游平台内存统计暂时失败时可能沿用最近值，因此 connection count limits 始终作为独立硬边界，不能被关闭。ASan/TSan 插桩会让空载进程 RSS 超过生产阈值，因此只有显式启用 `yonder_sanitizer` cfg 的 sanitizer 验证构建把 endpoint 与 relay 阈值提高到 `512 MiB`；普通 dev/test/release 仍固定为上述 `96 MiB`/`64 MiB`，连接数与其他资源边界也不变。

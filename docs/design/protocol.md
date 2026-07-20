@@ -51,7 +51,11 @@ owner PeerId 和来源地址取自 relay 本地该 PeerId 名册中的唯一 lib
 
 只有“该 PeerId 存在有效 relay reservation”且“至少一条该 PeerId 到 relay 的连接仍存在”时映射为 Active。任一条件失效即进入 Suspended；即使控制连接仍在，reservation 到期也必须 Suspended。Suspended 查询返回 Retry，`120s` 后删除。正常 Release 立即删除。
 
-新建映射总数默认 `128`，每 PeerId `1`，每来源 IPv4 `/32` 或 IPv6 `/64` 默认 `32`。映射记录首次创建时的来源前缀并在该映射生命周期内保持不变；同 PeerId 从其他网络恢复不会转移计数，也不会被当作新建。总数和来源配额都只统计仍存活的 Active/Suspended 映射，Release 或宽限到期删除时同步递减，绝不能变成 relay 重启前的累计终身计数。分配从随机 20 bit 起点环形递增；表未满时最多检查 `129` 个值。容量满时不驱逐。
+新建映射总数默认 `128`，每 PeerId `1`，每来源 IPv4 `/32` 或 IPv6 `/64` 默认 `32`。映射记录首次创建时的来源前缀并在该映射生命周期内保持不变；同 PeerId 从其他网络恢复不会转移计数，也不会被当作新建。总数和来源配额都只统计仍存活的 Active/Suspended 映射，Release 或宽限到期删除时同步递减，绝不能变成 relay 重启前的累计终身计数。分配从随机 20 bit 起点环形递增；表未满时最多检查配置的总容量个值，默认最多 `128`、允许的配置上限最多 `320`。
+
+registry 子流入站时必须记录当时唯一的本地 `ConnectionId`，单一 owner 执行请求前必须重新确认名册仍恰好只包含同一个 ID；A 已离开而同 PeerId 的 B 已替换时统一返回 `Retry`，不得在 B 上执行 A 的请求。`libp2p-stream 0.4.0-alpha` 不直接暴露子流所属 `ConnectionId`，因此当前绑定依赖“入站唯一屏障 + owner 同 ID 复查”；无法从该 API 直接证明子流归属是明确残余限制。
+
+容量满时不驱逐已有映射。relay 在成功写入、flush 并关闭 `Capacity` 响应子流后保留发起请求的精确连接 `1s` 作为有界 muxer drain 窗口；从 owner 决定 `Capacity` 起到该 PeerId 的连接名册清空前，同 PeerId 新建立的连接必须立即关闭，drain 结束后关闭名册中该 PeerId 的全部连接，确保未注册端点不能用替换连接保留 reservation。响应写入失败、超时或服务取消时不等待 drain，立即关闭该 PeerId 当前全部连接；不得影响其他 PeerId。该窗口不等价于应用层读取确认，但避免立即关闭物理连接稳定丢弃已完成的子流写；增加专用确认协议会扩大状态、往返和滥用面，当前接受极端时延或丢包下客户端可能只观察到连接失败而非 `Capacity` 的可用性残余风险。
 
 ## Resolve
 
