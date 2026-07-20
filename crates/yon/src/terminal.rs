@@ -859,6 +859,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn terminal_copy_loops_preserve_every_reachable_io_failure_boundary() {
+        async fn input_failure(writer: FailingWrite) -> io::Result<()> {
+            let (mut input, bridge) = tokio::io::duplex(16);
+            input.write_all(b"input").await.unwrap();
+            input.shutdown().await.unwrap();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let mut bridge = SyncIoBridge::new_with_handle(bridge, runtime);
+                let mut writer = writer;
+                copy_input(&mut bridge, &mut writer)
+            })
+            .await
+            .unwrap()
+        }
+
+        assert!(input_failure(FailingWrite::write()).await.is_err());
+        assert!(input_failure(FailingWrite::flush()).await.is_err());
+
+        let (bridge, _output) = tokio::io::duplex(1);
+        let runtime = tokio::runtime::Handle::current();
+        let read_failure = tokio::task::spawn_blocking(move || {
+            let mut bridge = SyncIoBridge::new_with_handle(bridge, runtime);
+            copy_output(&mut FailingRead, &mut bridge)
+        })
+        .await
+        .unwrap();
+        assert!(read_failure.is_err());
+
+        let (bridge, output) = tokio::io::duplex(1);
+        drop(output);
+        let runtime = tokio::runtime::Handle::current();
+        let write_failure = tokio::task::spawn_blocking(move || {
+            let mut bridge = SyncIoBridge::new_with_handle(bridge, runtime);
+            copy_output(&mut Cursor::new(b"output"), &mut bridge)
+        })
+        .await
+        .unwrap();
+        assert!(write_failure.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn synthetic_session_covers_bounded_io_and_terminal_errors() {
         let (mut session, mut controls) = synthetic_session();
         let mut chunk = TerminalChunk::new();
@@ -1181,6 +1222,48 @@ mod tests {
         input_result: oneshot::Sender<Result<(), io::Error>>,
         output_result: oneshot::Sender<Result<(), io::Error>>,
         exit: oneshot::Sender<Result<ChildExit, TerminalError>>,
+    }
+
+    struct FailingRead;
+
+    impl io::Read for FailingRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("synthetic read failure"))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum WriteFailure {
+        Write,
+        Flush,
+    }
+
+    struct FailingWrite(WriteFailure);
+
+    impl FailingWrite {
+        const fn write() -> Self {
+            Self(WriteFailure::Write)
+        }
+
+        const fn flush() -> Self {
+            Self(WriteFailure::Flush)
+        }
+    }
+
+    impl io::Write for FailingWrite {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            match self.0 {
+                WriteFailure::Write => Err(io::Error::other("synthetic write failure")),
+                WriteFailure::Flush => Ok(buffer.len()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            match self.0 {
+                WriteFailure::Write => Ok(()),
+                WriteFailure::Flush => Err(io::Error::other("synthetic flush failure")),
+            }
+        }
     }
 
     fn synthetic_session() -> (PtySession, SyntheticControls) {

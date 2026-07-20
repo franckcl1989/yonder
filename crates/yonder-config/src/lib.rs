@@ -745,6 +745,11 @@ mod tests {
                 .unwrap(),
             absolute
         );
+        let untracked = ConfigurationKey::new("untracked_path");
+        assert!(matches!(
+            loaded.resolve_path(untracked, Path::new("relative.der")),
+            Err(ConfigurationError::MissingPathOrigin("untracked_path"))
+        ));
         assert_eq!(loaded.into_value().relays, ["relay"]);
     }
 

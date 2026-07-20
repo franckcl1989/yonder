@@ -779,14 +779,14 @@ impl Drop for RawModeGuard {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        ControllerError, CrosstermFrontend, EndpointError, REMOTE_COMPLETION_TIMEOUT, RawModeGuard,
-        RemoteCompletion, TerminalFrontend, await_remote_completion, await_until,
-        changed_terminal_size, complete_after_output_eof, decode_terminal_exit,
-        direct_fallback_required, enter_raw_mode_before, exchange_terminal_ready,
-        exchange_terminal_ready_timed, fallback_transport, local_terminal_hello,
-        local_terminal_hello_with, next_retry_delay, read_auth_response, read_local_input,
-        run_until_interrupted, terminal_environment, terminal_environment_from,
-        wait_for_remote_completion_deadline,
+        ControllerConfig, ControllerError, CrosstermFrontend, EndpointError,
+        REMOTE_COMPLETION_TIMEOUT, RawModeGuard, RemoteCompletion, TerminalFrontend,
+        await_remote_completion, await_until, changed_terminal_size, complete_after_output_eof,
+        decode_terminal_exit, direct_fallback_required, enter_raw_mode_before,
+        exchange_terminal_ready, exchange_terminal_ready_timed, fallback_transport,
+        local_terminal_hello, local_terminal_hello_with, next_retry_delay, read_auth_response,
+        read_local_input, run_controller, run_until_interrupted, terminal_environment,
+        terminal_environment_from, wait_for_remote_completion_deadline,
     };
     use std::cell::Cell;
     use std::io;
@@ -798,8 +798,13 @@ mod tests {
     use tokio::sync::oneshot;
     use yonder_core::wire::auth::AuthServerResponse;
     use yonder_core::wire::terminal::{TerminalHello, TerminalReady};
-    use yonder_core::{RetryAfter, SecretDocument, TerminalSize, TerminalValue};
-    use yonder_net::WssTransportConfig;
+    use yonder_core::{
+        ConnectionCode, Locator, PakeSecret, RetryAfter, SecretDocument, TerminalSize,
+        TerminalValue,
+    };
+    use yonder_net::{
+        EndpointRelayAddress, EndpointRelaySet, Keypair, NetworkBuildError, WssTransportConfig,
+    };
 
     #[test]
     fn relay_only_fallback_is_narrowly_classified_and_requires_client_tls() {
@@ -824,6 +829,35 @@ mod tests {
                 SecretDocument::new(vec![2]),
             )),
             Err(ControllerError::InvalidTransportRole)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_wss_ca_is_rejected_before_controller_network_activity() {
+        let relay_identity = Keypair::generate_ed25519();
+        let relay: EndpointRelayAddress = format!(
+            "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
+            relay_identity.public().to_peer_id()
+        )
+        .parse()
+        .unwrap();
+        let config = ControllerConfig::new(
+            Keypair::generate_ed25519(),
+            EndpointRelaySet::new(vec![relay]).unwrap(),
+            WssTransportConfig::client(Some(vec![1])),
+            ConnectionCode::new(Locator::new(0).unwrap(), PakeSecret::from_u64(0).unwrap()),
+            TerminalHello::new(
+                TerminalSize::new(80, 24).unwrap(),
+                TerminalValue::new("xterm").unwrap(),
+                TerminalValue::new("truecolor").unwrap(),
+            ),
+        );
+
+        assert!(matches!(
+            run_controller(config).await,
+            Err(ControllerError::Endpoint(EndpointError::Build(
+                NetworkBuildError::InvalidTlsMaterial
+            )))
         ));
     }
 

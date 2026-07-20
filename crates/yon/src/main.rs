@@ -326,7 +326,7 @@ mod tests {
     use super::{
         AppError, Cli, Command, ConnectionCodeArgument, ENDPOINT_SCHEMA, LogLevel,
         RUNTIME_SHUTDOWN_TIMEOUT, endpoint_config_with, portable_process_exit, process_result,
-        read_ca, read_ca_document, read_connection_code_from, run_command,
+        read_ca, read_ca_document, read_connection_code_from, run, run_command,
     };
     use clap::Parser;
     use std::ffi::OsString;
@@ -368,6 +368,18 @@ mod tests {
             ExitCode::from(130)
         );
         assert_eq!(RUNTIME_SHUTDOWN_TIMEOUT, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn diagnostics_initialization_has_one_process_owner() {
+        let invalid = || Cli {
+            log_level: LogLevel::Off,
+            command: Command::Connect {
+                code: Some("0000-0000-0000-000U".parse().unwrap()),
+            },
+        };
+        assert!(matches!(run(invalid()), Err(AppError::Code(_))));
+        assert!(matches!(run(invalid()), Err(AppError::Diagnostics)));
     }
 
     #[test]
