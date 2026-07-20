@@ -1,0 +1,53 @@
+[package]
+name = "yonder-fuzz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "=0.4.13", default-features = false, features = ["link_libfuzzer"] }
+yonder-core = { version = "=0.1.0", path = "../crates/yonder-core", default-features = false }
+yonder-net = { version = "=0.1.0", path = "../crates/yonder-net", default-features = false, optional = true }
+
+[features]
+network-address = ["dep:yonder-net"]
+
+[[bin]]
+name = "connection_code"
+path = "fuzz_targets/connection_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_protocol"
+path = "fuzz_targets/wire_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_state"
+path = "fuzz_targets/session_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "network_address"
+path = "fuzz_targets/network_address.rs"
+test = false
+doc = false
+bench = false
+required-features = ["network-address"]
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "forbid"

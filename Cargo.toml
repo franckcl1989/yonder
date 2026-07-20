@@ -1,0 +1,77 @@
+[workspace]
+members = [
+    "crates/yon",
+    "crates/yon-relay",
+    "crates/yonder-config",
+    "crates/yonder-core",
+    "crates/yonder-net",
+]
+exclude = ["fuzz"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yonder-rs/yonder"
+publish = false
+
+[workspace.dependencies]
+backon = { version = "=1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
+clap = { version = "=4.6.2", default-features = false, features = ["color", "derive", "error-context", "help", "std", "suggestions", "usage"] }
+config = { version = "=0.15.25", default-features = false, features = ["toml"] }
+crossterm = { version = "=0.29.0", default-features = false, features = ["windows"] }
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
+data-encoding = { version = "=2.11.0", default-features = false, features = ["std"] }
+futures = { version = "=0.3.33", default-features = false, features = ["async-await", "std"] }
+governor = { version = "=0.10.4", default-features = false, features = ["std"] }
+libfuzzer-sys = { version = "=0.4.13", default-features = false, features = ["link_libfuzzer"] }
+libp2p = { version = "=0.56.0", default-features = false, features = ["autonat", "dcutr", "dns", "ed25519", "identify", "macros", "memory-connection-limits", "noise", "ping", "quic", "relay", "tcp", "tokio", "upnp", "websocket", "yamux"] }
+libp2p-stream = { version = "=0.4.0-alpha", default-features = false }
+libp2p-swarm-test = { version = "=0.6.0", default-features = false, features = ["tokio"] }
+opaque-ke = { version = "=4.0.1", default-features = false, features = ["argon2", "ristretto255"] }
+portable-pty = { version = "=0.9.0", default-features = false }
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+rand = { version = "=0.8.7", default-features = false, features = ["getrandom"] }
+rpassword = { version = "=7.5.4", default-features = false }
+rustls-pki-types = { version = "=1.15.0", default-features = false, features = ["alloc"] }
+serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
+sha2 = { version = "=0.10.9", default-features = false }
+tempfile = { version = "=3.27.0", default-features = false, features = ["getrandom"] }
+thiserror = { version = "=2.0.19", default-features = false, features = ["std"] }
+tokio = { version = "=1.53.0", default-features = false, features = ["io-std", "io-util", "macros", "rt", "signal", "sync", "time"] }
+tokio-util = { version = "=0.7.18", default-features = false, features = ["compat", "io-util", "rt"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["ansi", "fmt"] }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", "cfg(yonder_sanitizer)"] }
+
+[profile.dev]
+codegen-units = 256
+debug = 2
+debug-assertions = true
+incremental = true
+lto = "off"
+opt-level = 0
+overflow-checks = true
+
+[profile.test]
+codegen-units = 256
+debug = 2
+debug-assertions = true
+incremental = true
+lto = "off"
+opt-level = 0
+overflow-checks = true
+
+[profile.release]
+codegen-units = 1
+incremental = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

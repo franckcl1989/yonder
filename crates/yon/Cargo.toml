@@ -1,0 +1,42 @@
+[package]
+name = "yon"
+description = "Peer-to-peer remote terminal client and host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+backon.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+opaque-ke.workspace = true
+portable-pty.workspace = true
+rand.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+yonder-config = { version = "=0.1.0", path = "../yonder-config", default-features = false }
+yonder-core = { version = "=0.1.0", path = "../yonder-core", default-features = false }
+yonder-net = { version = "=0.1.0", path = "../yonder-net", default-features = false }
+zeroize.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+yon-relay = { version = "=0.1.0", path = "../yon-relay", default-features = false }
+
+[[bench]]
+name = "opaque"
+harness = false
+
+[lints]
+workspace = true

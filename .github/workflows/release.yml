@@ -1,0 +1,596 @@
+name: Release Candidate
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Install actionlint 1.7.12
+        shell: bash
+        run: bash .github/scripts/install-actionlint.sh
+      - run: actionlint
+      - name: Verify tag matches the workspace version
+        shell: bash
+        run: |
+          mapfile -t versions < <(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -r '
+                  .workspace_members as $members
+                  | .packages[]
+                  | select(.id as $id | $members | index($id))
+                  | .version
+                ' \
+              | sort -u
+          )
+          test "${#versions[@]}" -eq 1
+          test "$GITHUB_REF_NAME" = "v${versions[0]}"
+      - run: cargo fmt --all --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-targets --all-features
+      - run: cargo test --locked --workspace --doc
+      - name: Reject unsafe first-party Rust
+        shell: bash
+        run: |
+          if git grep -n -E '(^|[^[:alnum:]_])unsafe([^[:alnum:]_]|$)' -- '*.rs'; then
+            echo 'first-party Rust source contains the unsafe keyword' >&2
+            exit 1
+          fi
+      - name: Verify security-sensitive dependency versions
+        shell: bash
+        run: |
+          for manifest in Cargo.toml fuzz/Cargo.toml; do
+            bash .github/scripts/verify-security-exceptions.sh "$manifest"
+          done
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - name: Audit production lockfile
+        run: >-
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2026-0118
+          --ignore RUSTSEC-2026-0119
+          --ignore RUSTSEC-2024-0436
+      - run: cargo deny -L error --locked check
+      - name: Audit fuzz lockfile
+        run: >-
+          cargo audit --file fuzz/Cargo.lock --deny warnings
+          --ignore RUSTSEC-2026-0118
+          --ignore RUSTSEC-2026-0119
+          --ignore RUSTSEC-2024-0436
+      - run: cargo deny -L error --manifest-path fuzz/Cargo.toml --locked --config fuzz/deny.toml check
+
+  coverage:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Enforce risk-based first-party coverage
+        shell: bash
+        run: |
+          cargo +nightly llvm-cov \
+            --locked --workspace --all-targets --all-features \
+            --target "${{ matrix.target }}" \
+            --branch --json --output-path coverage.json \
+            --fail-under-lines 95 \
+            --fail-under-functions 95 \
+            --fail-under-regions 90 \
+            --fail-under-file-lines 75
+          jq --exit-status '
+            [.data[].totals.branches] as $branches
+            | ($branches | length) > 0
+            and ([$branches[].count] | add) > 0
+            and all($branches[];
+              .count > 0
+              and ((.count - .notcovered) * 100 >= .count * 75)
+            )
+          ' coverage.json >/dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-${{ matrix.target }}
+          path: coverage.json
+          if-no-files-found: error
+
+  sbom:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-cyclonedx@0.5.9
+      - name: Generate reproducible CycloneDX SBOMs
+        shell: bash
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show --no-patch --format=%ct HEAD)"
+          cargo metadata --locked --format-version 1 >/dev/null
+          lockfile_sha256="$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+          cargo cyclonedx \
+            --format json \
+            --describe binaries \
+            --all-features \
+            --target all \
+            --spec-version 1.5
+          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "$lockfile_sha256"
+
+          mkdir dist
+          mapfile -d '' sboms < <(find crates -type f -name '*.cdx.json' -print0)
+          test "${#sboms[@]}" -eq 2
+          for sbom in "${sboms[@]}"; do
+            name="$(jq --raw-output '.metadata.component.name' "$sbom")"
+            case "$name" in
+              yon|yon-relay)
+                jq --exit-status \
+                  '.bomFormat == "CycloneDX" and .specVersion == "1.5"' \
+                  "$sbom" >/dev/null
+                cp "$sbom" "dist/${name}.cdx.json"
+                ;;
+              *)
+                echo "unexpected SBOM component: $name" >&2
+                exit 1
+                ;;
+            esac
+          done
+          test -s dist/yon.cdx.json
+          test -s dist/yon-relay.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yonder-sbom
+          path: dist/*.cdx.json
+          if-no-files-found: error
+
+  licenses:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - name: Install cargo-about 0.9.1
+        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+      - name: Generate third-party license bundle
+        shell: bash
+        run: |
+          mkdir dist
+          cargo about generate --locked --workspace --all-features --fail \
+            --output-file dist/THIRD-PARTY-LICENSES.html about.hbs
+          cp LICENSE-MIT LICENSE-APACHE dist/
+          test -s dist/THIRD-PARTY-LICENSES.html
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yonder-licenses
+          path: dist/*
+          if-no-files-found: error
+
+  msrv:
+    needs: quality
+    name: MSRV ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # 1.88.0
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - run: cargo build --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
+
+  miri:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+      - run: cargo +nightly miri test --locked -p yonder-core
+
+  sanitizer:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Run ${{ matrix.sanitizer }} sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
+        run: >-
+          cargo +nightly test --locked -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          --workspace --all-targets --all-features
+
+  release-fuzz:
+    needs: quality
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [connection_code, wire_protocol, session_state, network_address]
+        shard: [1, 2, 3, 4, 5]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Fuzz ${{ matrix.target }} shard ${{ matrix.shard }} for five hours
+        shell: bash
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SEED: ${{ matrix.shard }}
+        run: |
+          if [[ "$FUZZ_TARGET" == "network_address" ]]; then
+            cargo +nightly fuzz run "$FUZZ_TARGET" --features network-address -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+          else
+            cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+          fi
+
+  build:
+    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, release-fuzz]
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            suffix: linux-x86_64
+            extension: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            suffix: linux-aarch64
+            extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+            extension: .exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            suffix: windows-aarch64
+            extension: .exe
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: macos-x86_64
+            extension: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            suffix: macos-aarch64
+            extension: ""
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: clippy
+          targets: ${{ matrix.target }}
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - run: cargo clippy --locked --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Stage Unix binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir stage
+          cp "target/${{ matrix.target }}/release/yon" stage/yon
+          cp "target/${{ matrix.target }}/release/yon-relay" stage/yon-relay
+
+          smoke_root="$(mktemp -d)"
+          mkdir "$smoke_root/yon" "$smoke_root/yon-relay"
+          cp stage/yon "$smoke_root/yon/yon"
+          cp stage/yon-relay "$smoke_root/yon-relay/yon-relay"
+          (
+            cd "$smoke_root/yon"
+            ./yon --version
+            ./yon --help >/dev/null
+          )
+          (
+            cd "$smoke_root/yon-relay"
+            ./yon-relay --version
+            ./yon-relay --help >/dev/null
+            ./yon-relay identity init --output relay.key
+            test -s relay.key
+          )
+
+          test "$(wc -c < stage/yon)" -le 20971520
+          test "$(wc -c < stage/yon-relay)" -le 16777216
+      - name: Stage Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage
+          Copy-Item "target/${{ matrix.target }}/release/yon.exe" "stage/yon.exe"
+          Copy-Item "target/${{ matrix.target }}/release/yon-relay.exe" "stage/yon-relay.exe"
+
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "yonder-smoke-${{ matrix.target }}-$([Guid]::NewGuid().ToString('N'))"
+          $yonSmoke = Join-Path $smokeRoot "yon"
+          $relaySmoke = Join-Path $smokeRoot "yon-relay"
+          New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+          New-Item -ItemType Directory -Path $yonSmoke,$relaySmoke | Out-Null
+          $yonExecutable = Join-Path $yonSmoke "yon.exe"
+          $relayExecutable = Join-Path $relaySmoke "yon-relay.exe"
+          Copy-Item "stage/yon.exe" $yonExecutable
+          Copy-Item "stage/yon-relay.exe" $relayExecutable
+
+          Push-Location $yonSmoke
+          try {
+            & $yonExecutable --version
+            if ($LASTEXITCODE -ne 0) { throw "yon --version failed with exit code $LASTEXITCODE" }
+            & $yonExecutable --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "yon --help failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+          Push-Location $relaySmoke
+          try {
+            & $relayExecutable --version
+            if ($LASTEXITCODE -ne 0) { throw "yon-relay --version failed with exit code $LASTEXITCODE" }
+            & $relayExecutable --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "yon-relay --help failed with exit code $LASTEXITCODE" }
+            & $relayExecutable identity init --output relay.key
+            if ($LASTEXITCODE -ne 0) { throw "yon-relay identity init failed with exit code $LASTEXITCODE" }
+            if ((Get-Item relay.key).Length -eq 0) { throw "empty relay identity" }
+          } finally {
+            Pop-Location
+          }
+
+          if ((Get-Item "stage/yon.exe").Length -gt 20MB) { throw "yon exceeds 20 MiB" }
+          if ((Get-Item "stage/yon-relay.exe").Length -gt 16MB) { throw "yon-relay exceeds 16 MiB" }
+      - name: Verify static Linux binaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for binary in stage/*; do
+            file "$binary" | grep -Eq "statically linked|static-pie linked"
+            ! readelf -l "$binary" | grep -q "INTERP"
+            ! readelf -d "$binary" | grep -q "NEEDED"
+            ! ldd "$binary"
+          done
+      - name: Verify Windows imports
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $targetArchitecture = switch ('${{ matrix.target }}') {
+            'x86_64-pc-windows-msvc' { 'x64' }
+            'aarch64-pc-windows-msvc' { 'arm64' }
+            default { throw "unsupported Windows target: ${{ matrix.target }}" }
+          }
+          $hostArchitecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
+            'X64' { 'x64' }
+            'Arm64' { 'arm64' }
+            default { throw "unsupported Windows runner architecture: $_" }
+          }
+          $component = switch ($targetArchitecture) {
+            'x64' { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+            'arm64' { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' }
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere not found: $vswhere"
+          }
+          $installationPath = & $vswhere -latest -products '*' -requires $component -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installationPath) {
+            throw "Visual Studio component not found: $component"
+          }
+          $toolsetFile = Join-Path $installationPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
+          $toolsetVersion = (Get-Content -LiteralPath $toolsetFile -Raw).Trim()
+          $dumpbin = Join-Path $installationPath "VC\Tools\MSVC\$toolsetVersion\bin\Host$hostArchitecture\$targetArchitecture\dumpbin.exe"
+          if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) {
+            throw "dumpbin not found: $dumpbin"
+          }
+
+          foreach ($binary in Get-ChildItem stage/*.exe) {
+            $output = & $dumpbin /NOLOGO /DEPENDENTS $binary.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed: $binary"
+            }
+            $imports = @(
+              $output | ForEach-Object {
+                if ($_ -match '^\s+([A-Za-z0-9._-]+\.dll)\s*$') {
+                  $Matches[1].ToUpperInvariant()
+                }
+              } | Sort-Object -Unique
+            )
+            if ($imports.Count -eq 0) {
+              throw "no PE imports found: $binary"
+            }
+            foreach ($import in $imports) {
+              if ($import -match '^(API-MS-WIN-CRT-.+|UCRTBASE|VCRUNTIME.*|MSVCP.*|MSVCR.*|CONCRT.*|VCOMP.*|VCAMP.*)\.DLL$') {
+                throw "dynamic CRT dependency in ${binary}: $import"
+              }
+              if ($import -match '^(API-MS-WIN-|EXT-MS-WIN-).+\.DLL$') {
+                continue
+              }
+              $systemLibrary = Join-Path ([Environment]::SystemDirectory) $import
+              if (-not (Test-Path -LiteralPath $systemLibrary -PathType Leaf)) {
+                throw "non-system DLL dependency in ${binary}: $import"
+              }
+            }
+          }
+      - name: Verify macOS system libraries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          for binary in stage/*; do
+            unexpected="$(otool -L "$binary" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/)' || true)"
+            test -z "$unexpected"
+          done
+      - name: Package Unix binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir dist
+          tar --create --gzip \
+            --file "dist/yon-${{ matrix.suffix }}.tar.gz" \
+            --directory stage yon
+          tar --create --gzip \
+            --file "dist/yon-relay-${{ matrix.suffix }}.tar.gz" \
+            --directory stage yon-relay
+          test "$(tar --list --gzip --file "dist/yon-${{ matrix.suffix }}.tar.gz" | wc -l)" -eq 1
+          test "$(tar --list --gzip --file "dist/yon-relay-${{ matrix.suffix }}.tar.gz" | wc -l)" -eq 1
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist
+          Compress-Archive -LiteralPath stage/yon.exe -DestinationPath "dist/yon-${{ matrix.suffix }}.zip"
+          Compress-Archive -LiteralPath stage/yon-relay.exe -DestinationPath "dist/yon-relay-${{ matrix.suffix }}.zip"
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          foreach ($archive in Get-ChildItem dist/*.zip) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($archive.FullName)
+            try {
+              if ($zip.Entries.Count -ne 1) {
+                throw "archive must contain exactly one executable: $archive"
+              }
+            } finally {
+              $zip.Dispose()
+            }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yonder-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  release-candidate:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: yonder-*
+          merge-multiple: true
+      - name: Add lockfile and checksums
+        shell: bash
+        run: |
+          cp Cargo.lock dist/Cargo.lock
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort --zero-terminated \
+            | xargs --null sha256sum > SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yonder-release-candidate
+          path: dist/*
+          if-no-files-found: error

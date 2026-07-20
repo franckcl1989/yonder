@@ -1,0 +1,257 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install actionlint 1.7.12
+        shell: bash
+        run: bash .github/scripts/install-actionlint.sh
+      - run: actionlint
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --doc
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-targets --all-features
+
+  coverage:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Enforce risk-based first-party coverage
+        shell: bash
+        run: |
+          cargo +nightly llvm-cov \
+            --locked --workspace --all-targets --all-features \
+            --target "${{ matrix.target }}" \
+            --branch --json --output-path coverage.json \
+            --fail-under-lines 95 \
+            --fail-under-functions 95 \
+            --fail-under-regions 90 \
+            --fail-under-file-lines 75
+          jq --exit-status '
+            [.data[].totals.branches] as $branches
+            | ($branches | length) > 0
+            and ([$branches[].count] | add) > 0
+            and all($branches[];
+              .count > 0
+              and ((.count - .notcovered) * 100 >= .count * 75)
+            )
+          ' coverage.json >/dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-${{ matrix.target }}
+          path: coverage.json
+          if-no-files-found: error
+
+  msrv:
+    name: MSRV ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # 1.88.0
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - run: cargo build --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
+
+  fuzz:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [connection_code, wire_protocol, session_state, network_address]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Fuzz ${{ matrix.target }}
+        shell: bash
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '60' }}
+        run: |
+          if [[ "$FUZZ_TARGET" == "network_address" ]]; then
+            cargo +nightly fuzz run "$FUZZ_TARGET" --features network-address -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+          else
+            cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+          fi
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+      - run: cargo +nightly miri test --locked -p yonder-core
+
+  sanitizer:
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Run ${{ matrix.sanitizer }} sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
+        run: >-
+          cargo +nightly test --locked -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          --workspace --all-targets --all-features
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Reject unsafe first-party Rust
+        shell: bash
+        run: |
+          if git grep -n -E '(^|[^[:alnum:]_])unsafe([^[:alnum:]_]|$)' -- '*.rs'; then
+            echo 'first-party Rust source contains the unsafe keyword' >&2
+            exit 1
+          fi
+      - name: Verify security-sensitive dependency versions
+        shell: bash
+        run: |
+          for manifest in Cargo.toml fuzz/Cargo.toml; do
+            bash .github/scripts/verify-security-exceptions.sh "$manifest"
+          done
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - name: Audit production lockfile
+        run: >-
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2026-0118
+          --ignore RUSTSEC-2026-0119
+          --ignore RUSTSEC-2024-0436
+      - run: cargo deny -L error --locked check
+      - name: Audit fuzz lockfile
+        run: >-
+          cargo audit --file fuzz/Cargo.lock --deny warnings
+          --ignore RUSTSEC-2026-0118
+          --ignore RUSTSEC-2026-0119
+          --ignore RUSTSEC-2024-0436
+      - run: cargo deny -L error --manifest-path fuzz/Cargo.toml --locked --config fuzz/deny.toml check

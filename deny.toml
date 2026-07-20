@@ -1,0 +1,44 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0118", reason = "libp2p 0.56.0 DNSSEC-only path is disabled; remove when libp2p updates Hickory" },
+    { id = "RUSTSEC-2026-0119", reason = "libp2p 0.56.0 only encodes bounded operator-supplied DNS queries; remove when libp2p updates Hickory" },
+    { id = "RUSTSEC-2024-0436", reason = "transitive build-time paste macro is unmaintained but has no vulnerability; remove with upstream netlink update" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
