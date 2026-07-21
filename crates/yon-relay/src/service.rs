@@ -377,6 +377,13 @@ pub async fn run_relay(config: RelayServeConfig) -> Result<(), RelayServiceError
         event = "relay_signal_handlers_installed",
         "relay process signal handlers are installed"
     );
+    run_relay_until_shutdown(config, shutdown).await
+}
+
+async fn run_relay_until_shutdown(
+    config: RelayServeConfig,
+    shutdown: impl Future<Output = Result<ShutdownReason, std::io::Error>>,
+) -> Result<(), RelayServiceError> {
     run_relay_until(config, async move {
         let reason = shutdown.await?;
         tracing::info!(
@@ -702,14 +709,32 @@ fn process_shutdown_signal()
     let mut console_logoff = ctrl_logoff()?;
     let mut console_shutdown = ctrl_shutdown()?;
     Ok(async move {
-        tokio::select! {
-            _ = interrupt.recv() => Ok(ShutdownReason::Interrupt),
-            _ = console_break.recv() => Ok(ShutdownReason::ConsoleBreak),
-            _ = console_close.recv() => Ok(ShutdownReason::ConsoleClose),
-            _ = console_logoff.recv() => Ok(ShutdownReason::ConsoleLogoff),
-            _ = console_shutdown.recv() => Ok(ShutdownReason::ConsoleShutdown),
-        }
+        Ok(select_windows_shutdown(
+            interrupt.recv(),
+            console_break.recv(),
+            console_close.recv(),
+            console_logoff.recv(),
+            console_shutdown.recv(),
+        )
+        .await)
     })
+}
+
+#[cfg(windows)]
+async fn select_windows_shutdown(
+    interrupt: impl Future<Output = Option<()>>,
+    console_break: impl Future<Output = Option<()>>,
+    console_close: impl Future<Output = Option<()>>,
+    console_logoff: impl Future<Output = Option<()>>,
+    console_shutdown: impl Future<Output = Option<()>>,
+) -> ShutdownReason {
+    tokio::select! {
+        _ = interrupt => ShutdownReason::Interrupt,
+        _ = console_break => ShutdownReason::ConsoleBreak,
+        _ = console_close => ShutdownReason::ConsoleClose,
+        _ = console_logoff => ShutdownReason::ConsoleLogoff,
+        _ = console_shutdown => ShutdownReason::ConsoleShutdown,
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1109,8 +1134,11 @@ mod tests {
         ShutdownReason, completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
         handle_registry_call, handle_resolve_call, handle_swarm_event as handle_swarm_event_inner,
         read_exact_eof, registry_exchange, registry_immediate_retry, report_ready_to,
-        resolve_exchange, resolve_immediate_retry, run_relay_until, with_timeout, write_close,
+        resolve_exchange, resolve_immediate_retry, run_relay_until, run_relay_until_shutdown,
+        with_timeout, write_close,
     };
+    #[cfg(windows)]
+    use super::{process_shutdown_signal, select_windows_shutdown};
     use crate::registry::{Registry, ResolveLimiters};
     use std::io;
     use std::num::NonZeroU32;
@@ -1364,6 +1392,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, RelayServiceError::Signal(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_process_shutdown_maps_the_typed_reason_before_stopping() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        run_relay_until_shutdown(config(), async { Ok(ShutdownReason::Interrupt) })
+            .await
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_shutdown_sources_are_installed_and_every_event_is_distinct() {
+        let real_shutdown = process_shutdown_signal().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), real_shutdown)
+                .await
+                .is_err()
+        );
+
+        use std::future::{pending, ready};
+        assert_eq!(
+            select_windows_shutdown(ready(Some(())), pending(), pending(), pending(), pending(),)
+                .await,
+            ShutdownReason::Interrupt
+        );
+        assert_eq!(
+            select_windows_shutdown(pending(), ready(Some(())), pending(), pending(), pending(),)
+                .await,
+            ShutdownReason::ConsoleBreak
+        );
+        assert_eq!(
+            select_windows_shutdown(pending(), pending(), ready(Some(())), pending(), pending(),)
+                .await,
+            ShutdownReason::ConsoleClose
+        );
+        assert_eq!(
+            select_windows_shutdown(pending(), pending(), pending(), ready(Some(())), pending(),)
+                .await,
+            ShutdownReason::ConsoleLogoff
+        );
+        assert_eq!(
+            select_windows_shutdown(pending(), pending(), pending(), pending(), ready(Some(())),)
+                .await,
+            ShutdownReason::ConsoleShutdown
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

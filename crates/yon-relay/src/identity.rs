@@ -142,8 +142,8 @@ fn sync_parent(_parent: &Path) -> Result<(), IdentityError> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        FileIdentityStore, IdentityError, IdentityStore, parent_directory, persist_error,
-        read_document,
+        FileIdentityStore, IdentityError, IdentityStore, map_policy_error, parent_directory,
+        persist_error, read_document,
     };
     use std::fs;
     #[cfg(not(unix))]
@@ -241,6 +241,16 @@ exit 0
             IdentityError::InsecurePermissions.to_string(),
             "the relay identity file or parent directory permits untrusted access"
         );
+        assert!(matches!(
+            map_policy_error(crate::SecretFileError::Insecure),
+            IdentityError::InsecurePermissions
+        ));
+        assert!(matches!(
+            map_policy_error(crate::SecretFileError::Platform(io::Error::other(
+                "platform"
+            ))),
+            IdentityError::Io(error) if error.kind() == io::ErrorKind::Other
+        ));
     }
 
     #[test]

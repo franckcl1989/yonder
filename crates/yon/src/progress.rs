@@ -39,7 +39,7 @@ pub(crate) async fn wait_with_progress<Stage: Copy, Output>(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{OperationProgress, wait_with_progress};
+    use super::{NoopProgress, OperationProgress, wait_with_progress};
     use std::time::Duration;
 
     #[derive(Default)]
@@ -57,6 +57,9 @@ mod tests {
 
     #[tokio::test]
     async fn progress_is_immediate_and_pulses_during_a_long_operation() {
+        let mut noop = NoopProgress;
+        OperationProgress::<()>::clear(&mut noop);
+
         let mut immediate = RecordingProgress::default();
         assert_eq!(
             wait_with_progress(&mut immediate, (), std::future::ready(7)).await,

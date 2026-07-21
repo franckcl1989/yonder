@@ -282,6 +282,46 @@ mod tests {
     }
 
     #[test]
+    fn measured_quality_precedes_unmeasured_fallbacks_and_empty_ties_are_stable() {
+        let measured = candidate(
+            1,
+            samples(&[20]),
+            CandidatePath::Direct,
+            TransportKind::Quic,
+            0,
+        );
+        let unmeasured = candidate(
+            2,
+            PingSamples::new(),
+            CandidatePath::Direct,
+            TransportKind::Quic,
+            0,
+        );
+        assert_eq!(
+            super::compare(&measured, &unmeasured),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            super::compare(&unmeasured, &measured),
+            std::cmp::Ordering::Greater
+        );
+
+        let later_unmeasured = candidate(
+            3,
+            PingSamples::new(),
+            CandidatePath::Direct,
+            TransportKind::Quic,
+            1,
+        );
+        assert_eq!(
+            QualityPathPolicy
+                .select(&[later_unmeasured, unmeasured])
+                .map(|candidate| candidate.id()),
+            Some(CandidateId::new(2))
+        );
+    }
+
+    #[test]
     fn samples_reject_durations_that_do_not_fit_the_frozen_wire_statistic() {
         let mut values = PingSamples::new();
         values.push(Duration::MAX);

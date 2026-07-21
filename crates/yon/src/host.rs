@@ -74,12 +74,14 @@ pub enum HostStage {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        EXCHANGE_TIMEOUT, HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair, binding_event,
-        host_error_event, read_auth_hello_io, read_terminal_hello_io, report_connection_code_to,
-        report_replacement_notice_to, retryable_relay_error, send_auth_retry_io, start_terminal_io,
+        EXCHANGE_TIMEOUT, HostConfig, HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair,
+        binding_event, host_error_event, read_auth_hello_io, read_terminal_hello_io,
+        report_connection_code_to, report_replacement_notice_to, retryable_relay_error, run_host,
+        run_host_with, run_host_with_progress, send_auth_retry_io, start_terminal_io,
         write_authenticated_io, write_terminal_ready_io,
     };
     use crate::network::EndpointError;
+    use crate::progress::NoopProgress;
     use crate::protocol::RelayProtocolError;
     use crate::terminal::{
         PtyEvent, TerminalBackend, TerminalChunk, TerminalError, TerminalSession,
@@ -93,6 +95,9 @@ mod tests {
     use yonder_core::wire::terminal::{MAX_HELLO_LEN, TerminalHello};
     use yonder_core::{
         ConnectionCode, Locator, PakeSecret, SessionEvent, TerminalSize, TerminalValue,
+    };
+    use yonder_net::{
+        EndpointRelayAddress, EndpointRelaySet, Keypair, NetworkBuildError, WssTransportConfig,
     };
 
     struct FailingOutput;
@@ -403,6 +408,37 @@ mod tests {
         assert_eq!(ready, yonder_core::wire::terminal::TerminalReady::ENCODED);
         TerminalSession::shutdown(session.unwrap()).await.unwrap();
         assert_eq!(shutdowns.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_public_host_entry_rejects_invalid_tls_before_network_activity() {
+        let invalid_config = || {
+            let relay_identity = Keypair::generate_ed25519();
+            let relay: EndpointRelayAddress = format!(
+                "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
+                relay_identity.public().to_peer_id()
+            )
+            .parse()
+            .unwrap();
+            HostConfig::new(
+                Keypair::generate_ed25519(),
+                EndpointRelaySet::new(vec![relay]).unwrap(),
+                WssTransportConfig::client(Some(vec![1])),
+            )
+        };
+        let assert_invalid = |result| {
+            assert!(matches!(
+                result,
+                Err(HostError::Endpoint(EndpointError::Build(
+                    NetworkBuildError::WssTls(_)
+                )))
+            ));
+        };
+
+        assert_invalid(run_host(invalid_config()).await);
+        let mut progress = NoopProgress;
+        assert_invalid(run_host_with_progress(invalid_config(), &mut progress).await);
+        assert_invalid(run_host_with(invalid_config(), TestBackend::open_failure()).await);
     }
 
     struct TestBackend {

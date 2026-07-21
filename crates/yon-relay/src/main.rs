@@ -468,8 +468,9 @@ mod tests {
     use super::{
         AppError, Cli, Command, ConfigCommand, IdentityCommand, LogLevel, RELAY_SCHEMA,
         TlsDocumentKind, execute_command, initialize_identity, initialize_identity_with,
-        read_tls_document, read_tls_document_from, relay_runtime, report_configuration_valid_to,
-        report_peer_id_to, run, serve_config_with, serve_relay, write_error_report,
+        map_tls_policy_error, read_tls_document, read_tls_document_from, relay_runtime,
+        report_configuration_valid_to, report_peer_id_to, run, serve_config_with, serve_relay,
+        write_error_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -593,6 +594,22 @@ exit 0
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[test]
+    fn tls_policy_failures_preserve_security_and_platform_categories() {
+        let path = std::path::Path::new("private-key.der");
+        assert!(matches!(
+            map_tls_policy_error(path, yon_relay::SecretFileError::Insecure),
+            AppError::InsecureTlsPrivateKeyPermissions(mapped) if mapped == path
+        ));
+        assert!(matches!(
+            map_tls_policy_error(
+                path,
+                yon_relay::SecretFileError::Platform(io::Error::other("platform")),
+            ),
+            AppError::TlsRead(error) if error.kind() == io::ErrorKind::Other
+        ));
     }
 
     #[test]
