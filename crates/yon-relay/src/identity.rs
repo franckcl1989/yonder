@@ -254,6 +254,25 @@ exit 0
     }
 
     #[test]
+    fn identity_store_propagates_policy_failures_at_both_boundaries() {
+        let directory = test_directory();
+        let denied = directory.path().join("denied.identity");
+        assert!(matches!(
+            FileIdentityStore.create_with(&denied, &Keypair::generate_ed25519(), &FailingPolicy,),
+            Err(IdentityError::InsecurePermissions)
+        ));
+
+        let existing = directory.path().join("existing.identity");
+        FileIdentityStore
+            .create(&existing, &Keypair::generate_ed25519())
+            .unwrap();
+        assert!(matches!(
+            FileIdentityStore.read_with(&existing, &FailingPolicy),
+            Err(IdentityError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
     fn invalid_and_oversized_documents_are_rejected() {
         let directory = test_directory();
         let invalid = directory.path().join("invalid.identity");
@@ -352,6 +371,29 @@ exit 0
     impl Read for FailingReader {
         fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::other("read failed"))
+        }
+    }
+
+    struct FailingPolicy;
+
+    impl crate::SecretFilePolicy for FailingPolicy {
+        fn protect_new(
+            &self,
+            _path: &Path,
+            _file: &fs::File,
+        ) -> Result<(), crate::SecretFileError> {
+            Err(crate::SecretFileError::Insecure)
+        }
+
+        fn validate_existing(
+            &self,
+            _path: &Path,
+            _file: &fs::File,
+        ) -> Result<(), crate::SecretFileError> {
+            Err(crate::SecretFileError::Platform(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "policy denied access",
+            )))
         }
     }
 }

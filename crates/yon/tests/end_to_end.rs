@@ -13,7 +13,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use yon::network::{EndpointDriver, ReservationLease, connect_relay, wait_for_reservation};
-use yon::protocol::{ReclaimResponse, reclaim_locator};
+use yon::protocol::{
+    ReclaimResponse, RelayProtocolError, ResolveDeadline, reclaim_locator, resolve_peer,
+};
 use yon_relay::{RelayServeConfig, run_relay_until};
 use yonder_core::{ConnectionCode, Locator, OsSecureRandom, SecretDocument};
 use yonder_net::{
@@ -732,7 +734,8 @@ fn host_reclaims_the_same_code_after_relay_restart() -> Result<(), std::io::Erro
 
     first_relay.stop()?;
     let second_relay = RelayProcess::start(identity, port)?;
-    thread::sleep(Duration::from_millis(500));
+    wait_for_tcp_listener(port)?;
+    wait_for_resolved_locator(&relay, parse_locator(&code)?)?;
     let outcome = run_controller_session(&config, &code, CodeInput::Argument);
     let host_result = if outcome.is_ok() {
         host.finish()
@@ -745,6 +748,48 @@ fn host_reclaims_the_same_code_after_relay_restart() -> Result<(), std::io::Erro
     outcome?;
     host_result?;
     relay_result
+}
+
+fn wait_for_resolved_locator(relay: &str, locator: Locator) -> Result<(), std::io::Error> {
+    let address: EndpointRelayAddress = relay
+        .parse()
+        .map_err(|error: yonder_net::AddressError| std::io::Error::other(error.to_string()))?;
+    let relays = EndpointRelaySet::new(vec![address])
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
+            let (mut driver, mut streams, relay) =
+                connect_relay(identity, &relays, WssTransportConfig::client(None))
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+            loop {
+                match resolve_peer(
+                    &mut driver,
+                    &mut streams,
+                    &relay,
+                    locator,
+                    ResolveDeadline::controller(),
+                )
+                .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(RelayProtocolError::Unavailable) => {}
+                    Err(error) => return Err(std::io::Error::other(error.to_string())),
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "host locator did not become active after relay restart",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
 }
 
 #[test]

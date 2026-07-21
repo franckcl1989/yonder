@@ -138,7 +138,7 @@ fn record_failure(slot: &mut Option<TaskFailure>, result: Result<(), TaskFailure
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{TaskFailure, TaskGroup, classify_join};
+    use super::{TaskFailure, TaskGroup, classify_join, record_failure};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -155,6 +155,17 @@ mod tests {
         let shutdown = tasks.shutdown(Duration::from_secs(1)).await;
         assert!(shutdown.was_cooperative());
         assert_eq!(shutdown.failure(), None);
+    }
+
+    #[test]
+    fn root_task_failure_is_never_replaced() {
+        let mut failure = None;
+        record_failure(&mut failure, Ok(()));
+        assert_eq!(failure, None);
+        record_failure(&mut failure, Err(TaskFailure::Panicked));
+        assert_eq!(failure, Some(TaskFailure::Panicked));
+        record_failure(&mut failure, Err(TaskFailure::Cancelled));
+        assert_eq!(failure, Some(TaskFailure::Panicked));
     }
 
     #[tokio::test(flavor = "current_thread")]

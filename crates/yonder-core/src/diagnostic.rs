@@ -33,9 +33,10 @@ pub fn write_error_report(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::write_error_report;
+    use super::{MAX_ERROR_CHAIN_DEPTH, write_error_report};
     use std::error::Error;
     use std::fmt;
+    use std::io::{self, Write};
 
     #[derive(Debug)]
     struct TestError {
@@ -70,6 +71,25 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct OwnedTestError {
+        source: Option<Box<Self>>,
+    }
+
+    impl fmt::Display for OwnedTestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("bounded")
+        }
+    }
+
+    impl Error for OwnedTestError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn Error + 'static))
+        }
+    }
+
     static LEAF: TestError = TestError {
         message: "precise cause",
         source: None,
@@ -101,5 +121,59 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "error: cycle\ncaused by: additional error context was omitted\n"
         );
+    }
+
+    #[test]
+    fn report_does_not_claim_omission_at_the_exact_depth_boundary() {
+        let mut error = OwnedTestError { source: None };
+        for _ in 0..MAX_ERROR_CHAIN_DEPTH {
+            error = OwnedTestError {
+                source: Some(Box::new(error)),
+            };
+        }
+        let mut output = Vec::new();
+        write_error_report(&mut output, &error).unwrap();
+        assert_eq!(output, b"error: bounded\n");
+    }
+
+    #[test]
+    fn report_propagates_failure_from_each_output_stage() {
+        assert!(write_error_report(&mut FailAfterReports::new(0), &ROOT).is_err());
+        assert!(write_error_report(&mut FailAfterReports::new(1), &ROOT).is_err());
+        assert!(write_error_report(&mut FailAfterReports::new(1), &SelfSourcingError).is_err());
+    }
+
+    struct FailAfterReports {
+        remaining: usize,
+    }
+
+    impl FailAfterReports {
+        const fn new(remaining: usize) -> Self {
+            Self { remaining }
+        }
+    }
+
+    impl Write for FailAfterReports {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                Err(io::Error::other("output closed"))
+            } else {
+                self.remaining -= 1;
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_fmt(&mut self, _arguments: fmt::Arguments<'_>) -> io::Result<()> {
+            if self.remaining == 0 {
+                Err(io::Error::other("output closed"))
+            } else {
+                self.remaining -= 1;
+                Ok(())
+            }
+        }
     }
 }

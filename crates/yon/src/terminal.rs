@@ -989,6 +989,13 @@ mod tests {
             eof_before_exit.next().await.unwrap().kind(),
             PtyEventKind::Exited(31)
         );
+        let mut after_exit = TerminalChunk::new();
+        after_exit.writable()[0] = 1;
+        after_exit.set_len(1).unwrap();
+        assert!(matches!(
+            eof_before_exit.send(after_exit).await,
+            Err(TerminalError::TaskStopped)
+        ));
         eof_before_exit.check_output_result().await.unwrap();
         exit_task.await.unwrap();
 
@@ -1140,6 +1147,20 @@ mod tests {
         .unwrap();
         assert_eq!(natural_exit.code, 7);
         assert!(!naturally_killed.load(Ordering::Acquire));
+
+        let auto_killed = Arc::new(AtomicBool::new(false));
+        let mut auto_deadline_child = FakeChild::running(Arc::clone(&auto_killed), true, false);
+        let auto_shutdown = tokio_util::sync::CancellationToken::new();
+        auto_shutdown.cancel();
+        let auto_deadline = CleanupDeadline::default();
+        assert_eq!(
+            supervise_child(&mut auto_deadline_child, &auto_shutdown, &auto_deadline)
+                .unwrap()
+                .code,
+            7
+        );
+        assert!(auto_killed.load(Ordering::Acquire));
+        assert!(auto_deadline.0.get().is_some());
     }
 
     #[test]

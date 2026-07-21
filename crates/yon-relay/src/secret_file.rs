@@ -115,21 +115,7 @@ fn run_windows_policy(
 ) -> Result<(), SecretFileError> {
     use std::process::{Command, Stdio};
 
-    let system_root = std::env::var_os("SystemRoot").filter(|root| !root.is_empty());
-    let executable = system_root
-        .map(std::path::PathBuf::from)
-        .map(|root| {
-            root.join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe")
-        })
-        .ok_or_else(|| {
-            SecretFileError::Platform(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "SystemRoot does not identify Windows PowerShell",
-            ))
-        })?;
+    let executable = windows_powershell_executable(std::env::var_os("SystemRoot"))?;
     let status = Command::new(executable)
         .args([
             "-NoLogo",
@@ -145,7 +131,29 @@ fn run_windows_policy(
         .stderr(Stdio::null())
         .status()
         .map_err(SecretFileError::Platform)?;
-    match status.code() {
+    windows_policy_status(status.code())
+}
+
+#[cfg(windows)]
+fn windows_powershell_executable(
+    system_root: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf, SecretFileError> {
+    let root = system_root.filter(|root| !root.is_empty()).ok_or_else(|| {
+        SecretFileError::Platform(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "SystemRoot does not identify Windows PowerShell",
+        ))
+    })?;
+    Ok(std::path::PathBuf::from(root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe"))
+}
+
+#[cfg(windows)]
+fn windows_policy_status(code: Option<i32>) -> Result<(), SecretFileError> {
+    match code {
         Some(0) => Ok(()),
         Some(10..=14) => Err(SecretFileError::Insecure),
         code => Err(SecretFileError::Platform(std::io::Error::other(
@@ -198,6 +206,8 @@ exit 0
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{SecretFileError, SecretFilePolicy, SystemSecretFilePolicy};
+    #[cfg(windows)]
+    use super::{windows_policy_status, windows_powershell_executable};
     use std::fs::File;
     use tempfile::tempdir;
 
@@ -211,6 +221,35 @@ mod tests {
         SystemSecretFilePolicy
             .validate_existing(&path, &file)
             .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_policy_platform_boundaries_are_deterministic() {
+        for root in [None, Some(std::ffi::OsString::new())] {
+            assert!(matches!(
+                windows_powershell_executable(root),
+                Err(SecretFileError::Platform(error))
+                    if error.kind() == std::io::ErrorKind::NotFound
+            ));
+        }
+        assert!(
+            windows_powershell_executable(Some(std::ffi::OsString::from("C:\\Windows")))
+                .unwrap()
+                .ends_with("System32/WindowsPowerShell/v1.0/powershell.exe")
+        );
+
+        assert!(windows_policy_status(Some(0)).is_ok());
+        for code in 10..=14 {
+            assert!(matches!(
+                windows_policy_status(Some(code)),
+                Err(SecretFileError::Insecure)
+            ));
+        }
+        assert!(matches!(
+            windows_policy_status(Some(15)),
+            Err(SecretFileError::Platform(error)) if error.to_string().contains("status 15")
+        ));
     }
 
     #[cfg(unix)]

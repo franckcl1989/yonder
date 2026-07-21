@@ -470,7 +470,7 @@ mod tests {
         TlsDocumentKind, execute_command, initialize_identity, initialize_identity_with,
         map_tls_policy_error, read_tls_document, read_tls_document_from, relay_runtime,
         report_configuration_valid_to, report_peer_id_to, run, serve_config_with, serve_relay,
-        write_error_report,
+        show_identity, write_error_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -567,6 +567,18 @@ exit 0
         }
     }
 
+    struct FlushFailingOutput;
+
+    impl io::Write for FlushFailingOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"))
+        }
+    }
+
     #[test]
     fn identity_output_is_flushed_and_broken_pipes_are_recoverable() {
         let peer = yonder_net::Keypair::generate_ed25519()
@@ -594,6 +606,24 @@ exit 0
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+        assert_eq!(
+            report_peer_id_to(&mut FlushFailingOutput, peer)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            report_configuration_valid_to(&mut FlushFailingOutput)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        let directory = test_directory();
+        assert!(matches!(
+            show_identity(&directory.path().join("missing.identity")),
+            Err(AppError::Identity(_))
+        ));
     }
 
     #[test]

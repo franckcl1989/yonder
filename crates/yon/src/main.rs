@@ -1030,6 +1030,35 @@ mod tests {
     }
 
     #[test]
+    fn progress_disables_itself_after_every_reachable_output_failure() {
+        let mut successful = TerminalProgress::with_columns(CallFailingWriter::never(), true, 80);
+        successful.update(ControllerStage::ConnectingRelay);
+        assert!(successful.visible);
+        let calls = successful.writer.calls;
+        assert!(calls > 1);
+
+        for fail_at in 0..calls {
+            let mut progress =
+                TerminalProgress::with_columns(CallFailingWriter::at(fail_at), true, 80);
+            progress.update(ControllerStage::ConnectingRelay);
+            assert!(
+                !progress.enabled,
+                "write call {fail_at} did not disable progress"
+            );
+            assert!(!progress.visible);
+        }
+
+        let mut unavailable_columns = TerminalProgress::with_scripted_columns(
+            CallFailingWriter::never(),
+            true,
+            [Err(io::ErrorKind::Unsupported)],
+        );
+        unavailable_columns.update(ControllerStage::ConnectingRelay);
+        assert!(!unavailable_columns.enabled);
+        assert_eq!(unavailable_columns.writer.calls, 0);
+    }
+
+    #[test]
     fn portable_process_exit_preserves_out_of_range_remote_values() {
         assert_eq!(portable_process_exit(0), Ok(ExitCode::SUCCESS));
         assert_eq!(portable_process_exit(255), Ok(ExitCode::from(255)));
@@ -1250,6 +1279,23 @@ mod tests {
     }
 
     #[test]
+    fn user_facing_reports_propagate_each_output_failure() {
+        for completed_reports in 0..4 {
+            assert!(
+                write_configuration_sources(
+                    &mut FailAfterReports::new(completed_reports),
+                    std::path::Path::new("/system/yon.toml"),
+                    ConfigurationFileStatus::Present,
+                    std::path::Path::new("/working/yon.toml"),
+                    ConfigurationFileStatus::Missing,
+                )
+                .is_err()
+            );
+        }
+        assert!(write_remote_exit_warning(&mut FailAfterReports::new(0), 256).is_err());
+    }
+
+    #[test]
     fn configuration_status_and_diagnostic_log_failures_are_structured() {
         let directory = test_directory("configuration-status");
         let present = directory.join("present.toml");
@@ -1425,6 +1471,82 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::other("flush failed"))
+        }
+    }
+
+    struct FailAfterReports {
+        remaining: usize,
+    }
+
+    impl FailAfterReports {
+        const fn new(remaining: usize) -> Self {
+            Self { remaining }
+        }
+    }
+
+    impl Write for FailAfterReports {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                Err(io::Error::other("output closed"))
+            } else {
+                self.remaining -= 1;
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_fmt(&mut self, _arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
+            if self.remaining == 0 {
+                Err(io::Error::other("output closed"))
+            } else {
+                self.remaining -= 1;
+                Ok(())
+            }
+        }
+    }
+
+    struct CallFailingWriter {
+        calls: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl CallFailingWriter {
+        const fn never() -> Self {
+            Self {
+                calls: 0,
+                fail_at: None,
+            }
+        }
+
+        const fn at(fail_at: usize) -> Self {
+            Self {
+                calls: 0,
+                fail_at: Some(fail_at),
+            }
+        }
+
+        fn next(&mut self) -> io::Result<()> {
+            let current = self.calls;
+            self.calls += 1;
+            if self.fail_at == Some(current) {
+                Err(io::Error::other("output closed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Write for CallFailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.next()?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.next()
         }
     }
 

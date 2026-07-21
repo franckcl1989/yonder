@@ -305,6 +305,17 @@ mod tests {
             super::compare(&unmeasured, &measured),
             std::cmp::Ordering::Greater
         );
+        let same_mean = candidate(
+            4,
+            samples(&[20]),
+            CandidatePath::Direct,
+            TransportKind::Quic,
+            0,
+        );
+        assert_eq!(
+            super::compare(&measured, &same_mean),
+            std::cmp::Ordering::Equal
+        );
 
         let later_unmeasured = candidate(
             3,
