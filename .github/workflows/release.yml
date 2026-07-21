@@ -497,7 +497,7 @@ jobs:
             $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, $inheritance, $propagation, $allow)
             [void]$directoryAcl.AddAccessRule($rule)
           }
-          [IO.Directory]::SetAccessControl($relaySmoke, $directoryAcl)
+          Set-Acl -LiteralPath $relaySmoke -AclObject $directoryAcl
           $yonExecutable = Join-Path $yonSmoke "yon.exe"
           $relayExecutable = Join-Path $relaySmoke "yon-relay.exe"
           Copy-Item "stage/yon.exe" $yonExecutable
