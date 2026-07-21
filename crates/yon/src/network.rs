@@ -1110,10 +1110,6 @@ async fn connect_target_until(
             Ok(event) => event,
             Err(_) if selection_deadline.is_some() && !selection_elapsed => {
                 selection_elapsed = true;
-                #[cfg(yonder_e2e_rebuild)]
-                if direct_upgrade.is_enabled() && has_candidate {
-                    direct_upgrade_outcome = Some(DirectUpgradeOutcome::Failed);
-                }
                 if target_selection_is_settled(
                     &selection,
                     direct_upgrade_outcome,
@@ -1183,6 +1179,11 @@ async fn connect_target_until(
             connect_deadline,
             &mut late_sample_deadline,
         );
+    }
+    #[cfg(yonder_e2e_rebuild)]
+    if direct_upgrade.is_enabled() {
+        driver.close_peer_and_wait(target).await?;
+        return Err(EndpointError::DirectUpgradeFailed);
     }
     if direct_upgrade.is_enabled()
         && matches!(direct_upgrade_outcome, Some(DirectUpgradeOutcome::Failed))

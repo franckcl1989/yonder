@@ -2,7 +2,7 @@
 
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -186,17 +186,128 @@ fn serve_cli_starts_the_real_relay_and_prints_its_canonical_address() {
         }
     })();
 
-    let _ = relay.kill();
-    relay.wait().unwrap();
+    let relay_status = stop_relay(&mut relay);
     reader.join().unwrap();
     let diagnostic_bytes = diagnostic_reader.join().unwrap().unwrap();
     assert!(!diagnostic_bytes.is_empty());
+    #[cfg(unix)]
+    {
+        assert!(relay_status.success());
+        let diagnostics = String::from_utf8_lossy(&diagnostic_bytes);
+        assert!(diagnostics.contains("relay_shutdown_requested"));
+        assert!(diagnostics.contains("relay_stopped"));
+    }
+    #[cfg(windows)]
+    let _ = relay_status;
     let mut product_lines = outcome.unwrap();
     product_lines.extend(line_rx.try_iter().map(Result::unwrap));
     assert!(product_lines.iter().all(|line| {
         line == &format!("Relay PeerId: {peer}") || line.parse::<EndpointRelayAddress>().is_ok()
     }));
     assert!(!product_lines.iter().any(|line| line.contains("0.0.0.0")));
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_process_signals_are_installed_before_network_startup() {
+    for (signal, reason) in [
+        ("INT", "interrupt"),
+        ("TERM", "terminate"),
+        ("HUP", "hangup"),
+    ] {
+        let directory = test_directory();
+        let port = available_port();
+        let identity = directory.path().join("relay.identity");
+        let initialized = Command::new(env!("CARGO_BIN_EXE_yon-relay"))
+            .args(["identity", "init", "--output"])
+            .arg(&identity)
+            .output()
+            .unwrap();
+        assert!(initialized.status.success());
+        std::fs::write(
+            directory.path().join("yon-relay.toml"),
+            format!(
+                "identity = \"relay.identity\"\n\
+                 listen = [\"/ip4/0.0.0.0/tcp/{port}\"]\n\
+                 external = [\"/ip4/127.0.0.1/tcp/{port}\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let mut relay = relay_command(directory.path())
+            .args(["--log-level", "trace", "serve"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = relay.stderr.take().expect("relay stderr was piped");
+        let (line_tx, line_rx) = mpsc::channel();
+        let diagnostic_reader = thread::spawn(move || {
+            let mut diagnostics = Vec::new();
+            for line in BufReader::new(stderr).lines() {
+                let line = line?;
+                diagnostics.extend_from_slice(line.as_bytes());
+                diagnostics.push(b'\n');
+                let _ = line_tx.send(line);
+            }
+            Ok::<_, std::io::Error>(diagnostics)
+        });
+
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = line_rx
+                .recv_timeout(remaining)
+                .expect("signal handler installation diagnostic arrives");
+            if line.contains("relay_signal_handlers_installed") {
+                break;
+            }
+        }
+        let status = stop_relay_with_signal(&mut relay, signal);
+        let diagnostics = diagnostic_reader.join().unwrap().unwrap();
+        assert!(status.success());
+        let diagnostics = String::from_utf8(diagnostics).unwrap();
+        let shutdown = diagnostics
+            .lines()
+            .find(|line| line.contains("relay_shutdown_requested"))
+            .expect("relay reports the graceful shutdown request");
+        assert!(shutdown.contains(reason));
+        assert!(diagnostics.contains("relay_stopped"));
+    }
+}
+
+#[cfg(unix)]
+fn stop_relay(relay: &mut Child) -> ExitStatus {
+    stop_relay_with_signal(relay, "TERM")
+}
+
+#[cfg(unix)]
+fn stop_relay_with_signal(relay: &mut Child, signal: &str) -> ExitStatus {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(relay.id().to_string())
+        .status()
+        .expect("the native kill utility starts");
+    assert!(status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = relay.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = relay.kill();
+            let _ = relay.wait();
+            panic!("relay exceeded the five second integration-test shutdown bound");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(windows)]
+fn stop_relay(relay: &mut Child) -> ExitStatus {
+    relay.kill().unwrap();
+    relay.wait().unwrap()
 }
 
 fn available_port() -> u16 {

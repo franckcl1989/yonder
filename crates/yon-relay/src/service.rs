@@ -372,8 +372,13 @@ impl ShutdownReason {
 
 /// Runs until a supported process termination signal or a root service failure.
 pub async fn run_relay(config: RelayServeConfig) -> Result<(), RelayServiceError> {
-    run_relay_until(config, async {
-        let reason = process_shutdown_signal().await?;
+    let shutdown = process_shutdown_signal().map_err(RelayServiceError::Signal)?;
+    tracing::debug!(
+        event = "relay_signal_handlers_installed",
+        "relay process signal handlers are installed"
+    );
+    run_relay_until(config, async move {
+        let reason = shutdown.await?;
         tracing::info!(
             event = "relay_shutdown_requested",
             reason = reason.as_str(),
@@ -670,21 +675,25 @@ pub async fn run_relay_until(
 }
 
 #[cfg(unix)]
-async fn process_shutdown_signal() -> Result<ShutdownReason, std::io::Error> {
+fn process_shutdown_signal()
+-> Result<impl Future<Output = Result<ShutdownReason, std::io::Error>>, std::io::Error> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
-    tokio::select! {
-        _ = interrupt.recv() => Ok(ShutdownReason::Interrupt),
-        _ = terminate.recv() => Ok(ShutdownReason::Terminate),
-        _ = hangup.recv() => Ok(ShutdownReason::Hangup),
-    }
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => Ok(ShutdownReason::Interrupt),
+            _ = terminate.recv() => Ok(ShutdownReason::Terminate),
+            _ = hangup.recv() => Ok(ShutdownReason::Hangup),
+        }
+    })
 }
 
 #[cfg(windows)]
-async fn process_shutdown_signal() -> Result<ShutdownReason, std::io::Error> {
+fn process_shutdown_signal()
+-> Result<impl Future<Output = Result<ShutdownReason, std::io::Error>>, std::io::Error> {
     use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
 
     let mut interrupt = ctrl_c()?;
@@ -692,19 +701,24 @@ async fn process_shutdown_signal() -> Result<ShutdownReason, std::io::Error> {
     let mut console_close = ctrl_close()?;
     let mut console_logoff = ctrl_logoff()?;
     let mut console_shutdown = ctrl_shutdown()?;
-    tokio::select! {
-        _ = interrupt.recv() => Ok(ShutdownReason::Interrupt),
-        _ = console_break.recv() => Ok(ShutdownReason::ConsoleBreak),
-        _ = console_close.recv() => Ok(ShutdownReason::ConsoleClose),
-        _ = console_logoff.recv() => Ok(ShutdownReason::ConsoleLogoff),
-        _ = console_shutdown.recv() => Ok(ShutdownReason::ConsoleShutdown),
-    }
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => Ok(ShutdownReason::Interrupt),
+            _ = console_break.recv() => Ok(ShutdownReason::ConsoleBreak),
+            _ = console_close.recv() => Ok(ShutdownReason::ConsoleClose),
+            _ = console_logoff.recv() => Ok(ShutdownReason::ConsoleLogoff),
+            _ = console_shutdown.recv() => Ok(ShutdownReason::ConsoleShutdown),
+        }
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn process_shutdown_signal() -> Result<ShutdownReason, std::io::Error> {
-    tokio::signal::ctrl_c().await?;
-    Ok(ShutdownReason::Interrupt)
+fn process_shutdown_signal()
+-> Result<impl Future<Output = Result<ShutdownReason, std::io::Error>>, std::io::Error> {
+    Ok(async {
+        tokio::signal::ctrl_c().await?;
+        Ok(ShutdownReason::Interrupt)
+    })
 }
 
 fn completed_task_result(
@@ -1778,11 +1792,33 @@ mod tests {
 
         let observations = RelayObservability::default();
         observations.observe_protocol_result(Ok(()));
+        observations.observe_protocol_result(Err(ProtocolTaskError::Timeout));
+        observations
+            .observe_protocol_result(Err(ProtocolTaskError::Io(io::Error::other("protocol I/O"))));
+        observations.observe_protocol_result(Err(ProtocolTaskError::Protocol(
+            ProtocolError::UnknownTag(0xff),
+        )));
         observations.observe_protocol_result(Err(ProtocolTaskError::OwnerStopped));
+        observations.observe_protocol_result(Err(ProtocolTaskError::Registry(
+            crate::registry::RegistryError::PeerIdTooLong,
+        )));
+        assert_eq!(observations.protocol_timeout.load(Ordering::Relaxed), 1);
+        assert_eq!(observations.protocol_io.load(Ordering::Relaxed), 1);
+        assert_eq!(observations.protocol_invalid.load(Ordering::Relaxed), 1);
         assert_eq!(
             observations.protocol_owner_stopped.load(Ordering::Relaxed),
             1
         );
+        assert_eq!(observations.protocol_registry.load(Ordering::Relaxed), 1);
+        observations.report_and_reset(3);
+        assert_eq!(observations.protocol_timeout.load(Ordering::Relaxed), 0);
+        assert_eq!(observations.protocol_io.load(Ordering::Relaxed), 0);
+        assert_eq!(observations.protocol_invalid.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observations.protocol_owner_stopped.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(observations.protocol_registry.load(Ordering::Relaxed), 0);
         assert_eq!(retry_after().millis(), 250);
         assert_eq!(RegistryResponse::Retry(retry_after()).encode()[0], 0x82);
     }

@@ -65,6 +65,13 @@ jobs:
         run: >-
           cargo test --locked -p yon --test end_to_end
           strict_relay_only_fallback_rebuilds_the_controller_swarm -- --exact
+      - name: Reject the test-only rebuild cfg in release builds
+        shell: bash
+        run: |
+          if RUSTFLAGS='--cfg yonder_e2e_rebuild' cargo check --locked --release -p yon; then
+            echo 'test-only rebuild cfg entered a release build' >&2
+            exit 1
+          fi
       - run: cargo test --locked --workspace --doc
       - name: Reject unsafe first-party Rust
         shell: bash

@@ -108,7 +108,7 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 
 被控端在 `Active` 前的任何可恢复失败都回到 `Advertised`；`Active` 后网络失败终止 shell 和进程。主控端任何网络失败先恢复本地终端再显示错误。relay 某条连接或协议失败只影响对应 PeerId，不得 panic 或停止 accept loop。
 
-host 在认证前最多用 `3s` 让目标 PeerId 名册收敛，并在此期间持续 poll Swarm、关闭额外 auth/control/data 子流；OPAQUE 每条消息的 `10s` 上限保持独立。relay 在 Unix 统一处理 SIGINT/SIGTERM/SIGHUP，在 Windows 统一处理 Ctrl+C/Break/Close/Logoff/Shutdown，并在既有 `2s` 绝对截止内协作关闭。生命周期只输出低基数 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped`，协议拒绝和失败按固定类别累加到每 `60s` 一次的 `relay_activity_summary`，不在公开 relay 上逐请求记录 PeerId 或错误。
+host 在认证前最多用 `3s` 让目标 PeerId 名册收敛，并在此期间持续 poll Swarm、关闭额外 auth/control/data 子流；OPAQUE 每条消息的 `10s` 上限保持独立。relay 在 Unix 统一处理 SIGINT/SIGTERM/SIGHUP，在 Windows 统一处理 Ctrl+C/Break/Close/Logoff/Shutdown，并在既有 `2s` 绝对截止内协作关闭。进程必须先同步安装平台信号监听，再构造 libp2p 网络；生命周期只输出低基数 debug 事件 `relay_signal_handlers_installed` 及 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped`，协议拒绝和失败按固定类别累加到每 `60s` 一次的 `relay_activity_summary`，不在公开 relay 上逐请求记录 PeerId 或错误。
 
 ## 重连与资源默认值
 

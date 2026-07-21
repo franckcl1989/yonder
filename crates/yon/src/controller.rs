@@ -1288,7 +1288,7 @@ mod tests {
         let _input = frontend.input();
         let _output = frontend.output();
         assert!(!restored.get());
-        drop(guard);
+        frontend.restore_raw_mode(Some(guard)).unwrap();
         assert!(restored.get());
     }
 

@@ -811,7 +811,7 @@ yon connect ABCD-EFGH-JKMP-QRST
 
 当 stdout 与 stderr 同为终端时，连接会在 stderr 的同一行依次显示 relay 连接、host 查询、路径建立、端到端认证和终端启动阶段；即使连接码或后续输入来自管道，画面上仍能看到当前等待内容。直连未在优先窗口内形成可信终态时会明确显示正在切换到 relay。收到远端 `TerminalReady` 后该进度行会被清除，之后屏幕只属于远端终端。启用诊断文件后，最终选中的 Direct/Relayed 路径和 QUIC/TCP/WS/WSS transport 会记录在诊断日志中，不写入远端终端画面。
 
-`host` 与 `connect` 的进度都会立即显示；同一阶段持续等待时，ASCII spinner 最迟每 `1s` 刷新一次。每次刷新都会重新读取终端宽度，提示限制在当前宽度减一列，不会自动换行。stdout 或 stderr 不是终端、stderr 已重定向、终端尺寸不可可靠取得，或 `TERM=dumb` 时不发送进度和光标控制序列。
+`host` 与 `connect` 的进度都会立即显示；同一阶段持续等待时，ASCII spinner 最迟每 `1s` 刷新一次。每次刷新都会重新读取终端宽度，提示限制在当前宽度减一列，不会自动换行。stdout 或 stderr 不是终端、stderr 已重定向、初始终端尺寸不可可靠取得，或 `TERM=dumb` 时不发送进度和光标控制序列；已显示进度后若终端尺寸查询失效，程序会用无 ANSI 的 CRLF 结束当前行并停用后续进度，避免 raw mode 下远端首行从旧列位置开始。
 
 ### 9.3 非交互调用
 

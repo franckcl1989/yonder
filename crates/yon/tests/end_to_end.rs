@@ -25,6 +25,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAIM_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_ENVIRONMENT_VALUE: &str = "inherited-by-remote-shell";
+#[cfg(any(unix, windows))]
+const CONTROLLER_LOG_SENTINEL: &[u8] = b"YON_E2E_LOG_SENTINEL\n";
 const TEST_WSS_CA_DER: &[u8] = include_bytes!("fixtures/localhost-test-ca.der");
 const TEST_WSS_CERT_DER: &[u8] = include_bytes!("fixtures/localhost-test-cert.der");
 const TEST_WSS_KEY_DER: &[u8] = include_bytes!("fixtures/localhost-test-key.der");
@@ -306,6 +308,18 @@ impl RelayTransport {
 #[test]
 fn interactive_pty_preserves_bytes_resize_interrupt_environment_and_exit()
 -> Result<(), std::io::Error> {
+    run_interactive_pty(false)
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_pty_appends_diagnostics_without_contaminating_terminal() -> Result<(), std::io::Error>
+{
+    run_interactive_pty(true)
+}
+
+#[cfg(unix)]
+fn run_interactive_pty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -316,6 +330,10 @@ fn interactive_pty_preserves_bytes_resize_interrupt_environment_and_exit()
     let config = EndpointConfigDirectory::new(&relay)?;
     let mut host = HostProcess::start(&config)?;
     let code = receive_code(&host.lines)?;
+    let controller_log = diagnostic_log.then(|| config.path().join("controller-debug.log"));
+    if let Some(path) = &controller_log {
+        std::fs::write(path, CONTROLLER_LOG_SENTINEL)?;
+    }
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -331,6 +349,10 @@ fn interactive_pty_preserves_bytes_resize_interrupt_environment_and_exit()
         .map_err(std::io::Error::other)?;
     let mut writer = pair.master.take_writer().map_err(std::io::Error::other)?;
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_yon"));
+    if let Some(path) = &controller_log {
+        command.args(["--log-level", "debug", "--log-file"]);
+        command.arg(path.as_os_str());
+    }
     command.args(["connect", code.as_str()]);
     command.cwd(config.path());
     command.env("TERM", "xterm-256color");
@@ -448,6 +470,9 @@ fn interactive_pty_preserves_bytes_resize_interrupt_environment_and_exit()
     assert_bytes_contain(&output, b"YON_SIZE_RESIZED=41 117", "resized PTY size")?;
     assert_bytes_contain(&output, b"YON_AFTER_INTERRUPT", "Ctrl+C recovery")?;
     assert_progress_precedes_terminal_output(&output, b"\x1b[31mYON_ANSI\x1b[0m")?;
+    if let Some(path) = &controller_log {
+        assert_controller_log_is_appended_and_isolated(path, &output)?;
+    }
 
     host.finish_with_exit(23)?;
     relay_process.stop()
@@ -526,9 +551,51 @@ fn assert_progress_precedes_terminal_output(
     Ok(())
 }
 
+#[cfg(any(unix, windows))]
+fn assert_controller_log_is_appended_and_isolated(
+    path: &Path,
+    terminal_output: &[u8],
+) -> Result<(), std::io::Error> {
+    let log = std::fs::read(path)?;
+    if !log.starts_with(CONTROLLER_LOG_SENTINEL) {
+        return Err(std::io::Error::other(
+            "controller diagnostics did not append to the existing log file",
+        ));
+    }
+    let log = String::from_utf8(log).map_err(std::io::Error::other)?;
+    for marker in ["endpoint path selected", "route=", "transport="] {
+        if !log.contains(marker) {
+            return Err(std::io::Error::other(format!(
+                "controller log did not record {marker:?}"
+            )));
+        }
+        if terminal_output
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+        {
+            return Err(std::io::Error::other(format!(
+                "controller diagnostic {marker:?} contaminated the active terminal"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_conpty_keeps_progress_separate_from_remote_output() -> Result<(), std::io::Error> {
+    run_windows_conpty(false)
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_conpty_appends_diagnostics_without_contaminating_terminal() -> Result<(), std::io::Error>
+{
+    run_windows_conpty(true)
+}
+
+#[cfg(windows)]
+fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     const OUTPUT_MARKER: &[u8] = b"YON_WINDOWS_CONPTY_OUTPUT";
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
@@ -540,6 +607,10 @@ fn windows_conpty_keeps_progress_separate_from_remote_output() -> Result<(), std
     let config = EndpointConfigDirectory::new(&relay)?;
     let mut host = HostProcess::start(&config)?;
     let code = receive_code(&host.lines)?;
+    let controller_log = diagnostic_log.then(|| config.path().join("controller-debug.log"));
+    if let Some(path) = &controller_log {
+        std::fs::write(path, CONTROLLER_LOG_SENTINEL)?;
+    }
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -555,6 +626,10 @@ fn windows_conpty_keeps_progress_separate_from_remote_output() -> Result<(), std
         .map_err(std::io::Error::other)?;
     let mut writer = pair.master.take_writer().map_err(std::io::Error::other)?;
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_yon"));
+    if let Some(path) = &controller_log {
+        command.args(["--log-level", "debug", "--log-file"]);
+        command.arg(path.as_os_str());
+    }
     command.arg("connect");
     command.cwd(config.path());
     command.env_remove("YON_RELAYS");
@@ -626,6 +701,9 @@ fn windows_conpty_keeps_progress_separate_from_remote_output() -> Result<(), std
     }
     assert_bytes_contain(&output, OUTPUT_MARKER, "Windows ConPTY output")?;
     assert_progress_precedes_terminal_output(&output, OUTPUT_MARKER)?;
+    if let Some(path) = &controller_log {
+        assert_controller_log_is_appended_and_isolated(path, &output)?;
+    }
     host.finish_with_exit(23)?;
     relay_process.stop()
 }

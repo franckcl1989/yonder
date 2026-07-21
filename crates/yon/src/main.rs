@@ -540,7 +540,7 @@ impl<W: std::io::Write> TerminalProgress<W> {
         debug_assert!(message.is_ascii());
         let Ok(columns) = self.columns.read() else {
             if self.visible {
-                let _ = self.writer.write_all(b"\n");
+                let _ = self.writer.write_all(b"\r\n");
                 let _ = self.writer.flush();
             }
             self.enabled = false;
@@ -763,17 +763,20 @@ mod tests {
     use super::{
         AppError, Cli, Command, ConfigCommand, ConfigurationFileStatus, ConnectionCodeArgument,
         ENDPOINT_SCHEMA, LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
-        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, map_controller_error,
-        portable_process_exit, process_result, read_ca, read_ca_document,
-        read_connection_code_from, run, terminal_supports_progress, validate_diagnostic_output,
-        write_configuration_sources, write_remote_exit_warning,
+        command_uses_terminal_ui, configuration_file_status, diagnostic_filter,
+        endpoint_config_with, map_controller_error, open_diagnostic_log, portable_process_exit,
+        process_result, read_ca, read_ca_document, read_connection_code_from, run,
+        terminal_supports_progress, validate_diagnostic_output, write_configuration_sources,
+        write_remote_exit_warning,
     };
     use clap::Parser;
+    use std::cell::Cell;
     use std::ffi::OsString;
     use std::fs;
     use std::io::{self, Cursor, Read, Write};
     use std::path::PathBuf;
     use std::process::ExitCode;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use yon::controller::ControllerStage;
     use yon::host::HostStage;
@@ -998,10 +1001,32 @@ mod tests {
         progress.update(ControllerStage::Authenticating);
         assert!(!progress.enabled);
         assert!(!progress.visible);
-        assert_eq!(&progress.writer[before_failure..], b"\n");
+        assert_eq!(&progress.writer[before_failure..], b"\r\n");
         let after_failure = progress.writer.len();
         progress.update(ControllerStage::StartingTerminal);
         assert_eq!(progress.writer.len(), after_failure);
+
+        let mut too_narrow =
+            TerminalProgress::with_scripted_columns(Vec::new(), true, [Ok(80), Ok(7)]);
+        too_narrow.update(ControllerStage::ConnectingRelay);
+        too_narrow.update(ControllerStage::ResolvingHost);
+        assert!(!too_narrow.enabled);
+        assert!(!too_narrow.visible);
+
+        let fail_writes = Rc::new(Cell::new(false));
+        let mut failed_clear = TerminalProgress::with_columns(
+            ToggleWriter {
+                fail: Rc::clone(&fail_writes),
+            },
+            true,
+            80,
+        );
+        failed_clear.update(ControllerStage::ConnectingRelay);
+        assert!(failed_clear.visible);
+        fail_writes.set(true);
+        failed_clear.clear_line();
+        assert!(!failed_clear.enabled);
+        assert!(!failed_clear.visible);
     }
 
     #[test]
@@ -1225,6 +1250,42 @@ mod tests {
     }
 
     #[test]
+    fn configuration_status_and_diagnostic_log_failures_are_structured() {
+        let directory = test_directory("configuration-status");
+        let present = directory.join("present.toml");
+        fs::write(&present, "relays = []\n").unwrap();
+        assert_eq!(
+            configuration_file_status(&present).unwrap(),
+            ConfigurationFileStatus::Present
+        );
+        assert_eq!(
+            configuration_file_status(&directory).unwrap(),
+            ConfigurationFileStatus::NotRegular
+        );
+        assert_eq!(
+            ConfigurationFileStatus::NotRegular.to_string(),
+            "not a regular file"
+        );
+        assert_eq!(
+            configuration_file_status(&directory.join("missing.toml")).unwrap(),
+            ConfigurationFileStatus::Missing
+        );
+        assert!(matches!(
+            configuration_file_status(std::path::Path::new("\0")),
+            Err(AppError::ConfigurationSource { .. })
+        ));
+
+        assert!(matches!(
+            open_diagnostic_log(&directory),
+            Err(AppError::LogFile { .. })
+        ));
+        let log = directory.join("yon.log");
+        drop(open_diagnostic_log(&log).unwrap());
+        drop(open_diagnostic_log(&log).unwrap());
+        assert!(log.is_file());
+    }
+
+    #[test]
     fn endpoint_ca_files_are_bounded_and_relay_sets_are_validated() {
         let directory = test_directory("endpoint-config");
         let path = directory.join("ca.der");
@@ -1364,6 +1425,28 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::other("flush failed"))
+        }
+    }
+
+    struct ToggleWriter {
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl Write for ToggleWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.fail.get() {
+                Err(io::Error::other("write failed"))
+            } else {
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail.get() {
+                Err(io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
         }
     }
 }

@@ -3,6 +3,9 @@
 
 //! End-user endpoint implementation for Yonder.
 
+#[cfg(all(yonder_e2e_rebuild, not(debug_assertions)))]
+compile_error!("yonder_e2e_rebuild is a test-only fault injection and cannot enter release builds");
+
 pub mod controller;
 pub mod host;
 pub mod network;
