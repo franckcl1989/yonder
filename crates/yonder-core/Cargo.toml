@@ -13,7 +13,6 @@ data-encoding.workspace = true
 governor.workspace = true
 rand.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

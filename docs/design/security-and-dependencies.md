@@ -38,10 +38,11 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 
 | crate | 精确版本与 feature | 放置/用途 | 选择与影响 |
 | --- | --- | --- | --- |
-| `backon` | `1.6.0`; `std,tokio-sleep` | `yonder-net`; 重连退避 | Apache-2.0，维护活跃；替代手写退避。冷路径，小型 fastrand jitter，无原生库 |
+| `backon` | `1.6.0`; `std,tokio-sleep` | `yon`; controller 重连、查询与认证退避 | Apache-2.0，维护活跃；替代手写退避。冷路径，小型 fastrand jitter，无原生库；不让共享网络 crate 或 fuzz 构建承担未使用依赖 |
 | `clap` | `4.6.2`; `color,derive,error-context,help,std,suggestions,usage` | 两个 binary；CLI | MIT/Apache-2.0，事实标准；替代手写解析。主要增加启动/体积，不在数据热路径 |
 | `config` | `0.15.25`; `toml` | `yonder-config`；严格分层配置 | MIT/Apache-2.0，成熟；替代手写 TOML、环境变量嵌套与合并。只在启动冷路径，禁用 async/json/yaml 等未使用能力 |
-| `crossterm` | `0.29.0`; `windows` | `yon`; raw mode、尺寸 | MIT，成熟跨平台；替代平台终端 FFI。只在 controller 链接 |
+| `crossterm` | `0.29.0`; `bracketed-paste,events,windows` | `yon`; raw mode、尺寸、显示恢复与终端事件控制序列 | MIT，成熟跨平台；替代平台终端 FFI 及手写 ANSI 序列。只在 controller 链接 |
+| `crossterm_winapi` | `0.9.1`; 无 feature | `yon` Windows；console input/output mode 保存与恢复 | MIT，Crossterm 同生态的 safe wrapper，已是锁定树中的传递依赖；替代第一方 Win32 FFI/`unsafe`，只在 Windows controller 链接，不新增 package |
 | `data-encoding` | `2.11.0`; `std` | `yonder-core`; Crockford Base32 | MIT，成熟、零拷贝 API；替代手写编码表。影响极小 |
 | `futures` | `0.3.33`; `async-await,std` | `yonder-net`; libp2p stream I/O | MIT/Apache-2.0，Rust 异步基础库；不引入 executor |
 | `governor` | `0.10.4`; `std` | `yonder-core`; relay/query/auth GCRA | MIT，成熟；替代手写令牌桶。只用 direct limiter，不用 keyed store/等待队列；已测 direct limiter 40 B、调用约 30 ns |
@@ -51,7 +52,7 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | `portable-pty` | `0.9.0`; 无 feature | `yon`; PTY 和 child | MIT，WezTerm 使用的跨平台实现；替代 Unix/ConPTY FFI。第三方含平台 unsafe，只在 `yon` 链接 |
 | `rand` | `0.8.7`; `getrandom` | `yonder-core`; OPAQUE 兼容 CSPRNG | MIT/Apache-2.0；0.8 最新修复补丁，因 opaque-ke Rand 0.8 约束不能用全局 0.10。系统熵路径无额外运行时 |
 | `rpassword` | `7.5.4`; 无 feature | `yon`; 隐藏 code 输入 | Apache-2.0，成熟跨平台；替代平台 console 手写。仅启动冷路径 |
-| `rustls-pki-types` | `1.15.0`; `alloc` | `yonder-net`; DER key/cert 边界校验 | MIT/Apache-2.0，rustls 官方类型；先校验再调用 libp2p websocket 避免无效 key 触发其 panic API |
+| `rustls-pki-types` | `1.15.0`; `alloc` | `yonder-net`; DER/PEM 证书链、信任锚与私钥边界解析 | MIT/Apache-2.0，rustls 官方类型；拒绝混合 PEM 块，先校验再调用 libp2p websocket 避免无效 key 触发其 panic API |
 | `rustls-webpki` (`webpki`) | `0.103.13`; 无 feature | `yonder-net`; WSS external DNS/IP SAN 启动校验 | ISC，rustls 官方 Web PKI 实现，维护活跃、MSRV 1.71；替代自研 X.509/SAN 解析和名称匹配。已存在于锁定的 rustls 传递树，本次只增加直接依赖边，不增加包、原生库或运行时热路径成本 |
 | `serde` | `1.0.229`; `derive,std` | 两个 binary；类型安全配置 schema | MIT/Apache-2.0，事实标准；只为启动配置反序列化启用 derive/std，不进入终端数据热路径 |
 | `sha2` | `0.10.9`; 无 feature | `yon`; OPAQUE SHA-512 | MIT/Apache-2.0；因 opaque-ke Digest 0.10 公开约束使用兼容主版本最新补丁，不让 relay 编译该依赖 |
@@ -59,7 +60,7 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | `thiserror` | `2.0.19`; `std` | 所有 package；结构化错误 | MIT/Apache-2.0，成熟 derive；替代重复 Display/Error 样板，无运行时分配要求 |
 | `tokio` | `1.53.0`; `io-std,io-util,macros,rt,signal,sync,time` | 网络库和 binaries；runtime/I/O | MIT，成熟；current-thread runtime，避免手写 reactor。阻塞池上限 4 |
 | `tokio-util` | `0.7.18`; `compat,io-util,rt` | `yonder-net`/`yon`; I/O 适配、取消、任务跟踪 | MIT，Tokio 官方；替代手写 bridge/cancellation。duplex 固定容量一次分配 |
-| `tracing` | `0.1.44`; `std` | 所有 package；结构化诊断 | MIT，生态标准；字段白名单确保秘密和终端数据不记录 |
+| `tracing` | `0.1.44`; `std` | `yon`、`yon-relay`、`yonder-net`；结构化诊断 | MIT，生态标准；字段白名单确保秘密和终端数据不记录，纯领域 package 不承担未使用依赖 |
 | `tracing-subscriber` | `0.3.23`; `ansi,fmt` | 两个 binary；文本日志 | MIT，官方 subscriber；只在进程边界，默认简洁 stderr |
 | `zeroize` | `1.9.0`; `alloc,derive` | `yonder-core`; 小型秘密清除 | MIT/Apache-2.0，RustCrypto；`alloc` 用于立即包裹 rpassword/Clap 交出的 code String，避免手写 volatile 清除。不承诺 swap/core dump 清除 |
 

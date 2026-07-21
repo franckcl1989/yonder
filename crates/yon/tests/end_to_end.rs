@@ -20,7 +20,7 @@ use yon_relay::{RelayServeConfig, run_relay_until};
 use yonder_core::{ConnectionCode, Locator, OsSecureRandom, SecretDocument};
 use yonder_net::{
     EndpointRelayAddress, EndpointRelaySet, Keypair, RelayExternalAddress, RelayListenAddress,
-    WssTransportConfig, generate_identity,
+    WssCertificateChain, WssPrivateKey, WssTransportConfig, generate_identity,
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(45);
@@ -69,7 +69,7 @@ impl EndpointConfigDirectory {
             .join(", ");
         let ca_config = if let Some(ca_der) = ca_der {
             std::fs::write(path.join("wss-ca.der"), ca_der)?;
-            "wss_ca_der = \"wss-ca.der\"\n"
+            "wss_ca = \"wss-ca.der\"\n"
         } else {
             ""
         };
@@ -198,6 +198,7 @@ fn secure_websocket_runs_a_real_tls_terminal_session() -> Result<(), std::io::Er
         TEST_WSS_CERT_DER,
         TEST_WSS_KEY_DER,
         TEST_WSS_CA_DER,
+        Some(TEST_WSS_CA_DER),
     )
 }
 
@@ -209,6 +210,7 @@ fn secure_websocket_accepts_an_explicitly_trusted_self_signed_ip_certificate()
         TEST_WSS_SELF_SIGNED_CERT_DER,
         TEST_WSS_SELF_SIGNED_KEY_DER,
         TEST_WSS_SELF_SIGNED_CERT_DER,
+        None,
     )
 }
 
@@ -217,6 +219,7 @@ fn run_secure_websocket_session(
     certificate_der: &[u8],
     private_key_der: &[u8],
     trust_anchor_der: &[u8],
+    issuer_der: Option<&[u8]>,
 ) -> Result<(), std::io::Error> {
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
@@ -224,14 +227,17 @@ fn run_secure_websocket_session(
     let peer = identity.public().to_peer_id();
     let listen = format!("/ip4/127.0.0.1/tcp/{port}/tls/ws");
     let external = format!("/{external_host}/tcp/{port}/tls/ws");
+    let certificate_chain = WssCertificateChain::from_documents(
+        std::iter::once(certificate_der.to_vec()).chain(issuer_der.into_iter().map(<[u8]>::to_vec)),
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let private_key = WssPrivateKey::from_document(SecretDocument::new(private_key_der.to_vec()))
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let relay_process = RelayProcess::start_addresses_with_wss(
         identity,
         vec![listen],
         vec![external.clone()],
-        WssTransportConfig::server(
-            certificate_der.to_vec(),
-            SecretDocument::new(private_key_der.to_vec()),
-        ),
+        WssTransportConfig::server_with_chain(certificate_chain, private_key),
     )?;
     thread::sleep(Duration::from_millis(500));
     let config = EndpointConfigDirectory::new_many_with_ca(
@@ -360,6 +366,7 @@ fn run_interactive_pty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env_remove("YON_RELAYS");
+    command.env_remove("YON_WSS_CA");
     command.env_remove("YON_WSS_CA_DER");
     let mut controller = pair
         .slave
@@ -384,6 +391,34 @@ fn run_interactive_pty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     let mut output = Vec::new();
 
     let outcome = (|| -> Result<u32, std::io::Error> {
+        writer.write_all(
+            b"old=$(stty -g); stty raw -echo; key=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); stty \"$old\"; printf 'YON_KEY_ESCAPE=%s\\n' \"$key\"\n",
+        )?;
+        writer.flush()?;
+        thread::sleep(Duration::from_millis(100));
+        writer.write_all(b"\x1b")?;
+        writer.flush()?;
+        wait_for_bytes(
+            &output_rx,
+            &mut output,
+            b"YON_KEY_ESCAPE=1b",
+            Duration::from_secs(5),
+        )?;
+
+        writer.write_all(
+            b"old=$(stty -g); stty raw -echo; key=$(dd bs=3 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); stty \"$old\"; printf 'YON_KEY_ARROW=%s\\n' \"$key\"\n",
+        )?;
+        writer.flush()?;
+        thread::sleep(Duration::from_millis(100));
+        writer.write_all(b"\x1b[A")?;
+        writer.flush()?;
+        wait_for_bytes(
+            &output_rx,
+            &mut output,
+            b"YON_KEY_ARROW=1b5b41",
+            Duration::from_secs(5),
+        )?;
+
         writer.write_all(
             concat!(
                 "printf '\\033[31mYON_ANSI\\033[0m\\n'\n",
@@ -452,6 +487,8 @@ fn run_interactive_pty(diagnostic_log: bool) -> Result<(), std::io::Error> {
         "controller did not preserve remote exit"
     );
     assert_bytes_contain(&output, b"\x1b[31mYON_ANSI\x1b[0m", "ANSI bytes")?;
+    assert_bytes_contain(&output, b"YON_KEY_ESCAPE=1b", "Escape key bytes")?;
+    assert_bytes_contain(&output, b"YON_KEY_ARROW=1b5b41", "arrow key bytes")?;
     let expected_working_directory = config.path().canonicalize()?;
     assert_bytes_contain(
         &output,
@@ -598,7 +635,10 @@ fn windows_conpty_appends_diagnostics_without_contaminating_terminal() -> Result
 
 #[cfg(windows)]
 fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
+    const REMOTE_BEGIN_MARKER: &[u8] = b"YON_REMOTE_BEGIN";
     const OUTPUT_MARKER: &[u8] = b"YON_WINDOWS_CONPTY_OUTPUT";
+    const UTF8_SCALAR: &[u8] = "\u{4e2d}".as_bytes();
+    const UTF8_SCALAR_COUNT: usize = 6_000;
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -635,6 +675,7 @@ fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     command.arg("connect");
     command.cwd(config.path());
     command.env_remove("YON_RELAYS");
+    command.env_remove("YON_WSS_CA");
     command.env_remove("YON_WSS_CA_DER");
     let mut controller = pair
         .slave
@@ -658,9 +699,86 @@ fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     }));
     let mut output = Vec::new();
     let outcome = (|| -> Result<u32, std::io::Error> {
+        writer.write_all(format!("{code}\r\x1b[1;1R\r").as_bytes())?;
+        writer.write_all(b"echo YON_REMOTE_BEGIN\r")?;
+        writer.flush()?;
+        wait_for_bytes(
+            &output_rx,
+            &mut output,
+            REMOTE_BEGIN_MARKER,
+            Duration::from_secs(30),
+        )
+        .map_err(|error| windows_probe_error("remote terminal start", error, &output))?;
+
         writer.write_all(
-            format!("{code}\r\n\x1b[1;1R\r\necho YON_WINDOWS_CONPTY_OUTPUT\r\nexit 23\r\n")
-                .as_bytes(),
+            concat!(
+                "powershell.exe -NoLogo -NoProfile -Command ",
+                "\"[Console]::WriteLine('YON_WAIT_ESCAPE'); ",
+                "$k=[Console]::ReadKey($true); ",
+                "[Console]::WriteLine(('YON_KEY_ESCAPE={0}:{1}' -f $k.Key,[int]$k.KeyChar))\"\r",
+            )
+            .as_bytes(),
+        )?;
+        writer.flush()?;
+        wait_for_bytes(
+            &output_rx,
+            &mut output,
+            b"YON_WAIT_ESCAPE",
+            Duration::from_secs(5),
+        )
+        .map_err(|error| windows_probe_error("Escape readiness", error, &output))?;
+        writer.write_all(b"\x1b")?;
+        writer.flush()?;
+        wait_for_bytes(
+            &output_rx,
+            &mut output,
+            b"YON_KEY_ESCAPE=Escape:27",
+            Duration::from_secs(5),
+        )
+        .map_err(|error| windows_probe_error("Escape result", error, &output))?;
+
+        writer.write_all(
+            concat!(
+                "powershell.exe -NoLogo -NoProfile -Command ",
+                "\"[Console]::WriteLine('YON_WAIT_ARROW'); ",
+                "$a=[Console]::ReadKey($true); $b=[Console]::ReadKey($true); ",
+                "$c=[Console]::ReadKey($true); ",
+                "[Console]::WriteLine(('YON_KEY_ARROW={0},{1},{2}' -f ",
+                "[int]$a.KeyChar,[int]$b.KeyChar,[int]$c.KeyChar))\"\r",
+            )
+            .as_bytes(),
+        )?;
+        writer.flush()?;
+        wait_for_bytes(
+            &output_rx,
+            &mut output,
+            b"YON_WAIT_ARROW",
+            Duration::from_secs(5),
+        )
+        .map_err(|error| windows_probe_error("arrow readiness", error, &output))?;
+        writer.write_all(b"\x1b[A")?;
+        writer.flush()?;
+        wait_for_bytes(
+            &output_rx,
+            &mut output,
+            b"YON_KEY_ARROW=27,91,65",
+            Duration::from_secs(5),
+        )
+        .map_err(|error| windows_probe_error("arrow result", error, &output))?;
+
+        writer.write_all(
+            format!(
+                concat!(
+                    "powershell.exe -NoLogo -NoProfile -NonInteractive -Command ",
+                    "\"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); ",
+                    "[Console]::Write(([char]0x4e2d).ToString()*{0}); ",
+                    "[Console]::WriteLine('YON_UTF8_END')\"\r",
+                    "echo YON_WINDOWS_CONPTY_OUTPUT\r",
+                    "exit 23\r",
+                ),
+                UTF8_SCALAR_COUNT,
+            )
+            .as_bytes(),
         )?;
         writer.flush()?;
         if let Err(error) = wait_for_bytes(
@@ -702,7 +820,36 @@ fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
         ));
     }
     assert_bytes_contain(&output, OUTPUT_MARKER, "Windows ConPTY output")?;
-    assert_progress_precedes_terminal_output(&output, OUTPUT_MARKER)?;
+    assert_bytes_contain(&output, REMOTE_BEGIN_MARKER, "first remote output")?;
+    assert_bytes_contain(
+        &output,
+        b"YON_KEY_ESCAPE=Escape:27",
+        "Windows ConPTY Escape key",
+    )?;
+    assert_bytes_contain(
+        &output,
+        b"YON_KEY_ARROW=27,91,65",
+        "Windows ConPTY arrow bytes",
+    )?;
+    assert_bytes_contain(&output, b"YON_UTF8_END", "Windows ConPTY UTF-8 output")?;
+    let utf8_scalar_count = output
+        .windows(UTF8_SCALAR.len())
+        .filter(|window| *window == UTF8_SCALAR)
+        .count();
+    if utf8_scalar_count < UTF8_SCALAR_COUNT {
+        return Err(std::io::Error::other(format!(
+            "Windows ConPTY UTF-8 output count was {utf8_scalar_count}, expected at least {UTF8_SCALAR_COUNT}"
+        )));
+    }
+    if output
+        .windows("\u{fffd}".len())
+        .any(|window| window == "\u{fffd}".as_bytes())
+    {
+        return Err(std::io::Error::other(
+            "Windows ConPTY replaced valid split UTF-8 output",
+        ));
+    }
+    assert_progress_precedes_terminal_output(&output, REMOTE_BEGIN_MARKER)?;
     if let Some(path) = &controller_log {
         assert_controller_log_is_appended_and_isolated(path, &output)?;
     }
@@ -1250,6 +1397,14 @@ fn close_gate_connections(
     Ok(())
 }
 
+#[cfg(windows)]
+fn windows_probe_error(stage: &str, source: std::io::Error, output: &[u8]) -> std::io::Error {
+    std::io::Error::other(format!(
+        "Windows ConPTY {stage} failed: {source}; output: {:?}",
+        String::from_utf8_lossy(output)
+    ))
+}
+
 fn reap_gate_connections(active: &mut Vec<GateConnection>) {
     let mut index = 0;
     while index < active.len() {
@@ -1548,6 +1703,7 @@ impl HostProcess {
             .current_dir(config.path())
             .env("YONDER_E2E_ENV", HOST_ENVIRONMENT_VALUE)
             .env_remove("YON_RELAYS")
+            .env_remove("YON_WSS_CA")
             .env_remove("YON_WSS_CA_DER")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1667,6 +1823,7 @@ fn run_controller_session(
         .args(["--log-level", "debug", "connect"])
         .current_dir(config.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER");
     if matches!(code_input, CodeInput::Argument) {
         command.arg(code);
@@ -1765,6 +1922,7 @@ fn run_rejected_host(config: &EndpointConfigDirectory) -> Result<(), std::io::Er
         .args(["--log-level", "debug", "host"])
         .current_dir(config.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1887,6 +2045,7 @@ fn run_rejected_controller(
         .args(["connect", wrong.as_str()])
         .current_dir(config.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

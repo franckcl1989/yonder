@@ -16,7 +16,7 @@ use yon_relay::{
 };
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
-    LayeredConfigLoader,
+    ConfigurationValues, LayeredConfigLoader,
 };
 use yonder_core::{
     CircuitBytes, CircuitCapacity, CircuitDuration, CircuitRelayLimits, DomainError,
@@ -26,7 +26,8 @@ use yonder_core::{
     SourceRegistrationCapacity, write_error_report,
 };
 use yonder_net::{
-    AddressError, NetworkBuildError, RelayExternalAddress, RelayListenAddress, WssTransportConfig,
+    AddressError, NetworkBuildError, RelayExternalAddress, RelayListenAddress,
+    WSS_CERTIFICATE_LIMIT, WssCertificateChain, WssPrivateKey, WssTransportConfig,
     generate_identity,
 };
 
@@ -35,12 +36,60 @@ const MAX_WSS_PRIVATE_KEY_DOCUMENT: u64 = 64 * 1024;
 const IDENTITY_KEY: ConfigurationKey = ConfigurationKey::new("identity");
 const LISTEN_KEY: ConfigurationKey = ConfigurationKey::new("listen");
 const EXTERNAL_KEY: ConfigurationKey = ConfigurationKey::new("external");
-const WSS_CERTIFICATE_KEY: ConfigurationKey = ConfigurationKey::new("wss_certificate_der");
-const WSS_PRIVATE_KEY_KEY: ConfigurationKey = ConfigurationKey::new("wss_private_key_der");
+const WSS_CERTIFICATE_KEY: ConfigurationKey = ConfigurationKey::new("wss_certificate");
+const WSS_CERTIFICATE_DER_KEY: ConfigurationKey = ConfigurationKey::new("wss_certificate_der");
+const WSS_PRIVATE_KEY_KEY: ConfigurationKey = ConfigurationKey::new("wss_private_key");
+const WSS_PRIVATE_KEY_DER_KEY: ConfigurationKey = ConfigurationKey::new("wss_private_key_der");
+const REGISTRY_CAPACITY_KEY: ConfigurationKey = ConfigurationKey::new("registry.capacity");
+const REGISTRY_PER_SOURCE_KEY: ConfigurationKey = ConfigurationKey::new("registry.per_source");
+const REGISTRY_RESERVATION_DURATION_KEY: ConfigurationKey =
+    ConfigurationKey::new("registry.reservation_duration_seconds");
+const RESOLVE_CONCURRENCY_KEY: ConfigurationKey = ConfigurationKey::new("resolve.concurrency");
+const RESOLVE_GLOBAL_RATE_KEY: ConfigurationKey =
+    ConfigurationKey::new("resolve.global_rate_per_second");
+const RESOLVE_GLOBAL_BURST_KEY: ConfigurationKey = ConfigurationKey::new("resolve.global_burst");
+const RESOLVE_SOURCE_RATE_KEY: ConfigurationKey =
+    ConfigurationKey::new("resolve.source_rate_per_second");
+const RESOLVE_SOURCE_BURST_KEY: ConfigurationKey = ConfigurationKey::new("resolve.source_burst");
+const RESOLVE_SOURCE_LIMITER_CAPACITY_KEY: ConfigurationKey =
+    ConfigurationKey::new("resolve.source_limiter_capacity");
+const RESOLVE_SOURCE_LIMITER_IDLE_KEY: ConfigurationKey =
+    ConfigurationKey::new("resolve.source_limiter_idle_seconds");
+const RESOLVE_RETRY_KEY: ConfigurationKey = ConfigurationKey::new("resolve.retry_milliseconds");
+const CIRCUIT_CAPACITY_KEY: ConfigurationKey = ConfigurationKey::new("circuit.capacity");
+const CIRCUIT_DURATION_KEY: ConfigurationKey = ConfigurationKey::new("circuit.duration_seconds");
+const CIRCUIT_BYTES_KEY: ConfigurationKey = ConfigurationKey::new("circuit.bytes");
 const RELAY_SCHEMA: ConfigurationSchema = ConfigurationSchema::new(
     Application::Relay,
-    &[LISTEN_KEY, EXTERNAL_KEY],
-    &[IDENTITY_KEY, WSS_CERTIFICATE_KEY, WSS_PRIVATE_KEY_KEY],
+    &[
+        LISTEN_KEY,
+        EXTERNAL_KEY,
+        WSS_CERTIFICATE_KEY,
+        WSS_CERTIFICATE_DER_KEY,
+    ],
+    &[
+        REGISTRY_CAPACITY_KEY,
+        REGISTRY_PER_SOURCE_KEY,
+        REGISTRY_RESERVATION_DURATION_KEY,
+        RESOLVE_CONCURRENCY_KEY,
+        RESOLVE_GLOBAL_RATE_KEY,
+        RESOLVE_GLOBAL_BURST_KEY,
+        RESOLVE_SOURCE_RATE_KEY,
+        RESOLVE_SOURCE_BURST_KEY,
+        RESOLVE_SOURCE_LIMITER_CAPACITY_KEY,
+        RESOLVE_SOURCE_LIMITER_IDLE_KEY,
+        RESOLVE_RETRY_KEY,
+        CIRCUIT_CAPACITY_KEY,
+        CIRCUIT_DURATION_KEY,
+        CIRCUIT_BYTES_KEY,
+    ],
+    &[
+        IDENTITY_KEY,
+        WSS_CERTIFICATE_KEY,
+        WSS_CERTIFICATE_DER_KEY,
+        WSS_PRIVATE_KEY_KEY,
+        WSS_PRIVATE_KEY_DER_KEY,
+    ],
 );
 
 #[derive(Debug, Parser)]
@@ -89,6 +138,8 @@ enum IdentityCommand {
 enum ConfigCommand {
     /// Loads and validates configuration, identity, addresses, limits, and TLS material.
     Check,
+    /// Shows configuration sources in increasing precedence order.
+    Sources,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,7 +148,9 @@ struct RelaySettings {
     identity: PathBuf,
     listen: Vec<String>,
     external: Vec<String>,
-    wss_certificate_der: Option<PathBuf>,
+    wss_certificate: Option<ConfigurationValues<PathBuf>>,
+    wss_certificate_der: Option<ConfigurationValues<PathBuf>>,
+    wss_private_key: Option<PathBuf>,
     wss_private_key_der: Option<PathBuf>,
     #[serde(default)]
     registry: RegistrySettings,
@@ -212,10 +265,23 @@ enum AppError {
     Resource(#[from] RelayResourceError),
     #[error("relay retry configuration is invalid: {0}")]
     Retry(#[from] DomainError),
-    #[error("failed to read TLS material: {0}")]
-    TlsRead(#[source] std::io::Error),
-    #[error("the TLS {0} document is too large")]
-    TlsTooLarge(TlsDocumentKind),
+    #[error("failed to read TLS material {path}: {source}")]
+    TlsRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("wss_certificate and the legacy wss_certificate_der setting cannot both be configured")]
+    ConflictingWssCertificate,
+    #[error("wss_certificate must contain between 1 and {WSS_CERTIFICATE_LIMIT} document paths")]
+    InvalidWssCertificateDocumentCount,
+    #[error("wss_private_key and the legacy wss_private_key_der setting cannot both be configured")]
+    ConflictingWssPrivateKey,
+    #[error("the TLS {kind} document is too large: {path}")]
+    TlsTooLarge {
+        path: PathBuf,
+        kind: TlsDocumentKind,
+    },
     #[error("the TLS private key or its parent directory permits untrusted access: {0}")]
     InsecureTlsPrivateKeyPermissions(PathBuf),
     #[error("failed to construct the async runtime: {0}")]
@@ -290,6 +356,9 @@ fn execute_command(
             drop(configure()?);
             report_configuration_valid()
         }
+        Command::Config {
+            command: ConfigCommand::Sources,
+        } => report_configuration_sources(),
         Command::Serve => {
             let config = configure()?;
             serve(config)
@@ -311,6 +380,14 @@ fn report_configuration_valid() -> Result<(), AppError> {
 fn report_configuration_valid_to(output: &mut impl std::io::Write) -> std::io::Result<()> {
     writeln!(output, "Relay configuration is valid.")?;
     output.flush()
+}
+
+fn report_configuration_sources() -> Result<(), AppError> {
+    let locations = LayeredConfigLoader::system(RELAY_SCHEMA).locations()?;
+    locations
+        .inspect()?
+        .write_to(&mut std::io::stdout().lock())
+        .map_err(AppError::Output)
 }
 
 fn serve_relay(config: RelayServeConfig) -> Result<(), AppError> {
@@ -357,17 +434,63 @@ fn serve_config_with(
 ) -> Result<RelayServeConfig, AppError> {
     let loaded = loader.load()?;
     let identity_path = loaded.resolve_path(IDENTITY_KEY, &loaded.value().identity)?;
-    let certificate_path = loaded
-        .value()
-        .wss_certificate_der
-        .as_deref()
-        .map(|path| loaded.resolve_path(WSS_CERTIFICATE_KEY, path))
+    let certificate_paths = match (
+        &loaded.value().wss_certificate,
+        &loaded.value().wss_certificate_der,
+    ) {
+        (Some(paths), Some(_))
+            if loaded.compare_source_precedence(WSS_CERTIFICATE_KEY, WSS_CERTIFICATE_DER_KEY)
+                == Some(std::cmp::Ordering::Greater) =>
+        {
+            Some((WSS_CERTIFICATE_KEY, paths.as_slice()))
+        }
+        (Some(_), Some(paths))
+            if loaded.compare_source_precedence(WSS_CERTIFICATE_KEY, WSS_CERTIFICATE_DER_KEY)
+                == Some(std::cmp::Ordering::Less) =>
+        {
+            Some((WSS_CERTIFICATE_DER_KEY, paths.as_slice()))
+        }
+        (Some(_), Some(_)) => return Err(AppError::ConflictingWssCertificate),
+        (Some(paths), None) => Some((WSS_CERTIFICATE_KEY, paths.as_slice())),
+        (None, Some(paths)) => Some((WSS_CERTIFICATE_DER_KEY, paths.as_slice())),
+        (None, None) => None,
+    };
+    if certificate_paths
+        .is_some_and(|(_, paths)| !(1..=WSS_CERTIFICATE_LIMIT).contains(&paths.len()))
+    {
+        return Err(AppError::InvalidWssCertificateDocumentCount);
+    }
+    let private_key = match (
+        loaded.value().wss_private_key.as_deref(),
+        loaded.value().wss_private_key_der.as_deref(),
+    ) {
+        (Some(path), Some(_))
+            if loaded.compare_source_precedence(WSS_PRIVATE_KEY_KEY, WSS_PRIVATE_KEY_DER_KEY)
+                == Some(std::cmp::Ordering::Greater) =>
+        {
+            Some((WSS_PRIVATE_KEY_KEY, path))
+        }
+        (Some(_), Some(path))
+            if loaded.compare_source_precedence(WSS_PRIVATE_KEY_KEY, WSS_PRIVATE_KEY_DER_KEY)
+                == Some(std::cmp::Ordering::Less) =>
+        {
+            Some((WSS_PRIVATE_KEY_DER_KEY, path))
+        }
+        (Some(_), Some(_)) => return Err(AppError::ConflictingWssPrivateKey),
+        (Some(path), None) => Some((WSS_PRIVATE_KEY_KEY, path)),
+        (None, Some(path)) => Some((WSS_PRIVATE_KEY_DER_KEY, path)),
+        (None, None) => None,
+    };
+    let certificate_paths = certificate_paths
+        .map(|(key, paths)| {
+            paths
+                .iter()
+                .map(|path| loaded.resolve_path(key, path))
+                .collect::<Result<Vec<_>, _>>()
+        })
         .transpose()?;
-    let private_key_path = loaded
-        .value()
-        .wss_private_key_der
-        .as_deref()
-        .map(|path| loaded.resolve_path(WSS_PRIVATE_KEY_KEY, path))
+    let private_key_path = private_key
+        .map(|(key, path)| loaded.resolve_path(key, path))
         .transpose()?;
     let listen = loaded
         .value()
@@ -383,11 +506,17 @@ fn serve_config_with(
         .collect::<Result<Vec<_>, _>>()?;
     let resources = relay_resources(loaded.value())?;
     let identity = FileIdentityStore.read(&identity_path)?;
-    let wss = match (certificate_path, private_key_path) {
-        (Some(certificate), Some(private_key)) => {
-            let certificate = read_tls_document(&certificate, TlsDocumentKind::Certificate)?;
+    let wss = match (certificate_paths, private_key_path) {
+        (Some(certificates), Some(private_key)) => {
+            let certificates = certificates
+                .iter()
+                .map(|certificate| read_tls_document(certificate, TlsDocumentKind::Certificate))
+                .map(|document| document.map(SecretDocument::into_upstream_bytes))
+                .collect::<Result<Vec<_>, _>>()?;
             let private_key = read_tls_document(&private_key, TlsDocumentKind::PrivateKey)?;
-            WssTransportConfig::server(certificate.into_upstream_bytes(), private_key)
+            let certificate_chain = WssCertificateChain::from_documents(certificates)?;
+            let private_key = WssPrivateKey::from_document(private_key)?;
+            WssTransportConfig::server_with_chain(certificate_chain, private_key)
         }
         (None, None) => WssTransportConfig::client(None),
         _ => return Err(RelayServiceError::MissingWssCertificate.into()),
@@ -425,21 +554,30 @@ fn relay_resources(settings: &RelaySettings) -> Result<RelayResourceConfig, AppE
 }
 
 fn read_tls_document(path: &Path, kind: TlsDocumentKind) -> Result<SecretDocument, AppError> {
-    let file = File::open(path).map_err(AppError::TlsRead)?;
+    let file = File::open(path).map_err(|source| AppError::TlsRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if kind == TlsDocumentKind::PrivateKey {
         SystemSecretFilePolicy
             .validate_existing(path, &file)
             .map_err(|error| map_tls_policy_error(path, error))?;
     }
-    let metadata = file.metadata().map_err(AppError::TlsRead)?;
+    let metadata = file.metadata().map_err(|source| AppError::TlsRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let reported_len = metadata.len();
-    read_tls_document_from(file, reported_len, kind)
+    read_tls_document_from(file, reported_len, kind, path)
 }
 
 fn map_tls_policy_error(path: &Path, error: SecretFileError) -> AppError {
     match error {
         SecretFileError::Insecure => AppError::InsecureTlsPrivateKeyPermissions(path.to_path_buf()),
-        SecretFileError::Platform(error) => AppError::TlsRead(error),
+        SecretFileError::Platform(source) => AppError::TlsRead {
+            path: path.to_path_buf(),
+            source,
+        },
     }
 }
 
@@ -447,17 +585,27 @@ fn read_tls_document_from(
     reader: impl std::io::Read,
     reported_len: u64,
     kind: TlsDocumentKind,
+    path: &Path,
 ) -> Result<SecretDocument, AppError> {
     let limit = kind.limit();
     if reported_len > limit {
-        return Err(AppError::TlsTooLarge(kind));
+        return Err(AppError::TlsTooLarge {
+            path: path.to_path_buf(),
+            kind,
+        });
     }
     let mut bytes = Vec::with_capacity(reported_len as usize);
     let read = reader.take(limit + 1).read_to_end(&mut bytes);
     let document = SecretDocument::new(bytes);
-    read.map_err(AppError::TlsRead)?;
+    read.map_err(|source| AppError::TlsRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if document.as_bytes().len() as u64 > limit {
-        return Err(AppError::TlsTooLarge(kind));
+        return Err(AppError::TlsTooLarge {
+            path: path.to_path_buf(),
+            kind,
+        });
     }
     Ok(document)
 }
@@ -469,8 +617,8 @@ mod tests {
         AppError, Cli, Command, ConfigCommand, IdentityCommand, LogLevel, RELAY_SCHEMA,
         TlsDocumentKind, execute_command, initialize_identity, initialize_identity_with,
         map_tls_policy_error, read_tls_document, read_tls_document_from, relay_runtime,
-        report_configuration_valid_to, report_peer_id_to, run, serve_config_with, serve_relay,
-        show_identity, write_error_report,
+        report_configuration_valid_to, report_peer_id_to, run, serve_config_with, show_identity,
+        write_error_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -480,7 +628,10 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::{TempDir, tempdir};
     use tracing_subscriber::filter::LevelFilter;
-    use yonder_config::{ConfigurationLocationError, ConfigurationSources, LayeredConfigLoader};
+    use yonder_config::{
+        ConfigLoader as _, ConfigurationLocationError, ConfigurationSources, LayeredConfigLoader,
+        LoadedConfiguration,
+    };
 
     const TEST_WSS_CERTIFICATE_DER: &[u8] =
         include_bytes!("../../yon/tests/fixtures/localhost-test-cert.der");
@@ -638,7 +789,8 @@ exit 0
                 path,
                 yon_relay::SecretFileError::Platform(io::Error::other("platform")),
             ),
-            AppError::TlsRead(error) if error.kind() == io::ErrorKind::Other
+            AppError::TlsRead { path: mapped, source }
+                if mapped == path && source.kind() == io::ErrorKind::Other
         ));
     }
 
@@ -658,6 +810,13 @@ exit 0
             check.command,
             Command::Config {
                 command: ConfigCommand::Check
+            }
+        ));
+        let sources = Cli::try_parse_from(["yon-relay", "config", "sources"]).unwrap();
+        assert!(matches!(
+            sources.command,
+            Command::Config {
+                command: ConfigCommand::Sources
             }
         ));
 
@@ -720,7 +879,7 @@ exit 0
         );
         assert!(matches!(
             serve_config_with(&loader),
-            Err(AppError::TlsRead(_))
+            Err(AppError::TlsRead { .. })
         ));
 
         let certificate = directory.path().join("certificate.der");
@@ -732,7 +891,7 @@ exit 0
         );
         assert!(matches!(
             serve_config_with(&loader),
-            Err(AppError::TlsRead(_))
+            Err(AppError::TlsRead { .. })
         ));
         write_private_key(&private_key, &[4, 5, 6]);
         assert_eq!(
@@ -747,14 +906,77 @@ exit 0
         );
         assert!(matches!(
             serve_config_with(&loader),
-            Err(AppError::Service(
-                yon_relay::RelayServiceError::NetworkBuild(_)
-            ))
+            Err(AppError::Network(_))
         ));
 
         fs::write(&certificate, TEST_WSS_CERTIFICATE_DER).unwrap();
         write_private_key(&private_key, TEST_WSS_PRIVATE_KEY_DER);
         assert!(serve_config_with(&loader).is_ok());
+
+        write_config(
+            directory.path(),
+            "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\nwss_certificate=['certificate.der']\nwss_private_key='private-key.der'\n",
+        );
+        assert!(serve_config_with(&loader).is_ok());
+
+        for paths in [
+            "[]",
+            "['certificate.der','certificate.der','certificate.der','certificate.der','certificate.der','certificate.der','certificate.der','certificate.der','certificate.der']",
+        ] {
+            write_config(
+                directory.path(),
+                &format!(
+                    "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\nwss_certificate={paths}\nwss_private_key='private-key.der'\n"
+                ),
+            );
+            assert!(matches!(
+                serve_config_with(&loader),
+                Err(AppError::InvalidWssCertificateDocumentCount)
+            ));
+        }
+        write_config(
+            directory.path(),
+            "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\nwss_certificate=['certificate.der']\nwss_private_key='private-key.der'\n",
+        );
+
+        fs::create_dir(directory.path().join("system")).unwrap();
+        fs::write(
+            directory.path().join("system").join("yon-relay.toml"),
+            "wss_certificate_der='legacy-missing.der'\nwss_private_key_der='legacy-missing.der'\n",
+        )
+        .unwrap();
+        assert!(serve_config_with(&loader).is_ok());
+        fs::remove_file(directory.path().join("system").join("yon-relay.toml")).unwrap();
+
+        fs::write(
+            directory.path().join("system").join("yon-relay.toml"),
+            "wss_certificate='new-missing.der'\nwss_private_key='new-missing.der'\n",
+        )
+        .unwrap();
+        write_config(
+            directory.path(),
+            "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\nwss_certificate_der='certificate.der'\nwss_private_key_der='private-key.der'\n",
+        );
+        assert!(serve_config_with(&loader).is_ok());
+        fs::remove_file(directory.path().join("system").join("yon-relay.toml")).unwrap();
+
+        write_config(
+            directory.path(),
+            "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\nwss_certificate='certificate.der'\nwss_certificate_der='certificate.der'\nwss_private_key='private-key.der'\n",
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::ConflictingWssCertificate)
+        ));
+
+        write_config(
+            directory.path(),
+            "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\nwss_certificate='certificate.der'\nwss_private_key='private-key.der'\nwss_private_key_der='private-key.der'\n",
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::ConflictingWssPrivateKey)
+        ));
     }
 
     #[cfg(unix)]
@@ -853,11 +1075,13 @@ exit 0
     fn tls_documents_are_bounded_before_and_during_reads() {
         use std::io::{self, Cursor, Read};
 
+        let path = std::path::Path::new("tls-document.der");
         assert_eq!(
             read_tls_document_from(
                 Cursor::new(vec![0_u8; 64 * 1024]),
                 64 * 1024,
                 TlsDocumentKind::PrivateKey,
+                path,
             )
             .unwrap()
             .as_bytes()
@@ -869,6 +1093,7 @@ exit 0
                 Cursor::new(vec![0_u8; 1024 * 1024]),
                 1024 * 1024,
                 TlsDocumentKind::Certificate,
+                path,
             )
             .unwrap()
             .as_bytes()
@@ -880,20 +1105,28 @@ exit 0
                 Cursor::new(Vec::new()),
                 64 * 1024 + 1,
                 TlsDocumentKind::PrivateKey,
+                path,
             ),
-            Err(AppError::TlsTooLarge(TlsDocumentKind::PrivateKey))
+            Err(AppError::TlsTooLarge {
+                kind: TlsDocumentKind::PrivateKey,
+                ..
+            })
         ));
         assert!(matches!(
             read_tls_document_from(
                 Cursor::new(vec![0_u8; 64 * 1024 + 1]),
                 64 * 1024,
                 TlsDocumentKind::PrivateKey,
+                path,
             ),
-            Err(AppError::TlsTooLarge(TlsDocumentKind::PrivateKey))
+            Err(AppError::TlsTooLarge {
+                kind: TlsDocumentKind::PrivateKey,
+                ..
+            })
         ));
         assert!(matches!(
-            read_tls_document_from(FailingReader, 0, TlsDocumentKind::Certificate),
-            Err(AppError::TlsRead(error)) if error.kind() == io::ErrorKind::Other
+            read_tls_document_from(FailingReader, 0, TlsDocumentKind::Certificate, path),
+            Err(AppError::TlsRead { source, .. }) if source.kind() == io::ErrorKind::Other
         ));
 
         struct FailingReader;
@@ -991,7 +1224,7 @@ exit 0
 
     #[test]
     fn mismatched_wss_key_is_rejected_by_the_real_relay_transport() {
-        let config = yon_relay::RelayServeConfig::new(
+        let Err(error) = yon_relay::RelayServeConfig::new(
             yonder_net::Keypair::generate_ed25519(),
             vec!["/ip4/127.0.0.1/tcp/0/tls/ws".parse().unwrap()],
             vec!["/dns4/localhost/tcp/443/tls/ws".parse().unwrap()],
@@ -999,16 +1232,14 @@ exit 0
                 TEST_WSS_CERTIFICATE_DER.to_vec(),
                 yonder_core::SecretDocument::new(TEST_WSS_MISMATCHED_PRIVATE_KEY_DER.to_vec()),
             ),
-        )
-        .unwrap();
-
-        let error = serve_relay(config).unwrap_err();
+        ) else {
+            panic!("mismatched WSS certificate and private key were accepted");
+        };
         assert!(matches!(
             &error,
-            AppError::Service(yon_relay::RelayServiceError::NetworkBuild(
-                yonder_net::NetworkBuildError::WssTls(_)
-            ))
+            yon_relay::RelayServiceError::NetworkBuild(yonder_net::NetworkBuildError::WssTls(_))
         ));
+        let error = AppError::from(error);
         let mut report = Vec::new();
         write_error_report(&mut report, &error).unwrap();
         let report = String::from_utf8(report).unwrap();
@@ -1079,6 +1310,7 @@ exit 0
     #[derive(Debug)]
     struct TestSources {
         cwd: PathBuf,
+        environment: Vec<(OsString, OsString)>,
     }
 
     impl ConfigurationSources for TestSources {
@@ -1091,12 +1323,86 @@ exit 0
         }
 
         fn environment(&self) -> Vec<(OsString, OsString)> {
-            Vec::new()
+            self.environment.clone()
         }
     }
 
     fn test_loader(directory: PathBuf) -> LayeredConfigLoader<TestSources> {
-        LayeredConfigLoader::new(TestSources { cwd: directory }, RELAY_SCHEMA)
+        LayeredConfigLoader::new(
+            TestSources {
+                cwd: directory,
+                environment: Vec::new(),
+            },
+            RELAY_SCHEMA,
+        )
+    }
+
+    #[test]
+    fn relay_numeric_environment_settings_use_the_shared_typed_parser() {
+        let directory = test_directory();
+        write_config(
+            directory.path(),
+            "identity='123'\nlisten=['/ip4/127.0.0.1/tcp/1']\nexternal=['/ip4/127.0.0.1/tcp/1']\n",
+        );
+        let environment = [
+            ("YON_RELAY_REGISTRY__CAPACITY", "129"),
+            ("YON_RELAY_REGISTRY__PER_SOURCE", "31"),
+            ("YON_RELAY_REGISTRY__RESERVATION_DURATION_SECONDS", "3599"),
+            ("YON_RELAY_RESOLVE__CONCURRENCY", "63"),
+            ("YON_RELAY_RESOLVE__GLOBAL_RATE_PER_SECOND", "5"),
+            ("YON_RELAY_RESOLVE__GLOBAL_BURST", "127"),
+            ("YON_RELAY_RESOLVE__SOURCE_RATE_PER_SECOND", "2"),
+            ("YON_RELAY_RESOLVE__SOURCE_BURST", "31"),
+            ("YON_RELAY_RESOLVE__SOURCE_LIMITER_CAPACITY", "4095"),
+            ("YON_RELAY_RESOLVE__SOURCE_LIMITER_IDLE_SECONDS", "599"),
+            ("YON_RELAY_RESOLVE__RETRY_MILLISECONDS", "251"),
+            ("YON_RELAY_CIRCUIT__CAPACITY", "127"),
+            ("YON_RELAY_CIRCUIT__DURATION_SECONDS", "86399"),
+            ("YON_RELAY_CIRCUIT__BYTES", "8388607"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let loader = LayeredConfigLoader::new(
+            TestSources {
+                cwd: directory.path().to_path_buf(),
+                environment,
+            },
+            RELAY_SCHEMA,
+        );
+
+        let loaded: LoadedConfiguration<super::RelaySettings> = loader.load().unwrap();
+        let settings = loaded.value();
+        assert_eq!(settings.identity, PathBuf::from("123"));
+        assert_eq!(
+            (
+                settings.registry.capacity,
+                settings.registry.per_source,
+                settings.registry.reservation_duration_seconds,
+            ),
+            (129, 31, 3599)
+        );
+        assert_eq!(
+            (
+                settings.resolve.concurrency,
+                settings.resolve.global_rate_per_second,
+                settings.resolve.global_burst,
+                settings.resolve.source_rate_per_second,
+                settings.resolve.source_burst,
+                settings.resolve.source_limiter_capacity,
+                settings.resolve.source_limiter_idle_seconds,
+                settings.resolve.retry_milliseconds,
+            ),
+            (63, 5, 127, 2, 31, 4095, 599, 251)
+        );
+        assert_eq!(
+            (
+                settings.circuit.capacity,
+                settings.circuit.duration_seconds,
+                settings.circuit.bytes,
+            ),
+            (127, 86399, 8388607)
+        );
     }
 
     fn write_config(directory: &std::path::Path, contents: &str) {

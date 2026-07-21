@@ -21,7 +21,7 @@
 - locator 环形分配 0/1/128/满表、wrap、冲突、RNG 失败。
 - direct governor 配额、确定性时钟、边界瞬间和来源表准入/回收。
 - 路径排序全部 tie-break、零样本 fallback、单样本不比较抖动、失败样本、迟到直连 `750ms` 采样和确定性；另以回归证明 relay RTT 更低时仍选择可用直连、controller 单侧选路后 host 绑定剩余唯一认证连接。
-- shell 选择、环境校验、exit code 映射和错误脱敏。
+- `portable-pty` default-program shell 选择、环境覆盖、资源数值环境变量的上游类型解析、纯数字路径保真、exit code 映射和错误脱敏。
 - 交互 `Ctrl+] .` 脱离、双 `Ctrl+]` 字面发送、跨读取块状态和非交互透明转发。
 - relay listen/external 重复项、transport 对应关系与允许 NAT 地址/端口改写的组合校验。
 
@@ -42,9 +42,9 @@
 - registry reservation/连接两个条件的笛卡尔组合、续租、Suspend/恢复、Release、中继重启和 locator 冲突。
 - `libp2p-stream` 接收循环饱和、endpoint 单入口、relay `16/64` permit、慢消费者、取消、关闭、重复协议流和 unsupported protocol。
 - 两个 `duplex` bridge 的背压、半关闭、大输出、慢 stdout、child 先退、最后输出排空、data/Exit 乱序、网络先断和清理期限。
-- DER cert/key/CA 合法与各种非法输入，确认边界返回错误而不是进入上游 panic API。
+- DER/PEM 证书链、信任锚、PKCS#1/PKCS#8/SEC1 私钥的合法、混合块、截断、空/超量文档列表的 I/O 前拒绝和超限输入，确认边界返回结构化错误而不是进入上游 panic API。
 - Unix identity/WSS 私钥 `0600` 创建、非普通文件拒绝、父目录 owner 与 group/other 写入权限；Windows 受保护 DACL、owner、文件 outsider ACE、父目录写入/创建权限和缺失 PowerShell 的 fail-closed 路径。
-- `yon config check/sources`、`yon-relay config check` 与 `identity show` 的成功、错误、脱敏和“检查不绑定 listener”语义。
+- `yon config check/sources`、`yon-relay config check/sources` 与 `identity show` 的成功、错误、脱敏和“检查不绑定 listener”语义。
 
 ### 端到端测试
 

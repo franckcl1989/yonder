@@ -4,7 +4,7 @@ use std::io::{Read as _, Write as _};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream};
 use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
 use tokio_util::sync::DropGuard;
@@ -92,14 +92,16 @@ pub trait TerminalBackend {
     ) -> impl Future<Output = Result<Self::Session, TerminalError>> + Send;
 }
 
+/// Replaceable, independently-driven input capability for one terminal session.
+pub trait TerminalInput: AsyncWrite + Unpin + Send {
+    fn close(&mut self);
+}
+
 /// Replaceable lifecycle and I/O capability of one running terminal session.
 pub trait TerminalSession: Send {
-    fn send(
-        &mut self,
-        chunk: TerminalChunk,
-    ) -> impl Future<Output = Result<(), TerminalError>> + Send;
+    type Input: TerminalInput;
 
-    fn close_input(&mut self);
+    fn take_input(&mut self) -> Result<Self::Input, TerminalError>;
 
     fn resize(
         &mut self,
@@ -145,9 +147,13 @@ fn open_resources(hello: &TerminalHello) -> Result<PtyResources, TerminalError> 
     command.cwd(std::env::current_dir().map_err(TerminalError::Io)?);
     if !hello.term().is_empty() {
         command.env("TERM", hello.term().as_str());
+    } else {
+        command.env_remove("TERM");
     }
     if !hello.color_term().is_empty() {
         command.env("COLORTERM", hello.color_term().as_str());
+    } else {
+        command.env_remove("COLORTERM");
     }
     let child = pair
         .slave
@@ -162,58 +168,6 @@ fn open_resources(hello: &TerminalHello) -> Result<PtyResources, TerminalError> 
     })
 }
 
-#[cfg(unix)]
-fn current_shell_command() -> CommandBuilder {
-    let configured = std::env::var_os("SHELL");
-    CommandBuilder::new(select_unix_shell(configured.as_deref()))
-}
-
-#[cfg(unix)]
-fn select_unix_shell(configured: Option<&std::ffi::OsStr>) -> &std::ffi::OsStr {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    match configured {
-        Some(shell)
-            if !shell.is_empty()
-                && !shell.as_bytes().contains(&0)
-                && std::path::Path::new(shell).is_absolute() =>
-        {
-            let path = std::path::Path::new(shell);
-            match std::fs::metadata(path) {
-                Ok(metadata)
-                    if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 =>
-                {
-                    shell
-                }
-                Ok(_) | Err(_) => std::ffi::OsStr::new("/bin/sh"),
-            }
-        }
-        Some(_) | None => std::ffi::OsStr::new("/bin/sh"),
-    }
-}
-
-#[cfg(windows)]
-fn current_shell_command() -> CommandBuilder {
-    let configured = std::env::var_os("COMSPEC");
-    CommandBuilder::new(select_windows_shell(configured.as_deref()))
-}
-
-#[cfg(windows)]
-fn select_windows_shell(configured: Option<&std::ffi::OsStr>) -> &std::ffi::OsStr {
-    match configured {
-        Some(shell)
-            if !shell.is_empty()
-                && std::path::Path::new(shell).is_absolute()
-                && std::path::Path::new(shell).is_file() =>
-        {
-            shell
-        }
-        Some(_) | None => std::ffi::OsStr::new("cmd.exe"),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
 fn current_shell_command() -> CommandBuilder {
     CommandBuilder::new_default_prog()
 }
@@ -242,6 +196,11 @@ pub struct PtySession {
     drain_deadline: Option<tokio::time::Instant>,
     output_closed: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// The independently-driven bounded input half of a native PTY session.
+pub struct PtyInput {
+    input: Option<DuplexStream>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +244,22 @@ pub struct PtyEvent {
 }
 
 impl PtyEvent {
+    #[must_use]
+    pub(crate) const fn output(output: TerminalChunk) -> Self {
+        Self {
+            kind: PtyEventKind::Output,
+            output,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn exited(code: u32) -> Self {
+        Self {
+            kind: PtyEventKind::Exited(code),
+            output: TerminalChunk::new(),
+        }
+    }
+
     #[must_use]
     pub const fn kind(&self) -> PtyEventKind {
         self.kind
@@ -390,6 +365,12 @@ impl PtySession {
             .map_err(TerminalError::Io)
     }
 
+    fn take_input(&mut self) -> Result<PtyInput, TerminalError> {
+        Ok(PtyInput {
+            input: Some(self.input.take().ok_or(TerminalError::TaskStopped)?),
+        })
+    }
+
     /// Applies the platform PTY input-EOF semantics after queued bytes are written.
     #[cfg(not(windows))]
     pub fn close_input(&mut self) {
@@ -456,10 +437,7 @@ impl PtySession {
                         continue;
                     }
                     output.set_len(length)?;
-                    return Ok(PtyEvent {
-                        kind: PtyEventKind::Output,
-                        output,
-                    });
+                    return Ok(PtyEvent::output(output));
                 }
                 result = wait_task_result(&mut self.input_result) => {
                     self.input_result.take();
@@ -485,10 +463,7 @@ impl PtySession {
             let deadline = self.drain_deadline.ok_or(TerminalError::TaskStopped)?;
             match tokio::time::timeout_at(deadline, self.receive()).await {
                 Ok(Ok(Some(output))) => {
-                    return Ok(PtyEvent {
-                        kind: PtyEventKind::Output,
-                        output,
-                    });
+                    return Ok(PtyEvent::output(output));
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => return Err(error),
@@ -549,16 +524,79 @@ impl PtySession {
     }
 }
 
-impl TerminalSession for PtySession {
-    fn send(
-        &mut self,
-        chunk: TerminalChunk,
-    ) -> impl Future<Output = Result<(), TerminalError>> + Send {
-        PtySession::send(self, chunk)
+impl PtyInput {
+    #[cfg(not(windows))]
+    fn close(&mut self) {
+        self.input.take();
     }
 
-    fn close_input(&mut self) {
-        PtySession::close_input(self);
+    #[cfg(windows)]
+    const fn close(&mut self) {}
+}
+
+impl AsyncWrite for PtyInput {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let input = self
+            .input
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY input closed"));
+        match input {
+            Ok(input) => std::pin::Pin::new(input).poll_write(context, bytes),
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        let input = self
+            .input
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY input closed"));
+        match input {
+            Ok(input) => std::pin::Pin::new(input).poll_flush(context),
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        #[cfg(windows)]
+        {
+            let _ = (&mut self, context);
+            std::task::Poll::Ready(Ok(()))
+        }
+        #[cfg(not(windows))]
+        {
+            let input = self.input.as_mut().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY input closed")
+            });
+            match input {
+                Ok(input) => std::pin::Pin::new(input).poll_shutdown(context),
+                Err(error) => std::task::Poll::Ready(Err(error)),
+            }
+        }
+    }
+}
+
+impl TerminalInput for PtyInput {
+    fn close(&mut self) {
+        PtyInput::close(self);
+    }
+}
+
+impl TerminalSession for PtySession {
+    type Input = PtyInput;
+
+    fn take_input(&mut self) -> Result<Self::Input, TerminalError> {
+        PtySession::take_input(self)
     }
 
     fn resize(
@@ -675,23 +713,17 @@ async fn wait_task_result(
 }
 
 fn exited_event(code: u32) -> PtyEvent {
-    PtyEvent {
-        kind: PtyEventKind::Exited(code),
-        output: TerminalChunk::new(),
-    }
+    PtyEvent::exited(code)
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    #[cfg(unix)]
-    use super::select_unix_shell;
-    #[cfg(windows)]
-    use super::select_windows_shell;
     use super::{
         CHUNK_CAPACITY, ChildExit, CleanupDeadline, DUPLEX_CAPACITY, PortablePtyBackend,
         PtyEventKind, PtySession, TerminalBackend, TerminalChunk, TerminalError, TerminalSession,
-        copy_input, copy_output, exited_event, supervise_child, to_pty_size, wait_task_result,
+        copy_input, copy_output, current_shell_command, exited_event, supervise_child, to_pty_size,
+        wait_task_result,
     };
     use std::future::{Future as _, poll_fn};
     use std::io::{self, Cursor};
@@ -748,63 +780,9 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn unix_shell_selection_requires_an_existing_executable_file() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        assert_eq!(select_unix_shell(None), OsStr::new("/bin/sh"));
-        assert_eq!(
-            select_unix_shell(Some(OsStr::new(""))),
-            OsStr::new("/bin/sh")
-        );
-        assert_eq!(
-            select_unix_shell(Some(OsStr::new("bin/bash"))),
-            OsStr::new("/bin/sh")
-        );
-        assert_eq!(
-            select_unix_shell(Some(OsStr::from_bytes(b"/bin/ba\0sh"))),
-            OsStr::new("/bin/sh")
-        );
-        assert_eq!(
-            select_unix_shell(Some(OsStr::new("/definitely/missing/yonder-shell"))),
-            OsStr::new("/bin/sh")
-        );
-
-        let path =
-            std::env::temp_dir().join(format!("yonder-shell-selection-{}", std::process::id()));
-        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            select_unix_shell(Some(path.as_os_str())),
-            OsStr::new("/bin/sh")
-        );
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(select_unix_shell(Some(path.as_os_str())), path.as_os_str());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_shell_selection_requires_an_existing_absolute_file() {
-        use std::ffi::OsStr;
-
-        assert_eq!(select_windows_shell(None), OsStr::new("cmd.exe"));
-        assert_eq!(
-            select_windows_shell(Some(OsStr::new("cmd.exe"))),
-            OsStr::new("cmd.exe")
-        );
-        assert_eq!(
-            select_windows_shell(Some(OsStr::new("Z:\\missing\\yonder-shell.exe"))),
-            OsStr::new("cmd.exe")
-        );
-        let current = std::env::current_exe().unwrap();
-        assert_eq!(
-            select_windows_shell(Some(current.as_os_str())),
-            current.as_os_str()
-        );
+    fn shell_selection_uses_portable_pty_default_program_semantics() {
+        assert!(current_shell_command().is_default_prog());
     }
 
     #[tokio::test(flavor = "current_thread")]

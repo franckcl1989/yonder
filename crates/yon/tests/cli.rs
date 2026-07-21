@@ -19,6 +19,7 @@ fn invalid_connection_code_is_rejected_without_echoing_the_secret() {
         .args(["connect", secret])
         .current_dir(directory.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER")
         .output()
         .unwrap();
@@ -46,6 +47,7 @@ fn invalid_connection_code_is_rejected_without_echoing_the_secret() {
         ])
         .current_dir(directory.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER")
         .output()
         .unwrap();
@@ -74,6 +76,7 @@ fn config_check_and_sources_are_script_friendly() {
         .args(["config", "check"])
         .current_dir(directory.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER")
         .output()
         .unwrap();
@@ -85,6 +88,7 @@ fn config_check_and_sources_are_script_friendly() {
         .args(["config", "sources"])
         .current_dir(directory.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER")
         .output()
         .unwrap();
@@ -109,6 +113,7 @@ fn configuration_failures_retain_a_safe_actionable_cause() {
         .arg("host")
         .current_dir(directory.path())
         .env_remove("YON_RELAYS")
+        .env_remove("YON_WSS_CA")
         .env_remove("YON_WSS_CA_DER")
         .output()
         .unwrap();
@@ -138,6 +143,7 @@ fn invalid_wss_ca_fails_closed_for_both_endpoint_roles() {
             .args(arguments)
             .current_dir(directory.path())
             .env_remove("YON_RELAYS")
+            .env_remove("YON_WSS_CA")
             .env_remove("YON_WSS_CA_DER")
             .output()
             .unwrap();
@@ -146,6 +152,9 @@ fn invalid_wss_ca_fails_closed_for_both_endpoint_roles() {
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("failed to configure WSS TLS"));
-        assert!(stderr.contains("invalid peer certificate"));
+        assert!(
+            stderr.contains("invalid peer certificate"),
+            "unexpected WSS diagnostic: {stderr}"
+        );
     }
 }

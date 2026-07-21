@@ -655,8 +655,11 @@ dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",
  "document-features",
+ "mio",
  "parking_lot",
  "rustix",
+ "signal-hook",
+ "signal-hook-mio",
  "winapi",
 ]
 
@@ -2277,6 +2280,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -3392,6 +3396,27 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook",
+]
 
 [[package]]
 name = "signal-hook-registry"
@@ -4514,6 +4539,7 @@ dependencies = [
  "clap",
  "criterion",
  "crossterm",
+ "crossterm_winapi",
  "opaque-ke",
  "portable-pty",
  "proptest",
@@ -4539,7 +4565,6 @@ name = "yon-relay"
 version = "0.1.0"
 dependencies = [
  "clap",
- "proptest",
  "serde",
  "tempfile",
  "thiserror 2.0.19",
@@ -4571,7 +4596,6 @@ dependencies = [
  "proptest",
  "rand 0.8.7",
  "thiserror 2.0.19",
- "tracing",
  "zeroize",
 ]
 
@@ -4579,7 +4603,6 @@ dependencies = [
 name = "yonder-net"
 version = "0.1.0"
 dependencies = [
- "backon",
  "criterion",
  "futures",
  "libp2p",

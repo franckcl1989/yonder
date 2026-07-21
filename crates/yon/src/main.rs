@@ -22,12 +22,12 @@ use yon::progress::OperationProgress;
 use yon::protocol::RelayProtocolError;
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
-    LayeredConfigLoader,
+    ConfigurationValues, LayeredConfigLoader,
 };
 use yonder_core::{CodeError, ConnectionCode, OsSecureRandom, write_error_report};
 use yonder_net::{
-    AddressError, EndpointRelayAddress, EndpointRelaySet, NetworkBuildError, WssTransportConfig,
-    generate_identity,
+    AddressError, EndpointRelayAddress, EndpointRelaySet, NetworkBuildError, WSS_CERTIFICATE_LIMIT,
+    WssTransportConfig, WssTrustAnchors, generate_identity,
 };
 use zeroize::Zeroizing;
 
@@ -36,9 +36,14 @@ const MAX_CODE_TEXT: usize = 19;
 const RUNTIME_STACK_SIZE: usize = 8 * 1024 * 1024;
 const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const RELAYS_KEY: ConfigurationKey = ConfigurationKey::new("relays");
+const WSS_CA_KEY: ConfigurationKey = ConfigurationKey::new("wss_ca");
 const WSS_CA_DER_KEY: ConfigurationKey = ConfigurationKey::new("wss_ca_der");
-const ENDPOINT_SCHEMA: ConfigurationSchema =
-    ConfigurationSchema::new(Application::Yon, &[RELAYS_KEY], &[WSS_CA_DER_KEY]);
+const ENDPOINT_SCHEMA: ConfigurationSchema = ConfigurationSchema::new(
+    Application::Yon,
+    &[RELAYS_KEY, WSS_CA_KEY, WSS_CA_DER_KEY],
+    &[],
+    &[WSS_CA_KEY, WSS_CA_DER_KEY],
+);
 
 #[derive(Debug, Parser)]
 #[command(name = "yon", version, about)]
@@ -117,7 +122,8 @@ impl std::fmt::Debug for ConnectionCodeArgument {
 #[serde(deny_unknown_fields)]
 struct EndpointSettings {
     relays: Vec<String>,
-    wss_ca_der: Option<PathBuf>,
+    wss_ca: Option<ConfigurationValues<PathBuf>>,
+    wss_ca_der: Option<ConfigurationValues<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -165,20 +171,24 @@ enum AppError {
     RelaySet(#[from] AddressError),
     #[error("failed to load endpoint configuration: {0}")]
     Configuration(#[from] ConfigurationError),
-    #[error("failed to inspect configuration source {path}: {source}")]
-    ConfigurationSource {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("failed to report configuration status")]
     ConfigurationOutput(#[source] std::io::Error),
     #[error("failed to create an ephemeral endpoint identity: {0}")]
     Identity(#[from] NetworkBuildError),
-    #[error("failed to read the WSS CA document: {0}")]
-    CaRead(#[source] std::io::Error),
-    #[error("the WSS CA document exceeds the 1 MiB limit")]
-    CaTooLarge,
+    #[error("the WSS trust configuration is invalid: {0}")]
+    WssConfiguration(#[source] NetworkBuildError),
+    #[error("wss_ca and the legacy wss_ca_der setting cannot both be configured")]
+    ConflictingWssCa,
+    #[error("wss_ca must contain between 1 and {WSS_CERTIFICATE_LIMIT} document paths")]
+    InvalidWssCaDocumentCount,
+    #[error("failed to read the WSS CA document {path}: {source}")]
+    CaRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the WSS CA document exceeds the 1 MiB limit: {0}")]
+    CaTooLarge(PathBuf),
     #[error("failed to construct the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("failed to start the endpoint runtime thread: {0}")]
@@ -392,73 +402,11 @@ fn map_controller_error(error: ControllerError) -> AppError {
 fn report_configuration_sources() -> Result<u32, AppError> {
     let loader = LayeredConfigLoader::system(ENDPOINT_SCHEMA);
     let locations = loader.locations()?;
-    let system = configuration_file_status(locations.system_file())?;
-    let working = configuration_file_status(locations.working_file())?;
-    write_configuration_sources(
-        &mut std::io::stdout().lock(),
-        locations.system_file(),
-        system,
-        locations.working_file(),
-        working,
-    )
-    .map_err(AppError::ConfigurationOutput)?;
+    locations
+        .inspect()?
+        .write_to(&mut std::io::stdout().lock())
+        .map_err(AppError::ConfigurationOutput)?;
     Ok(0)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigurationFileStatus {
-    Present,
-    Missing,
-    NotRegular,
-}
-
-impl std::fmt::Display for ConfigurationFileStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Present => "present",
-            Self::Missing => "missing",
-            Self::NotRegular => "not a regular file",
-        })
-    }
-}
-
-fn configuration_file_status(path: &Path) -> Result<ConfigurationFileStatus, AppError> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(ConfigurationFileStatus::Present),
-        Ok(_) => Ok(ConfigurationFileStatus::NotRegular),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(ConfigurationFileStatus::Missing)
-        }
-        Err(source) => Err(AppError::ConfigurationSource {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn write_configuration_sources(
-    output: &mut impl std::io::Write,
-    system_file: &Path,
-    system_status: ConfigurationFileStatus,
-    working_file: &Path,
-    working_status: ConfigurationFileStatus,
-) -> std::io::Result<()> {
-    writeln!(output, "Configuration precedence (lowest to highest):")?;
-    writeln!(
-        output,
-        "1. System file: {} ({system_status})",
-        system_file.display()
-    )?;
-    writeln!(
-        output,
-        "2. Working-directory file: {} ({working_status})",
-        working_file.display()
-    )?;
-    writeln!(
-        output,
-        "3. Environment variables: {}_* (values hidden)",
-        Application::Yon.configuration_environment_prefix()
-    )
 }
 
 enum TerminalColumns {
@@ -693,12 +641,27 @@ fn endpoint_config_with(
     loader: &impl ConfigLoader<EndpointSettings>,
 ) -> Result<(EndpointRelaySet, WssTransportConfig), AppError> {
     let loaded = loader.load()?;
-    let ca_path = loaded
-        .value()
-        .wss_ca_der
-        .as_deref()
-        .map(|path| loaded.resolve_path(WSS_CA_DER_KEY, path))
-        .transpose()?;
+    let ca_paths = match (&loaded.value().wss_ca, &loaded.value().wss_ca_der) {
+        (Some(paths), Some(_))
+            if loaded.compare_source_precedence(WSS_CA_KEY, WSS_CA_DER_KEY)
+                == Some(std::cmp::Ordering::Greater) =>
+        {
+            Some((WSS_CA_KEY, paths.as_slice()))
+        }
+        (Some(_), Some(paths))
+            if loaded.compare_source_precedence(WSS_CA_KEY, WSS_CA_DER_KEY)
+                == Some(std::cmp::Ordering::Less) =>
+        {
+            Some((WSS_CA_DER_KEY, paths.as_slice()))
+        }
+        (Some(_), Some(_)) => return Err(AppError::ConflictingWssCa),
+        (Some(paths), None) => Some((WSS_CA_KEY, paths.as_slice())),
+        (None, Some(paths)) => Some((WSS_CA_DER_KEY, paths.as_slice())),
+        (None, None) => None,
+    };
+    if ca_paths.is_some_and(|(_, paths)| !(1..=WSS_CERTIFICATE_LIMIT).contains(&paths.len())) {
+        return Err(AppError::InvalidWssCaDocumentCount);
+    }
     let relay_addresses = loaded
         .value()
         .relays
@@ -706,25 +669,55 @@ fn endpoint_config_with(
         .map(|address| address.parse::<EndpointRelayAddress>())
         .collect::<Result<Vec<_>, _>>()?;
     let relays = EndpointRelaySet::new(relay_addresses)?;
-    let ca = ca_path.as_deref().map(read_ca).transpose()?;
-    Ok((relays, WssTransportConfig::client(ca)))
+    let ca_documents = ca_paths
+        .into_iter()
+        .flat_map(|(key, paths)| paths.iter().map(move |path| (key, path)))
+        .map(|(key, path)| {
+            let path = loaded.resolve_path(key, path)?;
+            read_ca(&path)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let trust =
+        WssTrustAnchors::from_documents(ca_documents).map_err(AppError::WssConfiguration)?;
+    let wss = WssTransportConfig::client_with_trust(trust);
+    wss.validate_tls_material()
+        .map_err(AppError::WssConfiguration)?;
+    Ok((relays, wss))
 }
 
 fn read_ca(path: &Path) -> Result<Vec<u8>, AppError> {
-    let file = File::open(path).map_err(AppError::CaRead)?;
-    let reported_len = file.metadata().map_err(AppError::CaRead)?.len();
-    read_ca_document(file, reported_len)
+    let file = File::open(path).map_err(|source| AppError::CaRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reported_len = file
+        .metadata()
+        .map_err(|source| AppError::CaRead {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    read_ca_document(file, reported_len, path)
 }
 
-fn read_ca_document(reader: impl Read, reported_len: u64) -> Result<Vec<u8>, AppError> {
+fn read_ca_document(
+    reader: impl Read,
+    reported_len: u64,
+    path: &Path,
+) -> Result<Vec<u8>, AppError> {
     if reported_len > MAX_CA_DOCUMENT {
-        return Err(AppError::CaTooLarge);
+        return Err(AppError::CaTooLarge(path.to_path_buf()));
     }
     let mut bytes = Vec::new();
     let mut bounded = reader.take(MAX_CA_DOCUMENT + 1);
-    bounded.read_to_end(&mut bytes).map_err(AppError::CaRead)?;
+    bounded
+        .read_to_end(&mut bytes)
+        .map_err(|source| AppError::CaRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if bytes.len() as u64 > MAX_CA_DOCUMENT {
-        return Err(AppError::CaTooLarge);
+        return Err(AppError::CaTooLarge(path.to_path_buf()));
     }
     Ok(bytes)
 }
@@ -761,12 +754,11 @@ fn write_remote_exit_warning(output: &mut impl std::io::Write, code: u32) -> std
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppError, Cli, Command, ConfigCommand, ConfigurationFileStatus, ConnectionCodeArgument,
-        ENDPOINT_SCHEMA, LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
-        command_uses_terminal_ui, configuration_file_status, diagnostic_filter,
-        endpoint_config_with, map_controller_error, open_diagnostic_log, portable_process_exit,
-        process_result, read_ca, read_ca_document, read_connection_code_from, run,
-        terminal_supports_progress, validate_diagnostic_output, write_configuration_sources,
+        AppError, Cli, Command, ConfigCommand, ConnectionCodeArgument, ENDPOINT_SCHEMA,
+        LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
+        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, map_controller_error,
+        open_diagnostic_log, portable_process_exit, process_result, read_ca, read_ca_document,
+        read_connection_code_from, run, terminal_supports_progress, validate_diagnostic_output,
         write_remote_exit_warning,
     };
     use clap::Parser;
@@ -783,6 +775,8 @@ mod tests {
     use yon::progress::OperationProgress as _;
     use yonder_config::{ConfigurationLocationError, ConfigurationSources, LayeredConfigLoader};
     use yonder_net::Keypair;
+
+    const TEST_CA_DER: &[u8] = include_bytes!("../tests/fixtures/localhost-test-ca.der");
 
     #[test]
     fn configuration_driven_cli_shape_parses() {
@@ -1120,11 +1114,14 @@ mod tests {
         );
 
         for error in [
-            AppError::CaTooLarge,
+            AppError::CaTooLarge(PathBuf::from("ca.der")),
             AppError::InteractiveDiagnostics,
             AppError::RuntimePanicked,
             AppError::CodeRead(io::Error::other("connection code read failed")),
-            AppError::CaRead(io::Error::other("CA read failed")),
+            AppError::CaRead {
+                path: PathBuf::from("ca.der"),
+                source: io::Error::other("CA read failed"),
+            },
             AppError::Runtime(io::Error::other("runtime construction failed")),
             AppError::RuntimeThread(io::Error::other("runtime thread failed")),
         ] {
@@ -1256,71 +1253,48 @@ mod tests {
 
     #[test]
     fn configuration_source_report_is_ordered_and_hides_values() {
+        let directory = test_directory("configuration-report");
+        fs::create_dir_all(directory.join("system")).unwrap();
+        fs::write(directory.join("system").join("yon.toml"), "relays = []\n").unwrap();
+        let locations = test_loader(directory.clone()).locations().unwrap();
         let mut output = Vec::new();
-        write_configuration_sources(
-            &mut output,
-            std::path::Path::new("/system/yon.toml"),
-            ConfigurationFileStatus::Present,
-            std::path::Path::new("/working/yon.toml"),
-            ConfigurationFileStatus::Missing,
-        )
-        .unwrap();
+        locations.inspect().unwrap().write_to(&mut output).unwrap();
         let report = String::from_utf8(output).unwrap();
-        assert_eq!(
-            report,
-            concat!(
-                "Configuration precedence (lowest to highest):\n",
-                "1. System file: /system/yon.toml (present)\n",
-                "2. Working-directory file: /working/yon.toml (missing)\n",
-                "3. Environment variables: YON_* (values hidden)\n",
-            )
+        let system = directory.join("system").join("yon.toml");
+        let working = directory.join("yon.toml");
+        assert!(report.starts_with("Configuration precedence (lowest to highest):\n"));
+        assert!(
+            report.contains(&format!("1. System file: {} (present)", system.display())),
+            "{report}"
         );
+        assert!(report.contains(&format!(
+            "2. Working-directory file: {} (missing)",
+            working.display()
+        )));
+        assert!(report.ends_with("3. Environment variables: YON_* (values hidden)\n"));
         assert!(!report.contains("relays ="));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn user_facing_reports_propagate_each_output_failure() {
+        let directory = test_directory("configuration-report-failure");
+        let locations = test_loader(directory.clone()).locations().unwrap();
+        let report = locations.inspect().unwrap();
         for completed_reports in 0..4 {
             assert!(
-                write_configuration_sources(
-                    &mut FailAfterReports::new(completed_reports),
-                    std::path::Path::new("/system/yon.toml"),
-                    ConfigurationFileStatus::Present,
-                    std::path::Path::new("/working/yon.toml"),
-                    ConfigurationFileStatus::Missing,
-                )
-                .is_err()
+                report
+                    .write_to(&mut FailAfterReports::new(completed_reports))
+                    .is_err()
             );
         }
         assert!(write_remote_exit_warning(&mut FailAfterReports::new(0), 256).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn configuration_status_and_diagnostic_log_failures_are_structured() {
         let directory = test_directory("configuration-status");
-        let present = directory.join("present.toml");
-        fs::write(&present, "relays = []\n").unwrap();
-        assert_eq!(
-            configuration_file_status(&present).unwrap(),
-            ConfigurationFileStatus::Present
-        );
-        assert_eq!(
-            configuration_file_status(&directory).unwrap(),
-            ConfigurationFileStatus::NotRegular
-        );
-        assert_eq!(
-            ConfigurationFileStatus::NotRegular.to_string(),
-            "not a regular file"
-        );
-        assert_eq!(
-            configuration_file_status(&directory.join("missing.toml")).unwrap(),
-            ConfigurationFileStatus::Missing
-        );
-        assert!(matches!(
-            configuration_file_status(std::path::Path::new("\0")),
-            Err(AppError::ConfigurationSource { .. })
-        ));
-
         assert!(matches!(
             open_diagnostic_log(&directory),
             Err(AppError::LogFile { .. })
@@ -1345,8 +1319,58 @@ mod tests {
         )
         .unwrap();
         let loader = test_loader(directory.clone());
+        assert!(matches!(
+            endpoint_config_with(&loader),
+            Err(AppError::WssConfiguration(_))
+        ));
+        fs::write(&path, TEST_CA_DER).unwrap();
         let (_, wss) = endpoint_config_with(&loader).unwrap();
-        assert!(format!("{wss:?}").contains("has_additional_ca: true"));
+        assert!(format!("{wss:?}").contains("additional_trust_count: 1"));
+
+        fs::write(
+            directory.join("yon.toml"),
+            format!(
+                "relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\nwss_ca = ['ca.der', 'ca.der']\n"
+            ),
+        )
+        .unwrap();
+        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        assert!(format!("{wss:?}").contains("additional_trust_count: 2"));
+
+        fs::create_dir(directory.join("system")).unwrap();
+        fs::write(
+            directory.join("system").join("yon.toml"),
+            "wss_ca_der = 'legacy-invalid.der'\n",
+        )
+        .unwrap();
+        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        assert!(format!("{wss:?}").contains("additional_trust_count: 2"));
+
+        fs::write(
+            directory.join("yon.toml"),
+            format!(
+                "relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\nwss_ca = 'ca.der'\nwss_ca_der = 'ca.der'\n"
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            endpoint_config_with(&loader),
+            Err(AppError::ConflictingWssCa)
+        ));
+
+        fs::write(
+            directory.join("system").join("yon.toml"),
+            "wss_ca = 'legacy-invalid.der'\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("yon.toml"),
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\nwss_ca_der = 'ca.der'\n"),
+        )
+        .unwrap();
+        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        assert!(format!("{wss:?}").contains("additional_trust_count: 1"));
+        fs::remove_file(directory.join("system").join("yon.toml")).unwrap();
 
         fs::write(
             directory.join("yon.toml"),
@@ -1354,7 +1378,22 @@ mod tests {
         )
         .unwrap();
         let (_, wss) = endpoint_config_with(&loader).unwrap();
-        assert!(format!("{wss:?}").contains("has_additional_ca: false"));
+        assert!(format!("{wss:?}").contains("additional_trust_count: 0"));
+
+        for paths in [
+            "[]",
+            "['ca.der','ca.der','ca.der','ca.der','ca.der','ca.der','ca.der','ca.der','ca.der']",
+        ] {
+            fs::write(
+                directory.join("yon.toml"),
+                format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\nwss_ca = {paths}\n"),
+            )
+            .unwrap();
+            assert!(matches!(
+                endpoint_config_with(&loader),
+                Err(AppError::InvalidWssCaDocumentCount)
+            ));
+        }
 
         fs::write(
             directory.join("yon.toml"),
@@ -1379,7 +1418,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             endpoint_config_with(&loader),
-            Err(AppError::CaRead(_))
+            Err(AppError::CaRead { .. })
         ));
 
         fs::write(directory.join("yon.toml"), "relays = 1\n").unwrap();
@@ -1389,21 +1428,22 @@ mod tests {
         ));
 
         fs::write(&path, vec![0; 1024 * 1024 + 1]).unwrap();
-        assert!(matches!(read_ca(&path), Err(AppError::CaTooLarge)));
+        assert!(matches!(read_ca(&path), Err(AppError::CaTooLarge(_))));
+        let fixture_path = std::path::Path::new("ca.der");
         assert!(matches!(
-            read_ca_document(Cursor::new(vec![0; 1024 * 1024 + 1]), 0),
-            Err(AppError::CaTooLarge)
+            read_ca_document(Cursor::new(vec![0; 1024 * 1024 + 1]), 0, fixture_path),
+            Err(AppError::CaTooLarge(_))
         ));
         assert!(matches!(
-            read_ca_document(Cursor::new([]), 1024 * 1024 + 1),
-            Err(AppError::CaTooLarge)
+            read_ca_document(Cursor::new([]), 1024 * 1024 + 1, fixture_path),
+            Err(AppError::CaTooLarge(_))
         ));
         assert!(matches!(
-            read_ca_document(FailingReader, 0),
-            Err(AppError::CaRead(_))
+            read_ca_document(FailingReader, 0, fixture_path),
+            Err(AppError::CaRead { .. })
         ));
         fs::remove_file(&path).unwrap();
-        assert!(matches!(read_ca(&path), Err(AppError::CaRead(_))));
+        assert!(matches!(read_ca(&path), Err(AppError::CaRead { .. })));
 
         let first = Keypair::generate_ed25519().public().to_peer_id();
         let second = Keypair::generate_ed25519().public().to_peer_id();

@@ -10,9 +10,10 @@ use crate::protocol::{
     release_locator_bound,
 };
 use crate::terminal::{
-    PortablePtyBackend, PtyEventKind, TerminalBackend, TerminalChunk, TerminalError,
+    PortablePtyBackend, PtyEventKind, TerminalBackend, TerminalError, TerminalInput,
     TerminalSession,
 };
+use std::convert::Infallible;
 use std::future::Future;
 use std::time::Duration;
 use thiserror::Error;
@@ -75,24 +76,28 @@ pub enum HostStage {
 mod tests {
     use super::{
         EXCHANGE_TIMEOUT, HostConfig, HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair,
-        binding_event, host_error_event, read_auth_hello_io, read_terminal_hello_io,
-        report_connection_code_to, report_replacement_notice_to, retryable_relay_error, run_host,
-        run_host_with, run_host_with_progress, send_auth_retry_io, start_terminal_io,
-        write_authenticated_io, write_terminal_ready_io,
+        binding_event, copy_controller_input, copy_terminal_output, host_error_event,
+        read_auth_hello_io, read_terminal_hello_io, report_connection_code_to,
+        report_replacement_notice_to, retryable_relay_error, run_host, run_host_with,
+        run_host_with_progress, send_auth_retry_io, start_terminal_io, write_authenticated_io,
+        write_terminal_ready_io,
     };
     use crate::network::EndpointError;
     use crate::progress::NoopProgress;
     use crate::protocol::RelayProtocolError;
     use crate::terminal::{
-        PtyEvent, TerminalBackend, TerminalChunk, TerminalError, TerminalSession,
+        PtyEvent, TerminalBackend, TerminalChunk, TerminalError, TerminalInput, TerminalSession,
     };
+    use std::collections::VecDeque;
     use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
     use yonder_core::wire::auth::{AuthClientHello, AuthServerResponse, CLIENT_HELLO_LEN};
-    use yonder_core::wire::terminal::{MAX_HELLO_LEN, TerminalHello};
+    use yonder_core::wire::terminal::{MAX_HELLO_LEN, TerminalExit, TerminalHello};
     use yonder_core::{
         ConnectionCode, Locator, PakeSecret, SessionEvent, TerminalSize, TerminalValue,
     };
@@ -411,6 +416,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn terminal_pumps_make_progress_under_bidirectional_backpressure() {
+        const PAYLOAD_LEN: usize = 128 * 1024;
+        const EXIT_CODE: u32 = 37;
+        let controller_payload = patterned_bytes(PAYLOAD_LEN, 3);
+        let terminal_payload = patterned_bytes(PAYLOAD_LEN, 11);
+        let mut events = terminal_payload
+            .chunks(16 * 1024)
+            .map(|bytes| {
+                let mut chunk = TerminalChunk::new();
+                chunk.writable()[..bytes.len()].copy_from_slice(bytes);
+                chunk.set_len(bytes.len()).unwrap();
+                PtyEvent::output(chunk)
+            })
+            .collect::<VecDeque<_>>();
+        events.push_back(PtyEvent::exited(EXIT_CODE));
+        let mut session = PumpSession { events };
+
+        let (host_data, controller_data) = tokio::io::duplex(31);
+        let (mut host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (mut controller_data_read, mut controller_data_write) =
+            tokio::io::split(controller_data);
+        let (host_control, controller_control) = tokio::io::duplex(31);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        let (mut controller_control_read, controller_control_write) =
+            tokio::io::split(controller_control);
+        let (pty_input, mut captured_input) = tokio::io::duplex(31);
+        let mut pty_input = DuplexInput(pty_input);
+
+        let host = async {
+            let input = copy_controller_input(&mut host_data_read, &mut pty_input);
+            let output = copy_terminal_output(
+                &mut session,
+                &mut host_data_write,
+                &mut host_control_read,
+                &mut host_control_write,
+            );
+            tokio::pin!(input);
+            tokio::pin!(output);
+            tokio::select! {
+                result = &mut input => match result {
+                    Ok(never) => match never {},
+                    Err(error) => Err(error),
+                },
+                result = &mut output => result,
+            }
+        };
+        let controller = async {
+            let _control_writer = controller_control_write;
+            controller_data_write.write_all(&controller_payload).await?;
+            controller_data_write.shutdown().await?;
+            let mut output = Vec::with_capacity(PAYLOAD_LEN);
+            controller_data_read.read_to_end(&mut output).await?;
+            let mut exit = [0_u8; 5];
+            controller_control_read.read_exact(&mut exit).await?;
+            Ok::<_, std::io::Error>((output, TerminalExit::decode(&exit).unwrap()))
+        };
+        let capture = async {
+            let mut input = vec![0_u8; PAYLOAD_LEN];
+            captured_input.read_exact(&mut input).await?;
+            Ok::<_, std::io::Error>(input)
+        };
+
+        let (host, controller, captured) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(host, controller, capture)
+        })
+        .await
+        .expect("full-duplex terminal pumps deadlocked");
+        assert_eq!(host.unwrap(), EXIT_CODE);
+        let (output, exit) = controller.unwrap();
+        assert_eq!(output, terminal_payload);
+        assert_eq!(exit.code(), EXIT_CODE);
+        assert_eq!(captured.unwrap(), controller_payload);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn every_public_host_entry_rejects_invalid_tls_before_network_activity() {
         let invalid_config = || {
             let relay_identity = Keypair::generate_ed25519();
@@ -485,12 +565,97 @@ mod tests {
         fail_shutdown: bool,
     }
 
-    impl TerminalSession for TestSession {
-        async fn send(&mut self, _chunk: TerminalChunk) -> Result<(), TerminalError> {
+    #[derive(Debug)]
+    struct TestInput;
+
+    struct DuplexInput(tokio::io::DuplexStream);
+
+    impl AsyncWrite for DuplexInput {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.0).poll_write(context, bytes)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.0).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.0).poll_shutdown(context)
+        }
+    }
+
+    impl TerminalInput for DuplexInput {
+        fn close(&mut self) {}
+    }
+
+    struct PumpSession {
+        events: VecDeque<PtyEvent>,
+    }
+
+    impl TerminalSession for PumpSession {
+        type Input = TestInput;
+
+        fn take_input(&mut self) -> Result<Self::Input, TerminalError> {
+            Ok(TestInput)
+        }
+
+        async fn resize(&mut self, _size: TerminalSize) -> Result<(), TerminalError> {
             Ok(())
         }
 
-        fn close_input(&mut self) {}
+        async fn next(&mut self) -> Result<PtyEvent, TerminalError> {
+            self.events.pop_front().ok_or(TerminalError::TaskStopped)
+        }
+
+        async fn shutdown(self) -> Result<(), TerminalError> {
+            Ok(())
+        }
+    }
+
+    impl AsyncWrite for TestInput {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TerminalInput for TestInput {
+        fn close(&mut self) {}
+    }
+
+    impl TerminalSession for TestSession {
+        type Input = TestInput;
+
+        fn take_input(&mut self) -> Result<Self::Input, TerminalError> {
+            Ok(TestInput)
+        }
 
         async fn resize(&mut self, _size: TerminalSize) -> Result<(), TerminalError> {
             Ok(())
@@ -508,6 +673,12 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    fn patterned_bytes(length: usize, seed: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| ((index + seed) % 251) as u8)
+            .collect()
     }
 }
 
@@ -645,7 +816,7 @@ async fn establish_host_relay(
                     continue;
                 }
             },
-            signal = tokio::signal::ctrl_c() => {
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 return Err(HostError::Interrupted);
             }
@@ -664,7 +835,7 @@ async fn establish_host_relay(
                 HostStage::ReservingRelay,
                 wait_for_reservation(driver, relay, listener),
             ) => result,
-            signal = tokio::signal::ctrl_c() => {
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 driver.remove_reservation(listener);
                 return Err(HostError::Interrupted);
@@ -709,7 +880,7 @@ async fn initialize_host_relay(
                 progress,
                 AdvertisementNotice::Initial,
             ) => Some(result),
-            signal = tokio::signal::ctrl_c() => {
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 None
             }
@@ -743,7 +914,7 @@ async fn wait_for_host_retry(
         .expect("the frozen host relay backoff is unbounded");
     tokio::select! {
         () = wait_with_progress(progress, stage, tokio::time::sleep(delay)) => Ok(()),
-        signal = tokio::signal::ctrl_c() => {
+        signal = crate::shutdown::endpoint_shutdown_signal() => {
             signal?;
             Err(HostError::Interrupted)
         }
@@ -885,7 +1056,7 @@ impl RelayRecovery<'_> {
                         self.advertised.locator,
                     ),
                 ) => Some(result),
-                signal = tokio::signal::ctrl_c() => {
+                signal = crate::shutdown::endpoint_shutdown_signal() => {
                     signal?;
                     None
                 }
@@ -912,7 +1083,7 @@ impl RelayRecovery<'_> {
                             progress,
                             AdvertisementNotice::Replacement,
                         ) => Some(result),
-                        signal = tokio::signal::ctrl_c() => {
+                        signal = crate::shutdown::endpoint_shutdown_signal() => {
                             signal?;
                             None
                         }
@@ -1225,7 +1396,7 @@ async fn wait_for_controller_quiescence(
                 driver.close_peer_and_wait(controller).await?;
                 return Err(EndpointError::TargetUpgradeDidNotSettle.into());
             }
-            signal = tokio::signal::ctrl_c() => {
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 return Err(HostError::Interrupted);
             }
@@ -1257,7 +1428,7 @@ async fn wait_for_auth(
             }
             stream = incoming.data.next() => drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?),
             stream = incoming.control.next() => drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?),
-            signal = tokio::signal::ctrl_c() => {
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 return Err(HostError::Interrupted);
             }
@@ -1294,7 +1465,7 @@ async fn drive_session_inputs<F: Future>(
                 driver.enforce_binding(binding)?;
                 return Ok(output);
             }
-            signal = tokio::signal::ctrl_c() => {
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 return Err(HostError::Interrupted);
             }
@@ -1435,7 +1606,7 @@ async fn acknowledge_and_wait_for_terminal_streams(
                 terminal_deadline = Some(tokio::time::Instant::now() + EXCHANGE_TIMEOUT);
             }
             () = tokio::time::sleep_until(deadline) => return Err(HostError::Timeout),
-            signal = tokio::signal::ctrl_c() => {
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 return Err(HostError::Interrupted);
             }
@@ -1587,12 +1758,16 @@ async fn bridge_terminal<S: TerminalSession>(
 ) -> Result<u32, HostError> {
     let (mut data_read, mut data_write) = tokio::io::split(data.into_tokio());
     let (mut control_read, mut control_write) = tokio::io::split(control.into_tokio());
-    let mut controller_input_open = true;
-    loop {
-        let mut input = TerminalChunk::new();
-        let mut resize = [0_u8; 5];
-        tokio::select! {
-            biased;
+    let mut pty_input = pty.take_input()?;
+    let result = {
+        let controller_input = copy_controller_input(&mut data_read, &mut pty_input);
+        let terminal_output =
+            copy_terminal_output(pty, &mut data_write, &mut control_read, &mut control_write);
+        tokio::pin!(controller_input);
+        tokio::pin!(terminal_output);
+        loop {
+            driver.enforce_binding(binding)?;
+            tokio::select! {
             event = driver.next() => match event {
                 EndpointEvent::Established { peer, .. } | EndpointEvent::Closed { peer, .. }
                     if peer == binding.peer() => driver.enforce_binding(binding)?,
@@ -1608,41 +1783,67 @@ async fn bridge_terminal<S: TerminalSession>(
             stream = incoming.control.next() => {
                 drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
             }
-            read = data_read.read(input.writable()), if controller_input_open => {
-                let length = read?;
-                tracing::debug!(length, "remote terminal input read completed");
-                if length == 0 {
-                    pty.close_input();
-                    controller_input_open = false;
-                    continue;
-                }
-                input.set_len(length)?;
-                drive_bound(driver, binding, pty.send(input)).await??;
+            result = &mut controller_input => match result {
+                Ok(never) => match never {},
+                Err(error) => break Err(error),
+            },
+            result = &mut terminal_output => {
+                break result;
             }
+            signal = crate::shutdown::endpoint_shutdown_signal() => {
+                signal?;
+                break Err(HostError::Interrupted);
+            }
+            }
+        }
+    };
+    drop(pty_input);
+    result
+}
+
+async fn copy_controller_input(
+    data_read: &mut (impl tokio::io::AsyncRead + Unpin),
+    pty_input: &mut impl TerminalInput,
+) -> Result<Infallible, HostError> {
+    tokio::io::copy(data_read, pty_input).await?;
+    pty_input.flush().await?;
+    pty_input.close();
+    std::future::pending().await
+}
+
+async fn copy_terminal_output<S: TerminalSession>(
+    pty: &mut S,
+    data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    control_read: &mut (impl tokio::io::AsyncRead + Unpin),
+    control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<u32, HostError> {
+    loop {
+        let mut resize = [0_u8; 5];
+        tokio::select! {
             read = control_read.read_exact(&mut resize) => {
                 read?;
                 let resize = TerminalResize::decode(&resize)?;
-                drive_bound(driver, binding, pty.resize(resize.size())).await??;
+                pty.resize(resize.size()).await?;
+                tokio::task::yield_now().await;
             }
             event = pty.next() => {
                 let event = event?;
                 match event.kind() {
-                PtyEventKind::Output => {
-                    let output = event.into_output();
-                    drive_bound(driver, binding, data_write.write_all(output.as_slice())).await??;
-                    drive_bound(driver, binding, data_write.flush()).await??;
+                    PtyEventKind::Output => {
+                        let output = event.into_output();
+                        data_write.write_all(output.as_slice()).await?;
+                        data_write.flush().await?;
+                        tokio::task::yield_now().await;
+                    }
+                    PtyEventKind::Exited(code) => {
+                        data_write.shutdown().await?;
+                        control_write
+                            .write_all(&TerminalExit::new(code).encode())
+                            .await?;
+                        control_write.shutdown().await?;
+                        return Ok(code);
+                    }
                 }
-                PtyEventKind::Exited(code) => {
-                    drive_bound(driver, binding, data_write.shutdown()).await??;
-                    drive_bound(driver, binding, control_write.write_all(&TerminalExit::new(code).encode())).await??;
-                    drive_bound(driver, binding, control_write.shutdown()).await??;
-                    return Ok(code);
-                }
-                }
-            },
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                return Err(HostError::Interrupted);
             }
         }
     }

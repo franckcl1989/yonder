@@ -87,6 +87,7 @@ impl RelayServeConfig {
         }
         if wss.is_server() {
             wss.validate_server_material()?;
+            wss.validate_tls_material()?;
         }
         for address in &external {
             wss.validate_server_for(address).map_err(|source| {

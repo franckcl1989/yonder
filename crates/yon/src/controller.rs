@@ -7,6 +7,7 @@ use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
 use crate::protocol::{RelayProtocolError, ResolveDeadline, resolve_peer};
 use crate::terminal::TerminalChunk;
 use backon::{BackoffBuilder as _, ConstantBuilder};
+use std::convert::Infallible;
 use std::io::IsTerminal as _;
 use std::time::Duration;
 use thiserror::Error;
@@ -34,6 +35,9 @@ const RETRY_LIMIT: usize = 20;
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const REMOTE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_ESCAPE: u8 = 0x1d;
+const UTF8_SEQUENCE_CAPACITY: usize = 4;
+const UTF8_OUTPUT_BATCH_CAPACITY: usize = 4 * 1024;
+const UTF8_REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
 
 trait TerminalFrontend {
     type Input: tokio::io::AsyncRead + Unpin;
@@ -48,8 +52,166 @@ trait TerminalFrontend {
         drop(guard);
         Ok(())
     }
+    fn restore_display(&self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
     fn input(&mut self) -> Self::Input;
     fn output(&mut self) -> Self::Output;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteTerminalOutputMode {
+    Bytes,
+    WindowsConsoleUtf8,
+}
+
+impl RemoteTerminalOutputMode {
+    const fn native(output_is_terminal: bool) -> Self {
+        if cfg!(windows) && output_is_terminal {
+            Self::WindowsConsoleUtf8
+        } else {
+            Self::Bytes
+        }
+    }
+}
+
+struct RemoteTerminalOutput {
+    mode: RemoteTerminalOutputMode,
+    pending: [u8; UTF8_SEQUENCE_CAPACITY],
+    pending_len: usize,
+}
+
+struct Utf8OutputBatch {
+    bytes: [u8; UTF8_OUTPUT_BATCH_CAPACITY],
+    len: usize,
+}
+
+impl Utf8OutputBatch {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; UTF8_OUTPUT_BATCH_CAPACITY],
+            len: 0,
+        }
+    }
+
+    async fn append(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+        bytes: &[u8],
+    ) -> Result<(), std::io::Error> {
+        debug_assert!(std::str::from_utf8(bytes).is_ok());
+        if bytes.len() > self.bytes.len() {
+            self.flush(output).await?;
+            return output.write_all(bytes).await;
+        }
+        if bytes.len() > self.bytes.len() - self.len {
+            self.flush(output).await?;
+        }
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+
+    async fn flush(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<(), std::io::Error> {
+        if self.len != 0 {
+            output.write_all(&self.bytes[..self.len]).await?;
+            self.len = 0;
+        }
+        Ok(())
+    }
+}
+
+impl RemoteTerminalOutput {
+    const fn new(mode: RemoteTerminalOutputMode) -> Self {
+        Self {
+            mode,
+            pending: [0; UTF8_SEQUENCE_CAPACITY],
+            pending_len: 0,
+        }
+    }
+
+    async fn write(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+        bytes: &[u8],
+    ) -> Result<(), std::io::Error> {
+        match self.mode {
+            RemoteTerminalOutputMode::Bytes => output.write_all(bytes).await,
+            RemoteTerminalOutputMode::WindowsConsoleUtf8 => {
+                self.write_windows_console_utf8(output, bytes).await
+            }
+        }
+    }
+
+    async fn write_windows_console_utf8(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+        mut bytes: &[u8],
+    ) -> Result<(), std::io::Error> {
+        let mut batch = Utf8OutputBatch::new();
+        while self.pending_len != 0 {
+            let Some((&next, remaining)) = bytes.split_first() else {
+                return batch.flush(output).await;
+            };
+            let candidate_len = self.pending_len + 1;
+            self.pending[self.pending_len] = next;
+            match std::str::from_utf8(&self.pending[..candidate_len]) {
+                Ok(_) => {
+                    batch.append(output, &self.pending[..candidate_len]).await?;
+                    self.pending_len = 0;
+                    bytes = remaining;
+                }
+                Err(error) if error.error_len().is_none() => {
+                    self.pending_len = candidate_len;
+                    bytes = remaining;
+                }
+                Err(_) => {
+                    batch.append(output, UTF8_REPLACEMENT).await?;
+                    self.pending_len = 0;
+                }
+            }
+        }
+
+        while !bytes.is_empty() {
+            match std::str::from_utf8(bytes) {
+                Ok(_) => {
+                    batch.append(output, bytes).await?;
+                    return batch.flush(output).await;
+                }
+                Err(error) => {
+                    let valid_len = error.valid_up_to();
+                    if valid_len != 0 {
+                        batch.append(output, &bytes[..valid_len]).await?;
+                        bytes = &bytes[valid_len..];
+                    }
+                    if let Some(invalid_len) = error.error_len() {
+                        batch.append(output, UTF8_REPLACEMENT).await?;
+                        bytes = &bytes[invalid_len..];
+                    } else {
+                        debug_assert!(bytes.len() < UTF8_SEQUENCE_CAPACITY);
+                        self.pending[..bytes.len()].copy_from_slice(bytes);
+                        self.pending_len = bytes.len();
+                        return batch.flush(output).await;
+                    }
+                }
+            }
+        }
+        batch.flush(output).await
+    }
+
+    async fn finish(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<(), std::io::Error> {
+        if self.mode == RemoteTerminalOutputMode::WindowsConsoleUtf8 && self.pending_len != 0 {
+            output.write_all(UTF8_REPLACEMENT).await?;
+            self.pending_len = 0;
+        }
+        output.flush().await
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -61,7 +223,7 @@ impl TerminalFrontend for CrosstermFrontend {
     type RawModeGuard = RawModeGuard;
 
     fn is_interactive(&self) -> bool {
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+        std::io::stdin().is_terminal()
     }
 
     fn output_is_terminal(&self) -> bool {
@@ -76,12 +238,15 @@ impl TerminalFrontend for CrosstermFrontend {
         if !self.is_interactive() {
             return Ok(None);
         }
-        crossterm::terminal::enable_raw_mode()?;
-        Ok(Some(RawModeGuard { armed: true }))
+        RawModeGuard::enter().map(Some)
     }
 
     fn restore_raw_mode(&self, guard: Option<Self::RawModeGuard>) -> Result<(), std::io::Error> {
         guard.map_or(Ok(()), RawModeGuard::restore)
+    }
+
+    fn restore_display(&self) -> Result<(), std::io::Error> {
+        restore_native_display()
     }
 
     fn input(&mut self) -> Self::Input {
@@ -148,6 +313,8 @@ pub enum ControllerError {
     TerminalEnvironment,
     #[error("the local terminal dimensions or environment are invalid")]
     TerminalDomain(#[from] DomainError),
+    #[error("failed to configure the local terminal")]
+    TerminalSetup(#[source] std::io::Error),
     #[error("the controller connection was lost")]
     ConnectionLost,
     #[error("failed to install the local interrupt handler")]
@@ -158,6 +325,14 @@ pub enum ControllerError {
     RemoteCompletionTimeout,
     #[error("failed to restore the local terminal mode")]
     TerminalRestore(#[source] std::io::Error),
+    #[error("failed to finish writing remote terminal output")]
+    TerminalOutput(#[source] std::io::Error),
+    #[error("the session failed and remote terminal output could not be finished: {output}")]
+    SessionAndTerminalOutput {
+        #[source]
+        session: Box<ControllerError>,
+        output: std::io::Error,
+    },
     #[error("the session failed and the local terminal mode could not be restored: {restore}")]
     SessionAndTerminalRestore {
         #[source]
@@ -179,13 +354,23 @@ pub enum ControllerStage {
 
 /// Connects, authenticates, and returns the remote shell exit code.
 pub async fn run_controller(config: ControllerConfig) -> Result<u32, ControllerError> {
+    let display_mode = DisplayModeGuard::enter(native_display_available())
+        .map_err(ControllerError::TerminalSetup)?;
     let mut progress = NoopProgress;
+    let cancellation = tokio_util::sync::CancellationToken::new();
     let session = Box::pin(run_controller_session(
         config,
         CrosstermFrontend,
         &mut progress,
+        cancellation.clone(),
     ));
-    run_until_interrupted(session, tokio::signal::ctrl_c()).await
+    let result = run_until_interrupted(
+        session,
+        crate::shutdown::endpoint_shutdown_signal(),
+        cancellation,
+    )
+    .await;
+    finish_terminal(result, DisplayModeGuard::restore_optional(display_mode))
 }
 
 /// Connects while reporting bounded, non-secret controller preparation milestones.
@@ -193,21 +378,49 @@ pub async fn run_controller_with_progress(
     config: ControllerConfig,
     progress: &mut impl OperationProgress<ControllerStage>,
 ) -> Result<u32, ControllerError> {
-    let session = Box::pin(run_controller_session(config, CrosstermFrontend, progress));
-    run_until_interrupted(session, tokio::signal::ctrl_c()).await
+    let display_mode = DisplayModeGuard::enter(native_display_available())
+        .map_err(ControllerError::TerminalSetup)?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let session = Box::pin(run_controller_session(
+        config,
+        CrosstermFrontend,
+        progress,
+        cancellation.clone(),
+    ));
+    let result = run_until_interrupted(
+        session,
+        crate::shutdown::endpoint_shutdown_signal(),
+        cancellation,
+    )
+    .await;
+    finish_terminal(result, DisplayModeGuard::restore_optional(display_mode))
+}
+
+fn native_display_available() -> bool {
+    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
 }
 
 async fn run_until_interrupted<T>(
     session: impl std::future::Future<Output = Result<T, ControllerError>>,
     signal: impl std::future::Future<Output = Result<(), std::io::Error>>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<T, ControllerError> {
+    tokio::pin!(session);
     tokio::select! {
         biased;
         signal = signal => {
-            signal.map_err(ControllerError::Signal)?;
-            Err(ControllerError::Interrupted)
+            let signal = signal.map_err(ControllerError::Signal);
+            cancellation.cancel();
+            let cleanup = session.await;
+            match signal {
+                Ok(()) => cleanup,
+                Err(error) => {
+                    let _ = cleanup;
+                    Err(error)
+                }
+            }
         }
-        result = session => result,
+        result = &mut session => result,
     }
 }
 
@@ -215,7 +428,20 @@ async fn run_controller_session<F: TerminalFrontend>(
     config: ControllerConfig,
     frontend: F,
     progress: &mut impl OperationProgress<ControllerStage>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<u32, ControllerError> {
+    let (prepared, terminal) = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(ControllerError::Interrupted),
+        result = prepare_controller_session(config, progress) => result?,
+    };
+    run_terminal(prepared, terminal, frontend, progress, &cancellation).await
+}
+
+async fn prepare_controller_session(
+    config: ControllerConfig,
+    progress: &mut impl OperationProgress<ControllerStage>,
+) -> Result<(PreparedController, TerminalHello), ControllerError> {
     let ControllerConfig {
         identity,
         relays,
@@ -309,23 +535,7 @@ async fn run_controller_session<F: TerminalFrontend>(
         Err(error) => return Err(error),
     };
     drop(code);
-    let PreparedController {
-        mut driver,
-        _streams,
-        binding,
-        control,
-        data,
-    } = prepared;
-    run_terminal(
-        &mut driver,
-        binding,
-        data,
-        control,
-        terminal,
-        frontend,
-        progress,
-    )
-    .await
+    Ok((prepared, terminal))
 }
 
 struct PreparedController {
@@ -425,14 +635,24 @@ pub fn local_terminal_hello() -> Result<TerminalHello, ControllerError> {
 fn local_terminal_hello_with(
     frontend: &impl TerminalFrontend,
 ) -> Result<TerminalHello, ControllerError> {
-    let (columns, rows) = if frontend.output_is_terminal() {
+    let (columns, rows) = if frontend.output_is_terminal() || frontend.is_interactive() {
         frontend.size()?
     } else {
         (80, 24)
     };
+    let mut term = terminal_environment("TERM")?;
+    if term.is_empty() {
+        term = TerminalValue::new(
+            if frontend.output_is_terminal() || frontend.is_interactive() {
+                "xterm-256color"
+            } else {
+                "dumb"
+            },
+        )?;
+    }
     Ok(TerminalHello::new(
         TerminalSize::new(columns, rows)?,
-        terminal_environment("TERM")?,
+        term,
         terminal_environment("COLORTERM")?,
     ))
 }
@@ -610,29 +830,40 @@ async fn await_until<T>(
 }
 
 async fn run_terminal(
-    driver: &mut EndpointDriver,
-    binding: ConnectionBinding,
-    data: ApplicationStream,
-    control: ApplicationStream,
+    prepared: PreparedController,
     hello: TerminalHello,
     mut frontend: impl TerminalFrontend,
     progress: &mut impl OperationProgress<ControllerStage>,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<u32, ControllerError> {
+    let PreparedController {
+        mut driver,
+        _streams,
+        binding,
+        control,
+        data,
+    } = prepared;
+    let driver = &mut driver;
     let (mut data_read, mut data_write) = tokio::io::split(data.into_tokio());
     let (mut control_read, mut control_write) = tokio::io::split(control.into_tokio());
     let handshake = async {
-        drive_bound(
-            driver,
-            binding,
-            exchange_terminal_ready_timed(
-                &mut data_read,
-                &mut control_write,
-                &hello,
-                EXCHANGE_TIMEOUT,
-            ),
-        )
-        .await??;
-        Ok(())
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ControllerError::Interrupted),
+            result = drive_bound(
+                driver,
+                binding,
+                exchange_terminal_ready_timed(
+                    &mut data_read,
+                    &mut control_write,
+                    &hello,
+                    EXCHANGE_TIMEOUT,
+                ),
+            ) => {
+                result??;
+                Ok(())
+            }
+        }
     };
     let (raw_mode, ()) = wait_with_progress(
         progress,
@@ -643,139 +874,238 @@ async fn run_terminal(
     progress.clear();
 
     let interactive = frontend.is_interactive();
+    let output_mode = RemoteTerminalOutputMode::native(frontend.output_is_terminal());
     let mut input = frontend.input();
     let mut output = frontend.output();
-    let mut input_open = true;
+    let mut terminal_output = RemoteTerminalOutput::new(output_mode);
     let mut local_escape = LocalInputEscape::new(interactive);
     let mut remote = RemoteCompletion::new();
-    let mut last_size = hello.size();
-    let mut size_poll = tokio::time::interval(SIZE_POLL_INTERVAL);
-    size_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let session = async {
+    let session = {
+        let local_input = copy_local_input(&mut input, &mut data_write, &mut local_escape);
+        let remote_output = copy_remote_output(&mut data_read, &mut output, &mut terminal_output);
+        let remote_exit = read_remote_exit(&mut control_read);
+        let terminal_resizes =
+            copy_terminal_resizes(&frontend, &mut control_write, hello.size(), interactive);
+        tokio::pin!(local_input);
+        tokio::pin!(remote_output);
+        tokio::pin!(remote_exit);
+        tokio::pin!(terminal_resizes);
         loop {
-            let mut remote_output = TerminalChunk::new();
-            let mut exit = [0_u8; 5];
             let completion_deadline = remote.deadline();
             tokio::select! {
-            biased;
-            () = wait_for_remote_completion_deadline(completion_deadline) => {
-                return Err(ControllerError::RemoteCompletionTimeout);
-            }
-            event = driver.next() => match event {
-                EndpointEvent::Established { peer, .. } | EndpointEvent::Closed { peer, .. }
-                    if peer == binding.peer() => driver.enforce_binding(binding)?,
-                _ => {}
-            },
-            read = read_local_input(&mut input, local_escape.read_reserve()), if input_open => {
-                let Some(local_input) = read? else {
-                    if let Some(pending_escape) = local_escape.finish()? {
-                        write_local_input(
-                            driver,
-                            binding,
-                            completion_deadline,
-                            &mut data_write,
-                            &pending_escape,
-                        )
-                        .await?;
+                biased;
+                () = wait_for_remote_completion_deadline(completion_deadline) => {
+                    break Err(ControllerError::RemoteCompletionTimeout);
+                }
+                event = async {
+                    tokio::select! {
+                        () = cancellation.cancelled() => TerminalPumpEvent::Cancelled,
+                        event = driver.next() => TerminalPumpEvent::Driver(event),
+                        result = &mut local_input => TerminalPumpEvent::LocalInput(result),
+                        result = &mut remote_output, if remote.output_open() => {
+                            TerminalPumpEvent::RemoteOutput(result)
+                        }
+                        result = &mut remote_exit, if remote.exit_pending() => {
+                            TerminalPumpEvent::RemoteExit(result)
+                        }
+                        result = &mut terminal_resizes => TerminalPumpEvent::Resize(result),
                     }
-                    drive_terminal_io(
-                        driver,
-                        binding,
-                        completion_deadline,
-                        data_write.shutdown(),
-                    )
-                    .await?;
-                    input_open = false;
-                    continue;
-                };
-                tracing::debug!(length = local_input.as_slice().len(), "local terminal input read completed");
-                let filtered = local_escape.filter(local_input)?;
-                if !filtered.chunk.as_slice().is_empty() {
-                    write_local_input(
-                        driver,
-                        binding,
-                        completion_deadline,
-                        &mut data_write,
-                        &filtered.chunk,
-                    )
-                    .await?;
-                }
-                if filtered.detach {
-                    return Err(ControllerError::Interrupted);
-                }
-            }
-            read = data_read.read(remote_output.writable()), if remote.output_open() => {
-                let length = read?;
-                if length == 0 {
-                    if let Some(code) = complete_after_output_eof(
-                        &mut remote,
-                        &mut output,
-                        tokio::time::Instant::now(),
-                    )
-                    .await?
-                    {
-                        return Ok(code);
+                } => match event {
+                    TerminalPumpEvent::Cancelled => break Err(ControllerError::Interrupted),
+                    TerminalPumpEvent::Driver(event) => match event {
+                        EndpointEvent::Established { peer, .. } | EndpointEvent::Closed { peer, .. }
+                            if peer == binding.peer() => {
+                                if let Err(error) = driver.enforce_binding(binding) {
+                                    break Err(error.into());
+                                }
+                            }
+                        _ => {}
+                    },
+                    TerminalPumpEvent::LocalInput(result) => match result {
+                        Ok(never) => match never {},
+                        Err(error) => break Err(error),
+                    },
+                    TerminalPumpEvent::RemoteOutput(result) => {
+                        if let Err(error) = result {
+                            break Err(error);
+                        }
+                        if let Some(code) = remote.observe_output_eof(tokio::time::Instant::now()) {
+                            break Ok(code);
+                        }
                     }
-                    continue;
+                    TerminalPumpEvent::RemoteExit(result) => {
+                        let code = match result {
+                            Ok(code) => code,
+                            Err(error) => break Err(error),
+                        };
+                        if let Some(code) = remote.observe_exit(code, tokio::time::Instant::now()) {
+                            break Ok(code);
+                        }
+                    }
+                    TerminalPumpEvent::Resize(result) => match result {
+                        Ok(never) => match never {},
+                        Err(error) => break Err(error),
+                    }
                 }
-                remote_output.set_len(length).map_err(|_| ControllerError::ConnectionLost)?;
-                await_remote_completion(
-                    completion_deadline,
-                    output.write_all(remote_output.as_slice()),
-                )
-                .await??;
-                await_remote_completion(completion_deadline, output.flush()).await??;
-            }
-            read = control_read.read_exact(&mut exit), if remote.exit_pending() => {
-                read?;
-                let code = decode_terminal_exit(&exit)?;
-                if let Some(code) = remote.observe_exit(code, tokio::time::Instant::now()) {
-                    await_remote_completion(remote.deadline(), output.flush()).await??;
-                    return Ok(code);
-                }
-            }
-            _ = size_poll.tick(), if interactive => {
-                if let Some((size, resize)) = changed_terminal_size(&frontend, last_size)? {
-                    drive_terminal_io(
-                        driver,
-                        binding,
-                        completion_deadline,
-                        control_write.write_all(&resize),
-                    )
-                    .await?;
-                    drive_terminal_io(
-                        driver,
-                        binding,
-                        completion_deadline,
-                        control_write.flush(),
-                    )
-                    .await?;
-                    last_size = size;
-                }
-            }
             }
         }
-    }
-    .await;
+    };
+    let output_deadline = remote
+        .deadline()
+        .unwrap_or_else(|| tokio::time::Instant::now() + REMOTE_COMPLETION_TIMEOUT);
+    let output_finish =
+        tokio::time::timeout_at(output_deadline, terminal_output.finish(&mut output))
+            .await
+            .map_err(|_| ControllerError::RemoteCompletionTimeout)
+            .and_then(|result| result.map_err(ControllerError::TerminalOutput));
+    let session = finish_terminal_output(session, output_finish);
+    let display_restore = if session.is_err() {
+        frontend.restore_display()
+    } else {
+        Ok(())
+    };
+    let session = finish_terminal(session, display_restore);
     finish_terminal(session, frontend.restore_raw_mode(raw_mode))
 }
 
-async fn write_local_input(
-    driver: &mut EndpointDriver,
-    binding: ConnectionBinding,
-    completion_deadline: Option<tokio::time::Instant>,
+enum TerminalPumpEvent {
+    Cancelled,
+    Driver(EndpointEvent),
+    LocalInput(Result<Infallible, ControllerError>),
+    RemoteOutput(Result<(), ControllerError>),
+    RemoteExit(Result<u32, ControllerError>),
+    Resize(Result<Infallible, ControllerError>),
+}
+
+fn restore_native_display() -> Result<(), std::io::Error> {
+    use crossterm::Command as _;
+    use std::io::Write as _;
+
+    if !native_display_available() {
+        return Ok(());
+    }
+    let mut commands = String::with_capacity(128);
+    crossterm::event::DisableBracketedPaste
+        .write_ansi(&mut commands)
+        .map_err(std::io::Error::other)?;
+    crossterm::event::DisableFocusChange
+        .write_ansi(&mut commands)
+        .map_err(std::io::Error::other)?;
+    crossterm::event::DisableMouseCapture
+        .write_ansi(&mut commands)
+        .map_err(std::io::Error::other)?;
+    crossterm::event::PopKeyboardEnhancementFlags
+        .write_ansi(&mut commands)
+        .map_err(std::io::Error::other)?;
+    crossterm::terminal::LeaveAlternateScreen
+        .write_ansi(&mut commands)
+        .map_err(std::io::Error::other)?;
+    crossterm::cursor::Show
+        .write_ansi(&mut commands)
+        .map_err(std::io::Error::other)?;
+    crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
+        .write_ansi(&mut commands)
+        .map_err(std::io::Error::other)?;
+
+    if std::io::stdout().is_terminal() {
+        let mut output = std::io::stdout().lock();
+        output.write_all(commands.as_bytes())?;
+        output.flush()
+    } else {
+        let mut output = std::io::stderr().lock();
+        output.write_all(commands.as_bytes())?;
+        output.flush()
+    }
+}
+
+async fn copy_local_input(
+    input: &mut (impl tokio::io::AsyncRead + Unpin),
+    data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    local_escape: &mut LocalInputEscape,
+) -> Result<Infallible, ControllerError> {
+    loop {
+        let Some(local_input) = read_local_input(input, local_escape.read_reserve()).await? else {
+            if let Some(pending_escape) = local_escape.finish()? {
+                write_local_input_io(data_write, &pending_escape).await?;
+            }
+            data_write.shutdown().await?;
+            return std::future::pending().await;
+        };
+        tracing::debug!(
+            length = local_input.as_slice().len(),
+            "local terminal input read completed"
+        );
+        let filtered = local_escape.filter(local_input)?;
+        if !filtered.chunk.as_slice().is_empty() {
+            write_local_input_io(data_write, &filtered.chunk).await?;
+        }
+        if filtered.detach {
+            return Err(ControllerError::Interrupted);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn write_local_input_io(
     data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
     input: &TerminalChunk,
 ) -> Result<(), ControllerError> {
-    drive_terminal_io(
-        driver,
-        binding,
-        completion_deadline,
-        data_write.write_all(input.as_slice()),
-    )
-    .await?;
-    drive_terminal_io(driver, binding, completion_deadline, data_write.flush()).await
+    data_write.write_all(input.as_slice()).await?;
+    data_write.flush().await?;
+    Ok(())
+}
+
+async fn copy_remote_output(
+    data_read: &mut (impl tokio::io::AsyncRead + Unpin),
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    terminal_output: &mut RemoteTerminalOutput,
+) -> Result<(), ControllerError> {
+    loop {
+        let mut chunk = TerminalChunk::new();
+        let length = data_read.read(chunk.writable()).await?;
+        if length == 0 {
+            return Ok(());
+        }
+        chunk
+            .set_len(length)
+            .map_err(|_| ControllerError::ConnectionLost)?;
+        terminal_output.write(output, chunk.as_slice()).await?;
+        output.flush().await?;
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn read_remote_exit(
+    control_read: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<u32, ControllerError> {
+    let mut exit = [0_u8; 5];
+    control_read.read_exact(&mut exit).await?;
+    decode_terminal_exit(&exit)
+}
+
+async fn copy_terminal_resizes(
+    frontend: &impl TerminalFrontend,
+    control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    mut last_size: TerminalSize,
+    enabled: bool,
+) -> Result<Infallible, ControllerError> {
+    if !enabled {
+        return std::future::pending().await;
+    }
+    let mut poll = tokio::time::interval(SIZE_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        poll.tick().await;
+        let Ok(changed) = changed_terminal_size(frontend, last_size) else {
+            continue;
+        };
+        if let Some((size, resize)) = changed {
+            control_write.write_all(&resize).await?;
+            control_write.flush().await?;
+            last_size = size;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 struct FilteredLocalInput {
@@ -888,13 +1218,41 @@ fn finish_terminal<T>(
     }
 }
 
+fn finish_terminal_output<T>(
+    session: Result<T, ControllerError>,
+    output: Result<(), ControllerError>,
+) -> Result<T, ControllerError> {
+    match (session, output) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(session), Err(ControllerError::TerminalOutput(output))) => {
+            Err(ControllerError::SessionAndTerminalOutput {
+                session: Box::new(session),
+                output,
+            })
+        }
+        (Err(session), Err(_)) => Err(session),
+    }
+}
+
 async fn enter_raw_mode_before<F: TerminalFrontend, T>(
     frontend: &F,
     operation: impl std::future::Future<Output = Result<T, ControllerError>>,
 ) -> Result<(Option<F::RawModeGuard>, T), ControllerError> {
-    let guard = frontend.enter_raw_mode()?;
-    let output = operation.await?;
-    Ok((guard, output))
+    let guard = frontend
+        .enter_raw_mode()
+        .map_err(ControllerError::TerminalSetup)?;
+    match operation.await {
+        Ok(output) => Ok((guard, output)),
+        Err(error) => match frontend.restore_raw_mode(guard) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(ControllerError::SessionAndTerminalRestore {
+                session: Box::new(error),
+                restore,
+            }),
+        },
+    }
 }
 
 fn changed_terminal_size(
@@ -906,6 +1264,7 @@ fn changed_terminal_size(
     Ok((observed != current).then_some((observed, TerminalResize::new(observed).encode())))
 }
 
+#[cfg(test)]
 async fn complete_after_output_eof(
     remote: &mut RemoteCompletion,
     output: &mut (impl tokio::io::AsyncWrite + Unpin),
@@ -941,6 +1300,7 @@ async fn wait_for_remote_completion_deadline(deadline: Option<tokio::time::Insta
     }
 }
 
+#[cfg(test)]
 async fn await_remote_completion<T>(
     deadline: Option<tokio::time::Instant>,
     future: impl std::future::Future<Output = T>,
@@ -951,17 +1311,6 @@ async fn await_remote_completion<T>(
             .map_err(|_| ControllerError::RemoteCompletionTimeout),
         None => Ok(future.await),
     }
-}
-
-async fn drive_terminal_io(
-    driver: &mut EndpointDriver,
-    binding: ConnectionBinding,
-    deadline: Option<tokio::time::Instant>,
-    operation: impl std::future::Future<Output = Result<(), std::io::Error>>,
-) -> Result<(), ControllerError> {
-    let result = await_remote_completion(deadline, drive_bound(driver, binding, operation)).await?;
-    result??;
-    Ok(())
 }
 
 async fn exchange_terminal_ready(
@@ -1069,12 +1418,54 @@ impl RemoteCompletion {
 }
 
 struct RawModeGuard {
+    #[cfg(windows)]
+    mode: crossterm_winapi::ConsoleMode,
+    #[cfg(windows)]
+    original: u32,
     armed: bool,
 }
 
 impl RawModeGuard {
+    #[cfg(windows)]
+    fn enter() -> Result<Self, std::io::Error> {
+        const ENABLE_LINE_INPUT: u32 = 0x0002;
+        const ENABLE_ECHO_INPUT: u32 = 0x0004;
+        const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+        const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+        const NOT_RAW: u32 = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
+
+        let mode =
+            crossterm_winapi::ConsoleMode::from(crossterm_winapi::Handle::current_in_handle()?);
+        let original = mode.mode()?;
+        mode.set_mode((original & !NOT_RAW) | ENABLE_VIRTUAL_TERMINAL_INPUT)?;
+        Ok(Self {
+            mode,
+            original,
+            armed: true,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn enter() -> Result<Self, std::io::Error> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self { armed: true })
+    }
+
     fn restore(mut self) -> Result<(), std::io::Error> {
-        self.armed = false;
+        let result = self.restore_inner();
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn restore_inner(&self) -> Result<(), std::io::Error> {
+        self.mode.set_mode(self.original)
+    }
+
+    #[cfg(not(windows))]
+    fn restore_inner(&self) -> Result<(), std::io::Error> {
         crossterm::terminal::disable_raw_mode()
     }
 }
@@ -1082,7 +1473,75 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = self.restore_inner();
+        }
+    }
+}
+
+struct DisplayModeGuard {
+    #[cfg(windows)]
+    mode: crossterm_winapi::ConsoleMode,
+    #[cfg(windows)]
+    original: u32,
+    armed: bool,
+}
+
+impl DisplayModeGuard {
+    #[cfg(windows)]
+    fn enter(enabled: bool) -> Result<Option<Self>, std::io::Error> {
+        const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+        if !enabled {
+            return Ok(None);
+        }
+        let mode =
+            crossterm_winapi::ConsoleMode::from(crossterm_winapi::Handle::current_out_handle()?);
+        let original = mode.mode()?;
+        mode.set_mode(original | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
+        Ok(Some(Self {
+            mode,
+            original,
+            armed: true,
+        }))
+    }
+
+    #[cfg(not(windows))]
+    const fn enter(enabled: bool) -> Result<Option<Self>, std::io::Error> {
+        if enabled {
+            Ok(Some(Self { armed: true }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn restore_optional(guard: Option<Self>) -> Result<(), std::io::Error> {
+        guard.map_or(Ok(()), Self::restore)
+    }
+
+    fn restore(mut self) -> Result<(), std::io::Error> {
+        let result = self.restore_inner();
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn restore_inner(&self) -> Result<(), std::io::Error> {
+        self.mode.set_mode(self.original)
+    }
+
+    #[cfg(not(windows))]
+    const fn restore_inner(&self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+impl Drop for DisplayModeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.restore_inner();
         }
     }
 }
@@ -1090,15 +1549,18 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    #[cfg(not(windows))]
+    use super::RawModeGuard;
     use super::{
         ControllerConfig, ControllerError, CrosstermFrontend, EndpointError, LOCAL_ESCAPE,
-        LocalInputEscape, REMOTE_COMPLETION_TIMEOUT, RawModeGuard, RemoteCompletion,
-        TerminalFrontend, await_remote_completion, await_until, changed_terminal_size,
-        complete_after_output_eof, controller_fallback_required, decode_terminal_exit,
-        direct_fallback_required, enter_raw_mode_before, exchange_terminal_ready,
-        exchange_terminal_ready_timed, fallback_transport, finish_terminal, local_terminal_hello,
-        local_terminal_hello_with, next_retry_delay, read_auth_response, read_local_input,
-        run_controller, run_controller_session, run_until_interrupted, terminal_environment,
+        LocalInputEscape, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
+        RemoteTerminalOutputMode, TerminalFrontend, await_remote_completion, await_until,
+        changed_terminal_size, complete_after_output_eof, controller_fallback_required,
+        copy_local_input, copy_remote_output, decode_terminal_exit, direct_fallback_required,
+        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
+        fallback_transport, finish_terminal, local_terminal_hello, local_terminal_hello_with,
+        next_retry_delay, read_auth_response, read_local_input, run_controller,
+        run_controller_session, run_until_interrupted, terminal_environment,
         terminal_environment_from, wait_for_remote_completion_deadline,
     };
     use crate::progress::NoopProgress;
@@ -1196,6 +1658,7 @@ mod tests {
             invalid_wss_controller_config(),
             CrosstermFrontend,
             &mut progress,
+            tokio_util::sync::CancellationToken::new(),
         );
         let size = std::mem::size_of_val(&session);
         assert!(
@@ -1242,6 +1705,7 @@ mod tests {
         let _ = frontend.size();
         if !frontend.is_interactive() {
             assert!(frontend.enter_raw_mode().unwrap().is_none());
+            #[cfg(not(windows))]
             drop(RawModeGuard { armed: false });
         }
     }
@@ -1375,7 +1839,7 @@ mod tests {
         };
         assert!(matches!(
             enter_raw_mode_before(&failed, operation).await,
-            Err(ControllerError::Io(_))
+            Err(ControllerError::TerminalSetup(_))
         ));
         assert!(!operation_polled.get());
         assert!(!restored.get());
@@ -1495,10 +1959,13 @@ mod tests {
         let restored = Rc::new(Cell::new(false));
         let session_restored = Rc::clone(&restored);
         let (started_tx, started_rx) = oneshot::channel();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let session_cancellation = cancellation.clone();
         let session = async move {
             let _guard = FakeRawGuard(session_restored);
             started_tx.send(()).unwrap();
-            std::future::pending::<Result<u32, ControllerError>>().await
+            session_cancellation.cancelled().await;
+            Err::<u32, _>(ControllerError::Interrupted)
         };
         let signal = async move {
             started_rx.await.unwrap();
@@ -1506,7 +1973,7 @@ mod tests {
         };
 
         assert!(matches!(
-            run_until_interrupted(session, signal).await,
+            run_until_interrupted(session, signal, cancellation).await,
             Err(ControllerError::Interrupted)
         ));
         assert!(restored.get());
@@ -1518,16 +1985,25 @@ mod tests {
             run_until_interrupted(
                 async { Ok::<_, ControllerError>(23) },
                 std::future::pending(),
+                tokio_util::sync::CancellationToken::new(),
             )
             .await
             .unwrap(),
             23
         );
         assert!(matches!(
-            run_until_interrupted(
-                std::future::pending::<Result<u32, ControllerError>>(),
-                async { Err(io::Error::other("signal")) },
-            )
+            {
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let session_cancellation = cancellation.clone();
+                run_until_interrupted(
+                    async move {
+                        session_cancellation.cancelled().await;
+                        Err::<u32, _>(ControllerError::Interrupted)
+                    },
+                    async { Err(io::Error::other("signal")) },
+                    cancellation,
+                )
+            }
             .await,
             Err(ControllerError::Signal(_))
         ));
@@ -1583,6 +2059,206 @@ mod tests {
         ));
     }
 
+    async fn render_remote_output(mode: RemoteTerminalOutputMode, chunks: &[&[u8]]) -> Vec<u8> {
+        let (mut output, mut captured) = tokio::io::duplex(128);
+        let writer = async {
+            let mut terminal_output = RemoteTerminalOutput::new(mode);
+            for chunk in chunks {
+                terminal_output.write(&mut output, chunk).await.unwrap();
+                output.flush().await.unwrap();
+            }
+            terminal_output.finish(&mut output).await.unwrap();
+            output.shutdown().await.unwrap();
+        };
+        let reader = async {
+            let mut bytes = Vec::new();
+            captured.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        };
+        let ((), bytes) = tokio::join!(writer, reader);
+        bytes
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn native_remote_output_mode_is_platform_and_destination_specific() {
+        assert_eq!(
+            RemoteTerminalOutputMode::native(false),
+            RemoteTerminalOutputMode::Bytes
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            RemoteTerminalOutputMode::native(true),
+            RemoteTerminalOutputMode::WindowsConsoleUtf8
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            RemoteTerminalOutputMode::native(true),
+            RemoteTerminalOutputMode::Bytes
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_console_output_preserves_ansi_and_split_utf8() {
+        let chunks: &[&[u8]] = &[b"\x1b[Htop \xe4", b"\xb8", b"\xad\xe6\x96", b"\x87\r\n"];
+        let rendered =
+            render_remote_output(RemoteTerminalOutputMode::WindowsConsoleUtf8, chunks).await;
+        assert_eq!(rendered, "\x1b[Htop \u{4e2d}\u{6587}\r\n".as_bytes());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_console_output_replaces_invalid_and_incomplete_utf8_without_stopping() {
+        let chunks: &[&[u8]] = &[b"ok\xff", b"\xe4\xb8", b"A", b"\xf0\x90", b""];
+        let rendered =
+            render_remote_output(RemoteTerminalOutputMode::WindowsConsoleUtf8, chunks).await;
+        assert_eq!(rendered, "ok\u{fffd}\u{fffd}A\u{fffd}".as_bytes());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_console_invalid_block_uses_bounded_batched_writes() {
+        let invalid = [0xff; 16 * 1024];
+        let mut output = CountingWriter::default();
+        let mut terminal_output =
+            RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
+        terminal_output.write(&mut output, &invalid).await.unwrap();
+        terminal_output.finish(&mut output).await.unwrap();
+        assert_eq!(output.bytes, String::from_utf8_lossy(&invalid).as_bytes());
+        assert!(output.writes <= 16, "write count: {}", output.writes);
+    }
+
+    #[test]
+    fn windows_console_streaming_matches_lossy_utf8_for_arbitrary_chunking() {
+        use proptest::prelude::*;
+        use proptest::test_runner::TestRunner;
+
+        let strategy = (
+            proptest::collection::vec(any::<u8>(), 0..2_048),
+            proptest::collection::vec(any::<usize>(), 0..64),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut runner = TestRunner::default();
+        runner
+            .run(&strategy, |(bytes, cuts)| {
+                let mut boundaries: Vec<usize> = cuts
+                    .into_iter()
+                    .map(|cut| cut % (bytes.len() + 1))
+                    .collect();
+                boundaries.extend([0, bytes.len()]);
+                boundaries.sort_unstable();
+                boundaries.dedup();
+                let chunks: Vec<&[u8]> = boundaries
+                    .windows(2)
+                    .map(|pair| &bytes[pair[0]..pair[1]])
+                    .collect();
+                let rendered = runtime.block_on(render_remote_output(
+                    RemoteTerminalOutputMode::WindowsConsoleUtf8,
+                    &chunks,
+                ));
+                let expected = String::from_utf8_lossy(&bytes);
+                prop_assert_eq!(rendered, expected.as_bytes());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_console_output_remains_byte_transparent() {
+        let chunks: &[&[u8]] = &[b"\xff\xe4", b"\xb8\x00\x1b[H"];
+        let rendered = render_remote_output(RemoteTerminalOutputMode::Bytes, chunks).await;
+        assert_eq!(rendered, b"\xff\xe4\xb8\x00\x1b[H");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_pumps_make_bidirectional_progress_under_tiny_backpressure() {
+        let local_payload = vec![0x5a; 128 * 1024];
+        let remote_payload = vec![0xa5; 128 * 1024];
+        let (controller, peer) = tokio::io::duplex(31);
+        let (mut controller_read, mut controller_write) = tokio::io::split(controller);
+        let (mut peer_read, mut peer_write) = tokio::io::split(peer);
+        let mut local_input = local_payload.as_slice();
+        let mut local_output = Vec::new();
+        let mut escape = LocalInputEscape::new(false);
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+
+        let input_pump = copy_local_input(&mut local_input, &mut controller_write, &mut escape);
+        let output_pump = copy_remote_output(
+            &mut controller_read,
+            &mut local_output,
+            &mut terminal_output,
+        );
+        let peer_exchange = async {
+            peer_write.write_all(&remote_payload).await.unwrap();
+            peer_write.shutdown().await.unwrap();
+            let mut received = vec![0; local_payload.len()];
+            peer_read.read_exact(&mut received).await.unwrap();
+            received
+        };
+
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::pin!(input_pump);
+            tokio::pin!(output_pump);
+            tokio::pin!(peer_exchange);
+            let mut output_complete = false;
+            let mut received = None;
+            loop {
+                tokio::select! {
+                    result = &mut input_pump => match result {
+                        Ok(never) => match never {},
+                        Err(error) => panic!("input pump failed: {error}"),
+                    },
+                    result = &mut output_pump, if !output_complete => {
+                        result.unwrap();
+                        output_complete = true;
+                    }
+                    result = &mut peer_exchange, if received.is_none() => {
+                        received = Some(result);
+                    }
+                }
+                if output_complete && let Some(received) = received.take() {
+                    break received;
+                }
+            }
+        })
+        .await
+        .expect("both bounded terminal directions must continue making progress");
+
+        assert_eq!(completed, local_payload);
+        assert_eq!(local_output, remote_payload);
+    }
+
     fn terminal_chunk(bytes: &[u8]) -> TerminalChunk {
         let mut chunk = TerminalChunk::new();
         chunk.writable()[..bytes.len()].copy_from_slice(bytes);
@@ -1606,6 +2282,10 @@ mod tests {
     #[test]
     fn interactive_escape_preserves_literal_and_non_command_sequences() {
         let mut escape = LocalInputEscape::new(true);
+        let terminal_escape = escape.filter(terminal_chunk(b"\x1b")).unwrap();
+        assert_eq!(terminal_escape.chunk.as_slice(), b"\x1b");
+        assert!(!terminal_escape.detach);
+
         let literal = escape
             .filter(terminal_chunk(&[LOCAL_ESCAPE, LOCAL_ESCAPE]))
             .unwrap();

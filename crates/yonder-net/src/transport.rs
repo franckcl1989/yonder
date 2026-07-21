@@ -5,35 +5,167 @@ use libp2p::core::transport::Boxed;
 use libp2p::core::{Transport, upgrade};
 use libp2p::identity::Keypair;
 use libp2p::{PeerId, dns, noise, quic, relay, tcp, websocket, yamux};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{
+    CertificateDer, PrivateKeyDer,
+    pem::{SectionKind, SliceIter},
+};
 use std::time::Duration;
 use yonder_core::{IdentitySeed, SecretDocument, SecureRandom};
 
 /// Maximum setup time for one transport dial across every supported stack.
 pub const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Maximum number of WSS certificates accepted in a chain or trust set.
+pub const WSS_CERTIFICATE_LIMIT: usize = 8;
+const MAX_WSS_CERTIFICATE_BYTES: usize = 1024 * 1024;
+const MAX_WSS_PRIVATE_KEY_BYTES: usize = 64 * 1024;
+
+/// A leaf-first, bounded WSS certificate chain.
+pub struct WssCertificateChain(Vec<Vec<u8>>);
+
+impl WssCertificateChain {
+    /// Parses one or more DER certificates or PEM bundles without reimplementing PEM.
+    pub fn from_documents(
+        documents: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<Self, NetworkBuildError> {
+        let certificates = parse_certificate_documents(documents)
+            .map_err(|_| NetworkBuildError::InvalidWssCertificateChain)?;
+        if certificates.is_empty() {
+            return Err(NetworkBuildError::InvalidWssCertificateChain);
+        }
+        Ok(Self(certificates))
+    }
+
+    fn single(certificate_der: Vec<u8>) -> Self {
+        Self(vec![certificate_der])
+    }
+
+    fn leaf(&self) -> Option<&[u8]> {
+        self.0.first().map(Vec::as_slice)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.iter().map(Vec::as_slice)
+    }
+
+    fn into_upstream(self) -> impl Iterator<Item = websocket::tls::Certificate> {
+        self.0.into_iter().map(websocket::tls::Certificate::new)
+    }
+}
+
+/// A bounded set of additional WSS trust anchors used during certificate rotation.
+pub struct WssTrustAnchors(Vec<Vec<u8>>);
+
+impl WssTrustAnchors {
+    /// Parses zero or more DER certificates or PEM bundles.
+    pub fn from_documents(
+        documents: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<Self, NetworkBuildError> {
+        parse_certificate_documents(documents)
+            .map(Self)
+            .map_err(|_| NetworkBuildError::InvalidWssTrustBundle)
+    }
+
+    fn single(certificate_der: Vec<u8>) -> Self {
+        Self(vec![certificate_der])
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.iter().map(Vec::as_slice)
+    }
+
+    fn into_upstream(self) -> impl Iterator<Item = websocket::tls::Certificate> {
+        self.0.into_iter().map(websocket::tls::Certificate::new)
+    }
+}
+
+/// A normalized, secret WSS private key document.
+pub struct WssPrivateKey(SecretDocument);
+
+impl WssPrivateKey {
+    /// Accepts PKCS#1, PKCS#8, or SEC1 in DER or PEM form and normalizes it to DER.
+    pub fn from_document(document: SecretDocument) -> Result<Self, NetworkBuildError> {
+        if document.as_bytes().len() > MAX_WSS_PRIVATE_KEY_BYTES {
+            return Err(NetworkBuildError::InvalidWssPrivateKey);
+        }
+        let normalized = if contains_pem_marker(document.as_bytes()) {
+            let mut sections = SliceIter::<(SectionKind, Vec<u8>)>::new(document.as_bytes());
+            let (kind, normalized) = sections
+                .next()
+                .ok_or(NetworkBuildError::InvalidWssPrivateKey)?
+                .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
+            if !matches!(
+                kind,
+                SectionKind::RsaPrivateKey | SectionKind::PrivateKey | SectionKind::EcPrivateKey
+            ) || sections.next().is_some()
+            {
+                return Err(NetworkBuildError::InvalidWssPrivateKey);
+            }
+            PrivateKeyDer::try_from(normalized.as_slice())
+                .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
+            normalized
+        } else {
+            PrivateKeyDer::try_from(document.as_bytes())
+                .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
+            return Ok(Self(document));
+        };
+        Ok(Self(SecretDocument::new(normalized)))
+    }
+
+    fn unvalidated(private_key_der: SecretDocument) -> Self {
+        Self(private_key_der)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    fn into_upstream(self) -> Vec<u8> {
+        self.0.into_upstream_bytes()
+    }
+}
+
 /// TLS material applied to the official libp2p WebSocket transport.
 pub enum WssTransportConfig {
     Client {
-        additional_ca_der: Option<Vec<u8>>,
+        additional_trust: WssTrustAnchors,
     },
     Server {
-        certificate_der: Vec<u8>,
-        private_key_der: SecretDocument,
+        certificate_chain: WssCertificateChain,
+        private_key: WssPrivateKey,
     },
 }
 
 impl WssTransportConfig {
     #[must_use]
-    pub const fn client(additional_ca_der: Option<Vec<u8>>) -> Self {
-        Self::Client { additional_ca_der }
+    pub fn client(additional_ca_der: Option<Vec<u8>>) -> Self {
+        Self::Client {
+            additional_trust: additional_ca_der
+                .map_or_else(|| WssTrustAnchors(Vec::new()), WssTrustAnchors::single),
+        }
     }
 
     #[must_use]
-    pub const fn server(certificate_der: Vec<u8>, private_key_der: SecretDocument) -> Self {
+    pub const fn client_with_trust(additional_trust: WssTrustAnchors) -> Self {
+        Self::Client { additional_trust }
+    }
+
+    #[must_use]
+    pub fn server(certificate_der: Vec<u8>, private_key_der: SecretDocument) -> Self {
         Self::Server {
-            certificate_der,
-            private_key_der,
+            certificate_chain: WssCertificateChain::single(certificate_der),
+            private_key: WssPrivateKey::unvalidated(private_key_der),
+        }
+    }
+
+    #[must_use]
+    pub const fn server_with_chain(
+        certificate_chain: WssCertificateChain,
+        private_key: WssPrivateKey,
+    ) -> Self {
+        Self::Server {
+            certificate_chain,
+            private_key,
         }
     }
 
@@ -45,18 +177,50 @@ impl WssTransportConfig {
     /// Validates the server certificate/key encoding before the transport starts.
     pub fn validate_server_material(&self) -> Result<(), NetworkBuildError> {
         let Self::Server {
-            certificate_der,
-            private_key_der,
+            certificate_chain,
+            private_key,
         } = self
         else {
             return Err(NetworkBuildError::InvalidTlsMaterial);
         };
-        PrivateKeyDer::try_from(private_key_der.as_bytes())
+        PrivateKeyDer::try_from(private_key.as_bytes())
             .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
-        let certificate = CertificateDer::from(certificate_der.as_slice());
-        webpki::EndEntityCert::try_from(&certificate)
-            .map(|_| ())
-            .map_err(NetworkBuildError::InvalidWssCertificate)
+        for certificate in certificate_chain.iter() {
+            let certificate = CertificateDer::from(certificate);
+            webpki::EndEntityCert::try_from(&certificate)
+                .map_err(NetworkBuildError::InvalidWssCertificate)?;
+        }
+        Ok(())
+    }
+
+    /// Runs the same rustls/libp2p builder used by the production transport.
+    pub fn validate_tls_material(&self) -> Result<(), NetworkBuildError> {
+        let mut builder = websocket::tls::Config::builder();
+        match self {
+            Self::Client { additional_trust } => {
+                for certificate in additional_trust.iter() {
+                    builder
+                        .add_trust(&websocket::tls::Certificate::new(certificate.to_vec()))
+                        .map_err(NetworkBuildError::WssTls)?;
+                }
+            }
+            Self::Server {
+                certificate_chain,
+                private_key,
+            } => {
+                PrivateKeyDer::try_from(private_key.as_bytes())
+                    .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
+                let key = websocket::tls::PrivateKey::new(private_key.as_bytes().to_vec());
+                let certificates = certificate_chain
+                    .iter()
+                    .map(|certificate| websocket::tls::Certificate::new(certificate.to_vec()));
+                builder
+                    .server(key, certificates)
+                    .map_err(NetworkBuildError::WssTls)?;
+            }
+        }
+        drop(builder.finish());
+        Ok(())
     }
 
     /// Checks a WSS external address against the certificate's DNS/IP SANs.
@@ -68,12 +232,16 @@ impl WssTransportConfig {
             return Ok(());
         };
         let Self::Server {
-            certificate_der, ..
+            certificate_chain, ..
         } = self
         else {
             return Err(NetworkBuildError::InvalidTlsMaterial);
         };
-        let certificate = CertificateDer::from(certificate_der.as_slice());
+        let certificate = CertificateDer::from(
+            certificate_chain
+                .leaf()
+                .ok_or(NetworkBuildError::InvalidWssCertificateChain)?,
+        );
         webpki::EndEntityCert::try_from(&certificate)
             .map_err(NetworkBuildError::InvalidWssCertificate)?
             .verify_is_valid_for_subject_name(server_name)
@@ -84,7 +252,9 @@ impl WssTransportConfig {
     #[must_use]
     pub fn clone_client(&self) -> Option<Self> {
         match self {
-            Self::Client { additional_ca_der } => Some(Self::client(additional_ca_der.clone())),
+            Self::Client { additional_trust } => Some(Self::Client {
+                additional_trust: WssTrustAnchors(additional_trust.0.clone()),
+            }),
             Self::Server { .. } => None,
         }
     }
@@ -93,19 +263,56 @@ impl WssTransportConfig {
 impl std::fmt::Debug for WssTransportConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Client { additional_ca_der } => formatter
+            Self::Client { additional_trust } => formatter
                 .debug_struct("WssTransportConfig::Client")
-                .field("has_additional_ca", &additional_ca_der.is_some())
+                .field("additional_trust_count", &additional_trust.0.len())
                 .finish(),
             Self::Server {
-                certificate_der, ..
+                certificate_chain, ..
             } => formatter
                 .debug_struct("WssTransportConfig::Server")
-                .field("certificate_len", &certificate_der.len())
+                .field("certificate_count", &certificate_chain.0.len())
                 .field("private_key", &"[REDACTED]")
                 .finish(),
         }
     }
+}
+
+fn parse_certificate_documents(
+    documents: impl IntoIterator<Item = Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, ()> {
+    let mut certificates = Vec::new();
+    let mut total_bytes = 0_usize;
+    for document in documents {
+        if contains_pem_marker(&document) {
+            let mut found = false;
+            for section in SliceIter::<(SectionKind, Vec<u8>)>::new(&document) {
+                let (kind, certificate) = section.map_err(|_| ())?;
+                if kind != SectionKind::Certificate {
+                    return Err(());
+                }
+                found = true;
+                total_bytes = total_bytes.checked_add(certificate.len()).ok_or(())?;
+                certificates.push(certificate);
+            }
+            if !found {
+                return Err(());
+            }
+        } else {
+            total_bytes = total_bytes.checked_add(document.len()).ok_or(())?;
+            certificates.push(document);
+        }
+        if certificates.len() > WSS_CERTIFICATE_LIMIT || total_bytes > MAX_WSS_CERTIFICATE_BYTES {
+            return Err(());
+        }
+    }
+    Ok(certificates)
+}
+
+fn contains_pem_marker(document: &[u8]) -> bool {
+    document
+        .windows(b"-----BEGIN".len())
+        .any(|window| window == b"-----BEGIN")
 }
 
 /// Generates an ephemeral endpoint identity through the fallible project RNG boundary.
@@ -190,23 +397,22 @@ fn build_quic_transport(identity: &Keypair, timeout: Duration) -> Boxed<(PeerId,
 fn websocket_tls(config: WssTransportConfig) -> Result<websocket::tls::Config, NetworkBuildError> {
     let mut builder = websocket::tls::Config::builder();
     match config {
-        WssTransportConfig::Client { additional_ca_der } => {
-            if let Some(certificate) = additional_ca_der {
+        WssTransportConfig::Client { additional_trust } => {
+            for certificate in additional_trust.into_upstream() {
                 builder
-                    .add_trust(&websocket::tls::Certificate::new(certificate))
+                    .add_trust(&certificate)
                     .map_err(NetworkBuildError::WssTls)?;
             }
         }
         WssTransportConfig::Server {
-            certificate_der,
-            private_key_der,
+            certificate_chain,
+            private_key,
         } => {
-            PrivateKeyDer::try_from(private_key_der.as_bytes())
+            PrivateKeyDer::try_from(private_key.as_bytes())
                 .map_err(|_| NetworkBuildError::InvalidWssPrivateKey)?;
-            let key = websocket::tls::PrivateKey::new(private_key_der.into_upstream_bytes());
-            let certificate = websocket::tls::Certificate::new(certificate_der);
+            let key = websocket::tls::PrivateKey::new(private_key.into_upstream());
             builder
-                .server(key, [certificate])
+                .server(key, certificate_chain.into_upstream())
                 .map_err(NetworkBuildError::WssTls)?;
         }
     }
@@ -217,8 +423,9 @@ fn websocket_tls(config: WssTransportConfig) -> Result<websocket::tls::Config, N
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        TRANSPORT_TIMEOUT, WssTransportConfig, build_endpoint_transport, build_quic_transport,
-        build_relay_transport, generate_identity,
+        MAX_WSS_CERTIFICATE_BYTES, TRANSPORT_TIMEOUT, WSS_CERTIFICATE_LIMIT, WssCertificateChain,
+        WssPrivateKey, WssTransportConfig, WssTrustAnchors, build_endpoint_transport,
+        build_quic_transport, build_relay_transport, generate_identity,
     };
     use crate::{NetworkBuildError, RelayExternalAddress};
     use libp2p::core::Endpoint;
@@ -327,6 +534,59 @@ mod tests {
     }
 
     #[test]
+    fn tls_documents_use_upstream_pem_parsing_and_enforce_bundle_bounds() {
+        let pem_chain = [TEST_CERTIFICATE_PEM, TEST_CERTIFICATE_PEM].concat();
+        let chain = WssCertificateChain::from_documents([pem_chain]).unwrap();
+        let key = WssPrivateKey::from_document(SecretDocument::new(TEST_PRIVATE_KEY_PEM.to_vec()))
+            .unwrap();
+        let server = WssTransportConfig::server_with_chain(chain, key);
+        assert!(format!("{server:?}").contains("certificate_count: 2"));
+
+        let trust = WssTrustAnchors::from_documents([TEST_CERTIFICATE_PEM.to_vec()]).unwrap();
+        let client = WssTransportConfig::client_with_trust(trust);
+        assert!(format!("{client:?}").contains("additional_trust_count: 1"));
+
+        assert!(matches!(
+            WssCertificateChain::from_documents(Vec::<Vec<u8>>::new()),
+            Err(NetworkBuildError::InvalidWssCertificateChain)
+        ));
+        assert!(matches!(
+            WssCertificateChain::from_documents([
+                b"-----BEGIN CERTIFICATE-----\ninvalid\n".to_vec()
+            ]),
+            Err(NetworkBuildError::InvalidWssCertificateChain)
+        ));
+        assert!(matches!(
+            WssCertificateChain::from_documents([
+                [TEST_CERTIFICATE_PEM, TEST_PRIVATE_KEY_PEM].concat()
+            ]),
+            Err(NetworkBuildError::InvalidWssCertificateChain)
+        ));
+        assert!(matches!(
+            WssTrustAnchors::from_documents(
+                (0..=WSS_CERTIFICATE_LIMIT).map(|_| TEST_SAN_CERTIFICATE_DER.to_vec())
+            ),
+            Err(NetworkBuildError::InvalidWssTrustBundle)
+        ));
+        assert!(matches!(
+            WssTrustAnchors::from_documents([vec![0; MAX_WSS_CERTIFICATE_BYTES + 1]]),
+            Err(NetworkBuildError::InvalidWssTrustBundle)
+        ));
+        assert!(matches!(
+            WssPrivateKey::from_document(SecretDocument::new(
+                b"-----BEGIN PRIVATE KEY-----\ninvalid\n".to_vec()
+            )),
+            Err(NetworkBuildError::InvalidWssPrivateKey)
+        ));
+        assert!(matches!(
+            WssPrivateKey::from_document(SecretDocument::new(
+                [TEST_PRIVATE_KEY_PEM, TEST_CERTIFICATE_PEM].concat()
+            )),
+            Err(NetworkBuildError::InvalidWssPrivateKey)
+        ));
+    }
+
+    #[test]
     fn server_material_and_dns_ip_sans_are_validated_before_listening() {
         let client = WssTransportConfig::client(None);
         assert!(!client.is_server());
@@ -398,15 +658,15 @@ mod tests {
         assert!(generate_identity(&mut failing).is_err());
 
         let client = WssTransportConfig::client(Some(vec![1, 2, 3]));
-        assert!(format!("{client:?}").contains("has_additional_ca: true"));
+        assert!(format!("{client:?}").contains("additional_trust_count: 1"));
         let server = WssTransportConfig::server(vec![1, 2], SecretDocument::new(vec![9, 9, 9]));
         let debug = format!("{server:?}");
-        assert!(debug.contains("certificate_len: 2"));
+        assert!(debug.contains("certificate_count: 1"));
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("9, 9, 9"));
 
         let cloned = client.clone_client().unwrap();
-        assert!(format!("{cloned:?}").contains("has_additional_ca: true"));
+        assert!(format!("{cloned:?}").contains("additional_trust_count: 1"));
         assert!(WssTransportConfig::client(None).clone_client().is_some());
         assert!(server.clone_client().is_none());
     }

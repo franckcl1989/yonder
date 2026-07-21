@@ -20,8 +20,5 @@ yonder-config = { version = "=0.1.0", path = "../yonder-config", default-feature
 yonder-core = { version = "=0.1.0", path = "../yonder-core", default-features = false }
 yonder-net = { version = "=0.1.0", path = "../yonder-net", default-features = false }
 
-[dev-dependencies]
-proptest.workspace = true
-
 [lints]
 workspace = true

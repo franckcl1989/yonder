@@ -4,7 +4,7 @@
 //! Strict layered runtime configuration shared by Yonder binaries.
 
 use config::{Config, Environment, File as ConfigFile, FileFormat};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
@@ -19,6 +19,14 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 pub enum Application {
     Yon,
     Relay,
+}
+
+/// The precedence of the layer that most recently supplied one field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfigurationLayer {
+    SystemFile,
+    WorkingFile,
+    Environment,
 }
 
 impl Application {
@@ -58,12 +66,54 @@ impl ConfigurationKey {
     }
 }
 
+/// A normalized environment-backed configuration key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConfigurationEnvironmentKey(String);
+
+impl std::fmt::Display for ConfigurationEnvironmentKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// The platform-provided name of one configuration environment variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationEnvironmentVariable(String);
+
+impl std::fmt::Display for ConfigurationEnvironmentVariable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Static information required to load one binary's typed schema.
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigurationSchema {
     application: Application,
     list_keys: &'static [ConfigurationKey],
+    parsed_scalar_keys: &'static [ConfigurationKey],
     path_keys: &'static [ConfigurationKey],
+}
+
+/// One configuration value or an ordered, non-normalized list of values.
+///
+/// This lets file configuration stay concise for the common case while still
+/// accepting repeated trust anchors or certificate-chain documents.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ConfigurationValues<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> ConfigurationValues<T> {
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
 }
 
 impl ConfigurationSchema {
@@ -71,11 +121,13 @@ impl ConfigurationSchema {
     pub const fn new(
         application: Application,
         list_keys: &'static [ConfigurationKey],
+        parsed_scalar_keys: &'static [ConfigurationKey],
         path_keys: &'static [ConfigurationKey],
     ) -> Self {
         Self {
             application,
             list_keys,
+            parsed_scalar_keys,
             path_keys,
         }
     }
@@ -123,6 +175,7 @@ pub struct LayeredConfigLoader<S> {
 pub struct ConfigurationLocations {
     system_file: PathBuf,
     working_file: PathBuf,
+    application: Application,
 }
 
 impl ConfigurationLocations {
@@ -134,6 +187,79 @@ impl ConfigurationLocations {
     #[must_use]
     pub fn working_file(&self) -> &Path {
         &self.working_file
+    }
+
+    /// Inspects both file layers without loading or exposing any values.
+    pub fn inspect(&self) -> Result<ConfigurationSourceReport<'_>, ConfigurationError> {
+        Ok(ConfigurationSourceReport {
+            locations: self,
+            system_status: configuration_file_status(&self.system_file)?,
+            working_status: configuration_file_status(&self.working_file)?,
+        })
+    }
+}
+
+/// A value-free, printable view of the configured precedence layers.
+#[derive(Debug)]
+pub struct ConfigurationSourceReport<'a> {
+    locations: &'a ConfigurationLocations,
+    system_status: ConfigurationFileStatus,
+    working_status: ConfigurationFileStatus,
+}
+
+impl ConfigurationSourceReport<'_> {
+    pub fn write_to(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(output, "Configuration precedence (lowest to highest):")?;
+        writeln!(
+            output,
+            "1. System file: {} ({})",
+            self.locations.system_file.display(),
+            self.system_status
+        )?;
+        writeln!(
+            output,
+            "2. Working-directory file: {} ({})",
+            self.locations.working_file.display(),
+            self.working_status
+        )?;
+        writeln!(
+            output,
+            "3. Environment variables: {}_* (values hidden)",
+            self.locations
+                .application
+                .configuration_environment_prefix()
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigurationFileStatus {
+    Present,
+    Missing,
+    NotRegular,
+}
+
+impl std::fmt::Display for ConfigurationFileStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::NotRegular => "not a regular file",
+        })
+    }
+}
+
+fn configuration_file_status(path: &Path) -> Result<ConfigurationFileStatus, ConfigurationError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(ConfigurationFileStatus::Present),
+        Ok(_) => Ok(ConfigurationFileStatus::NotRegular),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ConfigurationFileStatus::Missing)
+        }
+        Err(source) => Err(ConfigurationError::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -158,6 +284,7 @@ where
         Ok(ConfigurationLocations {
             system_file: system_directory.join(self.schema.application.file_name()),
             working_file: cwd.join(self.schema.application.file_name()),
+            application: self.schema.application,
         })
     }
 }
@@ -188,6 +315,7 @@ where
         let environment = environment_layers(
             self.schema.application,
             self.schema.list_keys,
+            self.schema.parsed_scalar_keys,
             self.sources.environment(),
         )?;
 
@@ -197,8 +325,15 @@ where
             self.schema.path_keys,
             system.as_ref(),
             &system_directory,
+            ConfigurationLayer::SystemFile,
         );
-        record_file_origins(&mut origins, self.schema.path_keys, working.as_ref(), &cwd);
+        record_file_origins(
+            &mut origins,
+            self.schema.path_keys,
+            working.as_ref(),
+            &cwd,
+            ConfigurationLayer::WorkingFile,
+        );
         record_environment_origins(&mut origins, self.schema.path_keys, &environment.keys, &cwd);
 
         let mut builder = Config::builder();
@@ -210,6 +345,7 @@ where
         }
         builder = builder
             .add_source(environment.scalar)
+            .add_source(environment.parsed_scalar)
             .add_source(environment.lists);
         let value = builder
             .build()
@@ -223,7 +359,13 @@ where
 #[derive(Debug)]
 pub struct LoadedConfiguration<T> {
     value: T,
-    origins: HashMap<ConfigurationKey, PathBuf>,
+    origins: HashMap<ConfigurationKey, ConfigurationOrigin>,
+}
+
+#[derive(Debug)]
+struct ConfigurationOrigin {
+    base: PathBuf,
+    layer: ConfigurationLayer,
 }
 
 impl<T> LoadedConfiguration<T> {
@@ -235,6 +377,22 @@ impl<T> LoadedConfiguration<T> {
     #[must_use]
     pub fn into_value(self) -> T {
         self.value
+    }
+
+    /// Returns the highest-precedence layer that supplied a path field.
+    #[must_use]
+    pub fn source_layer(&self, key: ConfigurationKey) -> Option<ConfigurationLayer> {
+        self.origins.get(&key).map(|origin| origin.layer)
+    }
+
+    /// Compares the layers that supplied two path fields.
+    #[must_use]
+    pub fn compare_source_precedence(
+        &self,
+        left: ConfigurationKey,
+        right: ConfigurationKey,
+    ) -> Option<std::cmp::Ordering> {
+        Some(self.source_layer(left)?.cmp(&self.source_layer(right)?))
     }
 
     /// Resolves a non-empty path relative to the source that supplied the field.
@@ -253,7 +411,7 @@ impl<T> LoadedConfiguration<T> {
             .origins
             .get(&key)
             .ok_or(ConfigurationError::MissingPathOrigin(key.as_str()))?;
-        Ok(base.join(path))
+        Ok(base.base.join(path))
     }
 }
 
@@ -296,7 +454,9 @@ pub enum ConfigurationError {
         source: Box<config::ConfigError>,
     },
     #[error("configuration environment variable is not Unicode: {0}")]
-    EnvironmentEncoding(String),
+    EnvironmentEncoding(ConfigurationEnvironmentVariable),
+    #[error("multiple environment variables configure the same field: {0}")]
+    DuplicateEnvironmentKey(ConfigurationEnvironmentKey),
     #[error("configuration schema is invalid: {0}")]
     Schema(#[source] Box<config::ConfigError>),
     #[error("configuration path field is empty: {0}")]
@@ -313,6 +473,7 @@ struct FileLayer {
 #[derive(Debug)]
 struct EnvironmentLayers {
     scalar: Config,
+    parsed_scalar: Config,
     lists: Config,
     keys: HashSet<String>,
 }
@@ -372,13 +533,17 @@ fn read_layer_document(
 fn environment_layers(
     application: Application,
     list_keys: &[ConfigurationKey],
+    parsed_scalar_keys: &[ConfigurationKey],
     variables: Vec<(OsString, OsString)>,
 ) -> Result<EnvironmentLayers, ConfigurationError> {
     let prefix = application.environment_prefix();
     let pattern = format!("{prefix}_").to_lowercase();
     let excluded = (application == Application::Yon).then_some("yon_relay_");
     let list_keys: HashSet<_> = list_keys.iter().map(|key| key.as_str()).collect();
+    let parsed_scalar_keys: HashSet<_> =
+        parsed_scalar_keys.iter().map(|key| key.as_str()).collect();
     let mut scalar = config::Map::new();
+    let mut parsed_scalar = config::Map::new();
     let mut lists = config::Map::new();
     let mut normalized_keys = HashSet::new();
 
@@ -392,22 +557,30 @@ fn environment_layers(
         {
             continue;
         }
-        let value = value
-            .into_string()
-            .map_err(|_| ConfigurationError::EnvironmentEncoding(key.clone()))?;
+        let value = value.into_string().map_err(|_| {
+            ConfigurationError::EnvironmentEncoding(ConfigurationEnvironmentVariable(key.clone()))
+        })?;
         let normalized = lower[pattern.len()..].replace("__", ".");
-        normalized_keys.insert(normalized.clone());
+        if !normalized_keys.insert(normalized.clone()) {
+            return Err(ConfigurationError::DuplicateEnvironmentKey(
+                ConfigurationEnvironmentKey(normalized),
+            ));
+        }
         if list_keys.contains(normalized.as_str()) {
             lists.insert(key, value);
+        } else if parsed_scalar_keys.contains(normalized.as_str()) {
+            parsed_scalar.insert(key, value);
         } else {
             scalar.insert(key, value);
         }
     }
 
-    let scalar = environment_config(prefix, scalar, false)?;
-    let lists = environment_config(prefix, lists, true)?;
+    let scalar = environment_config(prefix, scalar, false, false)?;
+    let parsed_scalar = environment_config(prefix, parsed_scalar, true, false)?;
+    let lists = environment_config(prefix, lists, true, true)?;
     Ok(EnvironmentLayers {
         scalar,
+        parsed_scalar,
         lists,
         keys: normalized_keys,
     })
@@ -416,13 +589,14 @@ fn environment_layers(
 fn environment_config(
     prefix: &str,
     source: config::Map<String, String>,
+    parse_scalars: bool,
     lists: bool,
 ) -> Result<Config, ConfigurationError> {
     let mut environment = Environment::with_prefix(prefix)
         .prefix_separator("_")
         .separator("__")
         .ignore_empty(false)
-        .try_parsing(lists)
+        .try_parsing(parse_scalars)
         .source(Some(source));
     if lists {
         environment = environment.list_separator(",");
@@ -434,30 +608,43 @@ fn environment_config(
 }
 
 fn record_file_origins(
-    origins: &mut HashMap<ConfigurationKey, PathBuf>,
+    origins: &mut HashMap<ConfigurationKey, ConfigurationOrigin>,
     path_keys: &[ConfigurationKey],
     layer: Option<&FileLayer>,
     base: &Path,
+    source_layer: ConfigurationLayer,
 ) {
     let Some(layer) = layer else {
         return;
     };
     for key in path_keys {
-        if layer.config.get_string(key.as_str()).is_ok() {
-            origins.insert(*key, base.to_path_buf());
+        if layer.config.get::<config::Value>(key.as_str()).is_ok() {
+            origins.insert(
+                *key,
+                ConfigurationOrigin {
+                    base: base.to_path_buf(),
+                    layer: source_layer,
+                },
+            );
         }
     }
 }
 
 fn record_environment_origins(
-    origins: &mut HashMap<ConfigurationKey, PathBuf>,
+    origins: &mut HashMap<ConfigurationKey, ConfigurationOrigin>,
     path_keys: &[ConfigurationKey],
     environment_keys: &HashSet<String>,
     base: &Path,
 ) {
     for key in path_keys {
         if environment_keys.contains(key.as_str()) {
-            origins.insert(*key, base.to_path_buf());
+            origins.insert(
+                *key,
+                ConfigurationOrigin {
+                    base: base.to_path_buf(),
+                    layer: ConfigurationLayer::Environment,
+                },
+            );
         }
     }
 }
@@ -500,7 +687,7 @@ fn system_directory(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        Application, ConfigLoader, ConfigurationError, ConfigurationKey,
+        Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationLayer,
         ConfigurationLocationError, ConfigurationSchema, ConfigurationSources, LayeredConfigLoader,
         read_layer, read_layer_document,
     };
@@ -516,8 +703,9 @@ mod tests {
 
     const RELAYS: ConfigurationKey = ConfigurationKey::new("relays");
     const CA: ConfigurationKey = ConfigurationKey::new("wss_ca_der");
+    const COUNT: ConfigurationKey = ConfigurationKey::new("count");
     const SCHEMA: ConfigurationSchema =
-        ConfigurationSchema::new(Application::Yon, &[RELAYS], &[CA]);
+        ConfigurationSchema::new(Application::Yon, &[RELAYS], &[COUNT], &[CA]);
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
@@ -589,13 +777,20 @@ mod tests {
             Sources {
                 cwd: cwd.clone(),
                 system: system.clone(),
-                environment: vec![("YON_RELAYS".into(), "env-a,env-b".into())],
+                environment: vec![
+                    ("YON_RELAYS".into(), "env-a,env-b".into()),
+                    ("YON_COUNT".into(), "3".into()),
+                ],
             },
             SCHEMA,
         );
         let loaded: super::LoadedConfiguration<Settings> = loader.load().unwrap();
         assert_eq!(loaded.value().relays, ["env-a", "env-b"]);
-        assert_eq!(loaded.value().count, 2);
+        assert_eq!(loaded.value().count, 3);
+        assert_eq!(
+            loaded.source_layer(CA),
+            Some(ConfigurationLayer::SystemFile)
+        );
         assert_eq!(
             loaded
                 .resolve_path(CA, loaded.value().wss_ca_der.as_deref().unwrap())
@@ -609,6 +804,10 @@ mod tests {
         let root = tempdir().unwrap();
         let cwd = root.path().join("cwd");
         let system = root.path().join("system");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::write(system.join("yon.toml"), "secret = true").unwrap();
+        fs::create_dir(cwd.join("yon.toml")).unwrap();
         let loader = LayeredConfigLoader::new(
             Sources {
                 cwd: cwd.clone(),
@@ -625,6 +824,30 @@ mod tests {
             Application::Relay.configuration_environment_prefix(),
             "YON_RELAY"
         );
+
+        let mut report = Vec::new();
+        locations.inspect().unwrap().write_to(&mut report).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("(present)"));
+        assert!(report.contains("(not a regular file)"));
+        assert!(report.contains("Environment variables: YON_* (values hidden)"));
+        assert!(!report.contains("secret-address"));
+
+        fs::remove_file(system.join("yon.toml")).unwrap();
+        fs::remove_dir(cwd.join("yon.toml")).unwrap();
+        let mut missing_report = Vec::new();
+        locations
+            .inspect()
+            .unwrap()
+            .write_to(&mut missing_report)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(missing_report)
+                .unwrap()
+                .matches("(missing)")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -640,7 +863,7 @@ mod tests {
                 system,
                 environment: vec![
                     ("YON_RELAYS".into(), "relay".into()),
-                    ("YON_WSS_CA_DER".into(), "ca.der".into()),
+                    ("YON_WSS_CA_DER".into(), "123".into()),
                     ("YON_RELAY_IDENTITY".into(), "ignored".into()),
                 ],
             },
@@ -651,7 +874,11 @@ mod tests {
             loaded
                 .resolve_path(CA, loaded.value().wss_ca_der.as_deref().unwrap())
                 .unwrap(),
-            cwd.join("ca.der")
+            cwd.join("123")
+        );
+        assert_eq!(
+            loaded.source_layer(CA),
+            Some(ConfigurationLayer::Environment)
         );
     }
 
@@ -836,11 +1063,12 @@ mod tests {
         let key = ConfigurationKey::new(std::hint::black_box("runtime.path"));
         let list_keys = std::hint::black_box(&KEYS[..]);
         let path_keys = std::hint::black_box(&KEYS[..]);
-        let schema = ConfigurationSchema::new(Application::Relay, list_keys, path_keys);
+        let schema = ConfigurationSchema::new(Application::Relay, list_keys, list_keys, path_keys);
 
         assert_eq!(key.as_str(), "runtime.path");
         assert_eq!(schema.application, Application::Relay);
         assert_eq!(schema.list_keys, [key]);
+        assert_eq!(schema.parsed_scalar_keys, [key]);
         assert_eq!(schema.path_keys, [key]);
     }
 
@@ -898,7 +1126,24 @@ mod tests {
         .load();
         assert!(matches!(
             relevant,
-            Err(ConfigurationError::EnvironmentEncoding(key)) if key == "YON_RELAYS"
+            Err(ConfigurationError::EnvironmentEncoding(key)) if key.to_string() == "YON_RELAYS"
+        ));
+
+        let duplicate: Result<super::LoadedConfiguration<Settings>, _> = LayeredConfigLoader::new(
+            Sources {
+                cwd: root.path().join("cwd"),
+                system: root.path().join("system"),
+                environment: vec![
+                    ("YON_RELAYS".into(), "first".into()),
+                    ("yon_relays".into(), "second".into()),
+                ],
+            },
+            SCHEMA,
+        )
+        .load();
+        assert!(matches!(
+            duplicate,
+            Err(ConfigurationError::DuplicateEnvironmentKey(key)) if key.to_string() == "relays"
         ));
     }
 

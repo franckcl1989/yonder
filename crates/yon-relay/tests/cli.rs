@@ -143,7 +143,9 @@ fn serve_cli_starts_the_real_relay_and_prints_its_canonical_address() {
         .env_remove("YON_RELAY_IDENTITY")
         .env_remove("YON_RELAY_LISTEN")
         .env_remove("YON_RELAY_EXTERNAL")
+        .env_remove("YON_RELAY_WSS_CERTIFICATE")
         .env_remove("YON_RELAY_WSS_CERTIFICATE_DER")
+        .env_remove("YON_RELAY_WSS_PRIVATE_KEY")
         .env_remove("YON_RELAY_WSS_PRIVATE_KEY_DER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -325,7 +327,9 @@ fn relay_command(directory: &std::path::Path) -> Command {
         .env_remove("YON_RELAY_IDENTITY")
         .env_remove("YON_RELAY_LISTEN")
         .env_remove("YON_RELAY_EXTERNAL")
+        .env_remove("YON_RELAY_WSS_CERTIFICATE")
         .env_remove("YON_RELAY_WSS_CERTIFICATE_DER")
+        .env_remove("YON_RELAY_WSS_PRIVATE_KEY")
         .env_remove("YON_RELAY_WSS_PRIVATE_KEY_DER");
     command
 }

@@ -27,6 +27,6 @@
 | R-023 | 0.1.0 实际体验可感知、终端零污染 | `OperationProgress<Stage>` + CLI renderer + file diagnostics | 配置先校验；首反馈同步；心跳 <=1s；动态单行宽度；Active tracing 隔离；路径可诊断 | renderer/unit、Unix PTY + Windows ConPTY E2E、`--log-file`、strict fallback、真实 namespace 时延门禁、错误/恢复回归 |
 | R-024 | relay 秘密文件在受支持平台 fail-closed | `SecretFilePolicy` + `IdentityStore` | Unix 0600、可信且不可被 group/other 写入的直接父目录；Windows protected DACL/可信 owner | Unix mode/父目录/普通文件、Windows ACL 正反测试、原生 config check、空目录 identity smoke |
 | R-025 | relay 可生产托管且可低噪声观测 | relay root task + aggregate observations | 跨平台停止信号；2s shutdown；60s 低基数汇总 | Unix/Windows 原生信号 E2E、聚合计数、拓扑配置拒绝、停止期限 |
-| R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |
+| R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | 两个二进制 config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |
 
 实现任务只有同时关联至少一个需求 ID、一个责任 package 和一个验证项才能进入开发。该矩阵是可追踪的当前基线，不是凌驾于产品目标之上的不可变规则；真实实现、网络或运维证据证明现有条目不合理时，应同时修订需求、设计、实现和验证，而不是为保持旧文本牺牲远程终端的正确性与可用性。发现需求没有可执行证据时视为设计缺口，不能用人工目测关闭。

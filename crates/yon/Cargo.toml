@@ -28,6 +28,9 @@ yonder-core = { version = "=0.1.0", path = "../yonder-core", default-features = 
 yonder-net = { version = "=0.1.0", path = "../yonder-net", default-features = false }
 zeroize.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
