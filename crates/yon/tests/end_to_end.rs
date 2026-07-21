@@ -391,6 +391,10 @@ fn run_interactive_pty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     let mut output = Vec::new();
 
     let outcome = (|| -> Result<u32, std::io::Error> {
+        writer.write_all(b"printf 'YON_SHELL_%s\\n' READY\n")?;
+        writer.flush()?;
+        wait_for_bytes(&output_rx, &mut output, b"YON_SHELL_READY", SESSION_TIMEOUT)?;
+
         writer.write_all(
             b"old=$(stty -g); stty raw -echo; key=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); stty \"$old\"; printf 'YON_KEY_ESCAPE=%s\\n' \"$key\"\n",
         )?;
@@ -1585,9 +1589,15 @@ fn wait_for_bytes(
     let deadline = Instant::now() + timeout;
     while !contains_bytes(output, expected) {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let chunk = chunks
-            .recv_timeout(remaining)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let chunk = chunks.recv_timeout(remaining).map_err(|error| {
+            const DIAGNOSTIC_TAIL_LIMIT: usize = 4 * 1024;
+            let tail_start = output.len().saturating_sub(DIAGNOSTIC_TAIL_LIMIT);
+            std::io::Error::other(format!(
+                "timed out waiting for {:?}: {error}; terminal output tail: {:?}",
+                String::from_utf8_lossy(expected),
+                String::from_utf8_lossy(&output[tail_start..]),
+            ))
+        })?;
         output.extend_from_slice(&chunk);
     }
     Ok(())
