@@ -2,6 +2,7 @@ use crate::registry::{Registry, RegistryError, ResolveLimiters};
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -23,6 +24,7 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const REJECTED_CONNECTION_DRAIN: Duration = Duration::from_secs(1);
 const REGISTRY_READERS: usize = 16;
+const OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Fully validated inputs required to run a relay process.
 pub struct RelayServeConfig {
@@ -61,6 +63,12 @@ impl RelayServeConfig {
         if listen.is_empty() || listen.len() > 8 || external.is_empty() || external.len() > 8 {
             return Err(RelayServiceError::InvalidConfiguration);
         }
+        if contains_duplicate_listen_address(&listen) {
+            return Err(RelayServiceError::DuplicateListenAddress);
+        }
+        if contains_duplicate_external_address(&external) {
+            return Err(RelayServiceError::DuplicateExternalAddress);
+        }
         let requires_wss = listen
             .iter()
             .any(|address| address.transport() == TransportKind::SecureWebSocket)
@@ -69,6 +77,13 @@ impl RelayServeConfig {
                 .any(|address| address.transport() == TransportKind::SecureWebSocket);
         if requires_wss && !wss.is_server() {
             return Err(RelayServiceError::MissingWssCertificate);
+        }
+        if external.iter().any(|advertised| {
+            !listen
+                .iter()
+                .any(|listener| listener.transport() == advertised.transport())
+        }) {
+            return Err(RelayServiceError::MissingListenTransport);
         }
         if wss.is_server() {
             wss.validate_server_material()?;
@@ -96,6 +111,12 @@ impl RelayServeConfig {
 pub enum RelayServiceError {
     #[error("relay configuration is invalid")]
     InvalidConfiguration,
+    #[error("relay listen addresses contain a duplicate endpoint")]
+    DuplicateListenAddress,
+    #[error("relay external addresses contain a duplicate endpoint")]
+    DuplicateExternalAddress,
+    #[error("an advertised relay transport has no matching listener")]
+    MissingListenTransport,
     #[error(
         "a TLS WebSocket listener or external address requires both certificate and private key"
     )]
@@ -134,6 +155,20 @@ pub enum RelayServiceError {
     },
     #[error("failed to report the relay's public addresses")]
     Output(#[source] std::io::Error),
+}
+
+fn contains_duplicate_listen_address(addresses: &[RelayListenAddress]) -> bool {
+    let mut unique = HashSet::with_capacity(addresses.len());
+    addresses
+        .iter()
+        .any(|address| !unique.insert(address.as_multiaddr()))
+}
+
+fn contains_duplicate_external_address(addresses: &[RelayExternalAddress]) -> bool {
+    let mut unique = HashSet::with_capacity(addresses.len());
+    addresses
+        .iter()
+        .any(|address| !unique.insert(address.as_multiaddr()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,9 +262,126 @@ enum ProtocolTaskError {
     Registry(#[from] RegistryError),
 }
 
-/// Runs until Ctrl+C or a root service failure.
+#[derive(Debug, Default)]
+struct RelayObservability {
+    connection_overflow: AtomicU64,
+    registry_overload: AtomicU64,
+    registry_retry: AtomicU64,
+    registry_capacity: AtomicU64,
+    resolve_overload: AtomicU64,
+    resolve_retry: AtomicU64,
+    resolve_global_limited: AtomicU64,
+    resolve_source_limited: AtomicU64,
+    protocol_timeout: AtomicU64,
+    protocol_io: AtomicU64,
+    protocol_invalid: AtomicU64,
+    protocol_owner_stopped: AtomicU64,
+    protocol_registry: AtomicU64,
+}
+
+impl RelayObservability {
+    fn increment(counter: &AtomicU64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        });
+    }
+
+    fn observe_protocol_result(&self, result: Result<(), ProtocolTaskError>) {
+        let counter = match result {
+            Ok(()) => return,
+            Err(ProtocolTaskError::Timeout) => &self.protocol_timeout,
+            Err(ProtocolTaskError::Io(_)) => &self.protocol_io,
+            Err(ProtocolTaskError::Protocol(_)) => &self.protocol_invalid,
+            Err(ProtocolTaskError::OwnerStopped) => &self.protocol_owner_stopped,
+            Err(ProtocolTaskError::Registry(_)) => &self.protocol_registry,
+        };
+        Self::increment(counter);
+    }
+
+    fn report_and_reset(&self, active_registrations: usize) {
+        let connection_overflow = self.connection_overflow.swap(0, Ordering::Relaxed);
+        let registry_overload = self.registry_overload.swap(0, Ordering::Relaxed);
+        let registry_retry = self.registry_retry.swap(0, Ordering::Relaxed);
+        let registry_capacity = self.registry_capacity.swap(0, Ordering::Relaxed);
+        let resolve_overload = self.resolve_overload.swap(0, Ordering::Relaxed);
+        let resolve_retry = self.resolve_retry.swap(0, Ordering::Relaxed);
+        let resolve_global_limited = self.resolve_global_limited.swap(0, Ordering::Relaxed);
+        let resolve_source_limited = self.resolve_source_limited.swap(0, Ordering::Relaxed);
+        let protocol_timeout = self.protocol_timeout.swap(0, Ordering::Relaxed);
+        let protocol_io = self.protocol_io.swap(0, Ordering::Relaxed);
+        let protocol_invalid = self.protocol_invalid.swap(0, Ordering::Relaxed);
+        let protocol_owner_stopped = self.protocol_owner_stopped.swap(0, Ordering::Relaxed);
+        let protocol_registry = self.protocol_registry.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            event = "relay_activity_summary",
+            active_registrations,
+            connection_overflow,
+            registry_overload,
+            registry_retry,
+            registry_capacity,
+            resolve_overload,
+            resolve_retry,
+            resolve_global_limited,
+            resolve_source_limited,
+            protocol_timeout,
+            protocol_io,
+            protocol_invalid,
+            protocol_owner_stopped,
+            protocol_registry,
+            "relay activity summary"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownReason {
+    Interrupt,
+    #[cfg(unix)]
+    Terminate,
+    #[cfg(unix)]
+    Hangup,
+    #[cfg(windows)]
+    ConsoleBreak,
+    #[cfg(windows)]
+    ConsoleClose,
+    #[cfg(windows)]
+    ConsoleLogoff,
+    #[cfg(windows)]
+    ConsoleShutdown,
+}
+
+impl ShutdownReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupt => "interrupt",
+            #[cfg(unix)]
+            Self::Terminate => "terminate",
+            #[cfg(unix)]
+            Self::Hangup => "hangup",
+            #[cfg(windows)]
+            Self::ConsoleBreak => "console_break",
+            #[cfg(windows)]
+            Self::ConsoleClose => "console_close",
+            #[cfg(windows)]
+            Self::ConsoleLogoff => "console_logoff",
+            #[cfg(windows)]
+            Self::ConsoleShutdown => "console_shutdown",
+        }
+    }
+}
+
+/// Runs until a supported process termination signal or a root service failure.
 pub async fn run_relay(config: RelayServeConfig) -> Result<(), RelayServiceError> {
-    run_relay_until(config, tokio::signal::ctrl_c()).await
+    run_relay_until(config, async {
+        let reason = process_shutdown_signal().await?;
+        tracing::info!(
+            event = "relay_shutdown_requested",
+            reason = reason.as_str(),
+            "relay shutdown requested"
+        );
+        Ok(())
+    })
+    .await
 }
 
 /// Runs the relay until an injected shutdown signal completes.
@@ -244,6 +396,15 @@ pub async fn run_relay_until(
         wss,
         resources,
     } = config;
+    tracing::info!(
+        event = "relay_starting",
+        listen_count = listen.len(),
+        external_count = external.len(),
+        registration_capacity = resources.registration().capacity().get(),
+        resolve_concurrency = resources.resolve().concurrency().get(),
+        circuit_capacity = resources.circuit().capacity().get(),
+        "relay service is starting"
+    );
     let mut node =
         RelayNode::with_limits(identity, wss, resources.registration(), resources.circuit())?;
     let mut listener_ids = Vec::with_capacity(listen.len());
@@ -280,12 +441,21 @@ pub async fn run_relay_until(
     let mut limiters = ResolveLimiters::with_limits(resources.resolve());
     let mut connections = ConnectionBook::new();
     let mut random = OsSecureRandom;
+    let observations = Arc::new(RelayObservability::default());
+    let mut observation_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + OBSERVABILITY_INTERVAL,
+        OBSERVABILITY_INTERVAL,
+    );
+    observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
 
     let root_result = loop {
         tokio::select! {
             signal = &mut shutdown => {
                 break signal.map_err(RelayServiceError::Signal);
+            }
+            _ = observation_tick.tick() => {
+                observations.report_and_reset(registry.len());
             }
             event = node.next_event() => {
                 let rejected_connection = match &event {
@@ -307,6 +477,7 @@ pub async fn run_relay_until(
                     &mut registry,
                     &mut listeners,
                     &external,
+                    &observations,
                 ) {
                     break Err(error);
                 }
@@ -325,6 +496,7 @@ pub async fn run_relay_until(
                     break Err(RelayServiceError::ProtocolRegistrationEnded);
                 };
                 let Ok(permit) = Arc::clone(&registry_permits).try_acquire_owned() else {
+                    RelayObservability::increment(&observations.registry_overload);
                     continue;
                 };
                 let admitted_connection = connections.unique(&peer).map(|connection| connection.id());
@@ -332,11 +504,13 @@ pub async fn run_relay_until(
                     || rejected_peers.contains(&peer)
                     || admitted_connection.is_none()
                 {
+                    RelayObservability::increment(&observations.registry_retry);
                     let cancellation = tasks.cancellation();
+                    let task_observations = Arc::clone(&observations);
                     tasks.spawn(async move {
                         let exchange = registry_immediate_retry(stream, retry_after);
                         tokio::select! {
-                            result = exchange => log_protocol_result(peer, result),
+                            result = exchange => task_observations.observe_protocol_result(result),
                             () = cancellation.cancelled() => {}
                         }
                         drop(permit);
@@ -350,6 +524,7 @@ pub async fn run_relay_until(
                 let calls = registry_calls_tx.clone();
                 let done = registry_done_tx.clone();
                 let cancellation = tasks.cancellation();
+                let task_observations = Arc::clone(&observations);
                 tasks.spawn(async move {
                     let mut rejected_connection = None;
                     let exchange = registry_exchange(
@@ -372,7 +547,7 @@ pub async fn run_relay_until(
                         }
                     }
                     if let Some(result) = completed {
-                        log_protocol_result(peer, result);
+                        task_observations.observe_protocol_result(result);
                     }
                     let _ = done.send(RegistryTaskDone {
                         peer,
@@ -386,14 +561,17 @@ pub async fn run_relay_until(
                     break Err(RelayServiceError::ProtocolRegistrationEnded);
                 };
                 let Ok(permit) = Arc::clone(&resolve_permits).try_acquire_owned() else {
+                    RelayObservability::increment(&observations.resolve_overload);
                     continue;
                 };
                 if resolve_active.contains(&peer) || connections.unique(&peer).is_none() {
+                    RelayObservability::increment(&observations.resolve_retry);
                     let cancellation = tasks.cancellation();
+                    let task_observations = Arc::clone(&observations);
                     tasks.spawn(async move {
                         let exchange = resolve_immediate_retry(stream, retry_after);
                         tokio::select! {
-                            result = exchange => log_protocol_result(peer, result),
+                            result = exchange => task_observations.observe_protocol_result(result),
                             () = cancellation.cancelled() => {}
                         }
                         drop(permit);
@@ -404,10 +582,11 @@ pub async fn run_relay_until(
                 let calls = resolve_calls_tx.clone();
                 let done = resolve_done_tx.clone();
                 let cancellation = tasks.cancellation();
+                let task_observations = Arc::clone(&observations);
                 tasks.spawn(async move {
                     let exchange = resolve_exchange(peer, stream, calls);
                     tokio::select! {
-                        result = exchange => log_protocol_result(peer, result),
+                        result = exchange => task_observations.observe_protocol_result(result),
                         () = cancellation.cancelled() => {}
                     }
                     let _ = done.send(peer).await;
@@ -427,6 +606,9 @@ pub async fn run_relay_until(
                 if decision.rejected_connection.is_some() {
                     rejected_peers.insert(call.peer);
                 }
+                if matches!(decision.response, RegistryResponse::Capacity) {
+                    RelayObservability::increment(&observations.registry_capacity);
+                }
                 if let Err(Ok(decision)) = call.response.send(Ok(decision))
                     && decision.rejected_connection.is_some()
                 {
@@ -434,12 +616,13 @@ pub async fn run_relay_until(
                 }
             }
             Some(call) = resolve_calls_rx.recv() => {
-                let response = match handle_resolve_call(
+                let response = match handle_resolve_call_observed(
                     &call,
                     &connections,
                     &clock,
                     &mut registry,
                     &mut limiters,
+                    &observations,
                 ) {
                     Ok(response) => Ok(response),
                     Err(ProtocolTaskError::Registry(error)) => {
@@ -469,7 +652,59 @@ pub async fn run_relay_until(
         }
     };
 
-    finish_relay_run(root_result, tasks).await
+    observations.report_and_reset(registry.len());
+    let result = finish_relay_run(root_result, tasks).await;
+    match &result {
+        Ok(()) => tracing::info!(
+            event = "relay_stopped",
+            outcome = "graceful",
+            "relay service stopped"
+        ),
+        Err(_) => tracing::warn!(
+            event = "relay_stopped",
+            outcome = "failure",
+            "relay service stopped"
+        ),
+    }
+    result
+}
+
+#[cfg(unix)]
+async fn process_shutdown_signal() -> Result<ShutdownReason, std::io::Error> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::select! {
+        _ = interrupt.recv() => Ok(ShutdownReason::Interrupt),
+        _ = terminate.recv() => Ok(ShutdownReason::Terminate),
+        _ = hangup.recv() => Ok(ShutdownReason::Hangup),
+    }
+}
+
+#[cfg(windows)]
+async fn process_shutdown_signal() -> Result<ShutdownReason, std::io::Error> {
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+
+    let mut interrupt = ctrl_c()?;
+    let mut console_break = ctrl_break()?;
+    let mut console_close = ctrl_close()?;
+    let mut console_logoff = ctrl_logoff()?;
+    let mut console_shutdown = ctrl_shutdown()?;
+    tokio::select! {
+        _ = interrupt.recv() => Ok(ShutdownReason::Interrupt),
+        _ = console_break.recv() => Ok(ShutdownReason::ConsoleBreak),
+        _ = console_close.recv() => Ok(ShutdownReason::ConsoleClose),
+        _ = console_logoff.recv() => Ok(ShutdownReason::ConsoleLogoff),
+        _ = console_shutdown.recv() => Ok(ShutdownReason::ConsoleShutdown),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn process_shutdown_signal() -> Result<ShutdownReason, std::io::Error> {
+    tokio::signal::ctrl_c().await?;
+    Ok(ShutdownReason::Interrupt)
 }
 
 fn completed_task_result(
@@ -515,6 +750,7 @@ fn handle_swarm_event<C: yonder_core::MonotonicClock>(
     registry: &mut Registry<C>,
     listeners: &mut RequiredListeners,
     external: &[RelayExternalAddress],
+    observations: &RelayObservability,
 ) -> Result<(), RelayServiceError> {
     match event {
         SwarmEvent::ConnectionEstablished {
@@ -523,8 +759,11 @@ fn handle_swarm_event<C: yonder_core::MonotonicClock>(
             endpoint,
             ..
         } => {
-            if let Err(error) = connections.established(peer_id, connection_id, endpoint) {
-                tracing::warn!(%peer_id, %connection_id, %error, "closing connection beyond roster bound");
+            if connections
+                .established(peer_id, connection_id, endpoint)
+                .is_err()
+            {
+                RelayObservability::increment(&observations.connection_overflow);
                 node.swarm_mut().close_connection(connection_id);
             }
             registry.set_connection(peer_id, connections.count(&peer_id) > 0);
@@ -585,7 +824,14 @@ fn report_ready(
         report_listen_address(peer_id, address.clone());
     }
     let stdout = std::io::stdout();
-    report_ready_to(&mut stdout.lock(), peer_id, external).map_err(RelayServiceError::Output)
+    report_ready_to(&mut stdout.lock(), peer_id, external).map_err(RelayServiceError::Output)?;
+    tracing::info!(
+        event = "relay_ready",
+        listener_count = listeners.ready_addresses.len(),
+        external_count = external.len(),
+        "relay service is ready"
+    );
+    Ok(())
 }
 
 fn report_ready_to(
@@ -657,6 +903,7 @@ fn close_peer_connections(node: &mut RelayNode, connections: &ConnectionBook, pe
     }
 }
 
+#[cfg(test)]
 fn handle_resolve_call<C: yonder_core::MonotonicClock>(
     call: &ResolveCall,
     connections: &ConnectionBook,
@@ -664,7 +911,39 @@ fn handle_resolve_call<C: yonder_core::MonotonicClock>(
     registry: &mut Registry<C>,
     limiters: &mut ResolveLimiters,
 ) -> Result<ResolveResponse, ProtocolTaskError> {
+    handle_resolve_call_inner(call, connections, clock, registry, limiters, None)
+}
+
+fn handle_resolve_call_observed<C: yonder_core::MonotonicClock>(
+    call: &ResolveCall,
+    connections: &ConnectionBook,
+    clock: &C,
+    registry: &mut Registry<C>,
+    limiters: &mut ResolveLimiters,
+    observations: &RelayObservability,
+) -> Result<ResolveResponse, ProtocolTaskError> {
+    handle_resolve_call_inner(
+        call,
+        connections,
+        clock,
+        registry,
+        limiters,
+        Some(observations),
+    )
+}
+
+fn handle_resolve_call_inner<C: yonder_core::MonotonicClock>(
+    call: &ResolveCall,
+    connections: &ConnectionBook,
+    clock: &C,
+    registry: &mut Registry<C>,
+    limiters: &mut ResolveLimiters,
+    observations: Option<&RelayObservability>,
+) -> Result<ResolveResponse, ProtocolTaskError> {
     if !limiters.check_global() {
+        if let Some(observations) = observations {
+            RelayObservability::increment(&observations.resolve_global_limited);
+        }
         return Ok(ResolveResponse::Retry(limiters.retry_after()));
     }
     let request = ResolveRequest::decode(&call.request).map_err(ProtocolTaskError::from)?;
@@ -672,9 +951,15 @@ fn handle_resolve_call<C: yonder_core::MonotonicClock>(
         .unique(&call.peer)
         .and_then(|connection| connection.source_prefix())
     else {
+        if let Some(observations) = observations {
+            RelayObservability::increment(&observations.resolve_retry);
+        }
         return Ok(ResolveResponse::Retry(limiters.retry_after()));
     };
     if !limiters.check_source(source, clock.now()) {
+        if let Some(observations) = observations {
+            RelayObservability::increment(&observations.resolve_source_limited);
+        }
         return Ok(ResolveResponse::Retry(limiters.retry_after()));
     }
     registry
@@ -801,27 +1086,22 @@ async fn write_close(
     Ok(())
 }
 
-fn log_protocol_result(peer: PeerId, result: Result<(), ProtocolTaskError>) {
-    if let Err(error) = result {
-        tracing::debug!(%peer, %error, "relay application protocol stream closed");
-    }
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
         ProtocolIo, ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision,
-        RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall, completed_task_result,
-        finish_relay_run, finish_relay_run_with_timeout, handle_registry_call, handle_resolve_call,
-        handle_swarm_event as handle_swarm_event_inner, log_protocol_result, read_exact_eof,
-        registry_exchange, registry_immediate_retry, report_ready_to, resolve_exchange,
-        resolve_immediate_retry, run_relay_until, with_timeout, write_close,
+        RelayObservability, RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall,
+        ShutdownReason, completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
+        handle_registry_call, handle_resolve_call, handle_swarm_event as handle_swarm_event_inner,
+        read_exact_eof, registry_exchange, registry_immediate_retry, report_ready_to,
+        resolve_exchange, resolve_immediate_retry, run_relay_until, with_timeout, write_close,
     };
     use crate::registry::{Registry, ResolveLimiters};
     use std::io;
     use std::num::NonZeroU32;
     use std::pin::Pin;
+    use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -971,6 +1251,41 @@ mod tests {
                 WssTransportConfig::client(None),
             ),
             Err(RelayServiceError::MissingWssCertificate)
+        ));
+    }
+
+    #[test]
+    fn relay_configuration_rejects_duplicate_and_unbacked_external_endpoints() {
+        let identity = Keypair::generate_ed25519();
+        let listen: RelayListenAddress = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
+        let external: RelayExternalAddress = "/ip4/203.0.113.1/tcp/4001".parse().unwrap();
+
+        assert!(matches!(
+            RelayServeConfig::new(
+                identity.clone(),
+                vec![listen.clone(), listen],
+                vec![external.clone()],
+                WssTransportConfig::client(None),
+            ),
+            Err(RelayServiceError::DuplicateListenAddress)
+        ));
+        assert!(matches!(
+            RelayServeConfig::new(
+                identity.clone(),
+                vec!["/ip4/0.0.0.0/tcp/4001".parse().unwrap()],
+                vec![external.clone(), external],
+                WssTransportConfig::client(None),
+            ),
+            Err(RelayServiceError::DuplicateExternalAddress)
+        ));
+        assert!(matches!(
+            RelayServeConfig::new(
+                identity,
+                vec!["/ip4/0.0.0.0/tcp/4001".parse().unwrap()],
+                vec!["/ip4/203.0.113.1/udp/4001/quic-v1".parse().unwrap(),],
+                WssTransportConfig::client(None),
+            ),
+            Err(RelayServiceError::MissingListenTransport)
         ));
     }
 
@@ -1461,11 +1776,32 @@ mod tests {
             Err(ProtocolTaskError::Timeout)
         ));
 
-        let peer = Keypair::generate_ed25519().public().to_peer_id();
-        log_protocol_result(peer, Ok(()));
-        log_protocol_result(peer, Err(ProtocolTaskError::OwnerStopped));
+        let observations = RelayObservability::default();
+        observations.observe_protocol_result(Ok(()));
+        observations.observe_protocol_result(Err(ProtocolTaskError::OwnerStopped));
+        assert_eq!(
+            observations.protocol_owner_stopped.load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(retry_after().millis(), 250);
         assert_eq!(RegistryResponse::Retry(retry_after()).encode()[0], 0x82);
+    }
+
+    #[test]
+    fn shutdown_reasons_have_low_cardinality_labels() {
+        assert_eq!(ShutdownReason::Interrupt.as_str(), "interrupt");
+        #[cfg(unix)]
+        {
+            assert_eq!(ShutdownReason::Terminate.as_str(), "terminate");
+            assert_eq!(ShutdownReason::Hangup.as_str(), "hangup");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(ShutdownReason::ConsoleBreak.as_str(), "console_break");
+            assert_eq!(ShutdownReason::ConsoleClose.as_str(), "console_close");
+            assert_eq!(ShutdownReason::ConsoleLogoff.as_str(), "console_logoff");
+            assert_eq!(ShutdownReason::ConsoleShutdown.as_str(), "console_shutdown");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2114,8 +2450,10 @@ mod tests {
         ));
 
         let overflow = Keypair::generate_ed25519().public().to_peer_id();
+        let observations = RelayObservability::default();
+        let mut no_required_listeners = RequiredListeners::new([]);
         for value in 1..=9 {
-            handle_swarm_event(
+            handle_swarm_event_inner(
                 established_event(
                     overflow,
                     ConnectionId::new_unchecked(value),
@@ -2124,9 +2462,14 @@ mod tests {
                 &mut node,
                 &mut connections,
                 &mut registry,
-            );
+                &mut no_required_listeners,
+                &[],
+                &observations,
+            )
+            .unwrap();
         }
         assert_eq!(connections.count(&overflow), 8);
+        assert_eq!(observations.connection_overflow.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2145,6 +2488,7 @@ mod tests {
         let mut listeners = RequiredListeners::new([first, second]);
         let mut connections = ConnectionBook::new();
         let mut registry = Registry::new(SystemClock::new());
+        let observations = RelayObservability::default();
         let first_address: yonder_net::Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
         let second_address: yonder_net::Multiaddr =
             "/ip4/127.0.0.1/udp/4002/quic-v1".parse().unwrap();
@@ -2159,6 +2503,7 @@ mod tests {
             &mut registry,
             &mut listeners,
             &[],
+            &observations,
         )
         .unwrap();
         assert_eq!(listeners.pending.len(), 1);
@@ -2173,6 +2518,7 @@ mod tests {
             &mut registry,
             &mut listeners,
             &[],
+            &observations,
         )
         .unwrap();
         assert_eq!(listeners.ready_addresses.len(), 1);
@@ -2186,6 +2532,7 @@ mod tests {
             &mut registry,
             &mut listeners,
             &[],
+            &observations,
         )
         .unwrap();
         assert!(listeners.ready_reported);
@@ -2200,6 +2547,7 @@ mod tests {
             &mut registry,
             &mut listeners,
             &[],
+            &observations,
         )
         .unwrap();
 
@@ -2213,6 +2561,7 @@ mod tests {
             &mut registry,
             &mut listeners,
             &[],
+            &observations,
         )
         .unwrap();
         handle_swarm_event_inner(
@@ -2226,6 +2575,7 @@ mod tests {
             &mut registry,
             &mut listeners,
             &[],
+            &observations,
         )
         .unwrap();
         assert!(matches!(
@@ -2239,6 +2589,7 @@ mod tests {
                 &mut registry,
                 &mut listeners,
                 &[],
+                &observations,
             ),
             Err(RelayServiceError::RequiredListenerError { listener_id, .. })
                 if listener_id == first
@@ -2255,6 +2606,7 @@ mod tests {
                 &mut registry,
                 &mut listeners,
                 &[],
+                &observations,
             ),
             Err(RelayServiceError::RequiredListenerClosed {
                 listener_id,
@@ -2273,6 +2625,7 @@ mod tests {
                 &mut registry,
                 &mut listeners,
                 &[],
+                &observations,
             ),
             Err(RelayServiceError::RequiredListenerClosed {
                 listener_id,
@@ -2583,7 +2936,16 @@ mod tests {
         registry: &mut Registry<C>,
     ) {
         let mut listeners = RequiredListeners::new([]);
-        handle_swarm_event_inner(event, node, connections, registry, &mut listeners, &[]).unwrap();
+        handle_swarm_event_inner(
+            event,
+            node,
+            connections,
+            registry,
+            &mut listeners,
+            &[],
+            &RelayObservability::default(),
+        )
+        .unwrap();
     }
 
     fn registry_call(

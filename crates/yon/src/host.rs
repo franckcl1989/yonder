@@ -1,7 +1,7 @@
 use crate::network::{
     ConnectionBinding, EndpointDriver, EndpointError, EndpointEvent, RelayConnection,
     ReservationLease, build_endpoint, connect_configured_relay, drive_bound, reconverge_relay,
-    relay_backoff, wait_for_reservation, wait_for_target_quiescence,
+    relay_backoff, wait_for_reservation,
 };
 use crate::pake::{OpaquePake, OpaquePakeError, OpaqueRegistration};
 use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
@@ -37,6 +37,7 @@ use yonder_net::{
 };
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const PRE_AUTH_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Complete input required to advertise one remote terminal.
 pub struct HostConfig {
@@ -73,9 +74,10 @@ pub enum HostStage {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        HostError, PendingPair, binding_event, host_error_event, read_auth_hello_io,
-        read_terminal_hello_io, report_connection_code_to, retryable_relay_error,
-        send_auth_retry_io, start_terminal_io, write_authenticated_io, write_terminal_ready_io,
+        EXCHANGE_TIMEOUT, HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair, binding_event,
+        host_error_event, read_auth_hello_io, read_terminal_hello_io, report_connection_code_to,
+        report_replacement_notice_to, retryable_relay_error, send_auth_retry_io, start_terminal_io,
+        write_authenticated_io, write_terminal_ready_io,
     };
     use crate::network::EndpointError;
     use crate::protocol::RelayProtocolError;
@@ -94,6 +96,13 @@ mod tests {
     };
 
     struct FailingOutput;
+
+    #[test]
+    fn pre_auth_convergence_is_tighter_than_each_frozen_message_timeout() {
+        assert_eq!(PRE_AUTH_QUIESCENCE_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(EXCHANGE_TIMEOUT, Duration::from_secs(10));
+        assert!(PRE_AUTH_QUIESCENCE_TIMEOUT < EXCHANGE_TIMEOUT);
+    }
 
     impl std::io::Write for FailingOutput {
         fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
@@ -122,6 +131,22 @@ mod tests {
         );
         assert_eq!(
             report_connection_code_to(&mut FailingOutput, &code)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn replacement_notice_makes_the_previous_code_state_explicit() {
+        let mut output = Vec::new();
+        report_replacement_notice_to(&mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Connection code changed; the previous code is no longer valid.\n"
+        );
+        assert_eq!(
+            report_replacement_notice_to(&mut FailingOutput)
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::BrokenPipe
@@ -646,6 +671,7 @@ async fn initialize_host_relay(
                 target,
                 pake,
                 progress,
+                AdvertisementNotice::Initial,
             ) => Some(result),
             signal = tokio::signal::ctrl_c() => {
                 signal?;
@@ -695,6 +721,7 @@ async fn allocate_advertisement(
     target: &PeerIdBytes,
     pake: &mut OpaquePake,
     progress: &mut impl OperationProgress<HostStage>,
+    notice: AdvertisementNotice,
 ) -> Result<AdvertisedLease, HostError> {
     let locator = wait_with_progress(
         progress,
@@ -711,12 +738,23 @@ async fn allocate_advertisement(
         }
     };
     progress.clear();
+    if notice == AdvertisementNotice::Replacement
+        && let Err(error) = report_replacement_notice()
+    {
+        tracing::debug!(%error, "replacement connection-code notice could not be displayed");
+    }
     if let Err(error) = report_connection_code(&code) {
         release_failed_advertisement(driver, streams, relay, locator).await;
         return Err(HostError::Output(error));
     }
     drop(code);
     Ok(advertised)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdvertisementNotice {
+    Initial,
+    Replacement,
 }
 
 fn create_advertisement(
@@ -751,6 +789,19 @@ async fn release_failed_advertisement(
 fn report_connection_code(code: &ConnectionCode) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     report_connection_code_to(&mut stdout.lock(), code)
+}
+
+fn report_replacement_notice() -> std::io::Result<()> {
+    let stderr = std::io::stderr();
+    report_replacement_notice_to(&mut stderr.lock())
+}
+
+fn report_replacement_notice_to(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "Connection code changed; the previous code is no longer valid."
+    )?;
+    output.flush()
 }
 
 fn report_connection_code_to(
@@ -823,6 +874,7 @@ impl RelayRecovery<'_> {
                             self.target,
                             self.pake,
                             progress,
+                            AdvertisementNotice::Replacement,
                         ) => Some(result),
                         signal = tokio::signal::ctrl_c() => {
                             signal?;
@@ -943,14 +995,15 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                     None => continue,
                 };
             progress.update(HostStage::AuthenticatingController);
-            let binding = match wait_for_target_quiescence(driver, controller).await {
-                Ok(binding) => binding,
-                Err(error) => {
-                    tracing::debug!(%error, "controller direct upgrade had not converged");
-                    drop(auth_stream);
-                    continue;
-                }
-            };
+            let binding =
+                match wait_for_controller_quiescence(driver, &mut incoming, controller).await {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        tracing::debug!(%error, "controller direct upgrade had not converged");
+                        drop(auth_stream);
+                        continue;
+                    }
+                };
             let hello = drive_session_inputs(
                 driver,
                 binding,
@@ -1105,6 +1158,40 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                     }
                     return Err(error);
                 }
+            }
+        }
+    }
+}
+
+async fn wait_for_controller_quiescence(
+    driver: &mut EndpointDriver,
+    incoming: &mut InboundProtocols<'_>,
+    controller: PeerId,
+) -> Result<ConnectionBinding, HostError> {
+    let deadline = tokio::time::Instant::now() + PRE_AUTH_QUIESCENCE_TIMEOUT;
+    loop {
+        if driver.direct_upgrade_ready(&controller) && driver.has_unique_connection(&controller) {
+            return driver.bind(controller).map_err(HostError::from);
+        }
+        tokio::select! {
+            biased;
+            _ = driver.next() => {}
+            stream = incoming.auth.next() => {
+                drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
+            }
+            stream = incoming.data.next() => {
+                drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
+            }
+            stream = incoming.control.next() => {
+                drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                driver.close_peer_and_wait(controller).await?;
+                return Err(EndpointError::TargetUpgradeDidNotSettle.into());
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                return Err(HostError::Interrupted);
             }
         }
     }

@@ -4,7 +4,7 @@ use crate::network::{
 };
 use crate::pake::{OpaquePake, OpaquePakeError};
 use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
-use crate::protocol::{RelayProtocolError, resolve_peer};
+use crate::protocol::{RelayProtocolError, ResolveDeadline, resolve_peer};
 use crate::terminal::TerminalChunk;
 use backon::{BackoffBuilder as _, ConstantBuilder};
 use std::io::IsTerminal as _;
@@ -33,6 +33,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_LIMIT: usize = 20;
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const REMOTE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCAL_ESCAPE: u8 = 0x1d;
 
 trait TerminalFrontend {
     type Input: tokio::io::AsyncRead + Unpin;
@@ -234,7 +235,13 @@ async fn run_controller_session<F: TerminalFrontend>(
     let target = wait_with_progress(
         progress,
         ControllerStage::ResolvingHost,
-        resolve_peer(&mut driver, &mut streams, &relay, code.locator()),
+        resolve_peer(
+            &mut driver,
+            &mut streams,
+            &relay,
+            code.locator(),
+            ResolveDeadline::controller(),
+        ),
     )
     .await?;
     let initial = Box::pin(prepare_controller(
@@ -272,6 +279,7 @@ async fn run_controller_session<F: TerminalFrontend>(
                     &mut fallback_streams,
                     &fallback_relay,
                     code.locator(),
+                    ResolveDeadline::controller(),
                 ),
             )
             .await?;
@@ -337,7 +345,7 @@ async fn prepare_controller(
     direct_upgrade: DirectUpgradePolicy,
     progress: &mut impl OperationProgress<ControllerStage>,
 ) -> Result<PreparedController, ControllerError> {
-    let binding = wait_with_progress(progress, ControllerStage::EstablishingPath, async {
+    let selected = wait_with_progress(progress, ControllerStage::EstablishingPath, async {
         match direct_upgrade {
             DirectUpgradePolicy::Enabled => connect_target(&mut driver, relay, target).await,
             DirectUpgradePolicy::Disabled => {
@@ -346,6 +354,13 @@ async fn prepare_controller(
         }
     })
     .await?;
+    let path = selected.path();
+    tracing::debug!(
+        route = ?path.route(),
+        transport = ?path.transport(),
+        "endpoint path selected"
+    );
+    let binding = selected.binding();
     wait_with_progress(
         progress,
         ControllerStage::Authenticating,
@@ -631,6 +646,7 @@ async fn run_terminal(
     let mut input = frontend.input();
     let mut output = frontend.output();
     let mut input_open = true;
+    let mut local_escape = LocalInputEscape::new(interactive);
     let mut remote = RemoteCompletion::new();
     let mut last_size = hello.size();
     let mut size_poll = tokio::time::interval(SIZE_POLL_INTERVAL);
@@ -651,8 +667,18 @@ async fn run_terminal(
                     if peer == binding.peer() => driver.enforce_binding(binding)?,
                 _ => {}
             },
-            read = read_local_input(&mut input), if input_open => {
+            read = read_local_input(&mut input, local_escape.read_reserve()), if input_open => {
                 let Some(local_input) = read? else {
+                    if let Some(pending_escape) = local_escape.finish()? {
+                        write_local_input(
+                            driver,
+                            binding,
+                            completion_deadline,
+                            &mut data_write,
+                            &pending_escape,
+                        )
+                        .await?;
+                    }
                     drive_terminal_io(
                         driver,
                         binding,
@@ -664,20 +690,20 @@ async fn run_terminal(
                     continue;
                 };
                 tracing::debug!(length = local_input.as_slice().len(), "local terminal input read completed");
-                drive_terminal_io(
-                    driver,
-                    binding,
-                    completion_deadline,
-                    data_write.write_all(local_input.as_slice()),
-                )
-                .await?;
-                drive_terminal_io(
-                    driver,
-                    binding,
-                    completion_deadline,
-                    data_write.flush(),
-                )
-                .await?;
+                let filtered = local_escape.filter(local_input)?;
+                if !filtered.chunk.as_slice().is_empty() {
+                    write_local_input(
+                        driver,
+                        binding,
+                        completion_deadline,
+                        &mut data_write,
+                        &filtered.chunk,
+                    )
+                    .await?;
+                }
+                if filtered.detach {
+                    return Err(ControllerError::Interrupted);
+                }
             }
             read = data_read.read(remote_output.writable()), if remote.output_open() => {
                 let length = read?;
@@ -735,6 +761,118 @@ async fn run_terminal(
     finish_terminal(session, frontend.restore_raw_mode(raw_mode))
 }
 
+async fn write_local_input(
+    driver: &mut EndpointDriver,
+    binding: ConnectionBinding,
+    completion_deadline: Option<tokio::time::Instant>,
+    data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    input: &TerminalChunk,
+) -> Result<(), ControllerError> {
+    drive_terminal_io(
+        driver,
+        binding,
+        completion_deadline,
+        data_write.write_all(input.as_slice()),
+    )
+    .await?;
+    drive_terminal_io(driver, binding, completion_deadline, data_write.flush()).await
+}
+
+struct FilteredLocalInput {
+    chunk: TerminalChunk,
+    detach: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalInputEscape {
+    enabled: bool,
+    pending: bool,
+}
+
+impl LocalInputEscape {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending: false,
+        }
+    }
+
+    const fn read_reserve(self) -> usize {
+        if self.enabled && self.pending { 1 } else { 0 }
+    }
+
+    fn filter(&mut self, input: TerminalChunk) -> Result<FilteredLocalInput, ControllerError> {
+        if !self.enabled {
+            return Ok(FilteredLocalInput {
+                chunk: input,
+                detach: false,
+            });
+        }
+
+        let mut output = TerminalChunk::new();
+        let mut length = 0;
+        let mut detach = false;
+        for &byte in input.as_slice() {
+            if self.pending {
+                self.pending = false;
+                match byte {
+                    b'.' => {
+                        detach = true;
+                        break;
+                    }
+                    LOCAL_ESCAPE => {
+                        push_local_byte(&mut output, &mut length, LOCAL_ESCAPE)?;
+                        continue;
+                    }
+                    _ => {
+                        push_local_byte(&mut output, &mut length, LOCAL_ESCAPE)?;
+                    }
+                }
+            }
+
+            if byte == LOCAL_ESCAPE {
+                self.pending = true;
+            } else {
+                push_local_byte(&mut output, &mut length, byte)?;
+            }
+        }
+        output
+            .set_len(length)
+            .map_err(|_| ControllerError::ConnectionLost)?;
+        Ok(FilteredLocalInput {
+            chunk: output,
+            detach,
+        })
+    }
+
+    fn finish(&mut self) -> Result<Option<TerminalChunk>, ControllerError> {
+        if !self.enabled || !self.pending {
+            return Ok(None);
+        }
+        self.pending = false;
+        let mut output = TerminalChunk::new();
+        output.writable()[0] = LOCAL_ESCAPE;
+        output
+            .set_len(1)
+            .map_err(|_| ControllerError::ConnectionLost)?;
+        Ok(Some(output))
+    }
+}
+
+fn push_local_byte(
+    output: &mut TerminalChunk,
+    length: &mut usize,
+    byte: u8,
+) -> Result<(), ControllerError> {
+    let slot = output
+        .writable()
+        .get_mut(*length)
+        .ok_or(ControllerError::ConnectionLost)?;
+    *slot = byte;
+    *length += 1;
+    Ok(())
+}
+
 fn finish_terminal<T>(
     session: Result<T, ControllerError>,
     restore: Result<(), std::io::Error>,
@@ -782,9 +920,11 @@ async fn complete_after_output_eof(
 
 async fn read_local_input(
     input: &mut (impl tokio::io::AsyncRead + Unpin),
+    reserve: usize,
 ) -> Result<Option<TerminalChunk>, ControllerError> {
     let mut chunk = TerminalChunk::new();
-    let length = input.read(chunk.writable()).await?;
+    let capacity = chunk.writable().len().saturating_sub(reserve);
+    let length = input.read(&mut chunk.writable()[..capacity]).await?;
     if length == 0 {
         return Ok(None);
     }
@@ -951,17 +1091,18 @@ impl Drop for RawModeGuard {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        ControllerConfig, ControllerError, CrosstermFrontend, EndpointError,
-        REMOTE_COMPLETION_TIMEOUT, RawModeGuard, RemoteCompletion, TerminalFrontend,
-        await_remote_completion, await_until, changed_terminal_size, complete_after_output_eof,
-        controller_fallback_required, decode_terminal_exit, direct_fallback_required,
-        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
-        fallback_transport, finish_terminal, local_terminal_hello, local_terminal_hello_with,
-        next_retry_delay, read_auth_response, read_local_input, run_controller,
-        run_controller_session, run_until_interrupted, terminal_environment,
+        ControllerConfig, ControllerError, CrosstermFrontend, EndpointError, LOCAL_ESCAPE,
+        LocalInputEscape, REMOTE_COMPLETION_TIMEOUT, RawModeGuard, RemoteCompletion,
+        TerminalFrontend, await_remote_completion, await_until, changed_terminal_size,
+        complete_after_output_eof, controller_fallback_required, decode_terminal_exit,
+        direct_fallback_required, enter_raw_mode_before, exchange_terminal_ready,
+        exchange_terminal_ready_timed, fallback_transport, finish_terminal, local_terminal_hello,
+        local_terminal_hello_with, next_retry_delay, read_auth_response, read_local_input,
+        run_controller, run_controller_session, run_until_interrupted, terminal_environment,
         terminal_environment_from, wait_for_remote_completion_deadline,
     };
     use crate::progress::NoopProgress;
+    use crate::terminal::TerminalChunk;
     use std::cell::Cell;
     use std::io;
     use std::pin::Pin;
@@ -1427,19 +1568,118 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn raw_ctrl_c_byte_remains_uninterpreted_terminal_input() {
         let mut input = [0x03_u8].as_slice();
-        let chunk = read_local_input(&mut input)
+        let chunk = read_local_input(&mut input, 0)
             .await
             .unwrap()
             .expect("one raw input byte");
         assert_eq!(chunk.as_slice(), [0x03]);
 
         let mut eof = tokio::io::empty();
-        assert!(read_local_input(&mut eof).await.unwrap().is_none());
+        assert!(read_local_input(&mut eof, 0).await.unwrap().is_none());
 
         assert!(matches!(
-            read_local_input(&mut FailingRead).await,
+            read_local_input(&mut FailingRead, 0).await,
             Err(ControllerError::Io(_))
         ));
+    }
+
+    fn terminal_chunk(bytes: &[u8]) -> TerminalChunk {
+        let mut chunk = TerminalChunk::new();
+        chunk.writable()[..bytes.len()].copy_from_slice(bytes);
+        chunk.set_len(bytes.len()).unwrap();
+        chunk
+    }
+
+    #[test]
+    fn interactive_detach_escape_is_chunk_boundary_independent() {
+        let mut escape = LocalInputEscape::new(true);
+        let first = escape.filter(terminal_chunk(b"typed\x1d")).unwrap();
+        assert_eq!(first.chunk.as_slice(), b"typed");
+        assert!(!first.detach);
+        assert_eq!(escape.read_reserve(), 1);
+
+        let second = escape.filter(terminal_chunk(b".")).unwrap();
+        assert!(second.chunk.as_slice().is_empty());
+        assert!(second.detach);
+    }
+
+    #[test]
+    fn interactive_escape_preserves_literal_and_non_command_sequences() {
+        let mut escape = LocalInputEscape::new(true);
+        let literal = escape
+            .filter(terminal_chunk(&[LOCAL_ESCAPE, LOCAL_ESCAPE]))
+            .unwrap();
+        assert_eq!(literal.chunk.as_slice(), [LOCAL_ESCAPE]);
+        assert!(!literal.detach);
+
+        let ordinary = escape
+            .filter(terminal_chunk(&[LOCAL_ESCAPE, b'x']))
+            .unwrap();
+        assert_eq!(ordinary.chunk.as_slice(), [LOCAL_ESCAPE, b'x']);
+        assert!(!ordinary.detach);
+
+        let before_detach = escape
+            .filter(terminal_chunk(b"abc\x1d.trailing bytes"))
+            .unwrap();
+        assert_eq!(before_detach.chunk.as_slice(), b"abc");
+        assert!(before_detach.detach);
+    }
+
+    #[test]
+    fn isolated_escape_is_forwarded_when_local_input_reaches_eof() {
+        let mut escape = LocalInputEscape::new(true);
+        let pending = escape.filter(terminal_chunk(&[LOCAL_ESCAPE])).unwrap();
+        assert!(pending.chunk.as_slice().is_empty());
+        assert!(!pending.detach);
+        assert_eq!(escape.finish().unwrap().unwrap().as_slice(), [LOCAL_ESCAPE]);
+        assert!(escape.finish().unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_escape_reserve_keeps_filter_output_within_fixed_chunk() {
+        let mut escape = LocalInputEscape::new(true);
+        escape.filter(terminal_chunk(&[LOCAL_ESCAPE])).unwrap();
+        assert_eq!(escape.read_reserve(), 1);
+        let input = vec![b'x'; 16 * 1024 - escape.read_reserve()];
+        let output = escape.filter(terminal_chunk(&input)).unwrap();
+        assert_eq!(output.chunk.as_slice().len(), 16 * 1024);
+        assert_eq!(output.chunk.as_slice()[0], LOCAL_ESCAPE);
+        assert!(
+            output.chunk.as_slice()[1..]
+                .iter()
+                .all(|byte| *byte == b'x')
+        );
+    }
+
+    #[test]
+    fn non_interactive_input_remains_byte_transparent() {
+        let mut escape = LocalInputEscape::new(false);
+        let bytes = [b'a', LOCAL_ESCAPE, b'.', LOCAL_ESCAPE, LOCAL_ESCAPE];
+        let filtered = escape.filter(terminal_chunk(&bytes)).unwrap();
+        assert_eq!(filtered.chunk.as_slice(), bytes);
+        assert!(!filtered.detach);
+        assert_eq!(escape.read_reserve(), 0);
+        assert!(escape.finish().unwrap().is_none());
+    }
+
+    fn assert_native_input_adapter_uses_byte_escape_semantics() {
+        let mut escape = LocalInputEscape::new(true);
+        let filtered = escape
+            .filter(terminal_chunk(&[LOCAL_ESCAPE, LOCAL_ESCAPE]))
+            .unwrap();
+        assert_eq!(filtered.chunk.as_slice(), [LOCAL_ESCAPE]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_input_adapter_uses_byte_escape_semantics() {
+        assert_native_input_adapter_uses_byte_escape_semantics();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_terminal_input_adapter_uses_byte_escape_semantics() {
+        assert_native_input_adapter_uses_byte_escape_semantics();
     }
 
     #[tokio::test(flavor = "current_thread")]

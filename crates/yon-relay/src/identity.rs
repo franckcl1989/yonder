@@ -7,6 +7,8 @@ use yonder_core::SecretDocument;
 use yonder_net::Keypair;
 use yonder_net::identity::{decode_identity, encode_identity};
 
+use crate::{SecretFileError, SecretFilePolicy, SystemSecretFilePolicy};
+
 const MAX_IDENTITY_DOCUMENT: u64 = 1_024;
 
 /// Persistent relay identity storage behind a replaceable cold-path boundary.
@@ -28,16 +30,35 @@ pub enum IdentityError {
     TooLarge,
     #[error("the relay identity document is invalid")]
     Invalid,
+    #[error("the relay identity file or parent directory permits untrusted access")]
+    InsecurePermissions,
     #[error("relay identity filesystem I/O failed")]
     Io(#[source] std::io::Error),
 }
 
 impl IdentityStore for FileIdentityStore {
     fn create(&self, path: &Path, identity: &Keypair) -> Result<(), IdentityError> {
+        self.create_with(path, identity, &SystemSecretFilePolicy)
+    }
+
+    fn read(&self, path: &Path) -> Result<Keypair, IdentityError> {
+        self.read_with(path, &SystemSecretFilePolicy)
+    }
+}
+
+impl FileIdentityStore {
+    fn create_with(
+        self,
+        path: &Path,
+        identity: &Keypair,
+        policy: &impl SecretFilePolicy,
+    ) -> Result<(), IdentityError> {
         let parent = parent_directory(path)?;
         let document = encode_identity(identity).map_err(|_| IdentityError::Invalid)?;
         let mut temporary = NamedTempFile::new_in(parent).map_err(IdentityError::Io)?;
-        set_owner_only_permissions(temporary.as_file()).map_err(IdentityError::Io)?;
+        policy
+            .protect_new(temporary.path(), temporary.as_file())
+            .map_err(map_policy_error)?;
         temporary
             .write_all(document.as_bytes())
             .map_err(IdentityError::Io)?;
@@ -49,14 +70,28 @@ impl IdentityStore for FileIdentityStore {
         Ok(())
     }
 
-    fn read(&self, path: &Path) -> Result<Keypair, IdentityError> {
+    fn read_with(
+        self,
+        path: &Path,
+        policy: &impl SecretFilePolicy,
+    ) -> Result<Keypair, IdentityError> {
         let file = File::open(path).map_err(IdentityError::Io)?;
+        policy
+            .validate_existing(path, &file)
+            .map_err(map_policy_error)?;
         let metadata = file.metadata().map_err(IdentityError::Io)?;
         if metadata.len() > MAX_IDENTITY_DOCUMENT {
             return Err(IdentityError::TooLarge);
         }
         let document = read_document(file, metadata.len())?;
         decode_identity(document.as_bytes()).map_err(|_| IdentityError::Invalid)
+    }
+}
+
+fn map_policy_error(error: SecretFileError) -> IdentityError {
+    match error {
+        SecretFileError::Insecure => IdentityError::InsecurePermissions,
+        SecretFileError::Platform(error) => IdentityError::Io(error),
     }
 }
 
@@ -92,17 +127,6 @@ fn parent_directory(path: &Path) -> Result<&Path, IdentityError> {
 }
 
 #[cfg(unix)]
-fn set_owner_only_permissions(file: &File) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_file: &File) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn sync_parent(parent: &Path) -> Result<(), IdentityError> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -122,14 +146,83 @@ mod tests {
         read_document,
     };
     use std::fs;
+    #[cfg(not(unix))]
+    use std::fs::File;
     use std::io::{self, Cursor, Read};
     use std::path::Path;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use yonder_net::Keypair;
+
+    #[cfg(not(unix))]
+    use crate::SecretFilePolicy as _;
+
+    #[cfg(unix)]
+    fn make_owner_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn make_owner_only(path: &Path) {
+        let file = File::open(path).unwrap();
+        crate::SystemSecretFilePolicy
+            .protect_new(path, &file)
+            .unwrap();
+    }
+
+    fn test_directory() -> TempDir {
+        let directory = tempdir().unwrap();
+        secure_test_directory(directory.path());
+        directory
+    }
+
+    #[cfg(not(windows))]
+    fn secure_test_directory(_path: &Path) {}
+
+    #[cfg(windows)]
+    fn secure_test_directory(path: &Path) {
+        use std::process::{Command, Stdio};
+
+        const SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$path=$env:YONDER_TEST_DIRECTORY
+$current=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+$administrators=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+$acl=New-Object Security.AccessControl.DirectorySecurity
+$acl.SetOwner($current)
+$acl.SetAccessRuleProtection($true,$false)
+$rights=[Security.AccessControl.FileSystemRights]::FullControl
+$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+$propagate=[Security.AccessControl.PropagationFlags]::None
+$allow=[Security.AccessControl.AccessControlType]::Allow
+foreach($sid in @($current,$system,$administrators)){$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,$rights,$inherit,$propagate,$allow);[void]$acl.AddAccessRule($rule)}
+[IO.Directory]::SetAccessControl($path,$acl)
+exit 0
+"#;
+        let executable = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let status = Command::new(executable)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                SCRIPT,
+            ])
+            .env("YONDER_TEST_DIRECTORY", path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn identity_is_atomic_round_trips_and_refuses_overwrite() {
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         let path = directory.path().join("relay.identity");
         let identity = Keypair::generate_ed25519();
         let peer = identity.public().to_peer_id();
@@ -143,10 +236,19 @@ mod tests {
     }
 
     #[test]
+    fn insecure_permission_error_is_platform_neutral_and_actionable() {
+        assert_eq!(
+            IdentityError::InsecurePermissions.to_string(),
+            "the relay identity file or parent directory permits untrusted access"
+        );
+    }
+
+    #[test]
     fn invalid_and_oversized_documents_are_rejected() {
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         let invalid = directory.path().join("invalid.identity");
         fs::write(&invalid, [1, 2, 3]).unwrap();
+        make_owner_only(&invalid);
         assert!(matches!(
             FileIdentityStore.read(&invalid),
             Err(IdentityError::Invalid)
@@ -154,6 +256,7 @@ mod tests {
 
         let oversized = directory.path().join("large.identity");
         fs::write(&oversized, vec![0; 1_025]).unwrap();
+        make_owner_only(&oversized);
         assert!(matches!(
             FileIdentityStore.read(&oversized),
             Err(IdentityError::TooLarge)
@@ -174,6 +277,24 @@ mod tests {
             IdentityError::Invalid.to_string(),
             "the relay identity document is invalid"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_read_rejects_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = test_directory();
+        let path = directory.path().join("relay.identity");
+        FileIdentityStore
+            .create(&path, &Keypair::generate_ed25519())
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(matches!(
+            FileIdentityStore.read(&path),
+            Err(IdentityError::InsecurePermissions)
+        ));
     }
 
     #[test]

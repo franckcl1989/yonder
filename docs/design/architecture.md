@@ -28,6 +28,7 @@
 | `PtyBackend` | 创建 PTY、spawn shell、resize、kill、wait | 冷路径允许适配 `portable-pty` 的第三方 trait object |
 | `TerminalFrontend` | raw mode guard、尺寸、stdin/stdout | 隔离 `crossterm` 和平台 I/O，支持伪终端集成测试 |
 | `IdentityStore` | 原子创建和读取中继身份 | relay 冷路径；生产使用 `tempfile` 原子持久化 |
+| `SecretFilePolicy` | 创建前收紧并读取前验证 identity/WSS 私钥及直接父目录权限 | 平台冷路径；Unix mode/owner 与 Windows ACL 实现可独立验证 |
 
 固定格式解析、newtype 方法、状态转换纯函数和包内辅助函数不包装成 trait。第一方热路径不使用 `dyn`；`portable-pty` API 自身返回的第三方 trait object 只被封装在终端适配层。
 
@@ -55,13 +56,13 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 1. 两个 endpoint 先通过配置的 relay 建立 circuit，保证存在保底候选。
 2. Identify、UPnP 和 DCUtR 提供直接候选；QUIC、TCP、WS 地址并发拨号，单个地址只允许一个在途拨号。
 3. relay 入口建立继续使用绝对 `10s` 期限；尚无任何 endpoint-to-endpoint 候选时，全能力建立保留 `30s` 总期限。第一条 relay 候选建立后质量窗口固定为 `1.5s`，DCUtR 另有 `3s` 优先窗口；底层 transport 的单次 `8s` timeout 仍约束独立拨号，但不可达直连不再串行占满三轮 timeout 后才使用已经可用的 relay。
-4. Ping 在每条连接建立后立即开始，单次超时 `750ms`；endpoint 后续间隔 `1s`，relay 后续间隔 `15s`，避免 128 个空闲 endpoint 对 relay 形成高频永久轮询。`1.5s` 选择窗口最多取前三个成功结果；没有成功结果的候选不可用，一个结果足以保留已建立链路，两个或三个结果因稳定性证据更多而优先排序。这样质量采样不会把高 RTT 但可用的链路误判为断开。
-5. 排序键固定为：成功样本数降序、RTT 中位数升序、RTT 极差升序、直连优先于 relay、QUIC 优先于 TCP、TCP 优先于 WS/WSS、建立时刻升序。没有主动带宽探测，避免额外流量、延迟和攻击面。
-6. DCUtR 成功事件必须对应一个已进入本地名册的精确 `ConnectionId`。选出 winner 后按 `ConnectionId` 关闭全部 loser，并等待本地 `ConnectionClosed`；两端都在 OPAQUE 前等待各自 DCUtR 终态与唯一名册。
-7. DCUtR 明确失败、首条 relay 候选后的 `3s` 优先窗口截止、无候选时 `30s` 总期限截止，或全能力连接在 OPAQUE 认证及两条 terminal 子流打开的预提交阶段丢失唯一绑定时，controller 销毁整个全能力 Swarm，生成新临时 PeerId，以 `Toggle<dcutr::Behaviour>` 禁用 DCUtR 构建新 Swarm，经同一 relay 重新查询并建立 relay-only circuit。额外同 PeerId 连接仍先触发 fail-closed 并关闭相关连接，旧 Swarm drop 是取消残余拨号的所有权边界；fallback 恰好一次，不循环，OPAQUE、协议和业务错误不触发降级。
+4. Ping 在每条连接建立后立即开始，单次超时 `750ms`；endpoint 后续间隔 `1s`，relay 后续间隔 `15s`，避免 128 个空闲 endpoint 对 relay 形成高频永久轮询。第一条候选后的 `1.5s` 是最小选择采样窗；尚无直连时继续驱动最长 `3s` 的 DCUtR 优先窗口。直连已建立但尚无样本时最多再等待 `750ms`，每条候选最多保存前三个成功结果。零样本的已建立候选仍保留为连通性 fallback，Ping 失败不等价于 transport 断开。
+5. 路由类别先于质量排序：只要窗口内存在已认证直连，controller 就排除全部 relay 候选，只在直连集合中排序；没有直连时才允许 relay fallback。同类候选排序键固定为：有成功样本优先于无样本、RTT 中位数升序；只有双方均有至少两个样本时才比较 RTT 极差，之后依次为 QUIC 优先于 TCP、TCP 优先于 WS/WSS、建立顺序升序。样本数量本身不参与排序。没有主动带宽探测，避免额外流量、延迟和攻击面。
+6. `libp2p-dcutr` 成功事件中的 `ConnectionId` 只对应本端发起的连接；对称同时拨号或单 NAT 入站成功时，两端可能报告不同 ID，甚至只有一侧报告成功。controller 是唯一选路者：它从本地已建立直连候选中选出 winner，按本地 `ConnectionId` 关闭全部 loser，并等待 `ConnectionClosed`；host 不独立排序，而是在收到 auth 子流后等待名册收敛，验证剩余唯一连接的路由类别并绑定它。两端都在 OPAQUE 前满足唯一名册。
+7. 没有直连候选且 DCUtR 明确失败、首条 relay 候选后的 `3s` 优先窗口截止、无候选时 `30s` 总期限截止，或全能力连接在 OPAQUE 认证及两条 terminal 子流打开的预提交阶段丢失唯一绑定时，controller 销毁整个全能力 Swarm，生成新临时 PeerId，以 `Toggle<dcutr::Behaviour>` 禁用 DCUtR 构建新 Swarm，经同一 relay 重新查询并建立 relay-only circuit。额外同 PeerId 连接仍先触发 fail-closed 并关闭相关连接，旧 Swarm drop 是取消残余拨号的所有权边界；fallback 恰好一次，不循环，OPAQUE、协议和业务错误不触发降级。
 8. v1 不热迁移。relay-only 尝试或 terminal 预提交准备完成后出现任何迟到的同 PeerId 额外连接仍按唯一连接屏障终止当前操作，而不是成为备用路径。
 
-该规则让连通性和稳定性先于 RTT，让 RTT 和抖动先于路径/transport 偏好；只有质量相同或不可区分时才偏向直连和 QUIC。
+该规则先保证已有连通路径不被 Ping 缺失误杀，再以“可用直连优先、否则 relay”确定路由类别，最后才用可比较的 RTT、抖动和 transport 偏好对同类候选排序。它避免两端依据各自 RTT 独立选择不同物理连接，也避免更低的 relay RTT 覆盖产品要求的点对点优先。
 
 ## 唯一连接屏障
 
@@ -97,6 +98,7 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 - PTY 同步两端与异步网络之间使用两个 `tokio::io::duplex(64 KiB)` 和 `SyncIoBridge`。每个复制方向使用一次创建的 `16 KiB` 缓冲区；稳定转发循环不得逐块分配。
 - 网络写入慢时，固定 duplex 容量自然反压 PTY/标准输入；不丢终端字节、不无限缓存。控制消息入口容量 `8`，重复 resize 在入队前合并为最新尺寸。
 - controller 为避免跨平台线程栈承载完整 libp2p 预提交 async 状态，只在启动阶段把该 future 固定到堆上；每次全能力或 relay-only 尝试各分配一次，严格最多两次，并在进入终端数据热路径前释放。
+- controller 的交互输入使用固定容量状态机识别 `Ctrl+] .` 本地脱离和双 `Ctrl+]` 字面发送；跨读取块保持状态，不在终端热路径分配。非交互输入绕过该状态机。
 - 主控端每 `250ms` 用 `crossterm::terminal::size()` 检查尺寸，只在变化时发送，避免同时读取按键事件再手写终端按键编码。
 - 本地 stdin/stdout 使用 Tokio `io-std`。stdin 的底层阻塞读取不能被所有平台可靠强制取消；raw mode guard 必须先恢复，随后 runtime 最多等待 `1s` 关闭并退出进程。这是进程边界内的有界清理，不允许形成常驻后台任务。
 
@@ -106,10 +108,12 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 
 被控端在 `Active` 前的任何可恢复失败都回到 `Advertised`；`Active` 后网络失败终止 shell 和进程。主控端任何网络失败先恢复本地终端再显示错误。relay 某条连接或协议失败只影响对应 PeerId，不得 panic 或停止 accept loop。
 
+host 在认证前最多用 `3s` 让目标 PeerId 名册收敛，并在此期间持续 poll Swarm、关闭额外 auth/control/data 子流；OPAQUE 每条消息的 `10s` 上限保持独立。relay 在 Unix 统一处理 SIGINT/SIGTERM/SIGHUP，在 Windows 统一处理 Ctrl+C/Break/Close/Logoff/Shutdown，并在既有 `2s` 绝对截止内协作关闭。生命周期只输出低基数 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped`，协议拒绝和失败按固定类别累加到每 `60s` 一次的 `relay_activity_summary`，不在公开 relay 上逐请求记录 PeerId 或错误。
+
 ## 重连与资源默认值
 
 - relay 入口重连复用 `backon` 指数退避：最小 `250ms`、倍率 `2`、builder 最大 `5s`，开启 crate 自带 jitter（在当前 delay 上增加 `0..delay`），因此实际硬上限小于 `10s`；host 在取消前无限重试，connect 受总连接期限控制。
-- 每个底层 transport 拨号/握手的内部 timeout 固定为 `8s`，而一次 relay 连接 API 继续使用入口创建的绝对 `10s` 总截止。rust-libp2p 的 safe 公共 API 不能取消尚未建立的 outbound connection，预留的最多 `2s` 用于消费精确 `ConnectionId` 对应的失败事件、关闭败选 established connection 并验证名册和 pending 集均已收敛；API 不得在仍登记 pending relay dial 时返回。
+- 每个底层 transport 拨号/握手的内部 timeout 固定为 `8s`，一次 relay 连接 API 使用入口创建的绝对 `10s` 总截止。第一批同时竞速全部已配置 transport；失败地址只允许在起始后的 `1.5s` 内按有界退避重试，之后不再发起新拨号，并预留 `500ms` 收敛/排空，因此 `1.5s + 8s + 500ms = 10s`。rust-libp2p 的 safe 公共 API 不能取消尚未建立的 outbound connection，API 必须持续消费拨号终态、关闭败选连接并在 pending 集清空后返回；不会为了等待不可取消的旧拨号把用户可见总预算扩展到 `18.5s`。
 - endpoint 每个目标 PeerId 最多 `8` 条正在选择的连接、每种 transport 最多 `2` 条；达到上限拒绝新候选。
 - endpoint 复用 `libp2p::connection_limits`：pending inbound/outbound 各 `16`、established inbound/outbound 各 `16`、established total `24`、per PeerId `8`；memory connection limit 为进程 RSS `96 MiB`。
 - relay 复用同一官方 behaviour：pending inbound `128`、pending outbound `64`、established inbound `320`、outbound `64`、total `320`、per PeerId `8`；该上限允许同一 endpoint 竞速最多 8 个入口及短暂 AutoNAT 连接，应用协议仍要求收敛到名册唯一。relay memory connection limit 为进程 RSS `64 MiB`。

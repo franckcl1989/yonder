@@ -9,7 +9,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::time::Duration;
 use yonder_core::{IdentitySeed, SecretDocument, SecureRandom};
 
-const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Maximum setup time for one transport dial across every supported stack.
+pub const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// TLS material applied to the official libp2p WebSocket transport.
 pub enum WssTransportConfig {

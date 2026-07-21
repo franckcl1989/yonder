@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal as _, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,6 +19,7 @@ use yon::controller::{
 };
 use yon::host::{HostConfig, HostError, HostStage, run_host_with_progress};
 use yon::progress::OperationProgress;
+use yon::protocol::RelayProtocolError;
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
     LayeredConfigLoader,
@@ -42,26 +43,48 @@ const ENDPOINT_SCHEMA: ConfigurationSchema =
 #[derive(Debug, Parser)]
 #[command(name = "yon", version, about)]
 struct Cli {
+    /// Diagnostic verbosity. Interactive diagnostics require --log-file or stderr redirection.
     #[arg(long, value_enum, default_value_t = LogLevel::Error, global = true)]
     log_level: LogLevel,
+    /// Append detailed diagnostics to this file, keeping terminal interaction clean.
+    #[arg(long, value_name = "PATH", global = true)]
+    log_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Advertise one single-use remote terminal.
+    /// Advertise this user's current shell as a single-use remote terminal.
     Host,
-    /// Connect the current terminal to an advertised host.
+    /// Connect this terminal to an advertised host.
+    ///
+    /// In an interactive session, press Ctrl+] followed by `.` to disconnect locally.
+    /// Press Ctrl+] twice to send one literal Ctrl+] to the remote shell.
     Connect {
+        /// Single-use connection code. Omit it for a hidden prompt that avoids shell history.
+        #[arg(value_name = "CODE")]
         code: Option<ConnectionCodeArgument>,
+    },
+    /// Inspect and validate endpoint configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
 }
 
 impl Command {
-    const fn is_connect(&self) -> bool {
-        matches!(self, Self::Connect { .. })
+    const fn uses_terminal_ui(&self) -> bool {
+        matches!(self, Self::Host | Self::Connect { .. })
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Load and validate the effective endpoint configuration.
+    Check,
+    /// Show configuration sources in increasing precedence order.
+    Sources,
 }
 
 #[derive(Clone)]
@@ -72,7 +95,7 @@ impl ConnectionCodeArgument {
         Arc::try_unwrap(self.0)
             .map_err(|_| AppError::SharedConnectionCode)?
             .parse()
-            .map_err(AppError::Code)
+            .map_err(connection_code_input_error)
     }
 }
 
@@ -129,13 +152,27 @@ enum AppError {
     #[error("failed to initialize diagnostics")]
     Diagnostics,
     #[error(
-        "--log-level warn/info/debug/trace requires stderr redirection when connect writes to a terminal (for example: yon --log-level debug connect 2> yon-debug.log)"
+        "--log-level warn/info/debug/trace requires --log-file <PATH> or stderr redirection while terminal progress is active (for example: yon --log-level debug --log-file yon-debug.log connect)"
     )]
     InteractiveDiagnostics,
+    #[error("failed to open diagnostic log file {path}: {source}")]
+    LogFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("the relay address set is invalid: {0}")]
     RelaySet(#[from] AddressError),
     #[error("failed to load endpoint configuration: {0}")]
     Configuration(#[from] ConfigurationError),
+    #[error("failed to inspect configuration source {path}: {source}")]
+    ConfigurationSource {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to report configuration status")]
+    ConfigurationOutput(#[source] std::io::Error),
     #[error("failed to create an ephemeral endpoint identity: {0}")]
     Identity(#[from] NetworkBuildError),
     #[error("failed to read the WSS CA document: {0}")]
@@ -152,12 +189,10 @@ enum AppError {
     SharedConnectionCode,
     #[error("failed to read the connection code")]
     CodeRead(#[source] std::io::Error),
-    #[error("the connection code input exceeds 19 bytes")]
-    CodeTooLong,
-    #[error("the connection code input is not UTF-8")]
-    CodeEncoding,
-    #[error("the connection code is invalid")]
-    Code(#[source] CodeError),
+    #[error("connection code is invalid or expired")]
+    ConnectionCodeInput,
+    #[error("connection code is invalid or expired")]
+    ConnectionCodeUnavailable,
     #[error(transparent)]
     Host(#[from] HostError),
     #[error(transparent)]
@@ -171,7 +206,10 @@ fn main() -> ExitCode {
 fn process_result(result: Result<u32, AppError>) -> ExitCode {
     match result {
         Ok(code) => process_exit(code),
-        Err(AppError::Controller(ControllerError::Interrupted)) => {
+        Err(
+            AppError::Controller(ControllerError::Interrupted)
+            | AppError::Host(HostError::Interrupted),
+        ) => {
             begin_terminal_report_line();
             ExitCode::from(130)
         }
@@ -180,10 +218,7 @@ fn process_result(result: Result<u32, AppError>) -> ExitCode {
                 begin_terminal_report_line();
             }
             let _ = write_error_report(&mut std::io::stderr().lock(), &error);
-            if matches!(
-                error,
-                AppError::Code(_) | AppError::CodeTooLong | AppError::CodeEncoding
-            ) {
+            if matches!(error, AppError::ConnectionCodeInput) {
                 ExitCode::from(2)
             } else {
                 ExitCode::FAILURE
@@ -194,20 +229,27 @@ fn process_result(result: Result<u32, AppError>) -> ExitCode {
 
 fn run(cli: Cli) -> Result<u32, AppError> {
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let terminal_output = controller_uses_terminal(
+    let terminal_output = command_uses_terminal_ui(
         &cli.command,
         std::io::stdout().is_terminal(),
         stderr_is_terminal,
     );
-    validate_diagnostic_output(cli.log_level, terminal_output)?;
-    tracing_subscriber::fmt()
-        .with_max_level(diagnostic_filter(cli.log_level, terminal_output))
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .with_ansi(stderr_is_terminal)
-        .compact()
-        .try_init()
-        .map_err(|_| AppError::Diagnostics)?;
+    validate_diagnostic_output(cli.log_level, terminal_output, cli.log_file.is_some())?;
+    let diagnostics_share_terminal = terminal_output && cli.log_file.is_none();
+    match cli.log_file.as_deref() {
+        Some(path) => initialize_diagnostics(
+            cli.log_level,
+            diagnostics_share_terminal,
+            open_diagnostic_log(path)?,
+            false,
+        )?,
+        None => initialize_diagnostics(
+            cli.log_level,
+            diagnostics_share_terminal,
+            std::io::stderr,
+            stderr_is_terminal,
+        )?,
+    }
 
     std::thread::Builder::new()
         .name("yon-runtime".to_owned())
@@ -218,19 +260,23 @@ fn run(cli: Cli) -> Result<u32, AppError> {
         .map_err(|_| AppError::RuntimePanicked)?
 }
 
-fn validate_diagnostic_output(level: LogLevel, terminal_output: bool) -> Result<(), AppError> {
-    if terminal_output && level.requires_redirect_for_terminal() {
+fn validate_diagnostic_output(
+    level: LogLevel,
+    terminal_output: bool,
+    has_log_file: bool,
+) -> Result<(), AppError> {
+    if terminal_output && !has_log_file && level.requires_redirect_for_terminal() {
         return Err(AppError::InteractiveDiagnostics);
     }
     Ok(())
 }
 
-fn controller_uses_terminal(
+fn command_uses_terminal_ui(
     command: &Command,
     stdout_is_terminal: bool,
     stderr_is_terminal: bool,
 ) -> bool {
-    command.is_connect() && stdout_is_terminal && stderr_is_terminal
+    command.uses_terminal_ui() && stdout_is_terminal && stderr_is_terminal
 }
 
 fn diagnostic_filter(level: LogLevel, terminal_output: bool) -> LevelFilter {
@@ -239,6 +285,36 @@ fn diagnostic_filter(level: LogLevel, terminal_output: bool) -> LevelFilter {
     } else {
         level.filter()
     }
+}
+
+fn initialize_diagnostics<W>(
+    level: LogLevel,
+    diagnostics_share_terminal: bool,
+    writer: W,
+    ansi: bool,
+) -> Result<(), AppError>
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_max_level(diagnostic_filter(level, diagnostics_share_terminal))
+        .with_target(false)
+        .with_writer(writer)
+        .with_ansi(ansi)
+        .compact()
+        .try_init()
+        .map_err(|_| AppError::Diagnostics)
+}
+
+fn open_diagnostic_log(path: &Path) -> Result<File, AppError> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| AppError::LogFile {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn run_command(command: Command) -> Result<u32, AppError> {
@@ -269,9 +345,9 @@ fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Resul
                 .map_err(AppError::from)
         }
         Command::Connect { code } => {
+            let (relays, wss) = endpoint_config()?;
             let code = code.map_or_else(read_connection_code, ConnectionCodeArgument::into_code)?;
             let terminal = local_terminal_hello()?;
-            let (relays, wss) = endpoint_config()?;
             let identity = generate_identity(&mut OsSecureRandom)?;
             let terminal_output = std::io::stdout().is_terminal()
                 && std::io::stderr().is_terminal()
@@ -282,13 +358,135 @@ fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Resul
                     ControllerConfig::new(identity, relays, wss, code, terminal),
                     &mut progress,
                 ))
-                .map_err(AppError::from)
+                .map_err(map_controller_error)
+        }
+        Command::Config { command } => match command {
+            ConfigCommand::Check => {
+                endpoint_config()?;
+                writeln!(std::io::stdout().lock(), "Configuration is valid.")
+                    .map_err(AppError::ConfigurationOutput)?;
+                Ok(0)
+            }
+            ConfigCommand::Sources => report_configuration_sources(),
+        },
+    }
+}
+
+fn connection_code_input_error(error: CodeError) -> AppError {
+    tracing::debug!(%error, "connection code input was rejected");
+    AppError::ConnectionCodeInput
+}
+
+fn map_controller_error(error: ControllerError) -> AppError {
+    if matches!(
+        &error,
+        ControllerError::Pake(_) | ControllerError::Relay(RelayProtocolError::Unavailable)
+    ) {
+        tracing::debug!(%error, "connection code was rejected by the remote endpoint");
+        AppError::ConnectionCodeUnavailable
+    } else {
+        AppError::Controller(error)
+    }
+}
+
+fn report_configuration_sources() -> Result<u32, AppError> {
+    let loader = LayeredConfigLoader::system(ENDPOINT_SCHEMA);
+    let locations = loader.locations()?;
+    let system = configuration_file_status(locations.system_file())?;
+    let working = configuration_file_status(locations.working_file())?;
+    write_configuration_sources(
+        &mut std::io::stdout().lock(),
+        locations.system_file(),
+        system,
+        locations.working_file(),
+        working,
+    )
+    .map_err(AppError::ConfigurationOutput)?;
+    Ok(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigurationFileStatus {
+    Present,
+    Missing,
+    NotRegular,
+}
+
+impl std::fmt::Display for ConfigurationFileStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::NotRegular => "not a regular file",
+        })
+    }
+}
+
+fn configuration_file_status(path: &Path) -> Result<ConfigurationFileStatus, AppError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(ConfigurationFileStatus::Present),
+        Ok(_) => Ok(ConfigurationFileStatus::NotRegular),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ConfigurationFileStatus::Missing)
+        }
+        Err(source) => Err(AppError::ConfigurationSource {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn write_configuration_sources(
+    output: &mut impl std::io::Write,
+    system_file: &Path,
+    system_status: ConfigurationFileStatus,
+    working_file: &Path,
+    working_status: ConfigurationFileStatus,
+) -> std::io::Result<()> {
+    writeln!(output, "Configuration precedence (lowest to highest):")?;
+    writeln!(
+        output,
+        "1. System file: {} ({system_status})",
+        system_file.display()
+    )?;
+    writeln!(
+        output,
+        "2. Working-directory file: {} ({working_status})",
+        working_file.display()
+    )?;
+    writeln!(
+        output,
+        "3. Environment variables: {}_* (values hidden)",
+        Application::Yon.configuration_environment_prefix()
+    )
+}
+
+enum TerminalColumns {
+    System,
+    #[cfg(test)]
+    Fixed(usize),
+    #[cfg(test)]
+    Scripted(std::collections::VecDeque<Result<usize, std::io::ErrorKind>>),
+}
+
+impl TerminalColumns {
+    fn read(&mut self) -> std::io::Result<usize> {
+        match self {
+            Self::System => crossterm::terminal::size().map(|(columns, _)| usize::from(columns)),
+            #[cfg(test)]
+            Self::Fixed(columns) => Ok(*columns),
+            #[cfg(test)]
+            Self::Scripted(results) => results
+                .pop_front()
+                .unwrap_or(Err(std::io::ErrorKind::Other))
+                .map_err(std::io::Error::from),
         }
     }
 }
 
 struct TerminalProgress<W: std::io::Write> {
     writer: W,
+    columns: TerminalColumns,
     enabled: bool,
     visible: bool,
     line_capacity: usize,
@@ -296,21 +494,41 @@ struct TerminalProgress<W: std::io::Write> {
 }
 
 impl<W: std::io::Write> TerminalProgress<W> {
-    fn new(writer: W, enabled: bool) -> Self {
-        let columns = enabled
-            .then(crossterm::terminal::size)
-            .and_then(Result::ok)
-            .map_or(0, |(columns, _)| usize::from(columns));
-        Self::with_columns(writer, enabled, columns)
-    }
-
-    const fn with_columns(writer: W, enabled: bool, columns: usize) -> Self {
-        let line_capacity = columns.saturating_sub(1);
+    const fn new(writer: W, enabled: bool) -> Self {
         Self {
             writer,
-            enabled: enabled && line_capacity >= 8,
+            columns: TerminalColumns::System,
+            enabled,
             visible: false,
-            line_capacity,
+            line_capacity: 0,
+            frame: 0,
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_columns(writer: W, enabled: bool, columns: usize) -> Self {
+        Self {
+            writer,
+            columns: TerminalColumns::Fixed(columns),
+            enabled,
+            visible: false,
+            line_capacity: 0,
+            frame: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_scripted_columns(
+        writer: W,
+        enabled: bool,
+        results: impl IntoIterator<Item = Result<usize, std::io::ErrorKind>>,
+    ) -> Self {
+        Self {
+            writer,
+            columns: TerminalColumns::Scripted(results.into_iter().collect()),
+            enabled,
+            visible: false,
+            line_capacity: 0,
             frame: 0,
         }
     }
@@ -320,6 +538,21 @@ impl<W: std::io::Write> TerminalProgress<W> {
             return;
         }
         debug_assert!(message.is_ascii());
+        let Ok(columns) = self.columns.read() else {
+            if self.visible {
+                let _ = self.writer.write_all(b"\n");
+                let _ = self.writer.flush();
+            }
+            self.enabled = false;
+            self.visible = false;
+            return;
+        };
+        self.line_capacity = columns.saturating_sub(1);
+        if self.line_capacity < 8 {
+            self.clear_line();
+            self.enabled = false;
+            return;
+        }
         let result = (|| {
             crossterm::queue!(
                 &mut self.writer,
@@ -419,7 +652,7 @@ fn read_connection_code() -> Result<ConnectionCode, AppError> {
         let input = Zeroizing::new(
             rpassword::prompt_password("Connection code: ").map_err(AppError::CodeRead)?,
         );
-        input.parse().map_err(AppError::Code)
+        input.parse().map_err(connection_code_input_error)
     } else {
         read_connection_code_from(&mut std::io::stdin().lock())
     }
@@ -430,7 +663,7 @@ fn read_connection_code_from(reader: &mut impl Read) -> Result<ConnectionCode, A
     let mut len = 0;
     loop {
         if len == text.len() {
-            return Err(AppError::CodeTooLong);
+            return Err(AppError::ConnectionCodeInput);
         }
         if reader
             .read(&mut text[len..=len])
@@ -446,10 +679,10 @@ fn read_connection_code_from(reader: &mut impl Read) -> Result<ConnectionCode, A
         len -= 1;
     }
     if len > MAX_CODE_TEXT {
-        return Err(AppError::CodeTooLong);
+        return Err(AppError::ConnectionCodeInput);
     }
-    let text = std::str::from_utf8(&text[..len]).map_err(|_| AppError::CodeEncoding)?;
-    text.parse().map_err(AppError::Code)
+    let text = std::str::from_utf8(&text[..len]).map_err(|_| AppError::ConnectionCodeInput)?;
+    text.parse().map_err(connection_code_input_error)
 }
 
 fn endpoint_config() -> Result<(EndpointRelaySet, WssTransportConfig), AppError> {
@@ -528,11 +761,12 @@ fn write_remote_exit_warning(output: &mut impl std::io::Write, code: u32) -> std
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppError, Cli, Command, ConnectionCodeArgument, ENDPOINT_SCHEMA, LevelFilter, LogLevel,
-        RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress, controller_uses_terminal, diagnostic_filter,
-        endpoint_config_with, portable_process_exit, process_result, read_ca, read_ca_document,
-        read_connection_code_from, run, run_command, terminal_supports_progress,
-        validate_diagnostic_output, write_remote_exit_warning,
+        AppError, Cli, Command, ConfigCommand, ConfigurationFileStatus, ConnectionCodeArgument,
+        ENDPOINT_SCHEMA, LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
+        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, map_controller_error,
+        portable_process_exit, process_result, read_ca, read_ca_document,
+        read_connection_code_from, run, terminal_supports_progress, validate_diagnostic_output,
+        write_configuration_sources, write_remote_exit_warning,
     };
     use clap::Parser;
     use std::ffi::OsString;
@@ -552,13 +786,81 @@ mod tests {
         let host = Cli::try_parse_from(["yon", "host"]).unwrap();
         assert!(matches!(host.command, Command::Host));
         assert!(matches!(host.log_level, LogLevel::Error));
+        assert!(host.log_file.is_none());
 
         let connect = Cli::try_parse_from(["yon", "connect", "0000-0000-0000-0000"]).unwrap();
         assert!(matches!(connect.command, Command::Connect { .. }));
 
         let prompted = Cli::try_parse_from(["yon", "connect"]).unwrap();
         assert!(matches!(prompted.command, Command::Connect { code: None }));
+        let checked = Cli::try_parse_from(["yon", "config", "check"]).unwrap();
+        assert!(matches!(
+            checked.command,
+            Command::Config {
+                command: ConfigCommand::Check
+            }
+        ));
+        let logged = Cli::try_parse_from([
+            "yon",
+            "--log-level",
+            "debug",
+            "--log-file",
+            "diagnostics.log",
+            "host",
+        ])
+        .unwrap();
+        assert!(matches!(logged.log_level, LogLevel::Debug));
+        assert_eq!(logged.log_file, Some(PathBuf::from("diagnostics.log")));
         assert!(Cli::try_parse_from(["yon", "host", "--relay", "ignored"]).is_err());
+    }
+
+    #[test]
+    fn cli_help_snapshots_expose_the_complete_user_workflow() {
+        let top = Cli::try_parse_from(["yon", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            top,
+            concat!(
+                "Peer-to-peer remote terminal client and host\n\n",
+                "Usage: yon [OPTIONS] <COMMAND>\n\n",
+                "Commands:\n",
+                "  host     Advertise this user's current shell as a single-use remote terminal\n",
+                "  connect  Connect this terminal to an advertised host\n",
+                "  config   Inspect and validate endpoint configuration\n",
+                "  help     Print this message or the help of the given subcommand(s)\n\n",
+                "Options:\n",
+                "      --log-level <LOG_LEVEL>  Diagnostic verbosity. Interactive diagnostics require --log-file or stderr redirection [default: error] [possible values: off, error, warn, info, debug, trace]\n",
+                "      --log-file <PATH>        Append detailed diagnostics to this file, keeping terminal interaction clean\n",
+                "  -h, --help                   Print help\n",
+                "  -V, --version                Print version\n",
+            )
+        );
+
+        let connect = Cli::try_parse_from(["yon", "connect", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            connect,
+            concat!(
+                "Connect this terminal to an advertised host.\n\n",
+                "In an interactive session, press Ctrl+] followed by `.` to disconnect locally. Press Ctrl+] twice to send one literal Ctrl+] to the remote shell.\n\n",
+                "Usage: yon connect [OPTIONS] [CODE]\n\n",
+                "Arguments:\n",
+                "  [CODE]\n",
+                "          Single-use connection code. Omit it for a hidden prompt that avoids shell history\n\n",
+                "Options:\n",
+                "      --log-level <LOG_LEVEL>\n",
+                "          Diagnostic verbosity. Interactive diagnostics require --log-file or stderr redirection\n",
+                "          \n",
+                "          [default: error]\n",
+                "          [possible values: off, error, warn, info, debug, trace]\n\n",
+                "      --log-file <PATH>\n",
+                "          Append detailed diagnostics to this file, keeping terminal interaction clean\n\n",
+                "  -h, --help\n",
+                "          Print help (see a summary with '-h')\n",
+            )
+        );
     }
 
     #[test]
@@ -570,13 +872,14 @@ mod tests {
             LogLevel::Trace,
         ] {
             assert!(matches!(
-                validate_diagnostic_output(level, true),
+                validate_diagnostic_output(level, true, false),
                 Err(AppError::InteractiveDiagnostics)
             ));
-            assert!(validate_diagnostic_output(level, false).is_ok());
+            assert!(validate_diagnostic_output(level, false, false).is_ok());
+            assert!(validate_diagnostic_output(level, true, true).is_ok());
         }
         for level in [LogLevel::Off, LogLevel::Error] {
-            assert!(validate_diagnostic_output(level, true).is_ok());
+            assert!(validate_diagnostic_output(level, true, false).is_ok());
         }
         assert_eq!(diagnostic_filter(LogLevel::Error, true), LevelFilter::OFF);
         assert_eq!(
@@ -585,10 +888,17 @@ mod tests {
         );
 
         let connect = Command::Connect { code: None };
-        assert!(controller_uses_terminal(&connect, true, true));
-        assert!(!controller_uses_terminal(&connect, false, true));
-        assert!(!controller_uses_terminal(&connect, true, false));
-        assert!(!controller_uses_terminal(&Command::Host, true, true));
+        assert!(command_uses_terminal_ui(&connect, true, true));
+        assert!(!command_uses_terminal_ui(&connect, false, true));
+        assert!(!command_uses_terminal_ui(&connect, true, false));
+        assert!(command_uses_terminal_ui(&Command::Host, true, true));
+        assert!(!command_uses_terminal_ui(
+            &Command::Config {
+                command: ConfigCommand::Check
+            },
+            true,
+            true
+        ));
     }
 
     #[test]
@@ -671,6 +981,30 @@ mod tests {
     }
 
     #[test]
+    fn progress_remeasures_width_and_disables_controls_after_query_failure() {
+        let mut progress = TerminalProgress::with_scripted_columns(
+            Vec::new(),
+            true,
+            [Ok(80), Ok(12), Err(io::ErrorKind::Unsupported), Ok(80)],
+        );
+        progress.update(ControllerStage::ConnectingRelay);
+        progress.update(ControllerStage::ResolvingHost);
+        let rendered = String::from_utf8_lossy(&progress.writer);
+        assert!(rendered.contains("Connecting to relay..."));
+        assert!(!rendered.contains("Finding remote host..."));
+        drop(rendered);
+
+        let before_failure = progress.writer.len();
+        progress.update(ControllerStage::Authenticating);
+        assert!(!progress.enabled);
+        assert!(!progress.visible);
+        assert_eq!(&progress.writer[before_failure..], b"\n");
+        let after_failure = progress.writer.len();
+        progress.update(ControllerStage::StartingTerminal);
+        assert_eq!(progress.writer.len(), after_failure);
+    }
+
+    #[test]
     fn portable_process_exit_preserves_out_of_range_remote_values() {
         assert_eq!(portable_process_exit(0), Ok(ExitCode::SUCCESS));
         assert_eq!(portable_process_exit(255), Ok(ExitCode::from(255)));
@@ -685,11 +1019,15 @@ mod tests {
     }
 
     #[test]
-    fn controller_interrupt_maps_to_130_and_runtime_shutdown_is_bounded() {
+    fn local_interrupts_map_to_130_and_runtime_shutdown_is_bounded() {
         assert_eq!(
             process_result(Err(AppError::Controller(
                 yon::controller::ControllerError::Interrupted,
             ))),
+            ExitCode::from(130)
+        );
+        assert_eq!(
+            process_result(Err(AppError::Host(yon::host::HostError::Interrupted))),
             ExitCode::from(130)
         );
         assert_eq!(RUNTIME_SHUTDOWN_TIMEOUT, std::time::Duration::from_secs(1));
@@ -699,30 +1037,24 @@ mod tests {
     fn diagnostics_initialization_has_one_process_owner() {
         let invalid = || Cli {
             log_level: LogLevel::Off,
-            command: Command::Connect {
-                code: Some("0000-0000-0000-000U".parse().unwrap()),
+            log_file: None,
+            command: Command::Config {
+                command: ConfigCommand::Sources,
             },
         };
-        assert!(matches!(run(invalid()), Err(AppError::Code(_))));
+        assert!(run(invalid()).is_ok());
         assert!(matches!(run(invalid()), Err(AppError::Diagnostics)));
     }
 
     #[test]
     fn connection_code_input_errors_preserve_usage_exit_without_echoing_values() {
-        let code_error = "invalid"
-            .parse::<yonder_core::ConnectionCode>()
-            .unwrap_err();
         assert_eq!(
-            process_result(Err(AppError::Code(code_error))),
+            process_result(Err(AppError::ConnectionCodeInput)),
             ExitCode::from(2)
         );
         assert_eq!(
-            process_result(Err(AppError::CodeTooLong)),
-            ExitCode::from(2)
-        );
-        assert_eq!(
-            process_result(Err(AppError::CodeEncoding)),
-            ExitCode::from(2)
+            process_result(Err(AppError::ConnectionCodeUnavailable)),
+            ExitCode::FAILURE
         );
         assert_eq!(
             process_result(Err(AppError::Diagnostics)),
@@ -744,6 +1076,39 @@ mod tests {
         ] {
             assert_eq!(process_result(Err(error)), ExitCode::FAILURE);
         }
+
+        for error in [
+            AppError::ConnectionCodeInput,
+            AppError::ConnectionCodeUnavailable,
+        ] {
+            let mut report = Vec::new();
+            yonder_core::write_error_report(&mut report, &error).unwrap();
+            let report = String::from_utf8(report).unwrap();
+            assert_eq!(report, "error: connection code is invalid or expired\n");
+            for forbidden in ["OPAQUE", "PeerId", "locator", "0000-0000-0000-0000"] {
+                assert!(
+                    !report.contains(forbidden),
+                    "public error leaked {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_code_rejections_use_the_same_public_error_boundary() {
+        for error in [
+            yon::controller::ControllerError::Pake(yon::pake::OpaquePakeError::Rejected),
+            yon::controller::ControllerError::Relay(yon::protocol::RelayProtocolError::Unavailable),
+        ] {
+            assert!(matches!(
+                map_controller_error(error),
+                AppError::ConnectionCodeUnavailable
+            ));
+        }
+        assert!(matches!(
+            map_controller_error(yon::controller::ControllerError::Timeout),
+            AppError::Controller(yon::controller::ControllerError::Timeout)
+        ));
     }
 
     #[test]
@@ -758,19 +1123,19 @@ mod tests {
         }
         assert!(matches!(
             read_connection_code_from(&mut Cursor::new(b"0000-0000-0000-00000\n")),
-            Err(AppError::CodeTooLong)
+            Err(AppError::ConnectionCodeInput)
         ));
         assert!(matches!(
             read_connection_code_from(&mut Cursor::new(b"000000000000000000000")),
-            Err(AppError::CodeTooLong)
+            Err(AppError::ConnectionCodeInput)
         ));
         assert!(matches!(
             read_connection_code_from(&mut Cursor::new([0xFF, b'\n'])),
-            Err(AppError::CodeEncoding)
+            Err(AppError::ConnectionCodeInput)
         ));
         assert!(matches!(
             read_connection_code_from(&mut Cursor::new(b"invalid\n")),
-            Err(AppError::Code(_))
+            Err(AppError::ConnectionCodeInput)
         ));
         assert!(matches!(
             read_connection_code_from(&mut FailingReader),
@@ -803,22 +1168,10 @@ mod tests {
         ));
         assert!(retained.into_code().is_ok());
         let invalid: ConnectionCodeArgument = "0000-0000-0000-000U".parse().unwrap();
-        assert!(matches!(invalid.into_code(), Err(AppError::Code(_))));
-
-        let invalid: ConnectionCodeArgument = "0000-0000-0000-000U".parse().unwrap();
         assert!(matches!(
-            run_command(Command::Connect {
-                code: Some(invalid)
-            }),
-            Err(AppError::Code(_))
+            invalid.into_code(),
+            Err(AppError::ConnectionCodeInput)
         ));
-        let shared: ConnectionCodeArgument = "0000-0000-0000-0000".parse().unwrap();
-        let retained = shared.clone();
-        assert!(matches!(
-            run_command(Command::Connect { code: Some(shared) }),
-            Err(AppError::SharedConnectionCode)
-        ));
-        assert!(retained.into_code().is_ok());
 
         for (level, expected) in [
             (LogLevel::Off, tracing_subscriber::filter::LevelFilter::OFF),
@@ -845,6 +1198,30 @@ mod tests {
         ] {
             assert_eq!(level.filter(), expected);
         }
+    }
+
+    #[test]
+    fn configuration_source_report_is_ordered_and_hides_values() {
+        let mut output = Vec::new();
+        write_configuration_sources(
+            &mut output,
+            std::path::Path::new("/system/yon.toml"),
+            ConfigurationFileStatus::Present,
+            std::path::Path::new("/working/yon.toml"),
+            ConfigurationFileStatus::Missing,
+        )
+        .unwrap();
+        let report = String::from_utf8(output).unwrap();
+        assert_eq!(
+            report,
+            concat!(
+                "Configuration precedence (lowest to highest):\n",
+                "1. System file: /system/yon.toml (present)\n",
+                "2. Working-directory file: /working/yon.toml (missing)\n",
+                "3. Environment variables: YON_* (values hidden)\n",
+            )
+        );
+        assert!(!report.contains("relays ="));
     }
 
     #[test]

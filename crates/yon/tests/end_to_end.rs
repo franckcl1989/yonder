@@ -1761,7 +1761,7 @@ fn run_rejected_controller(
     *last = if *last == b'0' { b'1' } else { b'0' };
     let wrong = String::from_utf8(wrong).map_err(std::io::Error::other)?;
     let mut controller = Command::new(env!("CARGO_BIN_EXE_yon"))
-        .args(["--log-level", "debug", "connect", wrong.as_str()])
+        .args(["connect", wrong.as_str()])
         .current_dir(config.path())
         .env_remove("YON_RELAYS")
         .env_remove("YON_WSS_CA_DER")
@@ -1813,10 +1813,18 @@ fn run_rejected_controller(
             "a rejected controller wrote diagnostics to stdout",
         ));
     }
-    if stderr.is_empty() {
-        return Err(std::io::Error::other(
-            "a rejected controller did not explain its failure on stderr",
-        ));
+    let stderr = String::from_utf8(stderr).map_err(std::io::Error::other)?;
+    if stderr != "error: connection code is invalid or expired\n" {
+        return Err(std::io::Error::other(format!(
+            "a rejected controller exposed an unexpected public error: {stderr:?}"
+        )));
+    }
+    for forbidden in ["OPAQUE", "PeerId", "locator", wrong.as_str(), code] {
+        if stderr.contains(forbidden) {
+            return Err(std::io::Error::other(format!(
+                "a rejected controller leaked {forbidden:?} in its public error"
+            )));
+        }
     }
     Ok(())
 }

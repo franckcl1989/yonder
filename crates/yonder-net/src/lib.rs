@@ -19,7 +19,9 @@ pub use address::{
     TransportKind,
 };
 pub use behaviour::{DirectUpgradePolicy, EndpointBehaviour, RelayBehaviour};
-pub use connection::{ConnectionBook, ConnectionSelection, SourcePrefix, UniqueConnection};
+pub use connection::{
+    ConnectionBook, ConnectionSelection, ConnectionSelectionResult, SourcePrefix, UniqueConnection,
+};
 pub use error::{AddressError, NetworkBuildError};
 pub use identity::{decode_identity, encode_identity, peer_id_bytes};
 pub use libp2p::core::ConnectedPoint;
@@ -28,8 +30,8 @@ pub use libp2p::swarm::ConnectionId;
 pub use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr, ping, relay, swarm};
 pub use node::{EndpointNode, NetworkNodeError, RelayNode};
 pub use path::{
-    CandidateId, CandidatePath, EstablishedOrder, FrozenPathPolicy, PathCandidate, PathPolicy,
-    PingSamples,
+    CandidateId, CandidatePath, EstablishedOrder, PathCandidate, PathPolicy, PingSamples,
+    QualityPathPolicy, SelectedPath,
 };
 pub use streams::{
     ApplicationStream, ApplicationStreamError, ApplicationStreams, IncomingApplicationStreams,
@@ -37,5 +39,6 @@ pub use streams::{
 };
 pub use tasks::{CancellationHandle, TaskFailure, TaskGroup, TaskShutdown};
 pub use transport::{
-    WssTransportConfig, build_endpoint_transport, build_relay_transport, generate_identity,
+    TRANSPORT_TIMEOUT, WssTransportConfig, build_endpoint_transport, build_relay_transport,
+    generate_identity,
 };

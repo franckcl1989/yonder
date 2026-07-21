@@ -11,7 +11,8 @@ use std::process::ExitCode;
 use thiserror::Error;
 use tracing_subscriber::filter::LevelFilter;
 use yon_relay::{
-    FileIdentityStore, IdentityError, IdentityStore, RelayServeConfig, RelayServiceError, run_relay,
+    FileIdentityStore, IdentityError, IdentityStore, RelayServeConfig, RelayServiceError,
+    SecretFileError, SecretFilePolicy, SystemSecretFilePolicy, run_relay,
 };
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
@@ -45,6 +46,7 @@ const RELAY_SCHEMA: ConfigurationSchema = ConfigurationSchema::new(
 #[derive(Debug, Parser)]
 #[command(name = "yon-relay", version, about)]
 struct Cli {
+    /// Sets diagnostic verbosity written to standard error.
     #[arg(long, value_enum, default_value_t = LogLevel::Info, global = true)]
     log_level: LogLevel,
     #[command(subcommand)]
@@ -53,19 +55,40 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Creates or inspects the persistent relay identity.
     Identity {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// Validates the effective layered configuration without starting listeners.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Starts the relay service using the effective layered configuration.
     Serve,
 }
 
 #[derive(Debug, Subcommand)]
 enum IdentityCommand {
+    /// Creates a new relay identity without replacing an existing file.
     Init {
+        /// Destination path for the new identity.
         #[arg(long)]
         output: PathBuf,
     },
+    /// Prints the PeerId encoded by an existing relay identity.
+    Show {
+        /// Path to the relay identity.
+        #[arg(long)]
+        input: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Loads and validates configuration, identity, addresses, limits, and TLS material.
+    Check,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,9 +216,11 @@ enum AppError {
     TlsRead(#[source] std::io::Error),
     #[error("the TLS {0} document is too large")]
     TlsTooLarge(TlsDocumentKind),
+    #[error("the TLS private key or its parent directory permits untrusted access: {0}")]
+    InsecureTlsPrivateKeyPermissions(PathBuf),
     #[error("failed to construct the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
-    #[error("failed to report the relay identity")]
+    #[error("failed to write command output")]
     Output(#[source] std::io::Error),
 }
 
@@ -256,11 +281,36 @@ fn execute_command(
         Command::Identity {
             command: IdentityCommand::Init { output },
         } => initialize_identity(&output),
+        Command::Identity {
+            command: IdentityCommand::Show { input },
+        } => show_identity(&input),
+        Command::Config {
+            command: ConfigCommand::Check,
+        } => {
+            drop(configure()?);
+            report_configuration_valid()
+        }
         Command::Serve => {
             let config = configure()?;
             serve(config)
         }
     }
+}
+
+fn show_identity(input: &Path) -> Result<(), AppError> {
+    let identity = FileIdentityStore.read(input)?;
+    let stdout = std::io::stdout();
+    report_peer_id_to(&mut stdout.lock(), identity.public().to_peer_id()).map_err(AppError::Output)
+}
+
+fn report_configuration_valid() -> Result<(), AppError> {
+    let stdout = std::io::stdout();
+    report_configuration_valid_to(&mut stdout.lock()).map_err(AppError::Output)
+}
+
+fn report_configuration_valid_to(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(output, "Relay configuration is valid.")?;
+    output.flush()
 }
 
 fn serve_relay(config: RelayServeConfig) -> Result<(), AppError> {
@@ -376,8 +426,21 @@ fn relay_resources(settings: &RelaySettings) -> Result<RelayResourceConfig, AppE
 
 fn read_tls_document(path: &Path, kind: TlsDocumentKind) -> Result<SecretDocument, AppError> {
     let file = File::open(path).map_err(AppError::TlsRead)?;
-    let reported_len = file.metadata().map_err(AppError::TlsRead)?.len();
+    if kind == TlsDocumentKind::PrivateKey {
+        SystemSecretFilePolicy
+            .validate_existing(path, &file)
+            .map_err(|error| map_tls_policy_error(path, error))?;
+    }
+    let metadata = file.metadata().map_err(AppError::TlsRead)?;
+    let reported_len = metadata.len();
     read_tls_document_from(file, reported_len, kind)
+}
+
+fn map_tls_policy_error(path: &Path, error: SecretFileError) -> AppError {
+    match error {
+        SecretFileError::Insecure => AppError::InsecureTlsPrivateKeyPermissions(path.to_path_buf()),
+        SecretFileError::Platform(error) => AppError::TlsRead(error),
+    }
 }
 
 fn read_tls_document_from(
@@ -403,10 +466,10 @@ fn read_tls_document_from(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppError, Cli, Command, IdentityCommand, LogLevel, RELAY_SCHEMA, TlsDocumentKind,
-        execute_command, initialize_identity, initialize_identity_with, read_tls_document,
-        read_tls_document_from, relay_runtime, report_peer_id_to, run, serve_config_with,
-        serve_relay, write_error_report,
+        AppError, Cli, Command, ConfigCommand, IdentityCommand, LogLevel, RELAY_SCHEMA,
+        TlsDocumentKind, execute_command, initialize_identity, initialize_identity_with,
+        read_tls_document, read_tls_document_from, relay_runtime, report_configuration_valid_to,
+        report_peer_id_to, run, serve_config_with, serve_relay, write_error_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -414,7 +477,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::PathBuf;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use tracing_subscriber::filter::LevelFilter;
     use yonder_config::{ConfigurationLocationError, ConfigurationSources, LayeredConfigLoader};
 
@@ -424,6 +487,72 @@ mod tests {
         include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
     const TEST_WSS_MISMATCHED_PRIVATE_KEY_DER: &[u8] =
         include_bytes!("../../yon/tests/fixtures/localhost-self-signed-key.der");
+
+    fn write_private_key(path: &std::path::Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use yon_relay::{SecretFilePolicy as _, SystemSecretFilePolicy};
+
+            let file = fs::File::open(path).unwrap();
+            SystemSecretFilePolicy.protect_new(path, &file).unwrap();
+        }
+    }
+
+    fn test_directory() -> TempDir {
+        let directory = tempdir().unwrap();
+        secure_test_directory(directory.path());
+        directory
+    }
+
+    #[cfg(not(windows))]
+    fn secure_test_directory(_path: &std::path::Path) {}
+
+    #[cfg(windows)]
+    fn secure_test_directory(path: &std::path::Path) {
+        use std::process::{Command, Stdio};
+
+        const SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$path=$env:YONDER_TEST_DIRECTORY
+$current=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+$administrators=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+$acl=New-Object Security.AccessControl.DirectorySecurity
+$acl.SetOwner($current)
+$acl.SetAccessRuleProtection($true,$false)
+$rights=[Security.AccessControl.FileSystemRights]::FullControl
+$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+$propagate=[Security.AccessControl.PropagationFlags]::None
+$allow=[Security.AccessControl.AccessControlType]::Allow
+foreach($sid in @($current,$system,$administrators)){$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,$rights,$inherit,$propagate,$allow);[void]$acl.AddAccessRule($rule)}
+[IO.Directory]::SetAccessControl($path,$acl)
+exit 0
+"#;
+        let executable = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let status = Command::new(executable)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                SCRIPT,
+            ])
+            .env("YONDER_TEST_DIRECTORY", path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     struct FailingOutput;
 
@@ -454,6 +583,16 @@ mod tests {
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+
+        let mut valid = Vec::new();
+        report_configuration_valid_to(&mut valid).unwrap();
+        assert_eq!(valid, b"Relay configuration is valid.\n");
+        assert_eq!(
+            report_configuration_valid_to(&mut FailingOutput)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
@@ -462,6 +601,18 @@ mod tests {
             Cli::try_parse_from(["yon-relay", "identity", "init", "--output", "relay.key"])
                 .unwrap();
         assert!(matches!(identity.command, Command::Identity { .. }));
+
+        let show =
+            Cli::try_parse_from(["yon-relay", "identity", "show", "--input", "relay.key"]).unwrap();
+        assert!(matches!(show.command, Command::Identity { .. }));
+
+        let check = Cli::try_parse_from(["yon-relay", "config", "check"]).unwrap();
+        assert!(matches!(
+            check.command,
+            Command::Config {
+                command: ConfigCommand::Check
+            }
+        ));
 
         let serve = Cli::try_parse_from(["yon-relay", "--log-level", "debug", "serve"]).unwrap();
         assert!(matches!(serve.command, Command::Serve));
@@ -484,7 +635,7 @@ mod tests {
             assert_eq!(level.filter(), expected);
         }
 
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         let identity = directory.path().join("relay.identity");
         initialize_identity(&identity).unwrap();
         assert!(matches!(
@@ -536,7 +687,7 @@ mod tests {
             serve_config_with(&loader),
             Err(AppError::TlsRead(_))
         ));
-        fs::write(&private_key, [4, 5, 6]).unwrap();
+        write_private_key(&private_key, &[4, 5, 6]);
         assert_eq!(
             read_tls_document(&certificate, TlsDocumentKind::Certificate)
                 .unwrap()
@@ -555,13 +706,30 @@ mod tests {
         ));
 
         fs::write(&certificate, TEST_WSS_CERTIFICATE_DER).unwrap();
-        fs::write(&private_key, TEST_WSS_PRIVATE_KEY_DER).unwrap();
+        write_private_key(&private_key, TEST_WSS_PRIVATE_KEY_DER);
         assert!(serve_config_with(&loader).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_private_key_rejects_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = test_directory();
+        let private_key = directory.path().join("private-key.der");
+        fs::write(&private_key, [1, 2, 3]).unwrap();
+        fs::set_permissions(&private_key, fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(matches!(
+            read_tls_document(&private_key, TlsDocumentKind::PrivateKey),
+            Err(AppError::InsecureTlsPrivateKeyPermissions(path)) if path == private_key
+        ));
+        assert!(read_tls_document(&private_key, TlsDocumentKind::Certificate).is_ok());
     }
 
     #[test]
     fn relay_resource_sections_are_strict_and_compositionally_validated() {
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         let identity = directory.path().join("relay.identity");
         initialize_identity(&identity).unwrap();
         let loader = test_loader(directory.path().to_path_buf());
@@ -728,7 +896,7 @@ mod tests {
         ));
         assert!(!missing_called.get());
 
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         let configured = Cell::new(false);
         execute_command(
             Command::Identity {
@@ -750,6 +918,25 @@ mod tests {
         )
         .unwrap();
         assert!(!configured.get());
+
+        let checked = Cell::new(false);
+        let served = Cell::new(false);
+        execute_command(
+            Command::Config {
+                command: ConfigCommand::Check,
+            },
+            || {
+                checked.set(true);
+                Ok(relay_config())
+            },
+            |_| {
+                served.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(checked.get());
+        assert!(!served.get());
 
         let runtime = relay_runtime().unwrap();
         assert_eq!(runtime.block_on(async { 7_u8 }), 7);
@@ -785,7 +972,7 @@ mod tests {
 
     #[test]
     fn invalid_address_configuration_fails_before_identity_loading() {
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         let loader = test_loader(directory.path().to_path_buf());
         write_config(
             directory.path(),
@@ -884,7 +1071,7 @@ mod tests {
             Err(yon_relay::RelayServiceError::NetworkBuild(_))
         ));
 
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         assert!(matches!(
             initialize_identity_with(
                 &directory.path().join("failed.identity"),
@@ -897,7 +1084,7 @@ mod tests {
 
     #[test]
     fn diagnostics_initialization_is_single_owner() {
-        let directory = tempdir().unwrap();
+        let directory = test_directory();
         let first = run(Cli {
             log_level: LogLevel::Off,
             command: Command::Identity {

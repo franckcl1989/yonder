@@ -6,9 +6,10 @@ use yonder_net::behaviour::EndpointBehaviourEvent;
 use yonder_net::swarm::SwarmEvent;
 use yonder_net::{
     ApplicationStream, ApplicationStreamError, ApplicationStreams, ConnectedPoint, ConnectionBook,
-    ConnectionId, ConnectionSelection, DirectUpgradePolicy, EndpointNode, EndpointRelayAddress,
-    EndpointRelaySet, Keypair, Libp2pApplicationStreams, ListenerId, Multiaddr, NetworkBuildError,
-    NetworkNodeError, PeerId, WssTransportConfig, multiaddr, ping, relay,
+    ConnectionId, ConnectionSelection, ConnectionSelectionResult, DirectUpgradePolicy,
+    EndpointNode, EndpointRelayAddress, EndpointRelaySet, Keypair, Libp2pApplicationStreams,
+    ListenerId, Multiaddr, NetworkBuildError, NetworkNodeError, PeerId, SelectedPath,
+    TRANSPORT_TIMEOUT, WssTransportConfig, multiaddr, ping, relay,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -16,10 +17,14 @@ const TARGET_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SELECTION_WINDOW: Duration = Duration::from_millis(1_500);
 const TARGET_SELECTION_WINDOW: Duration = Duration::from_millis(1_500);
 const DIRECT_UPGRADE_WINDOW: Duration = Duration::from_secs(3);
+const LATE_DIRECT_SAMPLE_WINDOW: Duration = Duration::from_millis(750);
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTION_CAPACITY: usize = 8;
-const RELAY_DIAL_WINDOW: Duration = Duration::from_millis(1_500);
 const RELAY_DRAIN_WINDOW: Duration = Duration::from_millis(500);
+// A started dial may consume its full transport timeout, and every return path must still drain it.
+const RELAY_DIAL_WINDOW: Duration = CONNECT_TIMEOUT
+    .saturating_sub(TRANSPORT_TIMEOUT)
+    .saturating_sub(RELAY_DRAIN_WINDOW);
 const RELAY_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const RELAY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
@@ -89,6 +94,25 @@ pub enum EndpointEvent {
 pub enum DirectUpgradeOutcome {
     Connected(ConnectionId),
     Failed,
+}
+
+/// One selected endpoint connection and its explicit route/transport classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedConnection {
+    binding: ConnectionBinding,
+    path: SelectedPath,
+}
+
+impl SelectedConnection {
+    #[must_use]
+    pub const fn binding(self) -> ConnectionBinding {
+        self.binding
+    }
+
+    #[must_use]
+    pub const fn path(self) -> SelectedPath {
+        self.path
+    }
 }
 
 /// The exact local physical connection authorized for one endpoint session.
@@ -245,15 +269,17 @@ impl EndpointDriver {
         self.connections.unique(peer).is_some()
     }
 
-    fn direct_upgrade_ready(&self, peer: &PeerId) -> bool {
-        match self.direct_upgrades.outcome(peer) {
-            Some(DirectUpgradeOutcome::Connected(connection)) => self
-                .connections
-                .connections(peer)
-                .any(|candidate| candidate == connection),
-            Some(DirectUpgradeOutcome::Failed) => true,
-            None => false,
+    pub(crate) fn direct_upgrade_ready(&self, peer: &PeerId) -> bool {
+        let Some(unique) = self.connections.unique(peer) else {
+            return false;
+        };
+        if !unique.endpoint().is_relayed() {
+            return true;
         }
+        matches!(
+            self.direct_upgrades.outcome(peer),
+            Some(DirectUpgradeOutcome::Failed)
+        )
     }
 
     pub fn bind(&self, peer: PeerId) -> Result<ConnectionBinding, EndpointError> {
@@ -345,6 +371,10 @@ impl EndpointDriver {
     pub async fn close_peer_and_wait(&mut self, peer: PeerId) -> Result<(), EndpointError> {
         let deadline = tokio::time::Instant::now() + CONVERGENCE_TIMEOUT;
         self.close_peer_and_wait_until(peer, deadline).await
+    }
+
+    fn record_relay_dial_failed(&mut self, connection: ConnectionId) {
+        self.pending_relay_dials.remove(connection);
     }
 
     async fn close_peer_and_wait_until(
@@ -471,7 +501,7 @@ impl EndpointDriver {
                     peer_id,
                     error,
                 } => {
-                    self.pending_relay_dials.remove(connection_id);
+                    self.record_relay_dial_failed(connection_id);
                     tracing::debug!(peer = ?peer_id, %error, "endpoint dial attempt failed");
                     return EndpointEvent::DialFailed(connection_id);
                 }
@@ -671,11 +701,13 @@ pub async fn connect_configured_relay(
     driver: &mut EndpointDriver,
     relays: &EndpointRelaySet,
 ) -> Result<RelayConnection, EndpointError> {
-    let connect_deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
-    let attempt_deadline = connect_deadline - RELAY_DRAIN_WINDOW;
+    let started = tokio::time::Instant::now();
+    let dial_cutoff = started + RELAY_DIAL_WINDOW;
+    let attempt_deadline = dial_cutoff + TRANSPORT_TIMEOUT;
+    let connect_deadline = attempt_deadline + RELAY_DRAIN_WINDOW;
     let relay_peer = relays.relay().get();
     drain_relay_state(driver, relay_peer, None, connect_deadline).await?;
-    let attempt = connect_relay_attempt(driver, relays, attempt_deadline).await;
+    let attempt = connect_relay_attempt(driver, relays, dial_cutoff, attempt_deadline).await;
     match attempt {
         Ok(connection) => {
             drain_relay_state(
@@ -697,10 +729,13 @@ pub async fn connect_configured_relay(
 async fn connect_relay_attempt(
     driver: &mut EndpointDriver,
     relays: &EndpointRelaySet,
-    connect_deadline: tokio::time::Instant,
+    dial_cutoff: tokio::time::Instant,
+    attempt_deadline: tokio::time::Instant,
 ) -> Result<RelayConnection, EndpointError> {
     let relay_peer = relays.relay().get();
-    let dial_cutoff = tokio::time::Instant::now() + RELAY_DIAL_WINDOW;
+    if tokio::time::Instant::now() > dial_cutoff {
+        return Err(EndpointError::RelayUnavailable);
+    }
     dial_relay_set(driver, relays)?;
 
     let mut backoff = relay_backoff();
@@ -722,11 +757,11 @@ async fn connect_relay_attempt(
             return Err(EndpointError::RelayUnavailable);
         }
         let deadline = selection_deadline
-            .unwrap_or_else(|| connect_deadline.min(next_dial.unwrap_or(connect_deadline)));
+            .unwrap_or_else(|| attempt_deadline.min(next_dial.unwrap_or(attempt_deadline)));
         let event = match tokio::time::timeout_at(deadline, driver.next()).await {
             Ok(event) => event,
             Err(_) if selection_deadline.is_some() => break,
-            Err(_) if tokio::time::Instant::now() >= connect_deadline => {
+            Err(_) if tokio::time::Instant::now() >= attempt_deadline => {
                 return Err(EndpointError::RelayUnavailable);
             }
             Err(_) => {
@@ -738,7 +773,7 @@ async fn connect_relay_attempt(
         if process_relay_selection_event(driver, &mut selection, &mut addresses, relay_peer, event)
         {
             selection_deadline.get_or_insert(
-                (tokio::time::Instant::now() + SELECTION_WINDOW).min(connect_deadline),
+                (tokio::time::Instant::now() + SELECTION_WINDOW).min(attempt_deadline),
             );
         }
         if selection_deadline.is_none()
@@ -758,7 +793,10 @@ fn finish_relay_selection(
     addresses: Vec<(ConnectionId, Multiaddr)>,
     relay_peer: PeerId,
 ) -> Result<RelayConnection, EndpointError> {
-    let (winner, losers) = selection.finish().ok_or(EndpointError::RelayUnavailable)?;
+    let (winner, losers, _) = selection
+        .finish()
+        .ok_or(EndpointError::RelayUnavailable)?
+        .into_parts();
     for loser in losers {
         driver.close(loser);
     }
@@ -1022,7 +1060,7 @@ pub async fn connect_target(
     driver: &mut EndpointDriver,
     relay: &EndpointRelayAddress,
     target: PeerId,
-) -> Result<ConnectionBinding, EndpointError> {
+) -> Result<SelectedConnection, EndpointError> {
     connect_target_with_policy(driver, relay, target, DirectUpgradePolicy::Enabled).await
 }
 
@@ -1031,7 +1069,7 @@ pub async fn connect_target_via_relay(
     driver: &mut EndpointDriver,
     relay: &EndpointRelayAddress,
     target: PeerId,
-) -> Result<ConnectionBinding, EndpointError> {
+) -> Result<SelectedConnection, EndpointError> {
     connect_target_with_policy(driver, relay, target, DirectUpgradePolicy::Disabled).await
 }
 
@@ -1040,7 +1078,7 @@ async fn connect_target_with_policy(
     relay: &EndpointRelayAddress,
     target: PeerId,
     direct_upgrade: DirectUpgradePolicy,
-) -> Result<ConnectionBinding, EndpointError> {
+) -> Result<SelectedConnection, EndpointError> {
     driver.dial(relay.circuit_to(target))?;
     let connect_deadline = tokio::time::Instant::now() + TARGET_SETTLE_TIMEOUT;
     connect_target_until(driver, target, connect_deadline, direct_upgrade).await
@@ -1051,16 +1089,20 @@ async fn connect_target_until(
     target: PeerId,
     connect_deadline: tokio::time::Instant,
     direct_upgrade: DirectUpgradePolicy,
-) -> Result<ConnectionBinding, EndpointError> {
+) -> Result<SelectedConnection, EndpointError> {
     let mut selection_deadline = None;
     let mut selection = ConnectionSelection::new();
     let mut has_candidate = false;
     let mut selection_elapsed = false;
     let mut direct_upgrade_deadline = None;
     let mut direct_upgrade_outcome = None;
+    let mut late_sample_deadline = None;
+    let mut late_sample_elapsed = false;
     loop {
         let deadline = if selection_elapsed {
-            direct_upgrade_deadline.unwrap_or(connect_deadline)
+            late_sample_deadline
+                .filter(|_| !late_sample_elapsed)
+                .unwrap_or_else(|| direct_upgrade_deadline.unwrap_or(connect_deadline))
         } else {
             selection_deadline.unwrap_or(connect_deadline)
         };
@@ -1077,6 +1119,26 @@ async fn connect_target_until(
                     direct_upgrade_outcome,
                     selection_elapsed,
                     direct_upgrade,
+                    late_sample_elapsed,
+                ) {
+                    break;
+                }
+                arm_late_sample_window(
+                    &selection,
+                    selection_elapsed,
+                    connect_deadline,
+                    &mut late_sample_deadline,
+                );
+                continue;
+            }
+            Err(_) if late_sample_deadline == Some(deadline) && !late_sample_elapsed => {
+                late_sample_elapsed = true;
+                if target_selection_is_settled(
+                    &selection,
+                    direct_upgrade_outcome,
+                    selection_elapsed,
+                    direct_upgrade,
+                    late_sample_elapsed,
                 ) {
                     break;
                 }
@@ -1096,8 +1158,7 @@ async fn connect_target_until(
         {
             direct_upgrade_outcome = Some(*outcome);
         }
-        if process_target_selection_event(driver, &mut selection, target, event, !selection_elapsed)
-        {
+        if process_target_selection_event(driver, &mut selection, target, event) {
             has_candidate = true;
         }
         if has_candidate && selection_deadline.is_none() {
@@ -1112,17 +1173,26 @@ async fn connect_target_until(
             direct_upgrade_outcome,
             selection_elapsed,
             direct_upgrade,
+            late_sample_elapsed,
         ) {
             break;
         }
+        arm_late_sample_window(
+            &selection,
+            selection_elapsed,
+            connect_deadline,
+            &mut late_sample_deadline,
+        );
     }
     if direct_upgrade.is_enabled()
         && matches!(direct_upgrade_outcome, Some(DirectUpgradeOutcome::Failed))
+        && !selection.has_direct()
     {
         driver.close_peer_and_wait(target).await?;
         return Err(EndpointError::DirectUpgradeFailed);
     }
-    let (winner, losers) = selection.finish().ok_or(EndpointError::RelayUnavailable)?;
+    let (winner, losers, path) =
+        finish_target_selection(&selection, direct_upgrade_outcome, direct_upgrade)?.into_parts();
     for loser in losers {
         driver.close(loser);
     }
@@ -1131,7 +1201,29 @@ async fn connect_target_until(
         connection: winner,
     };
     converge_to_binding(driver, binding, connect_deadline).await?;
-    Ok(binding)
+    Ok(SelectedConnection { binding, path })
+}
+
+fn finish_target_selection(
+    selection: &ConnectionSelection,
+    direct_upgrade_outcome: Option<DirectUpgradeOutcome>,
+    direct_upgrade: DirectUpgradePolicy,
+) -> Result<ConnectionSelectionResult, EndpointError> {
+    match (direct_upgrade, direct_upgrade_outcome) {
+        (DirectUpgradePolicy::Enabled, _) if selection.has_direct() => selection
+            .finish_direct()
+            .ok_or(EndpointError::TargetUpgradeDidNotSettle),
+        (DirectUpgradePolicy::Enabled, Some(DirectUpgradeOutcome::Failed)) => {
+            Err(EndpointError::DirectUpgradeFailed)
+        }
+        (DirectUpgradePolicy::Enabled, Some(DirectUpgradeOutcome::Connected(_))) => {
+            Err(EndpointError::TargetUpgradeDidNotSettle)
+        }
+        (DirectUpgradePolicy::Enabled, None) => Err(EndpointError::TargetUpgradeDidNotSettle),
+        (DirectUpgradePolicy::Disabled, _) => {
+            selection.finish().ok_or(EndpointError::RelayUnavailable)
+        }
+    }
 }
 
 fn target_selection_is_settled(
@@ -1139,14 +1231,28 @@ fn target_selection_is_settled(
     direct_upgrade_outcome: Option<DirectUpgradeOutcome>,
     selection_elapsed: bool,
     direct_upgrade: DirectUpgradePolicy,
+    late_sample_elapsed: bool,
 ) -> bool {
-    selection_elapsed
-        && (!direct_upgrade.is_enabled()
-            || match direct_upgrade_outcome {
-                Some(DirectUpgradeOutcome::Connected(connection)) => selection.contains(connection),
-                Some(DirectUpgradeOutcome::Failed) => true,
-                None => false,
-            })
+    if !selection_elapsed || !direct_upgrade.is_enabled() {
+        return selection_elapsed;
+    }
+    if selection.has_direct() {
+        return selection.has_direct_sample() || late_sample_elapsed;
+    }
+    matches!(direct_upgrade_outcome, Some(DirectUpgradeOutcome::Failed))
+}
+
+fn arm_late_sample_window(
+    selection: &ConnectionSelection,
+    selection_elapsed: bool,
+    connect_deadline: tokio::time::Instant,
+    late_sample_deadline: &mut Option<tokio::time::Instant>,
+) {
+    if selection_elapsed && selection.has_direct() && !selection.has_direct_sample() {
+        late_sample_deadline.get_or_insert(
+            (tokio::time::Instant::now() + LATE_DIRECT_SAMPLE_WINDOW).min(connect_deadline),
+        );
+    }
 }
 
 fn process_target_selection_event(
@@ -1154,7 +1260,6 @@ fn process_target_selection_event(
     selection: &mut ConnectionSelection,
     target: PeerId,
     event: EndpointEvent,
-    collect_quality: bool,
 ) -> bool {
     match event {
         EndpointEvent::Established {
@@ -1173,7 +1278,7 @@ fn process_target_selection_event(
             peer,
             connection,
             round_trip: Ok(round_trip),
-        } if peer == target && collect_quality => {
+        } if peer == target => {
             let _ = selection.ping(connection, round_trip);
             false
         }
@@ -1184,26 +1289,6 @@ fn process_target_selection_event(
             false
         }
         _ => false,
-    }
-}
-
-/// Waits until an inbound peer has completed DCUtR and converged to one connection.
-pub async fn wait_for_target_quiescence(
-    driver: &mut EndpointDriver,
-    target: PeerId,
-) -> Result<ConnectionBinding, EndpointError> {
-    let deadline = tokio::time::Instant::now() + TARGET_SETTLE_TIMEOUT;
-    loop {
-        if driver.direct_upgrade_ready(&target) && driver.has_unique_connection(&target) {
-            return driver.bind(target);
-        }
-        if tokio::time::timeout_at(deadline, driver.next())
-            .await
-            .is_err()
-        {
-            driver.close_peer_and_wait(target).await?;
-            return Err(EndpointError::TargetUpgradeDidNotSettle);
-        }
     }
 }
 
@@ -1282,12 +1367,13 @@ mod tests {
     use super::{
         CONNECT_TIMEOUT, CONVERGENCE_TIMEOUT, ConnectionBinding, DIRECT_UPGRADE_WINDOW,
         DirectUpgradeOutcome, DirectUpgradeTracker, EndpointDriver, EndpointError, EndpointEvent,
-        PendingRelayDials, RELAY_DIAL_WINDOW, RELAY_DRAIN_WINDOW, RelayConnection,
-        ReservationDecision, ReservationLease, ReservationListenerId, ReservationSlot,
-        SELECTION_WINDOW, TARGET_SELECTION_WINDOW, TARGET_SETTLE_TIMEOUT, connect_relay_attempt,
+        LATE_DIRECT_SAMPLE_WINDOW, PendingRelayDials, RELAY_DIAL_WINDOW, RELAY_DRAIN_WINDOW,
+        RelayConnection, ReservationDecision, ReservationLease, ReservationListenerId,
+        ReservationSlot, SELECTION_WINDOW, TARGET_SELECTION_WINDOW, TARGET_SETTLE_TIMEOUT,
+        arm_late_sample_window, connect_configured_relay, connect_relay_attempt,
         connect_target_until, converge_to_binding, dial_relay_set, drain_relay_state, drive,
         drive_bound, enforce_binding_after_event, finish_bound_output, finish_relay_selection,
-        next_relay_dial, open_stream, process_relay_selection_event,
+        finish_target_selection, next_relay_dial, open_stream, process_relay_selection_event,
         process_target_selection_event, reconverge_relay, relay_backoff_builder, relay_drain_event,
         reservation_decision, selected_relay_address, target_selection_is_settled,
         wait_for_reservation, wait_for_reservation_until,
@@ -1296,7 +1382,8 @@ mod tests {
     use std::time::Duration;
     use yonder_net::{
         ConnectedPoint, ConnectionId, ConnectionSelection, DirectUpgradePolicy, EndpointNode,
-        EndpointRelayAddress, EndpointRelaySet, Keypair, ListenerId, Multiaddr, WssTransportConfig,
+        EndpointRelayAddress, EndpointRelaySet, Keypair, ListenerId, Multiaddr, TRANSPORT_TIMEOUT,
+        WssTransportConfig,
     };
 
     #[test]
@@ -1306,11 +1393,15 @@ mod tests {
         assert_eq!(SELECTION_WINDOW, TARGET_SELECTION_WINDOW);
         assert!(TARGET_SELECTION_WINDOW < CONVERGENCE_TIMEOUT);
         assert_eq!(DIRECT_UPGRADE_WINDOW, Duration::from_secs(3));
+        assert_eq!(LATE_DIRECT_SAMPLE_WINDOW, Duration::from_millis(750));
         assert!(TARGET_SELECTION_WINDOW < DIRECT_UPGRADE_WINDOW);
         assert!(DIRECT_UPGRADE_WINDOW < TARGET_SETTLE_TIMEOUT);
         assert_eq!(RELAY_DIAL_WINDOW, SELECTION_WINDOW);
         assert_eq!(RELAY_DRAIN_WINDOW, Duration::from_millis(500));
-        assert!(RELAY_DIAL_WINDOW + Duration::from_secs(8) + RELAY_DRAIN_WINDOW <= CONNECT_TIMEOUT);
+        assert_eq!(
+            RELAY_DIAL_WINDOW + TRANSPORT_TIMEOUT + RELAY_DRAIN_WINDOW,
+            CONNECT_TIMEOUT
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1322,39 +1413,73 @@ mod tests {
             None,
             true,
             DirectUpgradePolicy::Disabled,
+            false,
         ));
         assert!(!target_selection_is_settled(
             &selection,
             None,
             true,
             DirectUpgradePolicy::Enabled,
+            false,
         ));
         assert!(target_selection_is_settled(
             &selection,
             Some(DirectUpgradeOutcome::Failed),
             true,
             DirectUpgradePolicy::Enabled,
+            false,
         ));
         assert!(!target_selection_is_settled(
             &selection,
             Some(DirectUpgradeOutcome::Connected(connection)),
             true,
             DirectUpgradePolicy::Enabled,
+            false,
         ));
         selection
             .established(connection, &listener_endpoint(700))
             .unwrap();
+        assert!(!target_selection_is_settled(
+            &selection,
+            Some(DirectUpgradeOutcome::Connected(connection)),
+            true,
+            DirectUpgradePolicy::Enabled,
+            false,
+        ));
+        let before = tokio::time::Instant::now();
+        let mut late_sample_deadline = None;
+        arm_late_sample_window(
+            &selection,
+            true,
+            before + Duration::from_secs(5),
+            &mut late_sample_deadline,
+        );
+        let armed = late_sample_deadline.unwrap();
+        assert!(armed >= before + LATE_DIRECT_SAMPLE_WINDOW);
+        assert!(armed <= tokio::time::Instant::now() + LATE_DIRECT_SAMPLE_WINDOW);
         assert!(target_selection_is_settled(
             &selection,
             Some(DirectUpgradeOutcome::Connected(connection)),
             true,
             DirectUpgradePolicy::Enabled,
+            true,
+        ));
+        selection
+            .ping(connection, Duration::from_millis(1))
+            .unwrap();
+        assert!(target_selection_is_settled(
+            &selection,
+            None,
+            true,
+            DirectUpgradePolicy::Enabled,
+            false,
         ));
         assert!(!target_selection_is_settled(
             &selection,
             Some(DirectUpgradeOutcome::Connected(connection)),
             false,
             DirectUpgradePolicy::Enabled,
+            true,
         ));
 
         let mut driver = endpoint_driver();
@@ -1372,10 +1497,82 @@ mod tests {
         assert!(driver.direct_upgrade_ready(&peer));
         driver.connections.closed(&peer, &connection);
         assert!(!driver.direct_upgrade_ready(&peer));
+        let counterpart = ConnectionId::new_unchecked(701);
+        driver
+            .connections
+            .established(peer, counterpart, listener_endpoint(701))
+            .unwrap();
+        assert!(driver.direct_upgrade_ready(&peer));
+        driver.connections.closed(&peer, &counterpart);
+        let relay = ConnectionId::new_unchecked(702);
+        driver
+            .connections
+            .established(peer, relay, relayed_listener_endpoint(702))
+            .unwrap();
+        assert!(!driver.direct_upgrade_ready(&peer));
         driver
             .direct_upgrades
             .finish(peer, DirectUpgradeOutcome::Failed);
         assert!(driver.direct_upgrade_ready(&peer));
+    }
+
+    #[test]
+    fn an_established_direct_candidate_outranks_relay_for_the_controller() {
+        let relay = ConnectionId::new_unchecked(699);
+        let direct = ConnectionId::new_unchecked(700);
+        let mut selection = ConnectionSelection::new();
+        selection
+            .established(relay, &relayed_listener_endpoint(699))
+            .unwrap();
+        selection
+            .established(direct, &listener_endpoint(700))
+            .unwrap();
+        for value in [1, 1, 1] {
+            selection.ping(relay, Duration::from_millis(value)).unwrap();
+        }
+        for value in [20, 20, 20] {
+            selection
+                .ping(direct, Duration::from_millis(value))
+                .unwrap();
+        }
+
+        assert_eq!(selection.finish().unwrap().connection(), relay);
+        for outcome in [
+            None,
+            Some(DirectUpgradeOutcome::Connected(direct)),
+            Some(DirectUpgradeOutcome::Failed),
+        ] {
+            let selected =
+                finish_target_selection(&selection, outcome, DirectUpgradePolicy::Enabled).unwrap();
+            assert_eq!(selected.connection(), direct);
+            assert_eq!(selected.path().route(), yonder_net::CandidatePath::Direct);
+        }
+        assert_eq!(
+            finish_target_selection(&selection, None, DirectUpgradePolicy::Disabled)
+                .unwrap()
+                .connection(),
+            relay
+        );
+        let mut relay_only = ConnectionSelection::new();
+        relay_only
+            .established(relay, &relayed_listener_endpoint(699))
+            .unwrap();
+        assert!(matches!(
+            finish_target_selection(
+                &relay_only,
+                Some(DirectUpgradeOutcome::Connected(relay)),
+                DirectUpgradePolicy::Enabled,
+            ),
+            Err(EndpointError::TargetUpgradeDidNotSettle)
+        ));
+        assert!(matches!(
+            finish_target_selection(
+                &relay_only,
+                Some(DirectUpgradeOutcome::Failed),
+                DirectUpgradePolicy::Enabled,
+            ),
+            Err(EndpointError::DirectUpgradeFailed)
+        ));
     }
 
     #[test]
@@ -1433,6 +1630,34 @@ mod tests {
                 tokio::time::Instant::now() + Duration::from_millis(1)
             )
             .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_entire_fast_failed_relay_batch_can_schedule_another_attempt() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let connection = ConnectionId::new_unchecked(10);
+        let mut driver = endpoint_driver();
+        driver.pending_relay_dials.insert(connection).unwrap();
+        let mut selection = ConnectionSelection::new();
+        let mut addresses = Vec::new();
+
+        driver.record_relay_dial_failed(connection);
+        assert!(!process_relay_selection_event(
+            &mut driver,
+            &mut selection,
+            &mut addresses,
+            peer,
+            EndpointEvent::DialFailed(connection),
+        ));
+        assert!(driver.pending_relay_dials.is_empty());
+        let mut immediate = [Duration::ZERO].into_iter();
+        assert!(
+            next_relay_dial(
+                &mut immediate,
+                tokio::time::Instant::now() + Duration::from_millis(1)
+            )
+            .is_some()
         );
     }
 
@@ -1749,10 +1974,20 @@ mod tests {
             Err(EndpointError::RelayDialTrackerUnavailable)
         ));
         driver.pending_relay_dials = PendingRelayDials::new();
+        let expired = tokio::time::Instant::now() - Duration::from_millis(1);
         assert!(matches!(
-            connect_relay_attempt(&mut driver, &relays, tokio::time::Instant::now()).await,
+            connect_relay_attempt(&mut driver, &relays, expired, expired).await,
             Err(EndpointError::RelayUnavailable)
         ));
+        assert!(driver.pending_relay_dials.is_empty());
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_configured_relay(&mut driver, &relays),
+        )
+        .await
+        .expect("fast local relay failures remain within the dial launch window");
+        assert!(matches!(result, Err(EndpointError::RelayUnavailable)));
+        assert!(driver.pending_relay_dials.is_empty());
 
         let mut streams = driver.node.streams().clone();
         let absent = Keypair::generate_ed25519().public().to_peer_id();
@@ -1936,7 +2171,6 @@ mod tests {
             &mut target_selection,
             peer,
             established(peer, 100, listener_endpoint(100)),
-            true,
         ));
         assert!(!process_target_selection_event(
             &mut driver,
@@ -1947,7 +2181,6 @@ mod tests {
                 connection: ConnectionId::new_unchecked(100),
                 round_trip: Ok(Duration::from_millis(1)),
             },
-            true,
         ));
         assert!(!process_target_selection_event(
             &mut driver,
@@ -1957,7 +2190,6 @@ mod tests {
                 peer,
                 connection: ConnectionId::new_unchecked(100),
             },
-            true,
         ));
         assert!(!process_target_selection_event(
             &mut driver,
@@ -1968,7 +2200,6 @@ mod tests {
                 connection: ConnectionId::new_unchecked(100),
                 round_trip: Err(()),
             },
-            true,
         ));
         for connection in 101..104 {
             let accepted = process_target_selection_event(
@@ -1976,7 +2207,6 @@ mod tests {
                 &mut target_selection,
                 peer,
                 established(peer, connection, listener_endpoint(connection)),
-                true,
             );
             assert_eq!(accepted, connection < 103);
         }
@@ -2191,6 +2421,15 @@ mod tests {
         ConnectedPoint::Listener {
             local_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
             send_back_addr: format!("/ip4/192.0.2.1/tcp/{port}").parse().unwrap(),
+        }
+    }
+
+    fn relayed_listener_endpoint(port: u16) -> ConnectedPoint {
+        ConnectedPoint::Listener {
+            local_addr: "/ip4/127.0.0.1/tcp/0/p2p-circuit".parse().unwrap(),
+            send_back_addr: format!("/ip4/192.0.2.1/tcp/{port}/p2p-circuit")
+                .parse()
+                .unwrap(),
         }
     }
 }

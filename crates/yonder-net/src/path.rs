@@ -36,6 +36,30 @@ pub enum CandidatePath {
     Relayed,
 }
 
+/// The selected end-to-end route and its negotiated transport category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SelectedPath {
+    route: CandidatePath,
+    transport: TransportKind,
+}
+
+impl SelectedPath {
+    #[must_use]
+    pub const fn new(route: CandidatePath, transport: TransportKind) -> Self {
+        Self { route, transport }
+    }
+
+    #[must_use]
+    pub const fn route(self) -> CandidatePath {
+        self.route
+    }
+
+    #[must_use]
+    pub const fn transport(self) -> TransportKind {
+        self.transport
+    }
+}
+
 /// Up to the first three successful selection-window ping samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PingSamples {
@@ -139,8 +163,13 @@ impl PathCandidate {
         self.id
     }
 
-    pub(crate) const fn is_usable(self) -> bool {
+    pub(crate) const fn has_samples(self) -> bool {
         self.samples.is_usable()
+    }
+
+    #[must_use]
+    pub const fn selected_path(self) -> SelectedPath {
+        SelectedPath::new(self.path, self.transport)
     }
 
     pub(crate) fn samples_mut(&mut self) -> &mut PingSamples {
@@ -153,33 +182,30 @@ pub trait PathPolicy {
     fn select<'a>(&self, candidates: &'a [PathCandidate]) -> Option<&'a PathCandidate>;
 }
 
-/// The frozen connectivity, stability, latency, path and transport ordering.
+/// Selects the best established path from bounded quality evidence.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct FrozenPathPolicy;
+pub struct QualityPathPolicy;
 
-impl PathPolicy for FrozenPathPolicy {
+impl PathPolicy for QualityPathPolicy {
     fn select<'a>(&self, candidates: &'a [PathCandidate]) -> Option<&'a PathCandidate> {
-        candidates
-            .iter()
-            .filter(|candidate| candidate.samples.is_usable())
-            .min_by(|left, right| compare(left, right))
+        candidates.iter().min_by(|left, right| compare(left, right))
     }
 }
 
 pub(crate) fn compare(left: &PathCandidate, right: &PathCandidate) -> Ordering {
-    let left_stats = left
-        .samples
-        .statistics()
-        .expect("only usable candidates are ranked");
-    let right_stats = right
-        .samples
-        .statistics()
-        .expect("only usable candidates are ranked");
-    right_stats
-        .0
-        .cmp(&left_stats.0)
-        .then_with(|| left_stats.1.cmp(&right_stats.1))
-        .then_with(|| left_stats.2.cmp(&right_stats.2))
+    let quality = match (left.samples.statistics(), right.samples.statistics()) {
+        (Some(left_stats), Some(right_stats)) => left_stats.1.cmp(&right_stats.1).then_with(|| {
+            if left_stats.0 > 1 && right_stats.0 > 1 {
+                left_stats.2.cmp(&right_stats.2)
+            } else {
+                Ordering::Equal
+            }
+        }),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    quality
         .then_with(|| left.path.cmp(&right.path))
         .then_with(|| left.transport.cmp(&right.transport))
         .then_with(|| left.established.cmp(&right.established))
@@ -189,22 +215,24 @@ pub(crate) fn compare(left: &PathCandidate, right: &PathCandidate) -> Ordering {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        CandidateId, CandidatePath, EstablishedOrder, FrozenPathPolicy, PathCandidate, PathPolicy,
-        PingSamples,
+        CandidateId, CandidatePath, EstablishedOrder, PathCandidate, PathPolicy, PingSamples,
+        QualityPathPolicy,
     };
     use crate::TransportKind;
     use proptest::prelude::*;
     use std::time::Duration;
 
     #[test]
-    fn one_success_is_usable_and_zero_successes_are_not() {
+    fn an_established_candidate_without_ping_remains_a_fallback() {
         let mut samples = PingSamples::default();
         assert!(samples.is_empty());
         assert_eq!(samples.len(), 0);
         assert_eq!(samples.statistics(), None);
         let empty = candidate(0, samples, CandidatePath::Direct, TransportKind::Quic, 0);
-        assert!(!empty.is_usable());
-        assert_eq!(FrozenPathPolicy.select(&[empty]), None);
+        assert_eq!(
+            QualityPathPolicy.select(&[empty]).map(|value| value.id()),
+            Some(CandidateId::new(0))
+        );
         assert!(samples.push(Duration::from_millis(1)));
         assert_eq!(samples.len(), 1);
         assert_eq!(
@@ -212,18 +240,44 @@ mod tests {
             Some((1, Duration::from_millis(1), Duration::ZERO))
         );
         let mut checked = candidate(0, samples, CandidatePath::Direct, TransportKind::Quic, 0);
-        assert!(checked.is_usable());
+        assert!(checked.has_samples());
         assert!(checked.samples_mut().push(Duration::from_millis(2)));
-        assert!(checked.is_usable());
+        assert!(checked.has_samples());
         assert_eq!(checked.id().get(), 0);
         assert!(checked.samples_mut().push(Duration::from_millis(3)));
         assert!(!checked.samples_mut().push(Duration::from_millis(4)));
         let candidate = candidate(0, samples, CandidatePath::Direct, TransportKind::Quic, 0);
         assert_eq!(
-            FrozenPathPolicy
+            QualityPathPolicy
                 .select(&[candidate])
                 .map(|value| value.id()),
             Some(CandidateId::new(0))
+        );
+    }
+
+    #[test]
+    fn latency_is_not_outvoted_by_connection_age_sample_count() {
+        let candidates = [
+            candidate(
+                1,
+                samples(&[20, 20, 20]),
+                CandidatePath::Relayed,
+                TransportKind::Quic,
+                0,
+            ),
+            candidate(
+                2,
+                samples(&[10]),
+                CandidatePath::Direct,
+                TransportKind::Quic,
+                1,
+            ),
+        ];
+        assert_eq!(
+            QualityPathPolicy
+                .select(&candidates)
+                .map(|value| value.id()),
+            Some(CandidateId::new(2))
         );
     }
 
@@ -239,9 +293,9 @@ mod tests {
     fn ranking_uses_every_frozen_tie_break() {
         let stable = samples(&[20, 20, 20]);
         let jitter = samples(&[10, 20, 30]);
-        let fewer = samples(&[1, 1]);
+        let faster = samples(&[1, 1]);
         let candidates = [
-            candidate(1, fewer, CandidatePath::Direct, TransportKind::Quic, 0),
+            candidate(1, faster, CandidatePath::Direct, TransportKind::Quic, 0),
             candidate(2, jitter, CandidatePath::Direct, TransportKind::Quic, 0),
             candidate(3, stable, CandidatePath::Relayed, TransportKind::Quic, 0),
             candidate(4, stable, CandidatePath::Direct, TransportKind::Tcp, 0),
@@ -249,8 +303,10 @@ mod tests {
             candidate(6, stable, CandidatePath::Direct, TransportKind::Quic, 0),
         ];
         assert_eq!(
-            FrozenPathPolicy.select(&candidates).map(|value| value.id()),
-            Some(CandidateId::new(6))
+            QualityPathPolicy
+                .select(&candidates)
+                .map(|value| value.id()),
+            Some(CandidateId::new(1))
         );
     }
 
@@ -266,7 +322,7 @@ mod tests {
                 candidate(4, samples(&[9, 10, 11]), CandidatePath::Relayed, TransportKind::Quic, 3),
             ];
             let permuted: Vec<_> = order.into_iter().map(|index| source[index]).collect();
-            prop_assert_eq!(FrozenPathPolicy.select(&permuted).map(|value| value.id()), Some(CandidateId::new(3)));
+            prop_assert_eq!(QualityPathPolicy.select(&permuted).map(|value| value.id()), Some(CandidateId::new(1)));
         }
     }
 

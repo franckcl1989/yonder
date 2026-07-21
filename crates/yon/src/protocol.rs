@@ -14,6 +14,23 @@ use yonder_net::{ApplicationStreams, Libp2pApplicationStreams, PeerId};
 
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_LIMIT: usize = 20;
+const CONTROLLER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The absolute controller discovery budget, shared across every relay retry.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolveDeadline(tokio::time::Instant);
+
+impl ResolveDeadline {
+    #[must_use]
+    pub fn controller() -> Self {
+        Self(tokio::time::Instant::now() + CONTROLLER_RESOLVE_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    fn instant(self) -> tokio::time::Instant {
+        self.0
+    }
+}
 
 /// Failures from a bounded relay registry or resolve exchange.
 #[derive(Debug, Error)]
@@ -214,22 +231,24 @@ pub async fn resolve_peer(
     streams: &mut Libp2pApplicationStreams,
     relay: &RelayConnection,
     locator: Locator,
+    deadline: ResolveDeadline,
 ) -> Result<PeerId, RelayProtocolError> {
-    let mut backoff = ConstantBuilder::default()
-        .with_delay(Duration::from_millis(250))
-        .with_max_times(RETRY_LIMIT)
-        .build();
-    loop {
-        reconverge_relay(driver, relay).await?;
-        match resolve_response(
-            resolve_call(driver, streams, relay.peer(), ResolveRequest::new(locator)).await?,
-        )? {
-            ResolvedResponse::Resolved(peer) => return Ok(peer),
-            ResolvedResponse::Retry(after) => {
-                retry(driver, relay.binding(), &mut backoff, after).await?;
+    tokio::time::timeout_at(deadline.0, async {
+        let mut backoff = std::iter::repeat(Duration::from_millis(250));
+        loop {
+            reconverge_relay(driver, relay).await?;
+            match resolve_response(
+                resolve_call(driver, streams, relay.peer(), ResolveRequest::new(locator)).await?,
+            )? {
+                ResolvedResponse::Resolved(peer) => return Ok(peer),
+                ResolvedResponse::Retry(after) => {
+                    retry(driver, relay.binding(), &mut backoff, after).await?;
+                }
             }
         }
-    }
+    })
+    .await
+    .map_err(|_| RelayProtocolError::Timeout)?
 }
 
 enum ResolvedResponse {
@@ -405,9 +424,10 @@ async fn bounded_exchange_io<const CAPACITY: usize>(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AllocationResponse, BoundedResponse, RETRY_LIMIT, ReclaimStep, RelayProtocolError,
-        ResolvedResponse, RetryAfter, allocation_response, bounded_exchange_io, exact_exchange_io,
-        reclaim_response, release_response, resolve_response, retry_delay,
+        AllocationResponse, BoundedResponse, CONTROLLER_RESOLVE_TIMEOUT, RETRY_LIMIT, ReclaimStep,
+        RelayProtocolError, ResolveDeadline, ResolvedResponse, RetryAfter, allocation_response,
+        bounded_exchange_io, exact_exchange_io, reclaim_response, release_response,
+        resolve_response, retry_delay,
     };
     use std::io;
     use std::pin::Pin;
@@ -423,6 +443,14 @@ mod tests {
     fn retry_budget_and_wire_hint_are_bounded() {
         assert_eq!(RETRY_LIMIT, 20);
         assert_eq!(RetryAfter::from_millis(250).unwrap().millis(), 250);
+    }
+
+    #[test]
+    fn controller_resolve_uses_one_absolute_thirty_second_budget() {
+        let now = tokio::time::Instant::now();
+        let deadline = ResolveDeadline::controller().instant();
+        assert!(deadline >= now + CONTROLLER_RESOLVE_TIMEOUT);
+        assert!(deadline <= tokio::time::Instant::now() + CONTROLLER_RESOLVE_TIMEOUT);
     }
 
     #[test]

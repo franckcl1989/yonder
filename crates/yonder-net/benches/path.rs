@@ -4,8 +4,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::Duration;
 use yonder_net::{
-    CandidateId, CandidatePath, EstablishedOrder, FrozenPathPolicy, PathCandidate, PathPolicy,
-    PingSamples, TransportKind,
+    CandidateId, CandidatePath, EstablishedOrder, PathCandidate, PathPolicy, PingSamples,
+    QualityPathPolicy, TransportKind,
 };
 
 fn rank_paths(criterion: &mut Criterion) {
@@ -34,7 +34,7 @@ fn rank_paths(criterion: &mut Criterion) {
         .collect::<Vec<_>>();
 
     criterion.bench_function("path/select_eight", |bencher| {
-        bencher.iter(|| FrozenPathPolicy.select(black_box(&candidates)))
+        bencher.iter(|| QualityPathPolicy.select(black_box(&candidates)))
     });
 }
 

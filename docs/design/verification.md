@@ -20,8 +20,10 @@
 - 状态机每个合法转换和每个非法事件；失败、超时、取消和重复事件幂等。
 - locator 环形分配 0/1/128/满表、wrap、冲突、RNG 失败。
 - direct governor 配额、确定性时钟、边界瞬间和来源表准入/回收。
-- 路径排序全部 tie-break、失败样本、迟到候选和确定性。
+- 路径排序全部 tie-break、零样本 fallback、单样本不比较抖动、失败样本、迟到直连 `750ms` 采样和确定性；另以回归证明 relay RTT 更低时仍选择可用直连、controller 单侧选路后 host 绑定剩余唯一认证连接。
 - shell 选择、环境校验、exit code 映射和错误脱敏。
+- 交互 `Ctrl+] .` 脱离、双 `Ctrl+]` 字面发送、跨读取块状态和非交互透明转发。
+- relay listen/external 重复项、transport 对应关系与允许 NAT 地址/端口改写的组合校验。
 
 ### 属性测试
 
@@ -41,14 +43,18 @@
 - `libp2p-stream` 接收循环饱和、endpoint 单入口、relay `16/64` permit、慢消费者、取消、关闭、重复协议流和 unsupported protocol。
 - 两个 `duplex` bridge 的背压、半关闭、大输出、慢 stdout、child 先退、最后输出排空、data/Exit 乱序、网络先断和清理期限。
 - DER cert/key/CA 合法与各种非法输入，确认边界返回错误而不是进入上游 panic API。
+- Unix identity/WSS 私钥 `0600` 创建、非普通文件拒绝、父目录 owner 与 group/other 写入权限；Windows 受保护 DACL、owner、文件 outsider ACE、父目录写入/创建权限和缺失 PowerShell 的 fail-closed 路径。
+- `yon config check/sources`、`yon-relay config check` 与 `identity show` 的成功、错误、脱敏和“检查不绑定 listener”语义。
 
 ### 端到端测试
 
 - 真进程 `yon-relay + yon host + yon connect`，用伪终端执行交互 shell、ANSI、Ctrl+C、resize、退出码、工作目录和环境继承。
 - 直连 QUIC、TCP、WS；仅 relay；UDP 被阻断自动落 TCP；普通 TCP 被代理限制时走 WS/WSS。
-- Linux network namespace 覆盖公网、单 NAT、双 NAT、端口受限/对称 NAT、IPv4-only、IPv6-only、双栈、丢包、延迟、抖动、乱序和 relay 中断。
+- Linux network namespace 覆盖公网、单 NAT、双 NAT、端口受限/对称 NAT、IPv4-only、IPv6-only、双栈、丢包、延迟、抖动、乱序和 relay 中断；公网/单 NAT/IPv6 必须断言最终为 Direct，严格双 NAT 必须断言 Relayed，全部场景同时断言实际 QUIC/TCP/WS/WSS transport。
 - relay 恶意丢弃/延迟/截断协议，错误必须有界且 endpoint 不死锁、不泄漏 secret。
-- 连接码位置参数、TTY 隐藏输入和 pipe 输入三条 CLI 路径。
+- 连接码位置参数、配置先于 TTY 隐藏输入和 pipe 输入三条 CLI 路径；错误码必须精确统一且不得出现 OPAQUE、PeerId、locator 或完整连接码。
+- 交互进度在网络前出现、最长 `1s` 心跳、动态宽度、`TerminalReady` 前清行、Active 无诊断污染；`--log-file` 仍保留进度并写入选中 route/transport。
+- Unix SIGINT/SIGTERM/SIGHUP 与 Windows Ctrl+C/Break/Close/Logoff/Shutdown 进入 relay `2s` 有界关闭；host 等待时 Ctrl+C 安静返回 `130`。
 - 六个发布 target 都运行原生 smoke；不能只交叉编译通过。
 
 ### 模糊测试
@@ -77,7 +83,7 @@ Criterion 覆盖 code encode/decode、wire decoder、locator allocation、govern
 - Miri 运行 `yonder-core` 全部单元/属性缩减集；Linux nightly 分别运行 ASan 和 TSan 集成测试。
 - 重复至少 10,000 次连接/取消/resize/child-exit 竞态，验证无死锁、任务泄漏、双提交和超时漂移。
 - 外部 profiler 验证终端稳定转发循环每个方向第一方逐块堆分配为 `0`；所有一次性 buffer 的数量、容量和生命周期与架构一致。
-- 故障注入覆盖 RNG 失败、时钟推进、channel/semaphore 满、连接数/内存限制、内存统计失败、DNS 超时/超量地址、reservation 到期、relay restart、磁盘满、权限失败、stdout 关闭和 child kill 失败。
+- 故障注入覆盖 RNG 失败、时钟推进、channel/semaphore 满、连接数/内存限制、内存统计失败、DNS 超时/超量地址、reservation 到期、relay restart、磁盘满、Unix mode/Windows ACL 不安全、stdout/stderr/log file 关闭和 child kill 失败。
 - 首根错误必须保持，secondary cleanup error 可观测但不覆盖；每个取消点都有有界完成时间。
 
 ## 性能与资源验收值
@@ -117,4 +123,4 @@ Criterion 覆盖 code encode/decode、wire decoder、locator allocation、govern
 
 ## 发布完成定义
 
-格式、Clippy、MSRV/current stable build、全部测试、逐目标风险分级覆盖率、doc、fuzz 时长、Miri/sanitizer、audit/deny、性能、资源、静态链接、六 target 原生 smoke、SBOM、许可证、校验和全部通过，才允许创建 release。tag workflow 可以生成并证明 release candidate，但在上述完整证据全部接入前不得自动创建正式 GitHub Release。任何未真实运行的项必须明确标为未完成，不能用设计评审结果替代交付验证。
+格式、Clippy、MSRV/current stable build、全部测试、逐目标风险分级覆盖率、doc、fuzz 时长、Miri/sanitizer、audit/deny、性能、资源、静态链接、六 target 原生 smoke、SBOM、许可证、校验和全部通过，才允许创建 release tag。手动 workflow 只生成候选 artifact；tag workflow 必须等待其全部自动化门禁通过，生成并证明 release candidate、provenance 与校验和后，才自动创建正式 GitHub Release。任何未真实运行的项必须明确标为未完成，不能用设计评审结果替代交付验证。

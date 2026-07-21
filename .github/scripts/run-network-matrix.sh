@@ -158,7 +158,7 @@ wait_for_process() {
 run_session() {
   local case_name="$1" relay_namespace="$2" host_namespace="$3"
   local controller_namespace="$4" relay_ip="$5" family="$6" port="$7"
-  local max_controller_ms="$8"
+  local max_controller_ms="$8" expected_route="${9}"
   local case_root="$root/$case_name" peer_output peer code host_pid controller_status
   local controller_started controller_elapsed
   mkdir -m 700 "$case_root" "$case_root/relay" "$case_root/endpoint"
@@ -247,6 +247,16 @@ EOF
     printf 'controller output missed the marker in case %s\n' "$case_name" >&2
     return 1
   fi
+  local selected_path
+  selected_path="$(
+    grep -a -E "endpoint path selected" "$case_root/controller.stderr" | tail -n 1 || true
+  )"
+  if [[ ! "$selected_path" =~ route=${expected_route}.*transport=(Quic|Tcp|WebSocket|SecureWebSocket) ]]; then
+    printf 'controller selected an unexpected or unclassified path in case %s (expected %s)\n' \
+      "$case_name" "$expected_route" >&2
+    tail -n 80 "$case_root/controller.stderr" >&2 || true
+    return 1
+  fi
   if ! wait_for_process "$host_pid" 30; then
     printf 'host did not exit after the terminal session in case %s\n' "$case_name" >&2
     return 1
@@ -271,7 +281,7 @@ run_public_ipv4() {
   attach_ipv4 "$host_ns" "$bridge" "v${tag}${case_id}h" 10.240.1.3/24
   attach_ipv4 "$controller_ns" "$bridge" "v${tag}${case_id}c" 10.240.1.4/24
   run_session "$case_name" "$relay_ns" "$host_ns" "$controller_ns" \
-    10.240.1.2 ip4 4401 20000
+    10.240.1.2 ip4 4401 20000 Direct
   cleanup_topology
 }
 
@@ -293,7 +303,7 @@ run_single_nat_ipv4() {
     10.241.2.2/24 10.241.2.1/24 10.241.2.1
   configure_nat "$nat_ns" 10.241.2.0/24
   run_session "$case_name" "$relay_ns" "$host_ns" "$controller_ns" \
-    10.240.2.2 ip4 4402 20000
+    10.240.2.2 ip4 4402 20000 Direct
   cleanup_topology
 }
 
@@ -320,7 +330,7 @@ run_strict_dual_nat_ipv4() {
   configure_nat "$host_nat" 10.241.3.0/24
   configure_nat "$controller_nat" 10.242.3.0/24
   run_session "$case_name" "$relay_ns" "$host_ns" "$controller_ns" \
-    10.240.3.2 ip4 4403 20000
+    10.240.3.2 ip4 4403 20000 Relayed
   cleanup_topology
 }
 
@@ -336,7 +346,7 @@ run_ipv6_only() {
   attach_ipv6 "$host_ns" "$bridge" "v${tag}${case_id}h" fd70:240:4::3/64
   attach_ipv6 "$controller_ns" "$bridge" "v${tag}${case_id}c" fd70:240:4::4/64
   run_session "$case_name" "$relay_ns" "$host_ns" "$controller_ns" \
-    fd70:240:4::2 ip6 4404 20000
+    fd70:240:4::2 ip6 4404 20000 Direct
   cleanup_topology
 }
 

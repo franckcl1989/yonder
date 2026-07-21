@@ -1,4 +1,6 @@
-use crate::path::{CandidateId, CandidatePath, EstablishedOrder, PathCandidate, PingSamples};
+use crate::path::{
+    CandidateId, CandidatePath, EstablishedOrder, PathCandidate, PingSamples, SelectedPath,
+};
 use crate::{TransportKind, path};
 use libp2p::PeerId;
 use libp2p::core::ConnectedPoint;
@@ -160,6 +162,31 @@ struct TrackedCandidate {
     ranked: PathCandidate,
 }
 
+/// A selected physical connection with explicit route and transport semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionSelectionResult {
+    connection: ConnectionId,
+    losers: Vec<ConnectionId>,
+    path: SelectedPath,
+}
+
+impl ConnectionSelectionResult {
+    #[must_use]
+    pub const fn connection(&self) -> ConnectionId {
+        self.connection
+    }
+
+    #[must_use]
+    pub const fn path(&self) -> SelectedPath {
+        self.path
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ConnectionId, Vec<ConnectionId>, SelectedPath) {
+        (self.connection, self.losers, self.path)
+    }
+}
+
 /// Bounded quality evidence for one endpoint-to-endpoint selection window.
 #[derive(Debug, Default)]
 pub struct ConnectionSelection {
@@ -180,6 +207,23 @@ impl ConnectionSelection {
         self.candidates
             .iter()
             .any(|candidate| candidate.connection == connection)
+    }
+
+    /// Reports whether an authenticated direct transport is available.
+    #[must_use]
+    pub fn has_direct(&self) -> bool {
+        self.candidates
+            .iter()
+            .any(|candidate| candidate.ranked.selected_path().route() == CandidatePath::Direct)
+    }
+
+    /// Reports whether a direct transport has one successful quality sample.
+    #[must_use]
+    pub fn has_direct_sample(&self) -> bool {
+        self.candidates.iter().any(|candidate| {
+            candidate.ranked.selected_path().route() == CandidatePath::Direct
+                && candidate.ranked.has_samples()
+        })
     }
 
     /// Adds an established candidate and assigns unique deterministic ordering.
@@ -256,11 +300,10 @@ impl ConnectionSelection {
 
     /// Selects the winner and returns all established losers for explicit closing.
     #[must_use]
-    pub fn finish(&self) -> Option<(ConnectionId, Vec<ConnectionId>)> {
+    pub fn finish(&self) -> Option<ConnectionSelectionResult> {
         let tracked = self
             .candidates
             .iter()
-            .filter(|candidate| candidate.ranked.is_usable())
             .min_by(|left, right| path::compare(&left.ranked, &right.ranked))?;
         let losers = self
             .candidates
@@ -268,7 +311,32 @@ impl ConnectionSelection {
             .filter(|candidate| candidate.connection != tracked.connection)
             .map(|candidate| candidate.connection)
             .collect();
-        Some((tracked.connection, losers))
+        Some(ConnectionSelectionResult {
+            connection: tracked.connection,
+            losers,
+            path: tracked.ranked.selected_path(),
+        })
+    }
+
+    /// Selects the best direct candidate without allowing relay RTT to override it.
+    #[must_use]
+    pub fn finish_direct(&self) -> Option<ConnectionSelectionResult> {
+        let tracked = self
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.ranked.selected_path().route() == CandidatePath::Direct)
+            .min_by(|left, right| path::compare(&left.ranked, &right.ranked))?;
+        let losers = self
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.connection != tracked.connection)
+            .map(|candidate| candidate.connection)
+            .collect();
+        Some(ConnectionSelectionResult {
+            connection: tracked.connection,
+            losers,
+            path: tracked.ranked.selected_path(),
+        })
     }
 }
 
@@ -298,6 +366,7 @@ fn classify_transport(address: &libp2p::Multiaddr) -> TransportKind {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{ConnectionBook, ConnectionSelection, SelectionError, SourcePrefix};
+    use crate::{CandidatePath, TransportKind};
     use libp2p::core::{ConnectedPoint, Endpoint, transport::PortUse};
     use libp2p::identity::Keypair;
     use libp2p::swarm::ConnectionId;
@@ -424,7 +493,80 @@ mod tests {
         for value in [20, 20, 20] {
             selection.ping(slow, Duration::from_millis(value)).unwrap();
         }
-        assert_eq!(selection.finish(), Some((fast, vec![slow])));
+        let result = selection.finish().unwrap();
+        assert_eq!(
+            result.into_parts(),
+            (
+                fast,
+                vec![slow],
+                crate::SelectedPath::new(CandidatePath::Direct, TransportKind::Quic)
+            )
+        );
+    }
+
+    #[test]
+    fn selection_keeps_an_unmeasured_established_connection_as_fallback() {
+        let connection = ConnectionId::new_unchecked(1);
+        let mut selection = ConnectionSelection::new();
+        selection
+            .established(connection, &dialer("/ip4/127.0.0.1/tcp/1"))
+            .unwrap();
+
+        let result = selection.finish().unwrap();
+        assert_eq!(result.connection(), connection);
+        assert_eq!(
+            result.path(),
+            crate::SelectedPath::new(CandidatePath::Direct, TransportKind::Tcp)
+        );
+    }
+
+    #[test]
+    fn direct_selection_is_not_overridden_by_relay_quality() {
+        let relay = ConnectionId::new_unchecked(1);
+        let slower_direct = ConnectionId::new_unchecked(2);
+        let faster_direct = ConnectionId::new_unchecked(3);
+        let mut selection = ConnectionSelection::new();
+        selection
+            .established(relay, &dialer("/ip4/127.0.0.1/tcp/1/p2p-circuit"))
+            .unwrap();
+        selection
+            .established(slower_direct, &dialer("/ip4/127.0.0.1/tcp/2"))
+            .unwrap();
+        selection
+            .established(faster_direct, &dialer("/ip4/127.0.0.1/udp/3/quic-v1"))
+            .unwrap();
+        assert!(selection.has_direct());
+        assert!(!selection.has_direct_sample());
+        for value in [1, 1, 1] {
+            selection.ping(relay, Duration::from_millis(value)).unwrap();
+        }
+        for value in [20, 20, 20] {
+            selection
+                .ping(slower_direct, Duration::from_millis(value))
+                .unwrap();
+        }
+        for value in [10, 10, 10] {
+            selection
+                .ping(faster_direct, Duration::from_millis(value))
+                .unwrap();
+        }
+
+        assert_eq!(selection.finish().unwrap().connection(), relay);
+        assert!(selection.has_direct_sample());
+        assert_eq!(
+            selection.finish_direct().unwrap().into_parts(),
+            (
+                faster_direct,
+                vec![relay, slower_direct],
+                crate::SelectedPath::new(CandidatePath::Direct, TransportKind::Quic)
+            )
+        );
+        let mut relay_only = ConnectionSelection::new();
+        relay_only
+            .established(relay, &dialer("/ip4/127.0.0.1/tcp/1/p2p-circuit"))
+            .unwrap();
+        assert!(!relay_only.has_direct());
+        assert_eq!(relay_only.finish_direct(), None);
     }
 
     #[test]

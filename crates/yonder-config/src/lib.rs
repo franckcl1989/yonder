@@ -35,6 +35,12 @@ impl Application {
             Self::Relay => "YON_RELAY",
         }
     }
+
+    /// Prefix used by this application's environment-variable layer.
+    #[must_use]
+    pub const fn configuration_environment_prefix(self) -> &'static str {
+        self.environment_prefix()
+    }
 }
 
 /// One known schema key, used to preserve path provenance without stringly APIs.
@@ -112,10 +118,47 @@ pub struct LayeredConfigLoader<S> {
     schema: ConfigurationSchema,
 }
 
+/// The two file locations consulted by a layered configuration loader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationLocations {
+    system_file: PathBuf,
+    working_file: PathBuf,
+}
+
+impl ConfigurationLocations {
+    #[must_use]
+    pub fn system_file(&self) -> &Path {
+        &self.system_file
+    }
+
+    #[must_use]
+    pub fn working_file(&self) -> &Path {
+        &self.working_file
+    }
+}
+
 impl<S> LayeredConfigLoader<S> {
     #[must_use]
     pub const fn new(sources: S, schema: ConfigurationSchema) -> Self {
         Self { sources, schema }
+    }
+}
+
+impl<S> LayeredConfigLoader<S>
+where
+    S: ConfigurationSources,
+{
+    /// Resolves configuration file locations without reading their contents.
+    pub fn locations(&self) -> Result<ConfigurationLocations, ConfigurationError> {
+        let cwd = self
+            .sources
+            .current_directory()
+            .map_err(ConfigurationError::CurrentDirectory)?;
+        let system_directory = self.sources.system_directory()?;
+        Ok(ConfigurationLocations {
+            system_file: system_directory.join(self.schema.application.file_name()),
+            working_file: cwd.join(self.schema.application.file_name()),
+        })
     }
 }
 
@@ -562,6 +605,29 @@ mod tests {
     }
 
     #[test]
+    fn source_locations_are_reportable_without_loading_configuration() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let system = root.path().join("system");
+        let loader = LayeredConfigLoader::new(
+            Sources {
+                cwd: cwd.clone(),
+                system: system.clone(),
+                environment: vec![("YON_RELAYS".into(), "secret-address".into())],
+            },
+            SCHEMA,
+        );
+        let locations = loader.locations().unwrap();
+        assert_eq!(locations.system_file(), system.join("yon.toml"));
+        assert_eq!(locations.working_file(), cwd.join("yon.toml"));
+        assert_eq!(Application::Yon.configuration_environment_prefix(), "YON");
+        assert_eq!(
+            Application::Relay.configuration_environment_prefix(),
+            "YON_RELAY"
+        );
+    }
+
+    #[test]
     fn environment_paths_resolve_from_cwd_and_relay_namespace_is_excluded() {
         let root = tempdir().unwrap();
         let system = root.path().join("system");
@@ -617,6 +683,17 @@ mod tests {
             LayeredConfigLoader::new(SourceFailure::SystemDirectory, SCHEMA).load();
         assert!(matches!(
             system,
+            Err(ConfigurationError::Location(
+                ConfigurationLocationError::UnsupportedPlatform
+            ))
+        ));
+
+        assert!(matches!(
+            LayeredConfigLoader::new(SourceFailure::CurrentDirectory, SCHEMA).locations(),
+            Err(ConfigurationError::CurrentDirectory(_))
+        ));
+        assert!(matches!(
+            LayeredConfigLoader::new(SourceFailure::SystemDirectory, SCHEMA).locations(),
             Err(ConfigurationError::Location(
                 ConfigurationLocationError::UnsupportedPlatform
             ))
