@@ -1218,6 +1218,25 @@ exit 0
         assert!(checked.get());
         assert!(!served.get());
 
+        let sources_configured = Cell::new(false);
+        let sources_served = Cell::new(false);
+        execute_command(
+            Command::Config {
+                command: ConfigCommand::Sources,
+            },
+            || {
+                sources_configured.set(true);
+                Ok(relay_config())
+            },
+            |_| {
+                sources_served.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!sources_configured.get());
+        assert!(!sources_served.get());
+
         let runtime = relay_runtime().unwrap();
         assert_eq!(runtime.block_on(async { 7_u8 }), 7);
     }

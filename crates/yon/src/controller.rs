@@ -25,7 +25,7 @@ use yonder_core::{
     SecureRandom, TerminalSize, TerminalValue,
 };
 use yonder_net::{
-    ApplicationStream, ApplicationStreams, DirectUpgradePolicy, EndpointRelayAddress,
+    ApplicationStream, ApplicationStreams, ConnectionId, DirectUpgradePolicy, EndpointRelayAddress,
     EndpointRelaySet, Keypair, Libp2pApplicationStreams, PeerId, WssTransportConfig,
     generate_identity, peer_id_bytes,
 };
@@ -642,19 +642,22 @@ fn local_terminal_hello_with(
     };
     let mut term = terminal_environment("TERM")?;
     if term.is_empty() {
-        term = TerminalValue::new(
-            if frontend.output_is_terminal() || frontend.is_interactive() {
-                "xterm-256color"
-            } else {
-                "dumb"
-            },
-        )?;
+        term = default_terminal_value(frontend.output_is_terminal() || frontend.is_interactive())?;
     }
     Ok(TerminalHello::new(
         TerminalSize::new(columns, rows)?,
         term,
         terminal_environment("COLORTERM")?,
     ))
+}
+
+fn default_terminal_value(interactive: bool) -> Result<TerminalValue, ControllerError> {
+    TerminalValue::new(if interactive {
+        "xterm-256color"
+    } else {
+        "dumb"
+    })
+    .map_err(ControllerError::from)
 }
 
 fn terminal_environment(name: &str) -> Result<TerminalValue, ControllerError> {
@@ -912,15 +915,27 @@ async fn run_terminal(
                     }
                 } => match event {
                     TerminalPumpEvent::Cancelled => break Err(ControllerError::Interrupted),
-                    TerminalPumpEvent::Driver(event) => match event {
-                        EndpointEvent::Established { peer, .. } | EndpointEvent::Closed { peer, .. }
-                            if peer == binding.peer() => {
+                    TerminalPumpEvent::Driver(event) => {
+                        match active_terminal_connection_event(
+                            &event,
+                            binding.peer(),
+                            binding.connection(),
+                        ) {
+                            ActiveTerminalConnectionEvent::EnforceBinding => {
                                 if let Err(error) = driver.enforce_binding(binding) {
                                     break Err(error.into());
                                 }
                             }
-                        _ => {}
-                    },
+                            ActiveTerminalConnectionEvent::DrainSelectedStreams => {
+                                tracing::debug!(
+                                    peer = %binding.peer(),
+                                    "selected connection closed; draining terminal streams"
+                                );
+                                remote.observe_transport_close(tokio::time::Instant::now());
+                            }
+                            ActiveTerminalConnectionEvent::Ignore => {}
+                        }
+                    }
                     TerminalPumpEvent::LocalInput(result) => match result {
                         Ok(never) => match never {},
                         Err(error) => break Err(error),
@@ -977,13 +992,58 @@ enum TerminalPumpEvent {
     Resize(Result<Infallible, ControllerError>),
 }
 
-fn restore_native_display() -> Result<(), std::io::Error> {
-    use crossterm::Command as _;
-    use std::io::Write as _;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveTerminalConnectionEvent {
+    EnforceBinding,
+    DrainSelectedStreams,
+    Ignore,
+}
 
+fn active_terminal_connection_event(
+    event: &EndpointEvent,
+    bound_peer: PeerId,
+    bound_connection: ConnectionId,
+) -> ActiveTerminalConnectionEvent {
+    match event {
+        EndpointEvent::Closed { peer, connection }
+            if *peer == bound_peer && *connection == bound_connection =>
+        {
+            ActiveTerminalConnectionEvent::DrainSelectedStreams
+        }
+        EndpointEvent::Established { peer, .. } | EndpointEvent::Closed { peer, .. }
+            if *peer == bound_peer =>
+        {
+            ActiveTerminalConnectionEvent::EnforceBinding
+        }
+        _ => ActiveTerminalConnectionEvent::Ignore,
+    }
+}
+
+fn restore_native_display() -> Result<(), std::io::Error> {
     if !native_display_available() {
         return Ok(());
     }
+    let commands = native_display_restore_commands()?;
+    if std::io::stdout().is_terminal() {
+        let mut output = std::io::stdout().lock();
+        write_native_display_restore(&mut output, &commands)
+    } else {
+        let mut output = std::io::stderr().lock();
+        write_native_display_restore(&mut output, &commands)
+    }
+}
+
+fn write_native_display_restore(
+    output: &mut impl std::io::Write,
+    commands: &str,
+) -> Result<(), std::io::Error> {
+    output.write_all(commands.as_bytes())?;
+    output.flush()
+}
+
+fn native_display_restore_commands() -> Result<String, std::io::Error> {
+    use crossterm::Command as _;
+
     let mut commands = String::with_capacity(128);
     crossterm::event::DisableBracketedPaste
         .write_ansi(&mut commands)
@@ -1006,16 +1066,7 @@ fn restore_native_display() -> Result<(), std::io::Error> {
     crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
         .write_ansi(&mut commands)
         .map_err(std::io::Error::other)?;
-
-    if std::io::stdout().is_terminal() {
-        let mut output = std::io::stdout().lock();
-        output.write_all(commands.as_bytes())?;
-        output.flush()
-    } else {
-        let mut output = std::io::stderr().lock();
-        output.write_all(commands.as_bytes())?;
-        output.flush()
-    }
+    Ok(commands)
 }
 
 async fn copy_local_input(
@@ -1348,6 +1399,9 @@ fn decode_terminal_exit(message: &[u8]) -> Result<u32, ControllerError> {
 enum RemoteCompletion {
     #[default]
     AwaitingBoth,
+    DrainingBoth {
+        deadline: tokio::time::Instant,
+    },
     AwaitingExit {
         deadline: tokio::time::Instant,
     },
@@ -1367,19 +1421,34 @@ impl RemoteCompletion {
     }
 
     const fn output_open(self) -> bool {
-        matches!(self, Self::AwaitingBoth | Self::AwaitingOutput { .. })
+        matches!(
+            self,
+            Self::AwaitingBoth | Self::DrainingBoth { .. } | Self::AwaitingOutput { .. }
+        )
     }
 
     const fn exit_pending(self) -> bool {
-        matches!(self, Self::AwaitingBoth | Self::AwaitingExit { .. })
+        matches!(
+            self,
+            Self::AwaitingBoth | Self::DrainingBoth { .. } | Self::AwaitingExit { .. }
+        )
     }
 
     const fn deadline(self) -> Option<tokio::time::Instant> {
         match self {
-            Self::AwaitingExit { deadline }
+            Self::DrainingBoth { deadline }
+            | Self::AwaitingExit { deadline }
             | Self::AwaitingOutput { deadline, .. }
             | Self::Complete { deadline, .. } => Some(deadline),
             Self::AwaitingBoth => None,
+        }
+    }
+
+    fn observe_transport_close(&mut self, now: tokio::time::Instant) {
+        if matches!(self, Self::AwaitingBoth) {
+            *self = Self::DrainingBoth {
+                deadline: now + REMOTE_COMPLETION_TIMEOUT,
+            };
         }
     }
 
@@ -1389,6 +1458,10 @@ impl RemoteCompletion {
                 *self = Self::AwaitingExit {
                     deadline: now + REMOTE_COMPLETION_TIMEOUT,
                 };
+                None
+            }
+            Self::DrainingBoth { deadline } => {
+                *self = Self::AwaitingExit { deadline };
                 None
             }
             Self::AwaitingOutput { code, deadline } => {
@@ -1406,6 +1479,10 @@ impl RemoteCompletion {
                     code,
                     deadline: now + REMOTE_COMPLETION_TIMEOUT,
                 };
+                None
+            }
+            Self::DrainingBoth { deadline } => {
+                *self = Self::AwaitingOutput { code, deadline };
                 None
             }
             Self::AwaitingExit { deadline } => {
@@ -1552,16 +1629,19 @@ mod tests {
     #[cfg(not(windows))]
     use super::RawModeGuard;
     use super::{
-        ControllerConfig, ControllerError, CrosstermFrontend, EndpointError, LOCAL_ESCAPE,
-        LocalInputEscape, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
-        RemoteTerminalOutputMode, TerminalFrontend, await_remote_completion, await_until,
-        changed_terminal_size, complete_after_output_eof, controller_fallback_required,
-        copy_local_input, copy_remote_output, decode_terminal_exit, direct_fallback_required,
+        ActiveTerminalConnectionEvent, ControllerConfig, ControllerError, CrosstermFrontend,
+        DisplayModeGuard, EndpointError, EndpointEvent, LOCAL_ESCAPE, LocalInputEscape,
+        REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
+        RemoteTerminalOutputMode, TerminalFrontend, active_terminal_connection_event,
+        await_remote_completion, await_until, changed_terminal_size, complete_after_output_eof,
+        controller_fallback_required, copy_local_input, copy_remote_output, copy_terminal_resizes,
+        decode_terminal_exit, default_terminal_value, direct_fallback_required,
         enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
-        fallback_transport, finish_terminal, local_terminal_hello, local_terminal_hello_with,
-        next_retry_delay, read_auth_response, read_local_input, run_controller,
-        run_controller_session, run_until_interrupted, terminal_environment,
-        terminal_environment_from, wait_for_remote_completion_deadline,
+        fallback_transport, finish_terminal, finish_terminal_output, local_terminal_hello,
+        local_terminal_hello_with, native_display_restore_commands, next_retry_delay,
+        read_auth_response, read_local_input, run_controller, run_controller_session,
+        run_until_interrupted, terminal_environment, terminal_environment_from,
+        wait_for_remote_completion_deadline, write_native_display_restore,
     };
     use crate::progress::NoopProgress;
     use crate::terminal::TerminalChunk;
@@ -1580,7 +1660,8 @@ mod tests {
         TerminalValue,
     };
     use yonder_net::{
-        EndpointRelayAddress, EndpointRelaySet, Keypair, NetworkBuildError, WssTransportConfig,
+        ConnectedPoint, ConnectionId, EndpointRelayAddress, EndpointRelaySet, Keypair,
+        NetworkBuildError, WssTransportConfig,
     };
 
     const CONTROLLER_SESSION_HEAP_LIMIT: usize = 128 * 1024;
@@ -1705,9 +1786,30 @@ mod tests {
         let _ = frontend.size();
         if !frontend.is_interactive() {
             assert!(frontend.enter_raw_mode().unwrap().is_none());
+            frontend.restore_display().unwrap();
             #[cfg(not(windows))]
             drop(RawModeGuard { armed: false });
         }
+    }
+
+    #[test]
+    fn display_restore_covers_every_terminal_mode_enabled_by_remote_apps() {
+        let commands = native_display_restore_commands().unwrap();
+        assert!(commands.starts_with("\u{1b}[?2004l"));
+        assert!(commands.contains("\u{1b}[?1004l"));
+        assert!(commands.contains("\u{1b}[?1006l"));
+        assert!(commands.contains("\u{1b}[?1049l"));
+        assert!(commands.contains("\u{1b}[?25h"));
+        assert!(commands.ends_with("\u{1b}[0m"));
+        assert!(commands.len() <= 128);
+
+        assert!(DisplayModeGuard::enter(false).unwrap().is_none());
+        DisplayModeGuard::restore_optional(None).unwrap();
+
+        let mut output = Vec::new();
+        write_native_display_restore(&mut output, &commands).unwrap();
+        assert_eq!(output, commands.as_bytes());
+        assert!(write_native_display_restore(&mut FailingDisplayOutput, &commands).is_err());
     }
 
     #[test]
@@ -1728,12 +1830,42 @@ mod tests {
             ),
             Err(ControllerError::SessionAndTerminalRestore { .. })
         ));
+
+        assert!(matches!(
+            finish_terminal_output::<()>(Err(ControllerError::ConnectionLost), Ok(())),
+            Err(ControllerError::ConnectionLost)
+        ));
+        assert!(matches!(
+            finish_terminal_output(Ok(()), Err(ControllerError::Timeout)),
+            Err(ControllerError::Timeout)
+        ));
+        assert!(matches!(
+            finish_terminal_output::<()>(
+                Err(ControllerError::ConnectionLost),
+                Err(ControllerError::TerminalOutput(io::Error::other(
+                    "output failed"
+                ))),
+            ),
+            Err(ControllerError::SessionAndTerminalOutput { .. })
+        ));
+        assert!(matches!(
+            finish_terminal_output::<()>(
+                Err(ControllerError::ConnectionLost),
+                Err(ControllerError::Timeout),
+            ),
+            Err(ControllerError::ConnectionLost)
+        ));
     }
 
     #[test]
     fn non_interactive_terminal_metadata_uses_safe_defaults() {
         let hello = local_terminal_hello().unwrap();
         assert_eq!(hello.size(), TerminalSize::new(80, 24).unwrap());
+        assert_eq!(default_terminal_value(false).unwrap().as_str(), "dumb");
+        assert_eq!(
+            default_terminal_value(true).unwrap().as_str(),
+            "xterm-256color"
+        );
     }
 
     #[test]
@@ -1751,6 +1883,7 @@ mod tests {
         let guard = frontend.enter_raw_mode().unwrap().unwrap();
         let _input = frontend.input();
         let _output = frontend.output();
+        frontend.restore_display().unwrap();
         assert!(!restored.get());
         frontend.restore_raw_mode(Some(guard)).unwrap();
         assert!(restored.get());
@@ -1824,6 +1957,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn terminal_resize_pump_sends_each_observed_size_once() {
+        let frontend = FakeFrontend {
+            restored: Rc::new(Cell::new(false)),
+            size: Ok((132, 43)),
+            raw_error: None,
+        };
+        let (mut controller, mut host) = tokio::io::duplex(5);
+        let pump = copy_terminal_resizes(
+            &frontend,
+            &mut controller,
+            TerminalSize::new(80, 24).unwrap(),
+            true,
+        );
+        let receive = async {
+            let mut resize = [0_u8; 5];
+            host.read_exact(&mut resize).await.unwrap();
+            resize
+        };
+        tokio::pin!(pump);
+        let resize = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut pump => match result {
+                    Ok(never) => match never {},
+                    Err(error) => panic!("resize pump failed: {error}"),
+                },
+                resize = receive => resize,
+            }
+        })
+        .await
+        .expect("the changed terminal size was not sent");
+        assert_eq!(resize, [0x02, 0, 132, 0, 43]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn raw_mode_is_ready_before_the_terminal_commit_exchange() {
         let restored = Rc::new(Cell::new(false));
         let operation_polled = Rc::new(Cell::new(false));
@@ -1871,6 +2038,14 @@ mod tests {
             Err(ControllerError::ConnectionLost)
         ));
         assert!(restored_after_handshake_failure.get());
+
+        assert!(matches!(
+            enter_raw_mode_before(&RestoreFailingFrontend, async {
+                Err::<(), _>(ControllerError::ConnectionLost)
+            })
+            .await,
+            Err(ControllerError::SessionAndTerminalRestore { .. })
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1948,10 +2123,99 @@ mod tests {
         assert!(only_eof.exit_pending());
         assert!(!only_eof.output_open());
 
+        let mut closed_exit_first = RemoteCompletion::new();
+        closed_exit_first.observe_transport_close(now);
+        assert_eq!(
+            closed_exit_first.deadline(),
+            Some(now + REMOTE_COMPLETION_TIMEOUT)
+        );
+        assert_eq!(closed_exit_first.observe_exit(13, now), None);
+        assert_eq!(closed_exit_first.observe_output_eof(now), Some(13));
+
+        let mut closed_eof_first = RemoteCompletion::new();
+        closed_eof_first.observe_transport_close(now);
+        closed_eof_first.observe_transport_close(now + Duration::from_secs(1));
+        assert_eq!(closed_eof_first.observe_output_eof(now), None);
+        assert_eq!(closed_eof_first.observe_exit(17, now), Some(17));
+        assert_eq!(
+            closed_eof_first.deadline(),
+            Some(now + REMOTE_COMPLETION_TIMEOUT)
+        );
+
         assert_eq!(exit_first.observe_exit(99, now), None);
         assert_eq!(exit_first.observe_output_eof(now), None);
         assert_eq!(only_exit.observe_exit(99, now), None);
         assert_eq!(only_eof.observe_output_eof(now), None);
+    }
+
+    #[test]
+    fn selected_connection_close_drains_terminal_protocol_before_failing() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let other = Keypair::generate_ed25519().public().to_peer_id();
+        let selected = ConnectionId::new_unchecked(17);
+        assert_eq!(
+            active_terminal_connection_event(
+                &EndpointEvent::Established {
+                    peer,
+                    connection: ConnectionId::new_unchecked(18),
+                    endpoint: ConnectedPoint::Listener {
+                        local_addr: "/memory/1".parse().unwrap(),
+                        send_back_addr: "/memory/2".parse().unwrap(),
+                    },
+                },
+                peer,
+                selected,
+            ),
+            ActiveTerminalConnectionEvent::EnforceBinding
+        );
+        assert_eq!(
+            active_terminal_connection_event(
+                &EndpointEvent::Closed {
+                    peer,
+                    connection: selected,
+                },
+                peer,
+                selected,
+            ),
+            ActiveTerminalConnectionEvent::DrainSelectedStreams
+        );
+        assert_eq!(
+            active_terminal_connection_event(
+                &EndpointEvent::Closed {
+                    peer,
+                    connection: ConnectionId::new_unchecked(18),
+                },
+                peer,
+                selected,
+            ),
+            ActiveTerminalConnectionEvent::EnforceBinding
+        );
+        assert_eq!(
+            active_terminal_connection_event(
+                &EndpointEvent::Closed {
+                    peer: other,
+                    connection: selected,
+                },
+                peer,
+                selected,
+            ),
+            ActiveTerminalConnectionEvent::Ignore
+        );
+        assert_eq!(
+            active_terminal_connection_event(
+                &EndpointEvent::Established {
+                    peer: other,
+                    connection: selected,
+                    endpoint: ConnectedPoint::Listener {
+                        local_addr: "/memory/1".parse().unwrap(),
+                        send_back_addr: "/memory/2".parse().unwrap(),
+                    },
+                },
+                peer,
+                selected,
+            ),
+            ActiveTerminalConnectionEvent::Ignore
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2557,6 +2821,42 @@ mod tests {
 
     struct FakeRawGuard(Rc<Cell<bool>>);
 
+    struct RestoreFailingFrontend;
+
+    impl TerminalFrontend for RestoreFailingFrontend {
+        type Input = tokio::io::Empty;
+        type Output = tokio::io::Sink;
+        type RawModeGuard = ();
+
+        fn is_interactive(&self) -> bool {
+            true
+        }
+
+        fn output_is_terminal(&self) -> bool {
+            true
+        }
+
+        fn size(&self) -> Result<(u16, u16), io::Error> {
+            Ok((80, 24))
+        }
+
+        fn enter_raw_mode(&self) -> Result<Option<Self::RawModeGuard>, io::Error> {
+            Ok(Some(()))
+        }
+
+        fn restore_raw_mode(&self, _guard: Option<Self::RawModeGuard>) -> Result<(), io::Error> {
+            Err(io::Error::other("restore failed"))
+        }
+
+        fn input(&mut self) -> Self::Input {
+            tokio::io::empty()
+        }
+
+        fn output(&mut self) -> Self::Output {
+            tokio::io::sink()
+        }
+    }
+
     impl Drop for FakeRawGuard {
         fn drop(&mut self) {
             self.0.set(true);
@@ -2576,6 +2876,18 @@ mod tests {
     }
 
     struct FailingFlush;
+
+    struct FailingDisplayOutput;
+
+    impl io::Write for FailingDisplayOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
 
     impl AsyncWrite for FailingFlush {
         fn poll_write(

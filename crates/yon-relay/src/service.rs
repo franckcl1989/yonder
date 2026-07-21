@@ -1133,10 +1133,10 @@ mod tests {
         ProtocolIo, ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision,
         RelayObservability, RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall,
         ShutdownReason, completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
-        handle_registry_call, handle_resolve_call, handle_swarm_event as handle_swarm_event_inner,
-        read_exact_eof, registry_exchange, registry_immediate_retry, report_ready_to,
-        resolve_exchange, resolve_immediate_retry, run_relay_until, run_relay_until_shutdown,
-        with_timeout, write_close,
+        handle_registry_call, handle_resolve_call, handle_resolve_call_observed,
+        handle_swarm_event as handle_swarm_event_inner, read_exact_eof, registry_exchange,
+        registry_immediate_retry, report_ready_to, resolve_exchange, resolve_immediate_retry,
+        run_relay, run_relay_until, run_relay_until_shutdown, with_timeout, write_close,
     };
     #[cfg(windows)]
     use super::{process_shutdown_signal, select_windows_shutdown};
@@ -1405,6 +1405,19 @@ mod tests {
         run_relay_until_shutdown(config(), async { Ok(ShutdownReason::Interrupt) })
             .await
             .unwrap();
+
+        let error = run_relay_until_shutdown(config(), async {
+            Err(io::Error::other("shutdown source failed"))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, RelayServiceError::Signal(_)));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), run_relay(config()))
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(windows)]
@@ -2342,17 +2355,19 @@ mod tests {
         ));
 
         let valid = resolve_call(peer, locator);
+        let observations = RelayObservability::default();
         let mut exhausted_global = ResolveLimiters::new();
         for _ in 0..128 {
             assert!(exhausted_global.check_global());
         }
         assert!(matches!(
-            handle_resolve_call(
+            handle_resolve_call_observed(
                 &valid,
                 &connections,
                 &clock,
                 &mut registry,
                 &mut exhausted_global,
+                &observations,
             )
             .unwrap(),
             ResolveResponse::Retry(_)
@@ -2360,12 +2375,13 @@ mod tests {
 
         let mut fresh = ResolveLimiters::new();
         assert!(matches!(
-            handle_resolve_call(
+            handle_resolve_call_observed(
                 &resolve_call(other, locator),
                 &connections,
                 &clock,
                 &mut registry,
                 &mut fresh,
+                &observations,
             )
             .unwrap(),
             ResolveResponse::Retry(_)
@@ -2377,16 +2393,26 @@ mod tests {
             assert!(exhausted_source.check_source(source, clock.now()));
         }
         assert!(matches!(
-            handle_resolve_call(
+            handle_resolve_call_observed(
                 &valid,
                 &connections,
                 &clock,
                 &mut registry,
                 &mut exhausted_source,
+                &observations,
             )
             .unwrap(),
             ResolveResponse::Retry(_)
         ));
+        assert_eq!(
+            observations.resolve_global_limited.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(observations.resolve_retry.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            observations.resolve_source_limited.load(Ordering::Relaxed),
+            1
+        );
 
         assert_eq!(
             handle_resolve_call(

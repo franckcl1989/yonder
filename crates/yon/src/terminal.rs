@@ -721,9 +721,9 @@ fn exited_event(code: u32) -> PtyEvent {
 mod tests {
     use super::{
         CHUNK_CAPACITY, ChildExit, CleanupDeadline, DUPLEX_CAPACITY, PortablePtyBackend,
-        PtyEventKind, PtySession, TerminalBackend, TerminalChunk, TerminalError, TerminalSession,
-        copy_input, copy_output, current_shell_command, exited_event, supervise_child, to_pty_size,
-        wait_task_result,
+        PtyEventKind, PtyInput, PtySession, TerminalBackend, TerminalChunk, TerminalError,
+        TerminalInput, TerminalSession, copy_input, copy_output, current_shell_command,
+        exited_event, supervise_child, to_pty_size, wait_task_result,
     };
     use std::future::{Future as _, poll_fn};
     use std::io::{self, Cursor};
@@ -733,9 +733,31 @@ mod tests {
     use std::task::Poll;
     use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream};
     use tokio::sync::oneshot;
+
     use tokio_util::io::SyncIoBridge;
     use yonder_core::wire::terminal::TerminalHello;
     use yonder_core::{TerminalSize, TerminalValue};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_native_pty_input_has_consistent_async_write_semantics() {
+        let mut input = PtyInput { input: None };
+        assert_eq!(
+            input.write_all(b"input").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            input.flush().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        #[cfg(windows)]
+        input.shutdown().await.unwrap();
+        #[cfg(not(windows))]
+        assert_eq!(
+            input.shutdown().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        TerminalInput::close(&mut input);
+    }
 
     #[test]
     fn chunk_and_size_boundaries_are_exact() {
@@ -760,6 +782,14 @@ mod tests {
         TerminalSession::resize(&mut session, TerminalSize::new(100, 30).unwrap())
             .await
             .unwrap();
+        TerminalSession::shutdown(session).await.unwrap();
+
+        let empty_environment = TerminalHello::new(
+            TerminalSize::new(80, 24).unwrap(),
+            TerminalValue::new("").unwrap(),
+            TerminalValue::new("").unwrap(),
+        );
+        let session = PortablePtyBackend.open(empty_environment).await.unwrap();
         TerminalSession::shutdown(session).await.unwrap();
     }
 

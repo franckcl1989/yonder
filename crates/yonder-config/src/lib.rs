@@ -1074,6 +1074,13 @@ mod tests {
 
     #[test]
     fn metadata_failures_remain_structured_read_errors() {
+        let status_error = super::configuration_file_status(Path::new("\0")).unwrap_err();
+        assert!(matches!(
+            status_error,
+            ConfigurationError::Read { source, .. }
+                if source.kind() == std::io::ErrorKind::InvalidInput
+        ));
+
         let error = read_layer(Path::new("\0")).unwrap_err();
         assert!(matches!(
             error,

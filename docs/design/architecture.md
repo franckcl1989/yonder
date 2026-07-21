@@ -74,7 +74,7 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 - host 的 OPAQUE `ServerFinish` 不直接写 `Authenticated`。网络 owner 在认证 future 返回并重验 binding 后先同步提交 `Authenticating -> AwaitingTerminal`，再在一个组合阶段并发 flush 确认、驱动连接事件并有界收集两条终端子流，消除 controller 收到确认后立即开流时的丢流窗口。
 - 从 `Authenticating` 开始到 `StartingTerminal` 结束，出现第二条同 PeerId 连接会撤销认证、关闭该 PeerId 全部连接并返回 `Advertised`，连接码不消耗。
 - `Active` 后出现第二条同 PeerId 连接会立即关闭全部该 PeerId 连接、终止 shell 并结束会话；连接码保持已消费。这样额外连接无法利用仅有 PeerId 的入站子流 API 继承授权。
-- 控制和数据子流只有在本地 roster 仍为记录的唯一连接时才进入状态机。连接关闭立即撤销未提交授权。
+- 控制和数据子流只有在本地 roster 仍为记录的唯一连接时才进入状态机。连接关闭立即撤销未提交授权；Active 后选中连接关闭不建立新授权或路径迁移，只允许既有 control/data 子流在同一个绝对 `2s` 截止内交付已经排队的 EOF 与 Exit，随后会话进入 Spent。
 - endpoint 到 relay 的 registry/resolve 使用同一名册原则，但不建立授权状态：名册不唯一时返回 Retry；每 PeerId 同时最多一个相应请求，代替无法实现的“按物理连接并发”表述。
 - host 的 reservation lease 只要求精确选中的 relay `ConnectionId` 仍存在且对应 listener 已 ready；同 relay PeerId 的短暂额外连接不会把 reservation 或注册映射误判为失效，也不会触发完整重连。registry/resolve 调用期间 relay 侧名册若暂时不唯一仍按上一条返回 Retry，并由既有有界退避等待临时连接收敛；这与注册映射 Active 所要求的“reservation 有效且至少一条连接仍存在”一致。
 
@@ -106,7 +106,7 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 
 正常顺序固定为：停止接受新子流和拨号、取消会话、关闭网络写半部、关闭 PTY master、由 supervisor kill 尚存 child、在同一绝对截止内等待 child 与三个 PTY 阻塞任务、等待受控异步任务 `2s` 并在截止后 abort、恢复本地 raw mode、runtime `shutdown_timeout(1s)`。达到期限时记录结构化清理错误并退出，不无限等待。若平台 `Child::kill` 本身失败且已移动的底层 PTY 读写句柄仍阻塞，`portable-pty` 的 safe 公共 API 无法强制关闭这些句柄；实现必须报告该残余失败，禁止声称进程内绝对零泄漏。
 
-被控端在 `Active` 前的任何可恢复失败都回到 `Advertised`；`Active` 后网络失败终止 shell 和进程。主控端任何网络失败先恢复本地终端再显示错误。relay 某条连接或协议失败只影响对应 PeerId，不得 panic 或停止 accept loop。
+被控端在 `Active` 前的任何可恢复失败都回到 `Advertised`；`Active` 后网络失败终止 shell 和进程。主控端在 Active 连接关闭时仅为已经建立的终端子流保留绝对 `2s` 收尾窗口：data EOF 与 Exit 都完成才正常返回远端退出码，否则报告连接/收尾错误；额外同 PeerId 连接仍立即违反精确绑定。任何错误都先恢复本地终端再显示。relay 某条连接或协议失败只影响对应 PeerId，不得 panic 或停止 accept loop。
 
 host 在认证前最多用 `3s` 让目标 PeerId 名册收敛，并在此期间持续 poll Swarm、关闭额外 auth/control/data 子流；OPAQUE 每条消息的 `10s` 上限保持独立。relay 在 Unix 统一处理 SIGINT/SIGTERM/SIGHUP，在 Windows 统一处理 Ctrl+C/Break/Close/Logoff/Shutdown，并在既有 `2s` 绝对截止内协作关闭。进程必须先同步安装平台信号监听，再构造 libp2p 网络；生命周期只输出低基数 debug 事件 `relay_signal_handlers_installed` 及 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped`，协议拒绝和失败按固定类别累加到每 `60s` 一次的 `relay_activity_summary`，不在公开 relay 上逐请求记录 PeerId 或错误。
 

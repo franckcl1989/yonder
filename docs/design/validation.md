@@ -50,11 +50,13 @@
 
 ## 覆盖率现状
 
-- Windows nightly `cargo-llvm-cov 0.8.7` 对本轮新增 WSS/容量/strict-E2E 修正前的审计快照真实运行 workspace all-target/all-feature 测试与 benchmark smoke，并通过硬门禁：line `95.1822% (6243/6559)`、function `98.3834% (852/866)`、region `90.0455% (8503/9443)`、branch `81.7507% (551/674)`，同时通过每文件 line `>=75%` 检查；报告保存在 `target/coverage-windows-final.json`。当前源码不得沿用该百分比冒充新结果，等待新 CI 逐 target 报告。
+- Windows nightly `cargo-llvm-cov 0.8.7` 对当前工作树真实运行 workspace all-target/all-feature 测试与 benchmark smoke，并通过硬门禁：line `95.232517% (8130/8537)`、function `98.356164% (1077/1095)`、region `90.161076% (10859/12044)`、branch `81.887202% (755/922)`；每文件 line 最低为 `yon/src/host.rs` 的 `79.277365% (746/941)`，没有文件低于 `75%`。报告保存在 `target/coverage-windows-current-final-2.json`；其他原生目标仍必须由新候选 workflow 独立复验，不能沿用本机数字。
 - 未覆盖内容仍集中在需要真实 TTY、精确网络故障时序、已认证连接替换和不可由 safe 公共 API 构造的上游错误状态。当前审核没有通过伪造非法状态、执行“若调用即失败”的保护闭包或排除生产模块来追求数字；认证、会话消费点、秘密边界、并发关闭和资源上限继续由定向、属性、模糊、sanitizer、真实进程与网络证据补充覆盖率百分比。
 - `NetworkBehaviour` 外部 integration test 已真实执行两个组合行为的八个连接生命周期回调，但 LLVM 仍会把 derive 宏源行及内联生成函数标为零；`libp2p-stream 0.4.0-alpha` 的 `OpenStreamError` 是 `#[non_exhaustive]` 且当前 safe 公共 API 只能构造已覆盖的两种 variant。项目所有者已确认不为追求形式 100% 而伪造不可构造状态，改用风险分级门禁且不排除生产模块。
 - nightly coverage 专用 cfg 与单元测试模块 `#[coverage(off)]` 已落地并由上述 Windows nightly 结果验证；stable/MSRV/Miri/sanitizer/正常 release 不启用。
 - CI 与 release 已接入五个可工作原生 target 各自独立的聚合 line/function `>=95%`、region `>=90%`、每文件 line `>=75%`、branch `>=75%` 硬门禁，并上传逐 target JSON。Windows x86_64 本机已取得完整 nightly 结果；其余四个目标仍等待原生 CI 实测。`aarch64-pc-windows-msvc` 仅按 Rust 上游 `#150123` 例外不运行 coverage，其他构建、测试、静态 CRT 与 smoke 不豁免。
+
+- 候选运行 `29828755111` 的 macOS Intel WS 真实终端用例捕获了快速 shell 正常退出竞态：远端已经写出 `YON_E2E` 与退出状态，但 libp2p 选中连接的 Closed 事件先于终端子流中已排队的数据/Exit 被主控端处理，旧实现立即以绑定丢失覆盖了正常完成。当前修复不弱化唯一 `ConnectionId` 绑定：额外同 PeerId 连接继续失败；仅当精确选中连接关闭时启动绝对 `2s` 的既有 data/control 子流排空，两项齐全才接受退出码，否则超时报错。类型状态机测试覆盖关闭前、Exit-first、EOF-first、重复关闭和额外连接分类；Windows 全量 `11/11` E2E 已通过，macOS Intel 仍等待新候选运行复验。
 
 ## 明确未完成
 

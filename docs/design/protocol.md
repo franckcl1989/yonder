@@ -133,7 +133,7 @@ Advertised -> Authenticating -> AwaitingTerminal -> StartingTerminal -> Active -
 
 Ready 后 data 子流全部字节都是不解释、不分帧的原始终端数据，双向传输直到 EOF。flush 成功不能证明主控应用已经读取 Ready；提交瞬间断网可能使 code 已消费但主控未显示终端，这是已接受的分布式提交窗口。
 
-child exit 后，被控端停止接受新输入，最多等待 `2s` 把 PTY reader 排空到 data 写半部并关闭，再发送 Exit；data EOF 与 Exit 的到达顺序不构成协议错误。主控端必须同时观察 data EOF 和 Exit 才按远端退出码正常结束。排空、Exit 或关闭在期限内失败属于 Active 会话错误，不能静默报告正常退出。
+child exit 后，被控端停止接受新输入，最多等待 `2s` 把 PTY reader 排空到 data 写半部并关闭，再发送 Exit；data EOF 与 Exit 的到达顺序不构成协议错误。主控端必须同时观察 data EOF 和 Exit 才按远端退出码正常结束。若选中的物理连接关闭事件先于已在两条终端子流中排队的 EOF/Exit 到达，主控端从该事件起沿用同一个绝对 `2s` 截止排空既有子流；期间不接受新连接、重绑定或新子流。两项完成后可保留真实远端退出码，任一缺失、排空失败或截止超时都属于 Active 会话错误，不能静默报告正常退出。
 
 ## Relay 信道与中继限制
 

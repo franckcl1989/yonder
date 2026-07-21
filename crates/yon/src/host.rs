@@ -97,7 +97,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
     use yonder_core::wire::auth::{AuthClientHello, AuthServerResponse, CLIENT_HELLO_LEN};
-    use yonder_core::wire::terminal::{MAX_HELLO_LEN, TerminalExit, TerminalHello};
+    use yonder_core::wire::terminal::{MAX_HELLO_LEN, TerminalExit, TerminalHello, TerminalResize};
     use yonder_core::{
         ConnectionCode, Locator, PakeSecret, SessionEvent, TerminalSize, TerminalValue,
     };
@@ -491,6 +491,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_applies_resize_before_reporting_exit() {
+        const EXIT_CODE: u32 = 41;
+        let resized = TerminalSize::new(117, 41).unwrap();
+        let mut session = ResizeThenExitSession {
+            resized: None,
+            exit_code: EXIT_CODE,
+        };
+        let (host_data, mut controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        let (mut controller_control_read, mut controller_control_write) =
+            tokio::io::split(controller_control);
+        controller_control_write
+            .write_all(&TerminalResize::new(resized).encode())
+            .await
+            .unwrap();
+
+        let host = copy_terminal_output(
+            &mut session,
+            &mut host_data_write,
+            &mut host_control_read,
+            &mut host_control_write,
+        );
+        let controller = async {
+            let mut terminal_bytes = Vec::new();
+            controller_data
+                .read_to_end(&mut terminal_bytes)
+                .await
+                .unwrap();
+            let mut exit = [0_u8; 5];
+            controller_control_read.read_exact(&mut exit).await.unwrap();
+            (terminal_bytes, TerminalExit::decode(&exit).unwrap())
+        };
+        let (exit, (terminal_bytes, remote_exit)) = tokio::join!(host, controller);
+
+        assert_eq!(exit.unwrap(), EXIT_CODE);
+        assert!(terminal_bytes.is_empty());
+        assert_eq!(remote_exit.code(), EXIT_CODE);
+        assert_eq!(session.resized, Some(resized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn every_public_host_entry_rejects_invalid_tls_before_network_activity() {
         let invalid_config = || {
             let relay_identity = Keypair::generate_ed25519();
@@ -602,6 +645,11 @@ mod tests {
         events: VecDeque<PtyEvent>,
     }
 
+    struct ResizeThenExitSession {
+        resized: Option<TerminalSize>,
+        exit_code: u32,
+    }
+
     impl TerminalSession for PumpSession {
         type Input = TestInput;
 
@@ -615,6 +663,31 @@ mod tests {
 
         async fn next(&mut self) -> Result<PtyEvent, TerminalError> {
             self.events.pop_front().ok_or(TerminalError::TaskStopped)
+        }
+
+        async fn shutdown(self) -> Result<(), TerminalError> {
+            Ok(())
+        }
+    }
+
+    impl TerminalSession for ResizeThenExitSession {
+        type Input = TestInput;
+
+        fn take_input(&mut self) -> Result<Self::Input, TerminalError> {
+            Ok(TestInput)
+        }
+
+        async fn resize(&mut self, size: TerminalSize) -> Result<(), TerminalError> {
+            self.resized = Some(size);
+            Ok(())
+        }
+
+        async fn next(&mut self) -> Result<PtyEvent, TerminalError> {
+            if self.resized.is_some() {
+                Ok(PtyEvent::exited(self.exit_code))
+            } else {
+                std::future::pending().await
+            }
         }
 
         async fn shutdown(self) -> Result<(), TerminalError> {
