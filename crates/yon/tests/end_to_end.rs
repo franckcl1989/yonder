@@ -16,7 +16,7 @@ use yon::network::{EndpointDriver, ReservationLease, connect_relay, wait_for_res
 use yon::protocol::{
     ReclaimResponse, RelayProtocolError, ResolveDeadline, reclaim_locator, resolve_peer,
 };
-use yon_relay::{RelayServeConfig, run_relay_until};
+use yon_relay::{FileIdentityStore, IdentityStore, RelayServeConfig, run_relay_until};
 use yonder_core::{ConnectionCode, Locator, OsSecureRandom, SecretDocument};
 use yonder_net::{
     EndpointRelayAddress, EndpointRelaySet, Keypair, RelayExternalAddress, RelayListenAddress,
@@ -132,11 +132,8 @@ fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(
     const MIN_REMOTE_BYTES_PER_SECOND: f64 = 384.0 * 1024.0;
     const MIN_REMOTE_TO_LOCAL_PTY_RATIO: f64 = 0.70;
     let port = available_port()?;
-    let identity = generate_identity(&mut OsSecureRandom)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let peer = identity.public().to_peer_id();
-    let relay_process = RelayProcess::start(identity, port)?;
-    wait_for_tcp_listener(port)?;
+    let relay_process = RelayBinaryProcess::start(port)?;
+    let peer = relay_process.peer();
     let config = EndpointConfigDirectory::new(&format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}"))?;
     let payload = config.path().join("throughput.bin");
     let mut payload_bytes = vec![PERFORMANCE_PAYLOAD_BYTE; PERFORMANCE_PAYLOAD_LEN];
@@ -213,8 +210,15 @@ fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(
         Ok::<_, std::io::Error>(samples)
     })();
     let relay_result = relay_process.stop();
-    let samples = outcome?;
-    relay_result?;
+    let samples = match (outcome, relay_result) {
+        (Ok(samples), Ok(())) => samples,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(relay_error)) => {
+            return Err(std::io::Error::other(format!(
+                "{error}; relay process also failed: {relay_error}",
+            )));
+        }
+    };
     let direct = median(samples.iter().map(|sample| sample.direct_bytes_per_second));
     let local_pty = median(
         samples
@@ -1135,6 +1139,180 @@ fn host_replaces_the_complete_code_after_reclaim_conflict() -> Result<(), std::i
 struct RelayProcess {
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<Result<(), std::io::Error>>>,
+}
+
+#[cfg(any(unix, windows))]
+struct RelayBinaryProcess {
+    child: Option<Child>,
+    _directory: tempfile::TempDir,
+    peer: yonder_net::PeerId,
+}
+
+#[cfg(any(unix, windows))]
+impl RelayBinaryProcess {
+    fn start(port: u16) -> Result<Self, std::io::Error> {
+        let identity = generate_identity(&mut OsSecureRandom)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let peer = identity.public().to_peer_id();
+        let directory = relay_test_directory()?;
+        FileIdentityStore
+            .create(&directory.path().join("relay.key"), &identity)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        std::fs::write(
+            directory.path().join("yon-relay.toml"),
+            format!(
+                "identity = \"relay.key\"\nlisten = [\"/ip4/127.0.0.1/tcp/{port}\"]\nexternal = [\"/ip4/127.0.0.1/tcp/{port}\"]\n",
+            ),
+        )?;
+
+        let mut command = Command::new(relay_binary_path()?);
+        command
+            .args(["--log-level", "error", "serve"])
+            .current_dir(directory.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("YON_RELAY_") {
+                command.env_remove(key);
+            }
+        }
+        let child = command.spawn()?;
+        let mut process = Self {
+            child: Some(child),
+            _directory: directory,
+            peer,
+        };
+        process.wait_until_ready(port)?;
+        Ok(process)
+    }
+
+    fn peer(&self) -> yonder_net::PeerId {
+        self.peer
+    }
+
+    fn wait_until_ready(&mut self, port: u16) -> Result<(), std::io::Error> {
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return Ok(());
+            }
+            if let Some(status) = self.child_mut()?.try_wait()? {
+                let output = self.finish_child(false)?;
+                return Err(std::io::Error::other(format!(
+                    "relay exited during startup with {status}: {}",
+                    String::from_utf8_lossy(&output.stderr),
+                )));
+            }
+            if Instant::now() >= deadline {
+                let output = self.finish_child(true)?;
+                return Err(std::io::Error::other(format!(
+                    "relay readiness timed out: {}",
+                    String::from_utf8_lossy(&output.stderr),
+                )));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stop(mut self) -> Result<(), std::io::Error> {
+        if let Some(status) = self.child_mut()?.try_wait()? {
+            let output = self.finish_child(false)?;
+            return Err(std::io::Error::other(format!(
+                "relay exited before test cleanup with {status}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            )));
+        }
+        let output = self.finish_child(true)?;
+        if output.stderr.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "relay emitted error diagnostics: {}",
+                String::from_utf8_lossy(&output.stderr),
+            )))
+        }
+    }
+
+    fn child_mut(&mut self) -> Result<&mut Child, std::io::Error> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("relay process was already reaped"))
+    }
+
+    fn finish_child(&mut self, terminate: bool) -> Result<std::process::Output, std::io::Error> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| std::io::Error::other("relay process was already reaped"))?;
+        if terminate {
+            let _ = child.kill();
+        }
+        child.wait_with_output()
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for RelayBinaryProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn relay_binary_path() -> Result<PathBuf, std::io::Error> {
+    if let Some(path) = std::env::var_os("YONDER_E2E_YON_RELAY") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "YONDER_E2E_YON_RELAY does not name a file: {}",
+                path.display(),
+            ),
+        ));
+    }
+
+    let mut path = std::env::current_exe()?;
+    path.pop();
+    if path.file_name().is_some_and(|name| name == "deps") {
+        path.pop();
+    }
+    path.push(format!("yon-relay{}", std::env::consts::EXE_SUFFIX));
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "optimized yon-relay binary was not found at {}; build it before running the ignored performance gate",
+                path.display(),
+            ),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn relay_test_directory() -> Result<tempfile::TempDir, std::io::Error> {
+    tempfile::tempdir()
+}
+
+#[cfg(windows)]
+fn relay_test_directory() -> Result<tempfile::TempDir, std::io::Error> {
+    let root = std::env::var_os("YONDER_E2E_RELAY_ROOT").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "YONDER_E2E_RELAY_ROOT must identify a protected directory on Windows",
+        )
+    })?;
+    tempfile::Builder::new()
+        .prefix("yonder-e2e-relay-")
+        .tempdir_in(PathBuf::from(root))
 }
 
 impl RelayProcess {

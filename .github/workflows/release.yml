@@ -700,9 +700,16 @@ jobs:
           cargo bench --locked --all-features -p yonder-net --bench path -- --noplot
       - name: Build optimized product binaries for process samples
         run: cargo build --locked --release -p yon -p yon-relay
+      - name: Create protected Windows resource-sampling directory
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/secure-directory
+        with:
+          path: ${{ runner.temp }}/yonder-performance-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Run real Linux process terminal throughput gate
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          YONDER_E2E_YON_RELAY: ${{ github.workspace }}/target/release/yon-relay
         run: |
           mkdir -p performance
           cargo test --locked --release -p yon --test end_to_end \
@@ -712,16 +719,14 @@ jobs:
       - name: Run real Windows process terminal throughput gate
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          YONDER_E2E_YON_RELAY: ${{ github.workspace }}\target\release\yon-relay.exe
+          YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}\yonder-performance-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           New-Item -ItemType Directory -Force performance | Out-Null
           cargo test --locked --release -p yon --test end_to_end process_terminal_throughput_baseline_uses_the_real_product_path -- --ignored --exact --nocapture 2>&1 |
             Tee-Object -FilePath performance/process-throughput.txt
           if ($LASTEXITCODE -ne 0) { throw "process throughput gate failed with exit code $LASTEXITCODE" }
-      - name: Create protected Windows resource-sampling directory
-        if: runner.os == 'Windows'
-        uses: ./.github/actions/secure-directory
-        with:
-          path: ${{ runner.temp }}/yonder-performance-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Record Linux runner and process startup samples
         if: runner.os == 'Linux'
         shell: bash

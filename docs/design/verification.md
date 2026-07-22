@@ -63,7 +63,7 @@
 
 ### 性能测试
 
-Criterion 覆盖 code encode/decode、wire decoder、locator allocation、governor check、path ranking 和固定 buffer copy。进程 benchmark 覆盖启动、OPAQUE、直接/relay 建连、交互延迟、吞吐、RSS、CPU、文件描述符和二进制体积。
+Criterion 覆盖 code encode/decode、wire decoder、locator allocation、governor check、path ranking 和固定 buffer copy。进程 benchmark 覆盖启动、OPAQUE、直接/relay 建连、交互延迟、吞吐、RSS、CPU、文件描述符和二进制体积。真实终端吞吐门禁必须把 `yon-relay`、host `yon` 与 controller `yon` 分别运行在独立 release 进程中；测试 harness 的采样缓冲、输出聚合和分配器保留内存不得计入 relay 的进程 RSS，也不得影响 relay 的生产内存连接保护。
 
 基准结果保存原始 JSON/环境信息。`0.1.0` 在记录完整身份的 Windows 与 Linux 环境上形成首份可复现基线，同时必须满足下方绝对验收值；从后续版本开始，只有 runner 类别、CPU 型号、OS 镜像、电源模式和工具链一致时，才执行相对该基线的吞吐、启动、RSS、体积回归不超过 `5%`、p99 延迟不超过 `10%` 的判定。GitHub hosted runner 的硬件身份变化时，结果只能作为绝对门槛与诊断证据，必须在受控环境重新测量并经审批更新相对基线，不能暗中接受漂移。噪声超过阈值时在同一 runner 重复至少 10 次取中位数，不能直接放宽门槛。
 
