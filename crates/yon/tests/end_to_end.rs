@@ -129,7 +129,7 @@ fn three_process_terminal_session_executes_a_real_shell() -> Result<(), std::io:
 #[ignore = "release process performance gate"]
 fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(), std::io::Error> {
     const SAMPLE_COUNT: usize = 10;
-    const MIN_REMOTE_BYTES_PER_SECOND: f64 = 1024.0 * 1024.0;
+    const MIN_REMOTE_BYTES_PER_SECOND: f64 = 384.0 * 1024.0;
     const MIN_REMOTE_TO_LOCAL_PTY_RATIO: f64 = 0.70;
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)

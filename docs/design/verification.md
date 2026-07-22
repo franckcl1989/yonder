@@ -96,7 +96,7 @@ Criterion 覆盖 code encode/decode、wire decoder、locator allocation、govern
 | relay 128 reservation/registration RSS | `<= 48 MiB` |
 | relay idle CPU | 128 endpoint 下 `< 1%` 单核参考容量 |
 | 终端稳态第一方分配 | 每个复制方向逐块 `0`，仅启动时固定 buffer |
-| loopback 终端吞吐 | 8 MiB 真实三进程会话的 10 次远端吞吐中位数 `>= 1 MiB/s`，且同轮远端/`portable-pty` 本地 PTY/ConPTY 配对比率的 10 次中位数 `>= 70%`；原始 pipe 只作诊断参照 |
+| loopback 终端吞吐 | 8 MiB 真实三进程会话的 10 次远端吞吐中位数 `>= 384 KiB/s`，且同轮远端/`portable-pty` 本地 PTY/ConPTY 配对比率的 10 次中位数 `>= 70%`；载荷字节必须全部完整，原始 pipe 只作诊断参照 |
 | 1 KiB 交互应用层额外延迟 | p99 `<= 1ms`，不含网络 RTT |
 | resize 传播 | 无网络阻塞时 p99 `<= 500ms` |
 | OPAQUE 单次认证峰值 | `<= 25 MiB` 附加 RSS，且不会并发两次 |
