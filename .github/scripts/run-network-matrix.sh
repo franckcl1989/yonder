@@ -10,7 +10,7 @@ test -x "$yon"
 test -x "$relay"
 test "$(id -u)" -eq 0
 
-for command in date ip iptables grep sed timeout; do
+for command in date ip iptables grep sed tc timeout; do
   command -v "$command" >/dev/null
 done
 
@@ -29,6 +29,12 @@ cleanup_processes() {
     wait "$pid" 2>/dev/null || true
   done
   processes=()
+}
+
+apply_netem() {
+  local namespace="$1"
+  ip netns exec "$namespace" tc qdisc replace dev eth0 root netem \
+    delay 35ms 12ms distribution normal loss 0.5% reorder 5% 50%
 }
 
 cleanup_topology() {
@@ -302,6 +308,8 @@ run_single_nat_ipv4() {
   connect_private_ipv4 "$host_ns" "$nat_ns" "p${tag}${case_id}" \
     10.241.2.2/24 10.241.2.1/24 10.241.2.1
   configure_nat "$nat_ns" 10.241.2.0/24
+  apply_netem "$host_ns"
+  apply_netem "$controller_ns"
   run_session "$case_name" "$relay_ns" "$host_ns" "$controller_ns" \
     10.240.2.2 ip4 4402 20000 Direct
   cleanup_topology
@@ -329,6 +337,8 @@ run_strict_dual_nat_ipv4() {
     10.242.3.2/24 10.242.3.1/24 10.242.3.1
   configure_nat "$host_nat" 10.241.3.0/24
   configure_nat "$controller_nat" 10.242.3.0/24
+  apply_netem "$host_ns"
+  apply_netem "$controller_ns"
   run_session "$case_name" "$relay_ns" "$host_ns" "$controller_ns" \
     10.240.3.2 ip4 4403 20000 Relayed
   cleanup_topology

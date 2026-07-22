@@ -99,6 +99,7 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 - 网络写入慢时，固定 duplex 容量自然反压 PTY/标准输入；不丢终端字节、不无限缓存。控制消息入口容量 `8`，重复 resize 在入队前合并为最新尺寸。
 - controller 为避免跨平台线程栈承载完整 libp2p 预提交 async 状态，只在启动阶段把该 future 固定到堆上；每次全能力或 relay-only 尝试各分配一次，严格最多两次，并在进入终端数据热路径前释放。
 - controller 的交互输入使用固定容量状态机识别 `Ctrl+] .` 本地脱离和双 `Ctrl+]` 字面发送；跨读取块保持状态，不在终端热路径分配。非交互输入绕过该状态机。
+- Crossterm 只负责 raw mode、终端尺寸和显示恢复；Windows 额外通过 safe 的 `crossterm_winapi` 打开 `ENABLE_VIRTUAL_TERMINAL_INPUT`。按键数据刻意不使用 Crossterm `EventStream`、termwiz 或其他会先解析再重编码的高层事件模型，而是保持终端产生的 raw bytes，使 Esc、方向键、Ctrl 组合、bracketed paste 和应用自定义序列无需第一方翻译即可进入远端 PTY。该取舍复用社区的平台状态抽象，同时避免重写或损坏终端协议。
 - 主控端每 `250ms` 用 `crossterm::terminal::size()` 检查尺寸，只在变化时发送，避免同时读取按键事件再手写终端按键编码。
 - 本地 stdin/stdout 使用 Tokio `io-std`。stdin 的底层阻塞读取不能被所有平台可靠强制取消；raw mode guard 必须先恢复，随后 runtime 最多等待 `1s` 关闭并退出进程。这是进程边界内的有界清理，不允许形成常驻后台任务。
 

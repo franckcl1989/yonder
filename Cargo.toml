@@ -19,7 +19,7 @@ publish = false
 
 [workspace.dependencies]
 backon = { version = "=1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
-clap = { version = "=4.6.2", default-features = false, features = ["color", "derive", "error-context", "help", "std", "suggestions", "usage"] }
+clap = { version = "=4.6.4", default-features = false, features = ["color", "derive", "error-context", "help", "std", "suggestions", "usage"] }
 config = { version = "=0.15.25", default-features = false, features = ["toml"] }
 crossterm = { version = "=0.29.0", default-features = false, features = ["bracketed-paste", "events", "windows"] }
 crossterm_winapi = { version = "=0.9.1", default-features = false }
@@ -42,7 +42,7 @@ serde = { version = "=1.0.229", default-features = false, features = ["derive", 
 sha2 = { version = "=0.10.9", default-features = false }
 tempfile = { version = "=3.27.0", default-features = false, features = ["getrandom"] }
 thiserror = { version = "=2.0.19", default-features = false, features = ["std"] }
-tokio = { version = "=1.53.0", default-features = false, features = ["io-std", "io-util", "macros", "rt", "signal", "sync", "time"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["io-std", "io-util", "macros", "rt", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.18", default-features = false, features = ["compat", "io-util", "rt"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["ansi", "fmt"] }

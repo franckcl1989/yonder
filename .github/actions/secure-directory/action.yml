@@ -1,0 +1,30 @@
+name: Create protected Windows directory
+description: Creates a directory writable only by the current account, SYSTEM and Administrators.
+inputs:
+  path:
+    description: Absolute directory path to create.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      env:
+        YONDER_SECURE_DIRECTORY: ${{ inputs.path }}
+      run: |
+        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+        $administrators = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $directoryAcl = New-Object Security.AccessControl.DirectorySecurity
+        $directoryAcl.SetOwner($current)
+        $directoryAcl.SetAccessRuleProtection($true, $false)
+        $rights = [Security.AccessControl.FileSystemRights]::FullControl
+        $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $propagation = [Security.AccessControl.PropagationFlags]::None
+        $allow = [Security.AccessControl.AccessControlType]::Allow
+        foreach ($sid in @($current, $system, $administrators)) {
+          $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, $inheritance, $propagation, $allow)
+          [void]$directoryAcl.AddAccessRule($rule)
+        }
+
+        New-Item -ItemType Directory -Force -Path $env:YONDER_SECURE_DIRECTORY | Out-Null
+        Set-Acl -LiteralPath $env:YONDER_SECURE_DIRECTORY -AclObject $directoryAcl

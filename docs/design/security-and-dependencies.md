@@ -29,7 +29,7 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 
 ## 依赖声明规则
 
-- 版本为 2026-07-16 核实的稳定版；Cargo 使用精确版本和受审 `Cargo.lock`。只有 `libp2p-stream` 是已批准的 alpha 例外。
+- 版本为 2026-07-22 核实的稳定版；Cargo 使用精确版本和受审 `Cargo.lock`。只有 `libp2p-stream` 是已批准的 alpha 例外。
 - 每个直接依赖都写 `default-features = false`，只打开下表 feature。兼容性例外 `rand 0.8.7` 和 `sha2 0.10.9` 由 `opaque-ke` 的公开 trait 主版本决定。
 - Rust 项目 MSRV 固定为 `1.88`。直接依赖最高声明 1.86，但锁定树中的 `time 0.3.53` 要求 1.88；CI 必须用 1.88 和当前 stable 分别构建。
 - 所有生产依赖是 Rust crate 或系统 API wrapper，不要求用户安装 OpenSSL、C runtime、动态网络库或其他第三方运行时。
@@ -39,7 +39,7 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | crate | 精确版本与 feature | 放置/用途 | 选择与影响 |
 | --- | --- | --- | --- |
 | `backon` | `1.6.0`; `std,tokio-sleep` | `yon`; controller 重连、查询与认证退避 | Apache-2.0，维护活跃；替代手写退避。冷路径，小型 fastrand jitter，无原生库；不让共享网络 crate 或 fuzz 构建承担未使用依赖 |
-| `clap` | `4.6.2`; `color,derive,error-context,help,std,suggestions,usage` | 两个 binary；CLI | MIT/Apache-2.0，事实标准；替代手写解析。主要增加启动/体积，不在数据热路径 |
+| `clap` | `4.6.4`; `color,derive,error-context,help,std,suggestions,usage` | 两个 binary；CLI | MIT/Apache-2.0，事实标准；替代手写解析。主要增加启动/体积，不在数据热路径 |
 | `config` | `0.15.25`; `toml` | `yonder-config`；严格分层配置 | MIT/Apache-2.0，成熟；替代手写 TOML、环境变量嵌套与合并。只在启动冷路径，禁用 async/json/yaml 等未使用能力 |
 | `crossterm` | `0.29.0`; `bracketed-paste,events,windows` | `yon`; raw mode、尺寸、显示恢复与终端事件控制序列 | MIT，成熟跨平台；替代平台终端 FFI 及手写 ANSI 序列。只在 controller 链接 |
 | `crossterm_winapi` | `0.9.1`; 无 feature | `yon` Windows；console input/output mode 保存与恢复 | MIT，Crossterm 同生态的 safe wrapper，已是锁定树中的传递依赖；替代第一方 Win32 FFI/`unsafe`，只在 Windows controller 链接，不新增 package |
@@ -58,13 +58,34 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | `sha2` | `0.10.9`; 无 feature | `yon`; OPAQUE SHA-512 | MIT/Apache-2.0；因 opaque-ke Digest 0.10 公开约束使用兼容主版本最新补丁，不让 relay 编译该依赖 |
 | `tempfile` | `3.27.0`; `getrandom` | `yon-relay` 身份原子写入、`yon` CLI 集成测试 | MIT/Apache-2.0，成熟；替代跨平台临时文件/rename 竞态手写。只在 init 冷路径或测试构建 |
 | `thiserror` | `2.0.19`; `std` | 所有 package；结构化错误 | MIT/Apache-2.0，成熟 derive；替代重复 Display/Error 样板，无运行时分配要求 |
-| `tokio` | `1.53.0`; `io-std,io-util,macros,rt,signal,sync,time` | 网络库和 binaries；runtime/I/O | MIT，成熟；current-thread runtime，避免手写 reactor。阻塞池上限 4 |
+| `tokio` | `1.53.1`; `io-std,io-util,macros,rt,signal,sync,time` | 网络库和 binaries；runtime/I/O | MIT，成熟；current-thread runtime，避免手写 reactor。阻塞池上限 4 |
 | `tokio-util` | `0.7.18`; `compat,io-util,rt` | `yonder-net`/`yon`; I/O 适配、取消、任务跟踪 | MIT，Tokio 官方；替代手写 bridge/cancellation。duplex 固定容量一次分配 |
 | `tracing` | `0.1.44`; `std` | `yon`、`yon-relay`、`yonder-net`；结构化诊断 | MIT，生态标准；字段白名单确保秘密和终端数据不记录，纯领域 package 不承担未使用依赖 |
 | `tracing-subscriber` | `0.3.23`; `ansi,fmt` | 两个 binary；文本日志 | MIT，官方 subscriber；只在进程边界，默认简洁 stderr |
 | `zeroize` | `1.9.0`; `alloc,derive` | `yonder-core`; 小型秘密清除 | MIT/Apache-2.0，RustCrypto；`alloc` 用于立即包裹 rpassword/Clap 交出的 code String，避免手写 volatile 清除。不承诺 swap/core dump 清除 |
 
 `governor` 同时用于 relay 查询和被控端认证启动限速。此前“只允许链接 relay”的约束被本冻结替换：不用它就只能手写 auth 限速，违反不造轮子目标。`yon` 增加的已测最小静态体积约 13.5 KiB，收益大于该成本。
+
+## 社区能力采用审计
+
+本节不是 crate 清单，而是实现审查门禁。升级、替换或新增第一方适配时必须重新核对“社区能力实际拥有的职责”和“第一方只保留的产品语义”，不能以依赖已经出现在 `Cargo.toml` 作为复用证明。
+
+| 能力 | 社区实现实际拥有的职责 | Yonder 只保留的职责与审计结论 |
+| --- | --- | --- |
+| 网络传输与 NAT | rust-libp2p 完整拥有 TCP、QUIC、WS/WSS、Noise、Yamux、Relay v2、DCUtR、AutoNAT、UPnP、Identify、Ping、连接/内存限制和传输身份认证 | 第一方只编排同一 relay 的候选、直连优先窗口、质量排序、唯一 `ConnectionId` 名册与产品资源策略；禁止自研传输、打洞、muxer、relay 或加密握手 |
+| 应用子流 | 官方 `libp2p-stream` 完成协议 ID 协商、子流打开和接收 | `ApplicationStreams` trait 隔离 alpha API，第一方只实现固定长度 Yonder auth/registry/resolve/terminal 协议；禁止另写 `ConnectionHandler` 或 multistream-select |
+| PTY/ConPTY 与 shell | `portable-pty` 完整拥有平台 PTY、默认程序发现、spawn、resize、child wait/kill 和同步句柄 | 第一方只做有界 async bridge、会话状态、背压和故障传播；同步 PTY I/O按上游模型进入 `spawn_blocking`，禁止第一方 Unix ioctl、ConPTY FFI 或 shell 发现 |
+| 本地终端状态 | Crossterm 拥有 raw mode、尺寸和显示恢复，`crossterm_winapi` 以 safe API 补足 Windows VT input mode | 按键保持 raw bytes，第一方仅识别固定本地脱离序列；禁止把高层事件解析后再手写重编码，避免损坏 Esc、方向键、Ctrl、粘贴和应用私有序列 |
+| 异步运行时与桥接 | Tokio 拥有 runtime、I/O、channel、signal、time；`tokio-util` 拥有 futures/Tokio I/O compat、`SyncIoBridge`、取消与任务跟踪 | 第一方只设置容量、deadline、owner 和清理顺序；禁止自研 reactor、waker、取消 token、任务 tracker 或 AsyncRead/AsyncWrite 适配器 |
+| PAKE | `opaque-ke` 完整拥有 RFC 9807 OPAQUE、Ristretto255、TripleDH 和 Argon2 KSF | 第一方只固定套件/参数、构造有界 context、绑定已认证 PeerId/名册并管理一次性状态；禁止自研 PAKE、KDF 或认证加密层 |
+| 配置 | `config` 拥有 TOML、环境层、嵌套键与合并；Serde 拥有类型反序列化 | 第一方只定义严格 schema、来源优先级、路径 provenance、大小/权限和领域校验；禁止手写 TOML/parser 或字符串键在模块边界扩散 |
+| 限速与重试 | `governor` 拥有 GCRA direct limiter，`backon` 拥有有界指数退避和 jitter | 第一方只固定容量、恢复率、绝对预算和可重试状态；禁止手写令牌桶、退避或随机抖动 |
+| 编码与秘密输入 | `data-encoding` 拥有 Crockford Base32，`rpassword` 拥有跨平台隐藏输入 | 第一方只定义连接码分组/别名/领域不变量和秘密生命周期；禁止手写编码表或控制台隐藏输入 |
+| WSS 密钥材料 | rustls 官方类型拥有 DER/PEM 和私钥类型，WebPKI 拥有证书与 DNS/IP 名称校验，libp2p websocket/rustls 拥有真实 TLS 握手 | 第一方只做有界读取、链顺序、配置组合、错误保真和启动前 fail-closed；禁止自研 X.509、SAN 匹配或 TLS |
+| CLI、错误与诊断 | Clap 拥有命令解析/help/suggestion，`thiserror` 拥有结构化错误样板，Tracing 拥有诊断事件/subscriber | 第一方只定义领域 newtype、退出码、秘密脱敏和终端画面隔离；禁止手写 argv parser、裸字符串跨边界错误或 Active 期日志污染 |
+| 验证工具 | Proptest、Criterion、libp2p-swarm-test、cargo-fuzz、Miri、sanitizer 和 LLVM coverage 分别拥有性质生成、统计基准、真实 Swarm、模糊与内存/竞态/覆盖工具能力 | 第一方只定义 Yonder 不变量、样本、绝对门槛和失败判定；禁止用 mock 百分比、单次计时或设计评审替代真实协议、PTY、网络和原生平台证据 |
+
+当前审查结论是：第一方代码的主要剩余体量属于连接码/OPAQUE/终端会话状态机、relay 注册与查询语义、直连优先选路、资源边界、产品进度和跨能力故障编排，这些都是 Yonder 特有的产品协议，不能由单一上游 crate 直接替代。任何新增第一方底层平台、协议、解析、限速、重试、终端按键翻译或加密实现都必须先证明上述成熟能力确实无法覆盖，并经过单独设计审批。
 
 ## 测试直接依赖与工具
 

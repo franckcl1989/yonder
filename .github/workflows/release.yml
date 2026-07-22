@@ -470,6 +470,11 @@ jobs:
 
           test "$(wc -c < stage/yon)" -le 20971520
           test "$(wc -c < stage/yon-relay)" -le 16777216
+      - name: Create protected Windows relay smoke directory
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/secure-directory
+        with:
+          path: ${{ runner.temp }}/yonder-smoke-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}/yon-relay
       - name: Stage Windows binaries
         if: runner.os == 'Windows'
         shell: pwsh
@@ -478,26 +483,10 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/yon.exe" "stage/yon.exe"
           Copy-Item "target/${{ matrix.target }}/release/yon-relay.exe" "stage/yon-relay.exe"
 
-          $smokeRoot = Join-Path $env:RUNNER_TEMP "yonder-smoke-${{ matrix.target }}-$([Guid]::NewGuid().ToString('N'))"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "yonder-smoke-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}"
           $yonSmoke = Join-Path $smokeRoot "yon"
           $relaySmoke = Join-Path $smokeRoot "yon-relay"
-          New-Item -ItemType Directory -Path $smokeRoot | Out-Null
-          New-Item -ItemType Directory -Path $yonSmoke,$relaySmoke | Out-Null
-          $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
-          $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
-          $administrators = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
-          $directoryAcl = New-Object Security.AccessControl.DirectorySecurity
-          $directoryAcl.SetOwner($current)
-          $directoryAcl.SetAccessRuleProtection($true, $false)
-          $rights = [Security.AccessControl.FileSystemRights]::FullControl
-          $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-          $propagation = [Security.AccessControl.PropagationFlags]::None
-          $allow = [Security.AccessControl.AccessControlType]::Allow
-          foreach ($sid in @($current, $system, $administrators)) {
-            $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, $inheritance, $propagation, $allow)
-            [void]$directoryAcl.AddAccessRule($rule)
-          }
-          Set-Acl -LiteralPath $relaySmoke -AclObject $directoryAcl
+          New-Item -ItemType Directory -Force -Path $yonSmoke | Out-Null
           $yonExecutable = Join-Path $yonSmoke "yon.exe"
           $relayExecutable = Join-Path $relaySmoke "yon-relay.exe"
           Copy-Item "stage/yon.exe" $yonExecutable
@@ -654,8 +643,251 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  network-matrix:
+    needs: [quality, build]
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yonder-linux-x86_64
+          path: candidate
+      - name: Install namespace test tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes iproute2 iptables
+      - name: Run risk-based namespace and impairment matrix
+        shell: bash
+        run: |
+          mkdir stage
+          tar --extract --gzip --file candidate/yon-linux-x86_64.tar.gz --directory stage
+          tar --extract --gzip --file candidate/yon-relay-linux-x86_64.tar.gz --directory stage
+          chmod +x stage/yon stage/yon-relay
+          sudo bash .github/scripts/run-network-matrix.sh \
+            stage/yon stage/yon-relay | tee network-matrix.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yonder-network-matrix
+          path: network-matrix.txt
+          if-no-files-found: error
+          overwrite: true
+
+  performance-baseline:
+    needs: quality
+    name: Performance baseline ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - name: Run Criterion benchmarks
+        shell: bash
+        run: |
+          cargo bench --locked --all-features -p yon --bench opaque -- --noplot
+          cargo bench --locked --all-features -p yonder-core --bench core -- --noplot
+          cargo bench --locked --all-features -p yonder-net --bench path -- --noplot
+      - name: Build optimized product binaries for process samples
+        run: cargo build --locked --release -p yon -p yon-relay
+      - name: Run real Linux process terminal throughput gate
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p performance
+          cargo test --locked --release -p yon --test end_to_end \
+            process_terminal_throughput_baseline_uses_the_real_product_path \
+            -- --ignored --exact --nocapture 2>&1 \
+            | tee performance/process-throughput.txt
+      - name: Run real Windows process terminal throughput gate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force performance | Out-Null
+          cargo test --locked --release -p yon --test end_to_end process_terminal_throughput_baseline_uses_the_real_product_path -- --ignored --exact --nocapture 2>&1 |
+            Tee-Object -FilePath performance/process-throughput.txt
+          if ($LASTEXITCODE -ne 0) { throw "process throughput gate failed with exit code $LASTEXITCODE" }
+      - name: Create protected Windows resource-sampling directory
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/secure-directory
+        with:
+          path: ${{ runner.temp }}/yonder-performance-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Record Linux runner and process startup samples
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p performance
+          rustc -Vv > performance/rustc.txt
+          uname -a > performance/system.txt
+          lscpu > performance/cpu.txt
+          free --bytes > performance/memory.txt
+          printf 'ImageOS=%s\nImageVersion=%s\nRUNNER_ARCH=%s\n' \
+            "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "${RUNNER_ARCH:-unknown}" \
+            > performance/runner-image.txt
+          if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+            cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \
+              > performance/power-mode.txt
+          fi
+          printf 'binary,iteration,elapsed_ns\n' > performance/startup.csv
+          for binary in yon yon-relay; do
+            for iteration in $(seq 1 11); do
+              started="$(date +%s%N)"
+              "target/release/$binary" --version >/dev/null
+              elapsed="$(($(date +%s%N) - started))"
+              printf '%s,%s,%s\n' "$binary" "$iteration" "$elapsed" \
+                >> performance/startup.csv
+            done
+          done
+          sample_root="$(mktemp -d)"
+          chmod 700 "$sample_root"
+          relay="$(realpath target/release/yon-relay)"
+          "$relay" identity init --output "$sample_root/relay.key" >/dev/null
+          cat > "$sample_root/yon-relay.toml" <<'EOF'
+          identity = "relay.key"
+          listen = ["/ip4/127.0.0.1/tcp/0"]
+          external = ["/ip4/127.0.0.1/tcp/46001"]
+          EOF
+          (
+            cd "$sample_root"
+            exec "$relay" serve
+          ) >"$sample_root/stdout" 2>"$sample_root/stderr" &
+          relay_pid="$!"
+          deadline=$((SECONDS + 30))
+          while ! grep -q '^Relay PeerId:' "$sample_root/stdout"; do
+            if ! kill -0 "$relay_pid" 2>/dev/null || ((SECONDS >= deadline)); then
+              cat "$sample_root/stderr" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          sleep 2
+          read -r sampled_pid rss_kib cpu_percent thread_count \
+            < <(ps -o pid=,rss=,pcpu=,nlwp= -p "$relay_pid")
+          fd_count="$(find "/proc/$relay_pid/fd" -mindepth 1 -maxdepth 1 | wc -l)"
+          printf 'pid=%s\nrss_kib=%s\ncpu_percent=%s\nthread_count=%s\nfd_count=%s\n' \
+            "$sampled_pid" "$rss_kib" "$cpu_percent" "$thread_count" "$fd_count" \
+            > performance/relay-idle.txt
+          test "$rss_kib" -le 49152
+          test "$fd_count" -le 256
+          kill -INT "$relay_pid"
+          wait "$relay_pid"
+          rm -rf "$sample_root"
+          cp -R target/criterion performance/criterion
+      - name: Record Windows runner and process startup samples
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force performance | Out-Null
+          rustc -Vv | Set-Content -Encoding utf8 performance/rustc.txt
+          [System.Runtime.InteropServices.RuntimeInformation]::OSDescription |
+            Set-Content -Encoding utf8 performance/system.txt
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
+            ConvertTo-Json | Set-Content -Encoding utf8 performance/cpu.json
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object TotalPhysicalMemory |
+            ConvertTo-Json | Set-Content -Encoding utf8 performance/memory.json
+          [ordered]@{
+            ImageOS = $env:ImageOS
+            ImageVersion = $env:ImageVersion
+            RunnerArch = $env:RUNNER_ARCH
+          } | ConvertTo-Json | Set-Content -Encoding utf8 performance/runner-image.json
+          powercfg /GETACTIVESCHEME | Set-Content -Encoding utf8 performance/power-mode.txt
+          'binary,iteration,elapsed_ns' | Set-Content -Encoding ascii performance/startup.csv
+          foreach ($binary in @('yon', 'yon-relay')) {
+            foreach ($iteration in 1..11) {
+              $watch = [System.Diagnostics.Stopwatch]::StartNew()
+              & "target/release/$binary.exe" --version | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "$binary --version failed" }
+              $watch.Stop()
+              $nanoseconds = [Math]::Round(
+                $watch.ElapsedTicks * (1000000000.0 / [System.Diagnostics.Stopwatch]::Frequency)
+              )
+              "$binary,$iteration,$nanoseconds" |
+                Add-Content -Encoding ascii performance/startup.csv
+              }
+          }
+          $relay = (Resolve-Path target/release/yon-relay.exe).Path
+          $relayRoot = Join-Path $env:RUNNER_TEMP "yonder-performance-${{ github.run_id }}-${{ github.run_attempt }}"
+          & $relay identity init --output (Join-Path $relayRoot 'relay.key') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'relay identity initialization failed' }
+          @'
+          identity = "relay.key"
+          listen = ["/ip4/127.0.0.1/tcp/0"]
+          external = ["/ip4/127.0.0.1/tcp/46001"]
+          '@ | Set-Content -Encoding ascii (Join-Path $relayRoot 'yon-relay.toml')
+          $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+          $startInfo.FileName = $relay
+          $startInfo.Arguments = 'serve'
+          $startInfo.WorkingDirectory = $relayRoot
+          $startInfo.UseShellExecute = $false
+          $startInfo.CreateNoWindow = $true
+          $startInfo.RedirectStandardOutput = $true
+          $startInfo.RedirectStandardError = $true
+          $relayProcess = [System.Diagnostics.Process]::new()
+          $relayProcess.StartInfo = $startInfo
+          if (-not $relayProcess.Start()) { throw 'relay process did not start' }
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+              $line = $relayProcess.StandardOutput.ReadLineAsync()
+              if (-not $line.Wait($remaining)) { throw 'relay readiness timed out' }
+              if ($relayProcess.HasExited -and $null -eq $line.Result) {
+                $diagnostics = $relayProcess.StandardError.ReadToEnd()
+                throw "relay exited during resource sampling: $diagnostics"
+              }
+              $ready = $line.Result -match '^Relay PeerId:'
+            } while (-not $ready -and [DateTime]::UtcNow -lt $deadline)
+            if (-not $ready) { throw 'relay readiness timed out' }
+            Start-Sleep -Seconds 2
+            $relayProcess.Refresh()
+            if ($relayProcess.WorkingSet64 -gt 48MB) {
+              throw "idle relay exceeded 48 MiB: $($relayProcess.WorkingSet64)"
+            }
+            if ($relayProcess.HandleCount -gt 256) {
+              throw "idle relay exceeded 256 handles: $($relayProcess.HandleCount)"
+            }
+            [ordered]@{
+              working_set_bytes = $relayProcess.WorkingSet64
+              private_memory_bytes = $relayProcess.PrivateMemorySize64
+              handle_count = $relayProcess.HandleCount
+              thread_count = $relayProcess.Threads.Count
+              cpu_seconds = $relayProcess.TotalProcessorTime.TotalSeconds
+            } | ConvertTo-Json | Set-Content -Encoding utf8 performance/relay-idle.json
+          } finally {
+            if (-not $relayProcess.HasExited) {
+              $relayProcess.Kill()
+              $relayProcess.WaitForExit()
+            }
+            $relayProcess.Dispose()
+            $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+            $resolvedRelayRoot = [IO.Path]::GetFullPath($relayRoot).TrimEnd('\') + '\'
+            if (-not $resolvedRelayRoot.StartsWith($runnerTemp, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "refusing to remove resource-sampling path outside RUNNER_TEMP: $resolvedRelayRoot"
+            }
+            Remove-Item -Recurse -Force $relayRoot
+          }
+          Copy-Item -Recurse target/criterion performance/criterion
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yonder-performance-${{ runner.os }}-${{ runner.arch }}
+          path: performance
+          if-no-files-found: error
+          overwrite: true
+
   release-candidate:
-    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, release-fuzz, build]
+    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, release-fuzz, build, network-matrix, performance-baseline]
     runs-on: ubuntu-latest
     permissions:
       contents: write

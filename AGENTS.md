@@ -21,6 +21,9 @@
 ## 依赖策略
 
 - 对已有成熟、流行且维护活跃的 crate 能可靠解决的问题，优先使用社区实现，尽量减少第一方手写代码；禁止重复实现成熟的算法、协议、解析器、数据结构、并发原语或平台抽象。
+- 社区资源必须“用好、用到位”，不能只完成形式上的引入：采用 crate 前必须读懂其职责边界、惯用模型、生命周期、取消/关闭/背压、错误和跨平台语义；采用后应让成熟抽象完整承担其擅长的能力，禁止在旁路重复手写同一核心逻辑、错误使用低层 API，或只包一层便宣称已经复用社区实现。
+- 借鉴成熟开源项目必须先理解其设计前提、不变量、状态与资源所有权、故障恢复、安全边界和平台适配，再把适用于 Yonder 的精髓映射到本项目经确认的 trait、类型与测试中。禁止脱离上下文照搬代码、只模仿表面结构、复制历史兼容负担，或以“参考过某项目”替代可执行验证。
+- 社区实现的存在不自动证明适合本项目。评审必须同时确认其能力覆盖是否完整、是否正确使用、是否与 Yonder 的协议和产品语义一致，以及剩余第一方代码是否确属产品特有的编排、不变量或边界适配；这些结论必须可由源码依据和测试证据审计。
 - 所有直接依赖默认必须选用经确认时的全局最新稳定版本。版本信息必须通过 crate 官方资料或 crates.io 核实，禁止凭记忆填写。
 - 如果已确认采用的最新稳定上层 crate 在公开 API 中绑定了不兼容的旧主版本，则允许直接依赖该兼容主版本的最新稳定补丁版。此例外必须逐项说明原因、证明无法直接使用全局最新版、确认不存在未解决的安全公告，并获得项目所有者明确批准；上游发布兼容稳定版本后必须立即重新评估。禁止借此使用任意旧版本或规避升级。
 - 每个直接依赖都必须显式设置 `default-features = false`，并仅显式开启实际需要且经过确认的 features。
@@ -240,11 +243,13 @@
 
 ## 最终审核补充决策
 
-- 已批准把直接依赖更新为当前稳定版 `futures 0.3.33`、`serde 1.0.229`、`thiserror 2.0.19`、`tokio 1.53.0`；各自继续禁用默认特性并保持冻结 feature 集不变。四者许可证与 MSRV 均兼容现有基线，升级后必须重跑完整依赖、安全、跨平台、性能和产物验证。
+- 已批准把直接依赖更新为当前稳定版 `futures 0.3.33`、`serde 1.0.229`、`thiserror 2.0.19`、`tokio 1.53.1`、`clap 4.6.4`；各自继续禁用默认特性并保持冻结 feature 集不变。许可证与 MSRV 均兼容现有基线，升级后必须重跑完整依赖、安全、跨平台、性能和产物验证。
 - 连接码位置参数必须在进入第一方所有权时立即放入可清除容器；Clap 只做无失败接收，领域解析在应用边界执行。任何无效连接码错误、Debug、日志或测试输出均不得包含原始位置参数；Clap 为满足其 `Clone` 边界所需的共享必须使用不复制秘密字节的共享所有权，并在移交领域解析时验证唯一所有权。
 - OPAQUE `ServerFinish` 完成后，host 网络 owner 必须先重验唯一连接并同步提交 `Authenticating -> AwaitingTerminal`，再发送和 flush `Authenticated`。确认阶段必须持续驱动 Swarm，并以有界 `PendingPair` 保存目标 PeerId 每类第一条 terminal 子流；禁止在确认 I/O 尚未结束时丢弃合法子流。确认 flush 后启动 `10s` terminal 绝对截止。
 - 产品 stdout 不得使用遇到 broken pipe 会 panic 的 `print!`/`println!`。连接码、relay identity 和 public external 地址必须通过可测试的 `Write` 边界写入、flush 并传播结构化 I/O 错误。连接码输出失败时必须尽力立即释放刚分配的 locator；relay stdout 只输出 `external + PeerId` 和 PeerId 行，listen 地址只进入诊断日志。
-- Unix `SHELL` 必须是无 NUL 的绝对路径并指向现存可执行普通文件，否则回退 `/bin/sh`；Windows `COMSPEC` 必须是指向现存普通文件的绝对路径，否则回退 `cmd.exe`。ConPTY 无法在不拆除 pseudoconsole 的前提下表达通用输入 EOF，因此 Windows 非交互脚本必须显式发送 shell 退出命令，不得用可能截断输出的伪 EOF 掩盖该平台边界。
+- shell 发现与启动必须完整采用 `portable-pty::CommandBuilder::new_default_prog()` 的跨平台语义，禁止第一方再实现一套路径校验或账户数据库查询。Unix 由上游优先采用可执行的 `SHELL`，否则查询当前账户数据库并按 login-shell 语义启动；Windows 由上游采用 `ComSpec`，缺失时回退 `cmd.exe`。ConPTY 无法在不拆除 pseudoconsole 的前提下表达通用输入 EOF，因此 Windows 非交互脚本必须显式发送 shell 退出命令，不得用可能截断输出的伪 EOF 掩盖该平台边界。
+- Unix PTY 与重定向到文件或管道的 controller stdout 保持任意字节透明；Windows 原生控制台 stdout 是 UTF-8 文本边界，无法写出的非 UTF-8 远端字节必须以替换字符稳定呈现并继续会话，不能让 Tokio 控制台写入失败终止连接。ANSI、Esc、方向键、Ctrl+C、resize 与其他终端控制序列在所有平台仍必须逐字节透传并有原生 PTY/ConPTY 回归证据。
 - Windows `PROGRAMDATA` 缺失、非 Unicode、为空或非绝对路径时继续 fail-closed；不为绕过系统层定位错误而猜目录或引入不安全 FFI。README 和产品契约必须明确此前置条件。
 - 仓库采用 `LICENSE-MIT` 与 `LICENSE-APACHE` 双许可证文本。已批准发布工具 `cargo-about 0.9.1`，仅启用 `cli`，用于生成独立 `THIRD-PARTY-LICENSES.html`；许可证资产必须纳入 checksum 和 provenance，但不得放入单二进制归档。
-- 在性能、资源、长时 fuzz、完整网络/恶意 relay、五目标覆盖率和六目标原生发布证据全部接入前，tag workflow 只允许生成并证明 release candidate artifact，不得自动创建正式 GitHub Release。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
+- 网络验证采用经批准的风险驱动成对矩阵：每种传输、关键 NAT/地址族拓扑、故障类别及 Direct/Relayed 结果都必须有真实代表组合和最终选路断言，不要求制造低价值的完整笛卡尔积。中继不可信行为通过端到端认证流的篡改/截断测试与真实网络延迟、丢包、乱序、断连和重置验证；禁止为注入中继内部明文钩子而 fork 或重写官方 `libp2p-relay`。
+- tag workflow 只有在性能、资源、长时 fuzz、风险驱动网络与故障矩阵、五目标覆盖率和六目标原生发布证据全部通过后才允许自动创建正式 GitHub Release。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。

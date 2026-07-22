@@ -29,6 +29,11 @@ const CLAIM_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_ENVIRONMENT_VALUE: &str = "inherited-by-remote-shell";
 #[cfg(any(unix, windows))]
 const CONTROLLER_LOG_SENTINEL: &[u8] = b"YON_E2E_LOG_SENTINEL\n";
+#[cfg(any(unix, windows))]
+const PERFORMANCE_PAYLOAD_RECORD: &[u8; 64] =
+    b"YONDER-PAYLOAD-0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\n";
+#[cfg(any(unix, windows))]
+const PERFORMANCE_PAYLOAD_RECORD_COUNT: usize = 128 * 1024;
 const TEST_WSS_CA_DER: &[u8] = include_bytes!("fixtures/localhost-test-ca.der");
 const TEST_WSS_CERT_DER: &[u8] = include_bytes!("fixtures/localhost-test-cert.der");
 const TEST_WSS_KEY_DER: &[u8] = include_bytes!("fixtures/localhost-test-key.der");
@@ -109,6 +114,106 @@ fn three_process_terminal_session_executes_a_real_shell() -> Result<(), std::io:
 
     outcome?;
     relay_result
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+#[ignore = "release process performance gate"]
+fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(), std::io::Error> {
+    const PAYLOAD_LEN: usize = PERFORMANCE_PAYLOAD_RECORD.len() * PERFORMANCE_PAYLOAD_RECORD_COUNT;
+    const SAMPLE_COUNT: usize = 10;
+    const MIN_REMOTE_BYTES_PER_SECOND: f64 = 1024.0 * 1024.0;
+    const MIN_REMOTE_TO_LOCAL_PTY_RATIO: f64 = 0.70;
+    let port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let relay_process = RelayProcess::start(identity, port)?;
+    wait_for_tcp_listener(port)?;
+    let config = EndpointConfigDirectory::new(&format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}"))?;
+    let payload = config.path().join("throughput.bin");
+    std::fs::write(
+        &payload,
+        PERFORMANCE_PAYLOAD_RECORD.repeat(PERFORMANCE_PAYLOAD_RECORD_COUNT),
+    )?;
+    let outcome = (|| {
+        let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+        for sample_index in 1..=SAMPLE_COUNT {
+            let direct = measure_direct_file_output(&payload)?;
+            let local_pty = measure_local_pty_file_output(&payload)?;
+            let host = HostProcess::start(&config)?;
+            let session = (|| {
+                let code = receive_code(&host.lines)?;
+                run_controller_session_with_script(
+                    &config,
+                    &code,
+                    CodeInput::Stdin,
+                    throughput_command_script(),
+                )
+            })();
+            let host_result = if session.is_ok() {
+                host.finish()
+            } else {
+                host.terminate();
+                Ok(())
+            };
+            let remote = session?;
+            host_result?;
+
+            let direct_records = count_performance_payload_records(&direct.bytes);
+            let local_pty_records = count_performance_payload_records(&local_pty.bytes);
+            if direct_records != PERFORMANCE_PAYLOAD_RECORD_COUNT
+                || local_pty_records != PERFORMANCE_PAYLOAD_RECORD_COUNT
+                || remote.payload_record_count != PERFORMANCE_PAYLOAD_RECORD_COUNT
+            {
+                return Err(std::io::Error::other(format!(
+                    "throughput payload record count differed from {PERFORMANCE_PAYLOAD_RECORD_COUNT}: direct={direct_records} local_pty={local_pty_records} remote={}",
+                    remote.payload_record_count,
+                )));
+            }
+            let sample = ThroughputSample {
+                direct_bytes_per_second: throughput(PAYLOAD_LEN, direct.active)?,
+                local_pty_bytes_per_second: throughput(PAYLOAD_LEN, local_pty.active)?,
+                remote_bytes_per_second: throughput(PAYLOAD_LEN, remote.transfer_duration)?,
+            };
+            println!(
+                "YONDER_PERFORMANCE_SAMPLE sample={sample_index}/{SAMPLE_COUNT} payload_bytes={PAYLOAD_LEN} direct_active_ns={} local_pty_active_ns={} remote_active_ns={} direct_bytes_per_second={:.0} local_pty_bytes_per_second={:.0} remote_bytes_per_second={:.0} remote_to_local_pty_ratio={:.6}",
+                direct.active.as_nanos(),
+                local_pty.active.as_nanos(),
+                remote.transfer_duration.as_nanos(),
+                sample.direct_bytes_per_second,
+                sample.local_pty_bytes_per_second,
+                sample.remote_bytes_per_second,
+                sample.remote_to_local_pty_ratio(),
+            );
+            samples.push(sample);
+        }
+        Ok::<_, std::io::Error>(samples)
+    })();
+    let relay_result = relay_process.stop();
+    let samples = outcome?;
+    relay_result?;
+    let direct = median(samples.iter().map(|sample| sample.direct_bytes_per_second));
+    let local_pty = median(
+        samples
+            .iter()
+            .map(|sample| sample.local_pty_bytes_per_second),
+    );
+    let remote = median(samples.iter().map(|sample| sample.remote_bytes_per_second));
+    let ratio = median(
+        samples
+            .iter()
+            .map(ThroughputSample::remote_to_local_pty_ratio),
+    );
+    println!(
+        "YONDER_PERFORMANCE_MEDIAN samples={SAMPLE_COUNT} payload_bytes={PAYLOAD_LEN} direct_bytes_per_second={direct:.0} local_pty_bytes_per_second={local_pty:.0} remote_bytes_per_second={remote:.0} remote_to_local_pty_ratio={ratio:.6}",
+    );
+    if remote < MIN_REMOTE_BYTES_PER_SECOND || ratio < MIN_REMOTE_TO_LOCAL_PTY_RATIO {
+        return Err(std::io::Error::other(format!(
+            "terminal throughput gate failed: remote={remote:.0}B/s ratio={ratio:.6} minimum_remote={MIN_REMOTE_BYTES_PER_SECOND:.0}B/s minimum_ratio={MIN_REMOTE_TO_LOCAL_PTY_RATIO:.2}",
+        )));
+    }
+    Ok(())
 }
 
 #[test]
@@ -1589,16 +1694,22 @@ fn wait_for_bytes(
     let deadline = Instant::now() + timeout;
     while !contains_bytes(output, expected) {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let chunk = chunks.recv_timeout(remaining).map_err(|error| {
-            const DIAGNOSTIC_TAIL_LIMIT: usize = 4 * 1024;
-            let tail_start = output.len().saturating_sub(DIAGNOSTIC_TAIL_LIMIT);
-            std::io::Error::other(format!(
-                "timed out waiting for {:?}: {error}; terminal output tail: {:?}",
-                String::from_utf8_lossy(expected),
-                String::from_utf8_lossy(&output[tail_start..]),
-            ))
-        })?;
-        output.extend_from_slice(&chunk);
+        match chunks.recv_timeout(remaining) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(error) => {
+                output.extend(chunks.try_iter().flatten());
+                if contains_bytes(output, expected) {
+                    return Ok(());
+                }
+                const DIAGNOSTIC_TAIL_LIMIT: usize = 4 * 1024;
+                let tail_start = output.len().saturating_sub(DIAGNOSTIC_TAIL_LIMIT);
+                return Err(std::io::Error::other(format!(
+                    "timed out waiting for {:?}: {error}; terminal output tail: {:?}",
+                    String::from_utf8_lossy(expected),
+                    String::from_utf8_lossy(&output[tail_start..]),
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1828,6 +1939,15 @@ fn run_controller_session(
     code: &str,
     code_input: CodeInput,
 ) -> Result<ControllerEvidence, std::io::Error> {
+    run_controller_session_with_script(config, code, code_input, command_script())
+}
+
+fn run_controller_session_with_script(
+    config: &EndpointConfigDirectory,
+    code: &str,
+    code_input: CodeInput,
+    script: &[u8],
+) -> Result<ControllerEvidence, std::io::Error> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_yon"));
     command
         .args(["--log-level", "debug", "connect"])
@@ -1843,17 +1963,22 @@ fn run_controller_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut input = Vec::with_capacity(code.len() + command_script().len() + 1);
+    let mut input = Vec::with_capacity(code.len() + script.len() + 1);
     if matches!(code_input, CodeInput::Stdin) {
         input.extend_from_slice(code.as_bytes());
         input.push(b'\n');
     }
-    input.extend_from_slice(command_script());
-    controller
+    input.extend_from_slice(script);
+    let input_result = controller
         .stdin
         .take()
-        .ok_or_else(|| std::io::Error::other("controller stdin was not piped"))?
-        .write_all(&input)?;
+        .ok_or_else(|| std::io::Error::other("controller stdin was not piped"))
+        .and_then(|mut stdin| stdin.write_all(&input));
+    if let Err(error) = input_result {
+        let _ = controller.kill();
+        let _ = controller.wait();
+        return Err(error);
+    }
     let stdout = controller
         .stdout
         .take()
@@ -1862,12 +1987,7 @@ fn run_controller_session(
         .stderr
         .take()
         .ok_or_else(|| std::io::Error::other("controller stderr was not piped"))?;
-    let output_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        BufReader::new(stdout)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
+    let output_reader = thread::spawn(move || read_to_end_timed(BufReader::new(stdout)));
     let diagnostic_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
         BufReader::new(stderr)
@@ -1875,27 +1995,31 @@ fn run_controller_session(
             .map(|_| bytes)
     });
     let status = match wait_for_exit(&mut controller, SESSION_TIMEOUT) {
-        Ok(status) => status,
+        Ok(status) => Ok(status),
         Err(error) => {
             let _ = controller.kill();
             let _ = controller.wait();
-            return Err(error);
+            Err(error)
         }
     };
-    let output = output_reader
+    let timed_output = output_reader
         .join()
-        .map_err(|_| std::io::Error::other("controller output reader panicked"))??;
+        .map_err(|_| std::io::Error::other("controller output reader panicked"));
     let diagnostics = diagnostic_reader
         .join()
-        .map_err(|_| std::io::Error::other("controller diagnostic reader panicked"))??;
+        .map_err(|_| std::io::Error::other("controller diagnostic reader panicked"));
+    let status = status?;
+    let timed_output = timed_output??;
+    let diagnostics = diagnostics??;
     if !status.success() {
         return Err(std::io::Error::other(format!(
             "controller exited unsuccessfully: {status}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(&timed_output.bytes),
             String::from_utf8_lossy(&diagnostics),
         )));
     }
-    let output = String::from_utf8_lossy(&output);
+    let payload_record_count = count_performance_payload_records(&timed_output.bytes);
+    let output = String::from_utf8_lossy(&timed_output.bytes);
     if output.matches("YON_E2E").count() < 2 {
         return Err(std::io::Error::other(format!(
             "remote shell did not execute the marker command: {output:?}"
@@ -1922,6 +2046,8 @@ fn run_controller_session(
         }
     }
     Ok(ControllerEvidence {
+        payload_record_count,
+        transfer_duration: timed_output.active,
         #[cfg(yonder_e2e_rebuild)]
         diagnostics,
     })
@@ -1995,8 +2121,163 @@ fn run_rejected_host(config: &EndpointConfigDirectory) -> Result<(), std::io::Er
 }
 
 struct ControllerEvidence {
+    payload_record_count: usize,
+    transfer_duration: Duration,
     #[cfg(yonder_e2e_rebuild)]
     diagnostics: Vec<u8>,
+}
+
+struct TimedOutput {
+    bytes: Vec<u8>,
+    active: Duration,
+}
+
+struct ThroughputSample {
+    direct_bytes_per_second: f64,
+    local_pty_bytes_per_second: f64,
+    remote_bytes_per_second: f64,
+}
+
+impl ThroughputSample {
+    fn remote_to_local_pty_ratio(&self) -> f64 {
+        self.remote_bytes_per_second / self.local_pty_bytes_per_second
+    }
+}
+
+fn median(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable_by(f64::total_cmp);
+    let midpoint = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[midpoint - 1] + values[midpoint]) / 2.0
+    } else {
+        values[midpoint]
+    }
+}
+
+fn read_to_end_timed(mut reader: impl std::io::Read) -> Result<TimedOutput, std::io::Error> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut first = None;
+    let mut last = None;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let observed = Instant::now();
+        first.get_or_insert(observed);
+        last = Some(observed);
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    let active = first
+        .zip(last)
+        .map_or(Duration::ZERO, |(first, last)| last.duration_since(first));
+    Ok(TimedOutput { bytes, active })
+}
+
+fn throughput(bytes: usize, duration: Duration) -> Result<f64, std::io::Error> {
+    if duration.is_zero() {
+        return Err(std::io::Error::other(
+            "throughput interval was below the monotonic clock resolution",
+        ));
+    }
+    Ok(bytes as f64 / duration.as_secs_f64())
+}
+
+#[cfg(any(unix, windows))]
+fn count_performance_payload_records(bytes: &[u8]) -> usize {
+    let record_body = &PERFORMANCE_PAYLOAD_RECORD[..PERFORMANCE_PAYLOAD_RECORD.len() - 1];
+    bytes
+        .windows(record_body.len())
+        .filter(|window| *window == record_body)
+        .count()
+}
+
+fn measure_direct_file_output(path: &Path) -> Result<TimedOutput, std::io::Error> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/Q", "/C", "type throughput.bin"]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("cat");
+        command.arg("throughput.bin");
+        command
+    };
+    let mut child = command
+        .current_dir(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("throughput path has no parent"))?,
+        )
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let output = read_to_end_timed(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("direct stdout was not piped"))?,
+    );
+    let status = child.wait()?;
+    let output = output?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "direct output command failed: {status}"
+        )));
+    }
+    Ok(output)
+}
+
+#[cfg(any(unix, windows))]
+fn measure_local_pty_file_output(path: &Path) -> Result<TimedOutput, std::io::Error> {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(std::io::Error::other)?;
+    let mut command = CommandBuilder::new_default_prog();
+    command.cwd(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("throughput path has no parent"))?,
+    );
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(std::io::Error::other)?;
+    let mut writer = pair.master.take_writer().map_err(std::io::Error::other)?;
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(std::io::Error::other)?;
+    drop(pair.slave);
+    let reader = thread::spawn(move || read_to_end_timed(reader));
+    let outcome = (|| {
+        writer.write_all(local_pty_throughput_command_script())?;
+        writer.flush()?;
+        wait_for_pty_exit(child.as_mut(), SESSION_TIMEOUT)
+    })();
+    if outcome.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop(writer);
+    drop(pair.master);
+    let output = reader
+        .join()
+        .map_err(|_| std::io::Error::other("local PTY output reader panicked"));
+    let exit_code = outcome?;
+    let output = output??;
+    if exit_code != 0 {
+        return Err(std::io::Error::other(format!(
+            "local PTY output command failed with exit code {exit_code}"
+        )));
+    }
+    Ok(output)
 }
 
 #[cfg(yonder_e2e_rebuild)]
@@ -2169,7 +2450,27 @@ fn command_script() -> &'static [u8] {
     b"\x1b[1;1R\r\necho YON_E2E\r\nexit\r\n"
 }
 
+#[cfg(windows)]
+fn throughput_command_script() -> &'static [u8] {
+    b"\x1b[1;1R\r\ntype throughput.bin\r\necho YON_E2E_PERFORMANCE\r\nexit\r\n"
+}
+
+#[cfg(windows)]
+fn local_pty_throughput_command_script() -> &'static [u8] {
+    b"\x1b[1;1R\r\ntype throughput.bin\r\nexit\r\n"
+}
+
 #[cfg(not(windows))]
 fn command_script() -> &'static [u8] {
     b"echo YON_E2E\nexit\n"
+}
+
+#[cfg(not(windows))]
+fn throughput_command_script() -> &'static [u8] {
+    b"cat throughput.bin\necho YON_E2E_PERFORMANCE\nexit\n"
+}
+
+#[cfg(not(windows))]
+fn local_pty_throughput_command_script() -> &'static [u8] {
+    b"cat throughput.bin\nexit\n"
 }

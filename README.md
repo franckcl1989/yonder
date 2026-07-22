@@ -122,4 +122,4 @@ cargo +nightly fuzz run network_address --features network-address
 | macOS Intel | `x86_64-apple-darwin` | 单 Mach-O，仅链接系统 `libSystem`/framework |
 | macOS Apple Silicon | `aarch64-apple-darwin` | 单 Mach-O，仅链接系统 `libSystem`/framework |
 
-macOS 不支持把 Apple 系统库静态链接进第三方程序，因此其产物是无需附带额外文件的单二进制，但不是字面意义上的全静态 Mach-O。推送 `v0.1.0` 形式的 tag 会在六个原生 runner 上构建并验证 release candidate，汇总 `yon`、`yon-relay`、SBOM、项目双许可证、第三方许可证清单、SHA-256、锁文件和构建来源证明。完整压力、网络和固定 runner 性能证据尚未接入自动门禁前，workflow 不会自动创建正式 GitHub Release。
+macOS 不支持把 Apple 系统库静态链接进第三方程序，因此其产物是无需附带额外文件的单二进制，但不是字面意义上的全静态 Mach-O。推送 `v0.1.0` 形式的 tag 会在六个原生 runner 上构建并验证 release candidate，同时等待长时 fuzz、风险驱动的真实网络/故障矩阵、Windows/Linux 原生性能与资源证据、覆盖率和安全门禁，最后汇总 `yon`、`yon-relay`、SBOM、项目双许可证、第三方许可证清单、SHA-256、锁文件和构建来源证明。任一门禁失败都不会创建正式 GitHub Release。

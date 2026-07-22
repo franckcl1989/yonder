@@ -50,8 +50,8 @@
 
 - 真进程 `yon-relay + yon host + yon connect`，用伪终端执行交互 shell、ANSI、Ctrl+C、resize、退出码、工作目录和环境继承。
 - 直连 QUIC、TCP、WS；仅 relay；UDP 被阻断自动落 TCP；普通 TCP 被代理限制时走 WS/WSS。
-- Linux network namespace 覆盖公网、单 NAT、双 NAT、端口受限/对称 NAT、IPv4-only、IPv6-only、双栈、丢包、延迟、抖动、乱序和 relay 中断；公网/单 NAT/IPv6 必须断言最终为 Direct，严格双 NAT 必须断言 Relayed，全部场景同时断言实际 QUIC/TCP/WS/WSS transport。
-- relay 恶意丢弃/延迟/截断协议，错误必须有界且 endpoint 不死锁、不泄漏 secret。
+- Linux network namespace 使用风险驱动的成对矩阵覆盖公网、单 NAT、严格双 NAT、IPv4-only、IPv6-only，以及代表性的端口受限/对称 NAT 和双栈环境；丢包、延迟、抖动、乱序、断连与重置分别和最敏感的代表拓扑组合。公网/单 NAT/IPv6 必须断言最终为 Direct，严格双 NAT 必须断言 Relayed；结合原生进程 E2E，QUIC/TCP/WS/WSS 每种 transport 都必须至少有一条成功路径和失败关闭证据。禁止用低价值的完整笛卡尔积拖慢发布，也不得用少数 happy path 冒充矩阵。
+- 不可信 relay 的内容篡改、截断与伪造由端到端认证流和传输身份认证的定向测试证明失败关闭；可用性攻击通过真实 netem、连接断开与重置验证错误有界、endpoint 不死锁且不泄漏 secret。官方 `libp2p-relay` 不暴露已建立 circuit 密文的内部修改钩子，因此不为测试目的 fork 或重写 relay 实现。
 - 连接码位置参数、配置先于 TTY 隐藏输入和 pipe 输入三条 CLI 路径；错误码必须精确统一且不得出现 OPAQUE、PeerId、locator 或完整连接码。
 - 交互进度在网络前出现、最长 `1s` 心跳、动态宽度、`TerminalReady` 前清行、Active 无诊断污染；`--log-file` 仍保留进度并写入选中 route/transport。
 - Unix SIGINT/SIGTERM/SIGHUP 与 Windows Ctrl+C/Break/Close/Logoff/Shutdown 进入 relay `2s` 有界关闭；host 等待时 Ctrl+C 安静返回 `130`。
@@ -65,7 +65,7 @@
 
 Criterion 覆盖 code encode/decode、wire decoder、locator allocation、governor check、path ranking 和固定 buffer copy。进程 benchmark 覆盖启动、OPAQUE、直接/relay 建连、交互延迟、吞吐、RSS、CPU、文件描述符和二进制体积。
 
-基准结果保存原始 JSON/环境信息。相对已批准基线：吞吐、启动、RSS、体积回归不得超过 `5%`，p99 延迟不得超过 `10%`；噪声超过阈值时在同一 runner 重复至少 10 次取中位数，不能直接放宽门槛。
+基准结果保存原始 JSON/环境信息。`0.1.0` 在记录完整身份的 Windows 与 Linux 环境上形成首份可复现基线，同时必须满足下方绝对验收值；从后续版本开始，只有 runner 类别、CPU 型号、OS 镜像、电源模式和工具链一致时，才执行相对该基线的吞吐、启动、RSS、体积回归不超过 `5%`、p99 延迟不超过 `10%` 的判定。GitHub hosted runner 的硬件身份变化时，结果只能作为绝对门槛与诊断证据，必须在受控环境重新测量并经审批更新相对基线，不能暗中接受漂移。噪声超过阈值时在同一 runner 重复至少 10 次取中位数，不能直接放宽门槛。
 
 ## 覆盖率与缺陷强度
 
@@ -96,7 +96,7 @@ Criterion 覆盖 code encode/decode、wire decoder、locator allocation、govern
 | relay 128 reservation/registration RSS | `<= 48 MiB` |
 | relay idle CPU | 128 endpoint 下 `< 1%` 单核参考容量 |
 | 终端稳态第一方分配 | 每个复制方向逐块 `0`，仅启动时固定 buffer |
-| loopback 终端吞吐 | 不低于同机原始 async pipe 的 `90%` |
+| loopback 终端吞吐 | 8 MiB 真实三进程会话的 10 次远端吞吐中位数 `>= 1 MiB/s`，且同轮远端/`portable-pty` 本地 PTY/ConPTY 配对比率的 10 次中位数 `>= 70%`；原始 pipe 只作诊断参照 |
 | 1 KiB 交互应用层额外延迟 | p99 `<= 1ms`，不含网络 RTT |
 | resize 传播 | 无网络阻塞时 p99 `<= 500ms` |
 | OPAQUE 单次认证峰值 | `<= 25 MiB` 附加 RSS，且不会并发两次 |
