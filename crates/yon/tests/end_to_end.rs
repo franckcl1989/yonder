@@ -30,10 +30,18 @@ const HOST_ENVIRONMENT_VALUE: &str = "inherited-by-remote-shell";
 #[cfg(any(unix, windows))]
 const CONTROLLER_LOG_SENTINEL: &[u8] = b"YON_E2E_LOG_SENTINEL\n";
 #[cfg(any(unix, windows))]
-const PERFORMANCE_PAYLOAD_RECORD: &[u8; 64] =
-    b"YONDER-PAYLOAD-0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\n";
+const PERFORMANCE_PAYLOAD_BYTE: u8 = b'~';
 #[cfg(any(unix, windows))]
-const PERFORMANCE_PAYLOAD_RECORD_COUNT: usize = 128 * 1024;
+const PERFORMANCE_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
+#[cfg(any(unix, windows))]
+const PERFORMANCE_PAYLOAD_LINE_LEN: usize = 64;
+#[cfg(any(unix, windows))]
+const PERFORMANCE_PAYLOAD_BYTE_COUNT: usize =
+    PERFORMANCE_PAYLOAD_LEN - (PERFORMANCE_PAYLOAD_LEN / PERFORMANCE_PAYLOAD_LINE_LEN);
+#[cfg(any(unix, windows))]
+const PERFORMANCE_PAYLOAD_BEGIN: &[u8] = b"YON_E2E_PERFORMANCE_BEGIN";
+#[cfg(any(unix, windows))]
+const PERFORMANCE_PAYLOAD_END: &[u8] = b"YON_E2E_PERFORMANCE_END";
 const TEST_WSS_CA_DER: &[u8] = include_bytes!("fixtures/localhost-test-ca.der");
 const TEST_WSS_CERT_DER: &[u8] = include_bytes!("fixtures/localhost-test-cert.der");
 const TEST_WSS_KEY_DER: &[u8] = include_bytes!("fixtures/localhost-test-key.der");
@@ -120,7 +128,6 @@ fn three_process_terminal_session_executes_a_real_shell() -> Result<(), std::io:
 #[test]
 #[ignore = "release process performance gate"]
 fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(), std::io::Error> {
-    const PAYLOAD_LEN: usize = PERFORMANCE_PAYLOAD_RECORD.len() * PERFORMANCE_PAYLOAD_RECORD_COUNT;
     const SAMPLE_COUNT: usize = 10;
     const MIN_REMOTE_BYTES_PER_SECOND: f64 = 1024.0 * 1024.0;
     const MIN_REMOTE_TO_LOCAL_PTY_RATIO: f64 = 0.70;
@@ -132,10 +139,15 @@ fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(
     wait_for_tcp_listener(port)?;
     let config = EndpointConfigDirectory::new(&format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}"))?;
     let payload = config.path().join("throughput.bin");
-    std::fs::write(
-        &payload,
-        PERFORMANCE_PAYLOAD_RECORD.repeat(PERFORMANCE_PAYLOAD_RECORD_COUNT),
-    )?;
+    let mut payload_bytes = vec![PERFORMANCE_PAYLOAD_BYTE; PERFORMANCE_PAYLOAD_LEN];
+    for line_break in payload_bytes
+        .iter_mut()
+        .skip(PERFORMANCE_PAYLOAD_LINE_LEN - 1)
+        .step_by(PERFORMANCE_PAYLOAD_LINE_LEN)
+    {
+        *line_break = b'\n';
+    }
+    std::fs::write(&payload, payload_bytes)?;
     let outcome = (|| {
         let mut samples = Vec::with_capacity(SAMPLE_COUNT);
         for sample_index in 1..=SAMPLE_COUNT {
@@ -160,24 +172,34 @@ fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(
             let remote = session?;
             host_result?;
 
-            let direct_records = count_performance_payload_records(&direct.bytes);
-            let local_pty_records = count_performance_payload_records(&local_pty.bytes);
-            if direct_records != PERFORMANCE_PAYLOAD_RECORD_COUNT
-                || local_pty_records != PERFORMANCE_PAYLOAD_RECORD_COUNT
-                || remote.payload_record_count != PERFORMANCE_PAYLOAD_RECORD_COUNT
+            let direct_payload_bytes = direct
+                .bytes
+                .iter()
+                .filter(|byte| **byte == PERFORMANCE_PAYLOAD_BYTE)
+                .count();
+            let local_pty_payload_bytes = framed_performance_payload_bytes(&local_pty.bytes)
+                .ok_or_else(|| std::io::Error::other("local PTY payload framing was missing"))?;
+            let remote_payload_bytes = remote
+                .payload_bytes
+                .ok_or_else(|| std::io::Error::other("remote payload framing was missing"))?;
+            if direct_payload_bytes != PERFORMANCE_PAYLOAD_BYTE_COUNT
+                || local_pty_payload_bytes != PERFORMANCE_PAYLOAD_BYTE_COUNT
+                || remote_payload_bytes != PERFORMANCE_PAYLOAD_BYTE_COUNT
             {
                 return Err(std::io::Error::other(format!(
-                    "throughput payload record count differed from {PERFORMANCE_PAYLOAD_RECORD_COUNT}: direct={direct_records} local_pty={local_pty_records} remote={}",
-                    remote.payload_record_count,
+                    "throughput payload byte count differed from {PERFORMANCE_PAYLOAD_BYTE_COUNT}: direct={direct_payload_bytes} local_pty={local_pty_payload_bytes} remote={remote_payload_bytes}",
                 )));
             }
             let sample = ThroughputSample {
-                direct_bytes_per_second: throughput(PAYLOAD_LEN, direct.active)?,
-                local_pty_bytes_per_second: throughput(PAYLOAD_LEN, local_pty.active)?,
-                remote_bytes_per_second: throughput(PAYLOAD_LEN, remote.transfer_duration)?,
+                direct_bytes_per_second: throughput(PERFORMANCE_PAYLOAD_LEN, direct.active)?,
+                local_pty_bytes_per_second: throughput(PERFORMANCE_PAYLOAD_LEN, local_pty.active)?,
+                remote_bytes_per_second: throughput(
+                    PERFORMANCE_PAYLOAD_LEN,
+                    remote.transfer_duration,
+                )?,
             };
             println!(
-                "YONDER_PERFORMANCE_SAMPLE sample={sample_index}/{SAMPLE_COUNT} payload_bytes={PAYLOAD_LEN} direct_active_ns={} local_pty_active_ns={} remote_active_ns={} direct_bytes_per_second={:.0} local_pty_bytes_per_second={:.0} remote_bytes_per_second={:.0} remote_to_local_pty_ratio={:.6}",
+                "YONDER_PERFORMANCE_SAMPLE sample={sample_index}/{SAMPLE_COUNT} payload_bytes={PERFORMANCE_PAYLOAD_LEN} direct_active_ns={} local_pty_active_ns={} remote_active_ns={} direct_bytes_per_second={:.0} local_pty_bytes_per_second={:.0} remote_bytes_per_second={:.0} remote_to_local_pty_ratio={:.6}",
                 direct.active.as_nanos(),
                 local_pty.active.as_nanos(),
                 remote.transfer_duration.as_nanos(),
@@ -206,7 +228,7 @@ fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(
             .map(ThroughputSample::remote_to_local_pty_ratio),
     );
     println!(
-        "YONDER_PERFORMANCE_MEDIAN samples={SAMPLE_COUNT} payload_bytes={PAYLOAD_LEN} direct_bytes_per_second={direct:.0} local_pty_bytes_per_second={local_pty:.0} remote_bytes_per_second={remote:.0} remote_to_local_pty_ratio={ratio:.6}",
+        "YONDER_PERFORMANCE_MEDIAN samples={SAMPLE_COUNT} payload_bytes={PERFORMANCE_PAYLOAD_LEN} direct_bytes_per_second={direct:.0} local_pty_bytes_per_second={local_pty:.0} remote_bytes_per_second={remote:.0} remote_to_local_pty_ratio={ratio:.6}",
     );
     if remote < MIN_REMOTE_BYTES_PER_SECOND || ratio < MIN_REMOTE_TO_LOCAL_PTY_RATIO {
         return Err(std::io::Error::other(format!(
@@ -2018,7 +2040,7 @@ fn run_controller_session_with_script(
             String::from_utf8_lossy(&diagnostics),
         )));
     }
-    let payload_record_count = count_performance_payload_records(&timed_output.bytes);
+    let payload_bytes = framed_performance_payload_bytes(&timed_output.bytes);
     let output = String::from_utf8_lossy(&timed_output.bytes);
     if output.matches("YON_E2E").count() < 2 {
         return Err(std::io::Error::other(format!(
@@ -2046,7 +2068,7 @@ fn run_controller_session_with_script(
         }
     }
     Ok(ControllerEvidence {
-        payload_record_count,
+        payload_bytes,
         transfer_duration: timed_output.active,
         #[cfg(yonder_e2e_rebuild)]
         diagnostics,
@@ -2121,7 +2143,7 @@ fn run_rejected_host(config: &EndpointConfigDirectory) -> Result<(), std::io::Er
 }
 
 struct ControllerEvidence {
-    payload_record_count: usize,
+    payload_bytes: Option<usize>,
     transfer_duration: Duration,
     #[cfg(yonder_e2e_rebuild)]
     diagnostics: Vec<u8>,
@@ -2186,12 +2208,40 @@ fn throughput(bytes: usize, duration: Duration) -> Result<f64, std::io::Error> {
 }
 
 #[cfg(any(unix, windows))]
-fn count_performance_payload_records(bytes: &[u8]) -> usize {
-    let record_body = &PERFORMANCE_PAYLOAD_RECORD[..PERFORMANCE_PAYLOAD_RECORD.len() - 1];
+fn framed_performance_payload_bytes(bytes: &[u8]) -> Option<usize> {
     bytes
-        .windows(record_body.len())
-        .filter(|window| *window == record_body)
-        .count()
+        .windows(PERFORMANCE_PAYLOAD_BEGIN.len())
+        .enumerate()
+        .filter_map(|(begin, window)| {
+            if window != PERFORMANCE_PAYLOAD_BEGIN {
+                return None;
+            }
+            let payload = &bytes[begin + PERFORMANCE_PAYLOAD_BEGIN.len()..];
+            payload
+                .windows(PERFORMANCE_PAYLOAD_END.len())
+                .enumerate()
+                .filter(|(_, candidate)| *candidate == PERFORMANCE_PAYLOAD_END)
+                .map(|(end, _)| {
+                    payload[..end]
+                        .iter()
+                        .filter(|byte| **byte == PERFORMANCE_PAYLOAD_BYTE)
+                        .count()
+                })
+                .max()
+        })
+        .max()
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn performance_payload_framing_ignores_a_later_empty_command_echo() {
+    let output = b"YON_E2E_PERFORMANCE_BEGIN~~~YON_E2E_PERFORMANCE_END\
+        YON_E2E_PERFORMANCE_BEGINYON_E2E_PERFORMANCE_END";
+    let interleaved = b"YON_E2E_PERFORMANCE_BEGIN~~YON_E2E_PERFORMANCE_END\
+        ~~~~YON_E2E_PERFORMANCE_END";
+
+    assert_eq!(framed_performance_payload_bytes(output), Some(3));
+    assert_eq!(framed_performance_payload_bytes(interleaved), Some(6));
 }
 
 fn measure_direct_file_output(path: &Path) -> Result<TimedOutput, std::io::Error> {
@@ -2452,12 +2502,12 @@ fn command_script() -> &'static [u8] {
 
 #[cfg(windows)]
 fn throughput_command_script() -> &'static [u8] {
-    b"\x1b[1;1R\r\ntype throughput.bin\r\necho YON_E2E_PERFORMANCE\r\nexit\r\n"
+    b"\x1b[1;1R\r\ncmd.exe /D /Q /C \"(echo YON_E2E_PERFORMANCE_BEGIN&type throughput.bin&echo YON_E2E_PERFORMANCE_END)\"\r\nexit\r\n"
 }
 
 #[cfg(windows)]
 fn local_pty_throughput_command_script() -> &'static [u8] {
-    b"\x1b[1;1R\r\ntype throughput.bin\r\nexit\r\n"
+    b"\x1b[1;1R\r\ncmd.exe /D /Q /C \"(echo YON_E2E_PERFORMANCE_BEGIN&type throughput.bin&echo YON_E2E_PERFORMANCE_END)\"\r\nexit\r\n"
 }
 
 #[cfg(not(windows))]
@@ -2467,10 +2517,10 @@ fn command_script() -> &'static [u8] {
 
 #[cfg(not(windows))]
 fn throughput_command_script() -> &'static [u8] {
-    b"cat throughput.bin\necho YON_E2E_PERFORMANCE\nexit\n"
+    b"sh -c 'printf YON_E2E_PERFORMANCE_BEGIN; cat throughput.bin; printf YON_E2E_PERFORMANCE_END'\nexit\n"
 }
 
 #[cfg(not(windows))]
 fn local_pty_throughput_command_script() -> &'static [u8] {
-    b"cat throughput.bin\nexit\n"
+    b"sh -c 'printf YON_E2E_PERFORMANCE_BEGIN; cat throughput.bin; printf YON_E2E_PERFORMANCE_END'\nexit\n"
 }

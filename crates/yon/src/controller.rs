@@ -913,53 +913,55 @@ async fn run_terminal(
                         }
                         result = &mut terminal_resizes => TerminalPumpEvent::Resize(result),
                     }
-                } => match event {
-                    TerminalPumpEvent::Cancelled => break Err(ControllerError::Interrupted),
-                    TerminalPumpEvent::Driver(event) => {
-                        match active_terminal_connection_event(
-                            &event,
-                            binding.peer(),
-                            binding.connection(),
-                        ) {
-                            ActiveTerminalConnectionEvent::EnforceBinding => {
-                                if let Err(error) = driver.enforce_binding(binding) {
-                                    break Err(error.into());
+                } => {
+                    let completion = match event {
+                        TerminalPumpEvent::Cancelled => break Err(ControllerError::Interrupted),
+                        TerminalPumpEvent::Driver(event) => {
+                            match active_terminal_connection_event(
+                                &event,
+                                binding.peer(),
+                                binding.connection(),
+                            ) {
+                                ActiveTerminalConnectionEvent::EnforceBinding => {
+                                    if let Err(error) = driver.enforce_binding(binding) {
+                                        break Err(error.into());
+                                    }
                                 }
+                                ActiveTerminalConnectionEvent::DrainSelectedStreams => {
+                                    tracing::debug!(
+                                        peer = %binding.peer(),
+                                        "selected connection closed; draining terminal streams"
+                                    );
+                                    remote.observe_transport_close(tokio::time::Instant::now());
+                                }
+                                ActiveTerminalConnectionEvent::Ignore => {}
                             }
-                            ActiveTerminalConnectionEvent::DrainSelectedStreams => {
-                                tracing::debug!(
-                                    peer = %binding.peer(),
-                                    "selected connection closed; draining terminal streams"
-                                );
-                                remote.observe_transport_close(tokio::time::Instant::now());
-                            }
-                            ActiveTerminalConnectionEvent::Ignore => {}
+                            None
                         }
-                    }
-                    TerminalPumpEvent::LocalInput(result) => match result {
-                        Ok(never) => match never {},
-                        Err(error) => break Err(error),
-                    },
-                    TerminalPumpEvent::RemoteOutput(result) => {
-                        if let Err(error) = result {
-                            break Err(error);
-                        }
-                        if let Some(code) = remote.observe_output_eof(tokio::time::Instant::now()) {
-                            break Ok(code);
-                        }
-                    }
-                    TerminalPumpEvent::RemoteExit(result) => {
-                        let code = match result {
-                            Ok(code) => code,
+                        TerminalPumpEvent::LocalInput(result) => match result {
+                            Ok(never) => match never {},
                             Err(error) => break Err(error),
-                        };
-                        if let Some(code) = remote.observe_exit(code, tokio::time::Instant::now()) {
-                            break Ok(code);
+                        },
+                        TerminalPumpEvent::RemoteOutput(result) => {
+                            if let Err(error) = result {
+                                break Err(error);
+                            }
+                            remote.observe_output_eof(tokio::time::Instant::now())
                         }
-                    }
-                    TerminalPumpEvent::Resize(result) => match result {
-                        Ok(never) => match never {},
-                        Err(error) => break Err(error),
+                        TerminalPumpEvent::RemoteExit(result) => {
+                            let code = match result {
+                                Ok(code) => code,
+                                Err(error) => break Err(error),
+                            };
+                            remote.observe_exit(code, tokio::time::Instant::now())
+                        }
+                        TerminalPumpEvent::Resize(result) => match result {
+                            Ok(never) => match never {},
+                            Err(error) => break Err(error),
+                        },
+                    };
+                    if let Some(code) = completion {
+                        break Ok(code);
                     }
                 }
             }
