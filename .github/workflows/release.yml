@@ -33,6 +33,9 @@ jobs:
         shell: bash
         run: bash .github/scripts/install-actionlint.sh
       - run: actionlint
+      - name: Test release asset inventory validation
+        shell: bash
+        run: bash .github/scripts/test-verify-release-assets.sh
       - name: Verify candidate version matches the workspace version
         shell: bash
         run: |
@@ -902,11 +905,34 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Download Linux release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-          pattern: yonder-*
+          pattern: yonder-linux-*
           merge-multiple: true
+      - name: Download macOS release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: yonder-macos-*
+          merge-multiple: true
+      - name: Download Windows release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: yonder-windows-*
+          merge-multiple: true
+      - name: Download release SBOMs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yonder-sbom
+          path: dist
+      - name: Download release licenses
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yonder-licenses
+          path: dist
       - name: Add lockfile and checksums
         shell: bash
         run: |
@@ -919,6 +945,9 @@ jobs:
               | xargs --null sha256sum
           ) > "$checksum_file"
           mv "$checksum_file" dist/SHA256SUMS
+      - name: Verify release asset inventory
+        shell: bash
+        run: bash .github/scripts/verify-release-assets.sh dist
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
@@ -933,8 +962,20 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$CANDIDATE_VERSION" dist/*
-          --verify-tag
-          --title "Yonder $CANDIDATE_VERSION"
-          --generate-notes
+        run: |
+          mapfile -d '' assets < <(
+            find dist -maxdepth 1 -type f -print0 | sort --zero-terminated
+          )
+          test "${#assets[@]}" -eq 19
+          gh release create "$CANDIDATE_VERSION" "${assets[@]}" \
+            --verify-tag \
+            --title "Yonder $CANDIDATE_VERSION" \
+            --generate-notes
+
+          expected="$(mktemp)"
+          uploaded="$(mktemp)"
+          trap 'rm -f "$expected" "$uploaded"' EXIT
+          printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort >"$expected"
+          gh release view "$CANDIDATE_VERSION" --json assets \
+            --jq '.assets[].name' | LC_ALL=C sort >"$uploaded"
+          diff --unified "$expected" "$uploaded"

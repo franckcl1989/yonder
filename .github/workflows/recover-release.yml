@@ -1,0 +1,167 @@
+name: Recover Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing version tag in vMAJOR.MINOR.PATCH form
+        required: true
+        type: string
+      source_run_id:
+        description: Failed tag release run whose gates and source artifacts must be reused
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Check out the verified release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          path: source
+          ref: ${{ inputs.version }}
+      - name: Validate source release run
+        shell: bash
+        run: |
+          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+
+          tag_sha="$(git -C source rev-parse HEAD)"
+          run_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID")"
+          jq --exit-status \
+            --arg sha "$tag_sha" \
+            '.event == "push"
+              and .status == "completed"
+              and .conclusion == "failure"
+              and .path == ".github/workflows/release.yml"
+              and .head_sha == $sha' \
+            <<<"$run_json" >/dev/null
+
+          jobs="$(mktemp)"
+          trap 'rm -f "$jobs"' EXIT
+          gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | [.id, .name, .conclusion] | @tsv' >"$jobs"
+
+          unexpected="$(awk -F '\t' '$2 != "release-candidate" && $3 != "success"' "$jobs")"
+          test -z "$unexpected"
+          candidate_id="$(awk -F '\t' '$2 == "release-candidate" && $3 == "failure" { print $1 }' "$jobs")"
+          test -n "$candidate_id"
+          test "$(wc -l <<<"$candidate_id")" -eq 1
+
+          candidate_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/jobs/$candidate_id")"
+          jq --exit-status '
+            ([.steps[] | select(
+              .name != "Publish GitHub Release" and .conclusion != "success"
+            )] | length) == 0
+            and ([.steps[] | select(
+              .name == "Publish GitHub Release" and .conclusion == "failure"
+            )] | length) == 1
+          ' <<<"$candidate_json" >/dev/null
+      - name: Download Linux release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: dist
+          pattern: yonder-linux-*
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Download macOS release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: dist
+          pattern: yonder-macos-*
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Download Windows release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: dist
+          pattern: yonder-windows-*
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Download release SBOMs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          name: yonder-sbom
+          path: dist
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Download release licenses
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          name: yonder-licenses
+          path: dist
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Add lockfile and checksums
+        shell: bash
+        run: |
+          cp source/Cargo.lock dist/Cargo.lock
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | sort --zero-terminated \
+              | xargs --null sha256sum >SHA256SUMS
+          )
+      - name: Verify release asset inventory
+        shell: bash
+        run: bash .github/scripts/verify-release-assets.sh dist
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          if-no-files-found: error
+          name: release-recovery-${{ inputs.version }}
+          overwrite: true
+          path: dist/*
+      - name: Replace the empty release and publish verified assets
+        shell: bash
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            asset_count="$(gh release view "$VERSION" --json assets --jq '.assets | length')"
+            test "$asset_count" -eq 0
+            gh release delete "$VERSION" --yes
+          fi
+
+          mapfile -d '' assets < <(
+            find dist -maxdepth 1 -type f -print0 | sort --zero-terminated
+          )
+          test "${#assets[@]}" -eq 19
+          gh release create "$VERSION" "${assets[@]}" \
+            --verify-tag \
+            --title "Yonder $VERSION" \
+            --generate-notes
+
+          expected="$(mktemp)"
+          uploaded="$(mktemp)"
+          trap 'rm -f "$expected" "$uploaded"' EXIT
+          printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort >"$expected"
+          gh release view "$VERSION" --json assets \
+            --jq '.assets[].name' | LC_ALL=C sort >"$uploaded"
+          diff --unified "$expected" "$uploaded"
