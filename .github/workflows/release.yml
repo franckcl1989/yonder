@@ -951,6 +951,18 @@ jobs:
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
+      - name: Verify release provenance as a consumer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while IFS= read -r -d '' asset; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF"
+          done < <(find dist -maxdepth 1 -type f -print0 | sort --zero-terminated)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-candidate-${{ env.CANDIDATE_VERSION }}
@@ -973,9 +985,19 @@ jobs:
             --generate-notes
 
           expected="$(mktemp)"
+          expected_digests="$(mktemp)"
           uploaded="$(mktemp)"
-          trap 'rm -f "$expected" "$uploaded"' EXIT
+          uploaded_digests="$(mktemp)"
+          trap 'rm -f "$expected" "$expected_digests" "$uploaded" "$uploaded_digests"' EXIT
           printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort >"$expected"
+          for asset in "${assets[@]}"; do
+            printf '%s\tsha256:%s\n' \
+              "${asset##*/}" "$(sha256sum "$asset" | cut -d ' ' -f 1)"
+          done | LC_ALL=C sort >"$expected_digests"
           gh release view "$CANDIDATE_VERSION" --json assets \
             --jq '.assets[].name' | LC_ALL=C sort >"$uploaded"
+          gh release view "$CANDIDATE_VERSION" --json assets \
+            --jq '.assets[] | [.name, .digest] | @tsv' \
+            | LC_ALL=C sort >"$uploaded_digests"
           diff --unified "$expected" "$uploaded"
+          diff --unified "$expected_digests" "$uploaded_digests"

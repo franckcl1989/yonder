@@ -38,12 +38,14 @@ jobs:
           path: source
           ref: ${{ inputs.version }}
       - name: Validate source release run
+        id: source
         shell: bash
         run: |
           [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
 
           tag_sha="$(git -C source rev-parse HEAD)"
+          printf 'tag_sha=%s\n' "$tag_sha" >>"$GITHUB_OUTPUT"
           run_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID")"
           jq --exit-status \
             --arg sha "$tag_sha" \
@@ -134,6 +136,26 @@ jobs:
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
+      - name: Verify original tag provenance as a consumer
+        shell: bash
+        env:
+          TAG_SHA: ${{ steps.source.outputs.tag_sha }}
+        run: |
+          while read -r _ name; do
+            gh attestation verify "dist/$name" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$TAG_SHA" \
+              --source-ref "refs/tags/$VERSION"
+          done <dist/SHA256SUMS
+      - name: Verify recovered checksum provenance as a consumer
+        shell: bash
+        run: |
+          gh attestation verify dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/recover-release.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           if-no-files-found: error
@@ -143,25 +165,49 @@ jobs:
       - name: Replace the empty release and publish verified assets
         shell: bash
         run: |
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            asset_count="$(gh release view "$VERSION" --json assets --jq '.assets | length')"
-            test "$asset_count" -eq 0
-            gh release delete "$VERSION" --yes
-          fi
-
           mapfile -d '' assets < <(
             find dist -maxdepth 1 -type f -print0 | sort --zero-terminated
           )
           test "${#assets[@]}" -eq 19
-          gh release create "$VERSION" "${assets[@]}" \
-            --verify-tag \
-            --title "Yonder $VERSION" \
-            --generate-notes
+
+          release_exists=false
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            asset_count="$(gh release view "$VERSION" --json assets --jq '.assets | length')"
+            case "$asset_count" in
+              0)
+                gh release delete "$VERSION" --yes
+                ;;
+              19)
+                release_exists=true
+                ;;
+              *)
+                echo "refusing to replace a non-empty partial release with $asset_count assets" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [[ "$release_exists" == false ]]; then
+            gh release create "$VERSION" "${assets[@]}" \
+              --verify-tag \
+              --title "Yonder $VERSION" \
+              --generate-notes
+          fi
 
           expected="$(mktemp)"
+          expected_digests="$(mktemp)"
           uploaded="$(mktemp)"
-          trap 'rm -f "$expected" "$uploaded"' EXIT
+          uploaded_digests="$(mktemp)"
+          trap 'rm -f "$expected" "$expected_digests" "$uploaded" "$uploaded_digests"' EXIT
           printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort >"$expected"
+          for asset in "${assets[@]}"; do
+            printf '%s\tsha256:%s\n' \
+              "${asset##*/}" "$(sha256sum "$asset" | cut -d ' ' -f 1)"
+          done | LC_ALL=C sort >"$expected_digests"
           gh release view "$VERSION" --json assets \
             --jq '.assets[].name' | LC_ALL=C sort >"$uploaded"
+          gh release view "$VERSION" --json assets \
+            --jq '.assets[] | [.name, .digest] | @tsv' \
+            | LC_ALL=C sort >"$uploaded_digests"
           diff --unified "$expected" "$uploaded"
+          diff --unified "$expected_digests" "$uploaded_digests"
