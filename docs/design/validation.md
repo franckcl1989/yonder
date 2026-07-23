@@ -1,6 +1,6 @@
 # 实现验证记录
 
-日期：2026-07-22。当前本机环境：Windows x86_64，`rustc 1.97.0`、`cargo 1.97.1`；Linux 证据来自 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
+日期：2026-07-23。当前本机环境：Windows x86_64，`rustc 1.97.0`、`cargo 1.97.1`；Linux 证据来自 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
 
 ## 当前通过证据
 
@@ -69,11 +69,12 @@
 - 手动候选 `29897753306` 对提交 `53fb3522150ba0182bf7bc5655eb7b404126412f` 的 quality、六目标原生构建、五目标 coverage、六目标 MSRV、Miri、ASan/TSan、供应链、Linux 性能和 namespace/netem 网络矩阵全部成功；Windows 性能 10/10 完整传输且相对 ConPTY 比率通过，仅被上述高于 runner 平台基线的旧绝对值阻断。该 run 已在确认不可能聚合后主动取消 20 个长 fuzz shard，避免无效占用；六平台 artifact 已完整下载到独立候选目录，`12` 个归档逐一验证为恰好一个规范可执行文件并计算 SHA-256。当前门禁修正仍须由新提交重跑完整矩阵。
 - 手动候选运行 `29894008962` 对提交 `2526693ceedb73eacc14e4241f2536dbdf3ec78c` 的质量、六目标 stable/MSRV 原生 build/test/release/static-link/空目录 smoke、Miri、ASan、TSan、供应链、Linux 性能和 namespace/netem 网络矩阵均成功；六个平台 artifact 已下载复核，`12` 个归档各恰好包含一个规范名称可执行文件。Windows coverage 因上述单一调度相关 region 缺口失败；Windows 性能在第二个样本中把 ConPTY 插入合法 VT 后不再连续的记录误判为少一条记录，聚合、release fuzz 和 release-candidate 因依赖图被正确阻断。当前修复保留全部产品与性能门槛，已在本机通过覆盖率及 10 样本真实 ConPTY/远程终端门禁；仍须由新候选在最终提交上重跑完整矩阵。
 - 手动候选运行 `29831739480` 对提交 `e48e2c1c0ec587beb029fcac4f432be13b8febb9` 完成五目标独立 coverage、六目标 stable/MSRV 原生 build/test/release/static-link/空目录 smoke、Miri、ASan、TSan、安全与许可证；全部 job 成功。当前最终修正仍须重新执行同一矩阵。
-- 同一候选的 `20` 个 release fuzz shard（四个 target 各五个五小时 shard）全部成功，等价于每 target `25h` 且无 crash、hang 或 OOM。当前修改未改变生产 parser/状态机，但正式发布仍按规则对最终提交重跑，不以风险推断省略。
-- 同一候选聚合 artifact 已独立下载复核：恰好 `19` 个文件，`18` 条 SHA-256 全匹配，`12` 个二进制归档各恰好一个规范名称可执行文件，两个 SBOM 均为正确 component 的 CycloneDX `1.5`。本地 `gh attestation verify` 因当前 gh 凭据失效和共享出口 API 限流无法复核远端签名；workflow 内 provenance job 为成功，最终 tag 后仍须在恢复认证的消费方环境再次验证。
-- 风险驱动的 namespace/netem 矩阵和 Windows/Linux 性能资源 job 已纳入 `release-candidate` 依赖图，但尚未在当前最终修正上远端执行。正式 tag、GitHub Release 及最终资产消费方验证仍未完成；这是当前交付链的剩余硬门禁。
+- 正式标签运行 `29911036318` 在提交 `429a78dcaebd5ffd5aec792d0d468cf9e30257ab` 上完成质量、六目标原生构建、五目标 coverage、六目标 MSRV、Miri、ASan/TSan、供应链、namespace 网络矩阵和 Windows/Linux 真实进程性能门禁；`20/20` 个 release fuzz shard（四个 target 各五个五小时 shard）全部跑满并成功，等价于每 target `25h`，无 crash、hang 或 OOM。
+- 该标签运行的候选聚合、checksum、provenance 和 artifact 上传均成功，最终 `gh release create` 因旧的 `yonder-*` 宽泛下载模式把 `criterion` 目录传给 GitHub CLI 而失败。修复后发布流程只下载六平台归档、SBOM 和许可证三类明确资产，并在 attestation 前强制验证恰好 `19` 个普通文件、`18` 条 checksum、`12` 个单文件二进制归档和两个 CycloneDX `1.5` SBOM；回归夹具明确证明额外目录会被拒绝。
+- 受控恢复运行 `29972534047` 仅复用上述同标签、同提交且除发布步骤外全部成功的原始 Actions 资产，删除零资产的半成品 Release 后发布正式 `v0.1.0`。幂等复核运行 `29973002925` 又让 `18` 个 checksum 所列资产逐一通过原标签 `release.yml@429a78d` 的 `gh attestation verify`，让重建的 `SHA256SUMS` 通过 `recover-release.yml` 的 provenance 验证，并逐项比较 GitHub Release 名称与 digest；运行整体成功。
+- 正式 Release 已独立复核：恰好 `19` 个发布文件，`18` 条 SHA-256 全匹配，`SHA256SUMS` 自身摘要为 `bf99ae75bf155dba41cccde1b029b21d52f70890513b986673ef92fdbff54ef0`，`12` 个归档各恰好一个规范名称可执行文件，两个 SBOM 均为正确 component 的 CycloneDX `1.5`，`Cargo.lock` 与标签源码一致。正式入口为 `https://github.com/franckcl1989/yonder/releases/tag/v0.1.0`。
 - Rocky Linux 8.10 x86_64 对当前 relay 源码执行了真实进程生命周期门禁：新建 identity mode 为 `0600`；进程先同步安装 SIGINT/SIGTERM/SIGHUP 监听并记录 `relay_signal_handlers_installed`，再构造 libp2p 网络；测试逐项在该安装事件后立即发送三种真实信号，均在 `5s` 绝对上限内成功退出并分别记录一次 `relay_shutdown_requested` 与 `relay_stopped`。临时把 identity 放宽为 `0640` 后，`identity show` 以非零状态拒绝读取并报告不可信访问权限。最终审查另发现并修复 Unix 仅检查文件 mode、未验证直接父目录替换权限的不一致；当前实现还要求父目录禁止 group/other 写入且 owner 为 `root` 或文件 owner，并拒绝非普通文件，Rocky Linux relay 全包 `56/56` 与 workspace Clippy 通过。
 
 ## 当前结论
 
-当前产品主路径、真实 PTY/ConPTY、四种 relay transport、自签 IP WSS、直连优先与严格 relay fallback、一次性 OPAQUE、relay restart/Reclaim/Conflict、不可信 relay 边界、资源限制、有界关闭、秘密文件和跨平台配置均已有定向、真实进程与候选证据。自动 CI `29901271178` 已让提交 `aa824c4` 的质量、五目标 coverage、六目标 MSRV、Miri/sanitizer、供应链和短 fuzz 矩阵全部成功；候选 `29901282778` 又让六目标原生包与风险网络矩阵成功，并暴露旧性能 harness 把测试进程内存误计为 relay RSS 的隔离缺陷。当前修正保持生产 `64 MiB` 连接保护并把三项产品角色置于独立 release 进程，尚须由新候选完成原生性能与全部长 fuzz 复验。正式 tag、GitHub Release 和最终 provenance 消费方验证仍未完成，在这些证据取得前不得声称 0.1.0 已发布。
+当前产品主路径、真实 PTY/ConPTY、四种 relay transport、自签 IP WSS、直连优先与严格 relay fallback、一次性 OPAQUE、relay restart/Reclaim/Conflict、不可信 relay 边界、资源限制、有界关闭、秘密文件和跨平台配置均已有定向、真实进程、跨平台候选和正式发布证据。`v0.1.0` 标签固定在 `429a78dcaebd5ffd5aec792d0d468cf9e30257ab`；正式标签矩阵、累计 `100h` 的长 fuzz、两平台真实进程性能、六平台单二进制归档、checksum、SBOM、许可证和 provenance 消费方验证均已完成，GitHub Release 已正式发布。后续主分支的发布自动化加固与测试稳定性修复不移动该标签，也不改变已发布产品二进制。
