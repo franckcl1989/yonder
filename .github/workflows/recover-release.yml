@@ -124,12 +124,14 @@ jobs:
         shell: bash
         run: |
           cp source/Cargo.lock dist/Cargo.lock
+          checksum_file="$RUNNER_TEMP/yonder-recovery-SHA256SUMS"
           (
             cd dist
             find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
               | sort --zero-terminated \
-              | xargs --null sha256sum >SHA256SUMS
-          )
+              | xargs --null sha256sum
+          ) >"$checksum_file"
+          mv "$checksum_file" dist/SHA256SUMS
       - name: Verify release asset inventory
         shell: bash
         run: bash .github/scripts/verify-release-assets.sh dist
