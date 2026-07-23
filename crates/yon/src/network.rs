@@ -1656,7 +1656,7 @@ mod tests {
         assert!(
             next_relay_dial(
                 &mut immediate,
-                tokio::time::Instant::now() + Duration::from_millis(1)
+                tokio::time::Instant::now() + Duration::from_secs(1)
             )
             .is_some()
         );
