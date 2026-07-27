@@ -77,8 +77,8 @@ pub enum HostStage {
 mod tests {
     use super::{
         EXCHANGE_TIMEOUT, HostConfig, HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair,
-        binding_event, copy_controller_input, copy_terminal_output, host_error_event,
-        read_auth_hello_io, read_terminal_hello_io, report_connection_code_to,
+        binding_event, complete_terminal_exit_io, copy_controller_input, copy_terminal_output,
+        host_error_event, read_auth_hello_io, read_terminal_hello_io, report_connection_code_to,
         report_replacement_notice_to, retryable_relay_error, run_host, run_host_with,
         run_host_with_progress, send_auth_retry_io, start_terminal_io, write_authenticated_io,
         write_terminal_ready_io,
@@ -650,6 +650,69 @@ mod tests {
         assert_eq!(host.unwrap(), EXIT_CODE);
         assert!(terminal_bytes.is_empty());
         assert_eq!(remote_exit.code(), EXIT_CODE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_drains_a_queued_resize_before_acknowledgement() {
+        let resized = TerminalSize::new(132, 43).unwrap();
+        let (host_control, controller_control) = tokio::io::duplex(8);
+        let (mut host_read, mut host_write) = tokio::io::split(host_control);
+        let (mut controller_read, mut controller_write) = tokio::io::split(controller_control);
+        let host =
+            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1));
+        let controller = async {
+            controller_write
+                .write_all(&TerminalResize::new(resized).encode())
+                .await
+                .unwrap();
+            controller_write
+                .write_all(&TerminalComplete::ENCODED)
+                .await
+                .unwrap();
+            controller_write.flush().await.unwrap();
+            let mut trailing = [0_u8; 1];
+            assert_eq!(controller_read.read(&mut trailing).await.unwrap(), 0);
+        };
+
+        let (result, ()) = tokio::join!(host, controller);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_rejects_invalid_and_truncated_queued_resizes() {
+        let (host_control, mut controller_control) = tokio::io::duplex(8);
+        let (mut host_read, mut host_write) = tokio::io::split(host_control);
+        controller_control
+            .write_all(&[0xff, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        assert!(matches!(
+            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1))
+                .await,
+            Err(HostError::Protocol(_))
+        ));
+
+        let (host_control, mut controller_control) = tokio::io::duplex(8);
+        let (mut host_read, mut host_write) = tokio::io::split(host_control);
+        controller_control.write_all(&[0x02, 0, 0]).await.unwrap();
+        controller_control.shutdown().await.unwrap();
+        assert!(matches!(
+            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1))
+                .await,
+            Err(HostError::Io(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_has_a_bounded_acknowledgement_wait() {
+        let (host_control, _controller_control) = tokio::io::duplex(1);
+        let (mut host_read, mut host_write) = tokio::io::split(host_control);
+
+        assert!(matches!(
+            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_millis(10))
+                .await,
+            Err(HostError::Timeout)
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

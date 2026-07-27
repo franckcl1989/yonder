@@ -16,9 +16,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-yonder-config = { version = "=0.1.0", path = "../yonder-config", default-features = false }
-yonder-core = { version = "=0.1.0", path = "../yonder-core", default-features = false }
-yonder-net = { version = "=0.1.0", path = "../yonder-net", default-features = false }
+yonder-config = { version = "=0.1.1", path = "../yonder-config", default-features = false }
+yonder-core = { version = "=0.1.1", path = "../yonder-core", default-features = false }
+yonder-net = { version = "=0.1.1", path = "../yonder-net", default-features = false }
 
 [lints]
 workspace = true

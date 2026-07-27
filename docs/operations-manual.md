@@ -1,6 +1,6 @@
-# Yonder 0.1.0 运维与使用手册
+# Yonder 0.1.1 运维与使用手册
 
-本文档面向需要部署、维护和使用 Yonder 的系统管理员、网络管理员与终端用户。文中的命令、配置字段和行为均对应 Yonder `0.1.0`。
+本文档面向需要部署、维护和使用 Yonder 的系统管理员、网络管理员与终端用户。文中的命令、配置字段和行为均对应 Yonder `0.1.1`。
 
 ## 目录
 
@@ -47,7 +47,7 @@ relay 不掌握连接码中的认证秘密，也不能读取终端内容。relay
 
 ### 1.2 当前功能边界
 
-Yonder `0.1.0` 提供一次性远程交互终端、终端尺寸同步、ANSI 字节传输、Ctrl+C、远端退出码传播和 TCP/QUIC/WS/WSS 自适应连接。它不提供 SSH/SFTP 兼容、文件同步、端口转发、常驻多会话账户体系或官方公共 relay。
+Yonder `0.1.1` 提供一次性远程交互终端、终端尺寸同步、ANSI 字节传输、Ctrl+C、远端退出码传播和 TCP/QUIC/WS/WSS 自适应连接。它不提供 SSH/SFTP 兼容、文件同步、端口转发、常驻多会话账户体系或官方公共 relay。
 
 ## 2. 平台与发布文件
 
@@ -64,9 +64,9 @@ Yonder `0.1.0` 提供一次性远程交互终端、终端尺寸同步、ANSI 字
 
 每个归档恰好包含一个规范名称的可执行文件。Linux 产物是完全静态 ELF；Windows 产物静态链接 CRT，不依赖第三方 DLL；macOS 产物只依赖 Apple 系统 `libSystem`/framework。macOS 不允许普通第三方程序把系统库静态嵌入 Mach-O，因此 macOS 的“单文件分发”不等于字面意义上的全静态链接。
 
-`0.1.0` 发布流程提供 SHA-256 和 GitHub 构建来源证明，但当前不包含 Windows Authenticode 签名或 Apple notarization。Windows SmartScreen、macOS Gatekeeper 或企业终端防护可能因此要求管理员批准。应先验证 SHA-256 与 provenance，再通过组织的软件分发、MDM 或应用白名单流程授权；不要为了运行 Yonder 全局关闭系统安全机制。
+`0.1.1` 发布流程提供 SHA-256 和 GitHub 构建来源证明，但当前不包含 Windows Authenticode 签名或 Apple notarization。Windows SmartScreen、macOS Gatekeeper 或企业终端防护可能因此要求管理员批准。应先验证 SHA-256 与 provenance，再通过组织的软件分发、MDM 或应用白名单流程授权；不要为了运行 Yonder 全局关闭系统安全机制。
 
-`0.1.0` 的生产支持基线如下。低于基线的系统可能仍能启动，但不属于发布验收范围：
+`0.1.1` 的生产支持基线如下。低于基线的系统可能仍能启动，但不属于发布验收范围：
 
 | 平台 | 最低生产基线 | 说明 |
 | --- | --- | --- |
@@ -74,7 +74,7 @@ Yonder `0.1.0` 提供一次性远程交互终端、终端尺寸同步、ANSI 字
 | Windows x86_64/arm64 | Windows 10 `1809` 或 Windows Server 2019 | 交互终端依赖 ConPTY；不支持 Windows Nano Server，也不依赖 WSL。 |
 | macOS Intel/Apple Silicon | macOS 12 | 只依赖 Apple 系统库；不同架构必须使用对应归档。 |
 
-Windows PowerShell `5.1` 是 relay identity 与 WSS 私钥 ACL 校验所用的系统组件；它随上述受支持的常规 Windows 客户端和 Server/Core 安装提供。精简掉 Windows PowerShell 的自定义镜像不属于 `0.1.0` 支持范围。Linux 与 macOS 不调用 PowerShell。
+Windows PowerShell `5.1` 是 relay identity 与 WSS 私钥 ACL 校验所用的系统组件；它随上述受支持的常规 Windows 客户端和 Server/Core 安装提供。精简掉 Windows PowerShell 的自定义镜像不属于 `0.1.1` 支持范围。Linux 与 macOS 不调用 PowerShell。
 
 ### 2.1 校验下载文件
 
@@ -202,7 +202,7 @@ Windows 首次运行 `yon` 时可能出现 Defender Firewall 网络访问提示�
 - IPv6 listener 示例为 `/ip6/::/tcp/4001` 和 `/ip6/::/udp/4001/quic-v1`。
 - DNS 变更生效前应保留旧地址，并在 endpoint 的 `relays` 列表中短期同时配置新旧入口。所有入口必须属于同一个 relay PeerId。
 
-同一 PeerId 下的多个地址仅表示**同一个 relay 进程的多个传输入口**，不是独立高可用节点。relay 的定位注册表只在本进程内存中；不要把同一 identity 同时复制给多个进程，不要在这些进程前使用 DNS 轮询或无会话一致性的四层负载均衡，否则 host 注册与 controller 查询可能落到不同内存注册表。`0.1.0` 不提供多 relay 一致性或活动会话迁移；生产可用性应通过单实例进程监督、稳定存储 identity、快速重启和多传输入口保障。
+同一 PeerId 下的多个地址仅表示**同一个 relay 进程的多个传输入口**，不是独立高可用节点。relay 的定位注册表只在本进程内存中；不要把同一 identity 同时复制给多个进程，不要在这些进程前使用 DNS 轮询或无会话一致性的四层负载均衡，否则 host 注册与 controller 查询可能落到不同内存注册表。`0.1.1` 不提供多 relay 一致性或活动会话迁移；生产可用性应通过单实例进程监督、稳定存储 identity、快速重启和多传输入口保障。
 
 ## 4. 配置加载规则
 
@@ -489,7 +489,7 @@ export YON_RELAY_LISTEN='/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1'
 export YON_RELAY_EXTERNAL='/dns4/relay.example.com/tcp/4001,/dns4/relay.example.com/udp/4001/quic-v1'
 ```
 
-`wss_certificate` 也是列表字段：环境变量中的证书链路径按叶证书到中间证书顺序用逗号分隔。兼容键 `wss_certificate_der`、`wss_private_key_der` 及其 `_DER` 环境变量在 `0.1.0` 仍可读取；高优先级新键可覆盖低优先级旧键，同一配置层同时设置同组新旧键会失败。
+`wss_certificate` 也是列表字段：环境变量中的证书链路径按叶证书到中间证书顺序用逗号分隔。兼容键 `wss_certificate_der`、`wss_private_key_der` 及其 `_DER` 环境变量在 `0.1.1` 仍可读取；高优先级新键可覆盖低优先级旧键，同一配置层同时设置同组新旧键会失败。
 
 ## 6. 配置 endpoint
 
@@ -535,7 +535,7 @@ $env:YON_WSS_CA = 'C:\ProgramData\Yonder\relay-ca.pem'
 export YON_WSS_CA='/etc/yonder/old-relay.pem,/etc/yonder/new-relay.pem'
 ```
 
-兼容键 `wss_ca_der`/`YON_WSS_CA_DER` 在 `0.1.0` 仍可读取。推荐新部署使用无格式后缀的新键；高优先级新键可覆盖低优先级旧键，同一配置层不能同时设置两者。
+兼容键 `wss_ca_der`/`YON_WSS_CA_DER` 在 `0.1.1` 仍可读取。推荐新部署使用无格式后缀的新键；高优先级新键可覆盖低优先级旧键，同一配置层不能同时设置两者。
 
 ## 7. WSS 证书部署
 
@@ -788,7 +788,7 @@ sudo launchctl print system/com.yonder.relay
 
 ### 8.3 Windows 进程托管
 
-`yon-relay` `0.1.0` 是 console 程序，不实现 Windows SCM 的 `ServiceMain`，因此不能直接用 `sc.exe create` 注册后期待正常启动。生产环境必须使用组织已有、经过验证的进程监督或编排系统，以专用低权限服务账户运行 console 程序：
+`yon-relay` `0.1.1` 是 console 程序，不实现 Windows SCM 的 `ServiceMain`，因此不能直接用 `sc.exe create` 注册后期待正常启动。生产环境必须使用组织已有、经过验证的进程监督或编排系统，以专用低权限服务账户运行 console 程序：
 
 ```powershell
 & 'C:\Program Files\Yonder\yon-relay.exe' --log-level info serve
@@ -942,6 +942,8 @@ relay 注册表只存在内存中。重启会丢失临时映射，但不会丢�
 
 `yon` 是单文件程序，没有本地持久身份。退出当前 host/connect 后替换二进制即可。不要在 Active 终端会话中直接覆盖正在运行的文件；先结束会话，再升级并重新生成连接码。
 
+`0.1.1` 与 `0.1.0` 的终端关闭流程可双向兼容，因此 host 和 controller 可以任意顺序滚动升级；完整的终端尾部消费确认只在两端都升级到 `0.1.1` 后生效。生产环境仍应尽快把两端统一到同一版本，不要把混合版本作为长期运行形态。
+
 ## 11. 安全运维要求
 
 ### 11.1 必须保护的材料
@@ -965,7 +967,7 @@ relay 按不可信基础设施设计。即使 relay 被入侵，攻击者也不�
 
 因此 relay 日志、网络流量和操作权限仍应纳入组织安全监控。不要把“不可信 relay”误解为“relay 无需加固”。
 
-`0.1.0` 的 relay 不提供租户账户、接入 allowlist、令牌鉴权或计费。只要能访问监听端口的任意 libp2p PeerId 都可以尝试申请 reservation；内置总容量、每 PeerId/来源限制和查询限速只保证资源有界，不把公网 listener 变成私有准入系统。互联网公开部署必须结合网络层访问控制、容量监控和组织的抗 DDoS 能力；若 relay 只供固定网络使用，应在云安全组/防火墙限制来源。不要把连接码的端到端认证误当作 relay 使用权认证。
+`0.1.1` 的 relay 不提供租户账户、接入 allowlist、令牌鉴权或计费。只要能访问监听端口的任意 libp2p PeerId 都可以尝试申请 reservation；内置总容量、每 PeerId/来源限制和查询限速只保证资源有界，不把公网 listener 变成私有准入系统。互联网公开部署必须结合网络层访问控制、容量监控和组织的抗 DDoS 能力；若 relay 只供固定网络使用，应在云安全组/防火墙限制来源。不要把连接码的端到端认证误当作 relay 使用权认证。
 
 ### 11.3 endpoint 主机安全
 
@@ -1004,7 +1006,7 @@ ss -lntup | grep -E ':(4001|4002|443)\b'
 
 ### 12.2 建议监控项
 
-Yonder `0.1.0` 主要通过结构化诊断日志和操作系统指标观测。relay 会输出低基数的 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped` 事件，并每 `60s` 输出一次 `relay_activity_summary` 聚合计数。建议采集：
+Yonder `0.1.1` 主要通过结构化诊断日志和操作系统指标观测。relay 会输出低基数的 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped` 事件，并每 `60s` 输出一次 `relay_activity_summary` 聚合计数。建议采集：
 
 - 进程存活、重启次数和退出码。
 - CPU、RSS、文件描述符数量和网络吞吐。
