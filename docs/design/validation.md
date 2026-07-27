@@ -1,12 +1,12 @@
 # 实现验证记录
 
-日期：2026-07-23。当前本机环境：Windows x86_64，`rustc 1.97.0`、`cargo 1.97.1`；Linux 证据来自 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
+日期：2026-07-27。当前本机环境：Windows x86_64，`rustc 1.97.0`、`cargo 1.97.1`；Linux 证据来自 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
 
 ## 当前通过证据
 
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` 通过。
-- `cargo test --locked --workspace --all-targets --all-features` 对当前源码在 Windows x86_64 聚合执行 `300` 项单元、集成和 E2E 测试：`296 passed / 4 ignored`；Rocky Linux 8.10 x86_64 仍为上一审计快照的 `273` 项平台适用测试：`270 passed / 3 ignored`，当前源码不沿用该数字冒充新的 Linux 结果。四项 ignored 中，一项是候选 workflow 单独执行的真实进程吞吐门禁，三项是 release stress gate。另有 `3` 个 rustdoc compile-fail 测试和 `10` 个真实 Criterion benchmark harness 场景成功。
+- `cargo test --locked --workspace --all-targets --all-features` 对当前源码在 Windows x86_64 聚合执行 `307` 项单元、集成和 E2E 测试：`303 passed / 4 ignored`；Rocky Linux 8.10 x86_64 仍为上一审计快照的 `273` 项平台适用测试：`270 passed / 3 ignored`，当前源码不沿用该数字冒充新的 Linux 结果。四项 ignored 中，一项是候选 workflow 单独执行的真实进程吞吐门禁，三项是 release stress gate。另有 `3` 个 rustdoc compile-fail 测试和 `10` 个真实 Criterion benchmark harness 场景成功。
 - `cargo test --locked --workspace --doc` 通过，其中 `3` 个 compile-fail rustdoc 测试锁定 `RetryAfter`、`PakeSecret` 和连接码暴露生命周期的不变量。
 - `yonder-config` 已实现 endpoint/relay 严格类型配置，优先级固定为系统配置文件 < 当前目录配置文件 < 环境变量；列表按层替换、字段按层合并，relay 的 `14` 个数值资源环境变量由上游 `config` 的 `try_parsing` 转换，路径等字符串字段不做数字猜测。新旧 WSS 环境变量同时出现或环境变量归一化后重名时在启动边界明确失败；`config sources` 仅报告存在性和优先级，不输出值。未知字段、非 UTF-8、目录、超限文件和无效组合均在启动边界失败。最终审核发现 Circuit Relay v2 在没有可发布地址时虽然接受 reservation，却会让 endpoint 收到 `NoAddressesInReservation`；`external` 因此修正为配置和 `RelayServeConfig` 领域边界共同强制的 `1..=8` 项，不从 wildcard、私网或 NAT 后的 listen 地址猜公网入口。
 - 真实进程 E2E 覆盖 TCP、QUIC、WS、独立 CA 的 WSS、显式信任的自签 IP SAN WSS、不可用 UDP/TCP 候选后的可用 transport、错码 OPAQUE 拒绝、真实 PTY/shell、relay 重启 Reclaim、locator Conflict 后完整换码、错误 relay PeerId 冒充和逐连接字节篡改代理。当前默认套件在 Windows 为 `11/11`；Windows ConPTY 与 Linux native PTY 均分别执行默认日志和 `--log-level debug --log-file` 两条真实会话，验证连接码提示/隐藏输入、进度先于远端输出、`TerminalReady` 前完整清行、Active 无 tracing 污染、既有日志 sentinel 按 append 语义保留，且最终 route/transport 只进入诊断文件。Windows 另验证真实 `cmd.exe` 与退出码 `23`；Linux 另验证 ANSI 字节、工作目录、环境、初始/动态尺寸、Ctrl+C 与退出码。终端宽度查询失败的生产降级以无 ANSI 的 `CRLF` 结束可见进度，保证 raw mode 下远端首行仍从第 `0` 列开始。专用 `yonder_e2e_rebuild` 构建另以 `1/1` 证明 controller 销毁旧 Swarm、更换 PeerId、禁用 DCUtR、实际绑定 relay circuit 后仍完成真实终端会话。
@@ -62,6 +62,8 @@
 - 提交 `53fb352` 的自动 CI `29897738696` 只有 macOS Intel 的 coverage 生成命令以 `101` 退出且未产生 JSON，其余测试、四目标 coverage、六目标 MSRV、Miri、ASan/TSan、供应链与四个短 fuzz job 均成功；同一提交随后在候选 `29897753306` 的相同 `macos-15-intel` 环境完整生成 coverage JSON 并通过全部数值门槛，因此该证据指向单次 runner/测试执行失败，而非稳定的覆盖率缺口。提交 `aa824c420ba49d558a55b06831cc2a7c31591de4` 的后续自动 CI `29901271178` 已让质量、五目标 coverage、六目标 MSRV、Miri、ASan/TSan、供应链和短 fuzz 矩阵全部成功，包括此前失败的 macOS Intel coverage；当前测试隔离修正仍须由新的自动 CI 与候选重新执行，不能沿用该次结果冒充最终提交。
 
 - 候选运行 `29828755111` 的 macOS Intel WS 真实终端用例捕获了快速 shell 正常退出竞态：远端已经写出 `YON_E2E` 与退出状态，但 libp2p 选中连接的 Closed 事件先于终端子流中已排队的数据/Exit 被主控端处理，旧实现立即以绑定丢失覆盖了正常完成。当前修复不弱化唯一 `ConnectionId` 绑定：额外同 PeerId 连接继续失败；仅当精确选中连接关闭时启动绝对 `2s` 的既有 data/control 子流排空，两项齐全才接受退出码，否则超时报错。类型状态机测试覆盖关闭前、Exit-first、EOF-first、重复关闭和额外连接分类；Windows 全量 `11/11` E2E 已通过，macOS Intel 仍等待新候选运行复验。
+- 自动 CI `30235870008` 对提交 `a9388777082fc53f44e32d71e60b74b061faa2bf` 的普通 Linux、Windows、macOS 测试、Linux x64/arm64 与 macOS arm64 coverage、六目标 MSRV、Miri、ASan/TSan、供应链和四个短 fuzz job 全部成功。macOS Intel coverage 中 `host_replaces_the_complete_code_after_reclaim_conflict` 在远端快速正常退出后收到 `early eof`：host 已写 data EOF 与 Exit，却立即销毁 Swarm，使尚未由 controller 消费的 yamux/relay 尾部存在丢失窗口；这是生产关闭协议缺口。Windows coverage 的唯一失败则是 ConPTY 把 crossterm 原生控制台整行清除投影为 `ESC[K` 后接 `CR`，现有测试 oracle 只接受另外三种等价序列；远端 `6,000` 个 UTF-8 标量、Escape、方向键、输出 marker 和退出码均已完整，因此这是平台测试判定缺口。
+- 当前修复在既有 `/yonder/terminal-control/1.0.0` 上增加单字节 TerminalComplete：controller 只有在 data EOF、Exit 和本地输出 flush 全部完成后才确认，host 收到确认才关闭 control 和销毁 Swarm，并保留对 `0.1.0` controller 清洁 EOF 的兼容。回归先证明旧 host 会在 controller 观察完成前返回，修复后覆盖确认、旧对端 EOF、非法尾随字节、resize 乱序和 `128 KiB` 双向背压；真实 reclaim-conflict 会话连续 `3/3`、Windows ConPTY 真进程和原生清行最小回归均通过。该修复仍须由新的五目标 coverage 和全平台自动 CI 复验，不能以本机结果冒充最终候选。
 
 ## 候选与剩余交付项
 

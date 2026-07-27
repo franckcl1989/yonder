@@ -156,6 +156,26 @@ impl TerminalExit {
     }
 }
 
+/// The controller consumed terminal output EOF and the authoritative exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalComplete;
+
+impl TerminalComplete {
+    pub const ENCODED: [u8; 1] = [0x03];
+
+    /// Decodes the one-byte terminal completion acknowledgement.
+    pub fn decode(message: &[u8]) -> Result<Self, ProtocolError> {
+        match message {
+            [0x03] => Ok(Self),
+            [tag] => Err(ProtocolError::UnknownTag(*tag)),
+            _ => Err(ProtocolError::InvalidLength {
+                expected: 1,
+                actual: message.len(),
+            }),
+        }
+    }
+}
+
 /// The target has created its PTY and committed the one-time code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalReady;
@@ -206,7 +226,7 @@ fn exact_control(message: &[u8]) -> Result<[u8; CONTROL_LEN], ProtocolError> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{TerminalExit, TerminalHello, TerminalReady, TerminalResize};
+    use super::{TerminalComplete, TerminalExit, TerminalHello, TerminalReady, TerminalResize};
     use crate::error::{ProtocolError, ProtocolField};
     use crate::{TerminalSize, TerminalValue};
 
@@ -228,6 +248,10 @@ mod tests {
         let exit = TerminalExit::new(255);
         assert_eq!(TerminalExit::decode(&exit.encode()), Ok(exit));
         assert_eq!(exit.code(), 255);
+        assert_eq!(
+            TerminalComplete::decode(&TerminalComplete::ENCODED),
+            Ok(TerminalComplete)
+        );
         assert_eq!(TerminalReady::decode(&[1]), Ok(TerminalReady));
     }
 
@@ -304,6 +328,14 @@ mod tests {
         );
         assert!(matches!(
             TerminalExit::decode(&[]),
+            Err(ProtocolError::InvalidLength { .. })
+        ));
+        assert_eq!(
+            TerminalComplete::decode(&[0x02]),
+            Err(ProtocolError::UnknownTag(0x02))
+        );
+        assert!(matches!(
+            TerminalComplete::decode(&[]),
             Err(ProtocolError::InvalidLength { .. })
         ));
         assert_eq!(

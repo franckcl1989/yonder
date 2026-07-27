@@ -17,7 +17,7 @@ use yonder_core::wire::auth::{
     RETRY_LEN,
 };
 use yonder_core::wire::terminal::{
-    CONTROL_LEN, TerminalExit, TerminalHello, TerminalReady, TerminalResize,
+    CONTROL_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalReady, TerminalResize,
 };
 use yonder_core::wire::{AUTH_PROTOCOL, TERMINAL_CONTROL_PROTOCOL, TERMINAL_DATA_PROTOCOL};
 use yonder_core::{
@@ -976,6 +976,18 @@ async fn run_terminal(
             .map_err(|_| ControllerError::RemoteCompletionTimeout)
             .and_then(|result| result.map_err(ControllerError::TerminalOutput));
     let session = finish_terminal_output(session, output_finish);
+    let session = match session {
+        Ok(code) => complete_terminal_control(
+            driver,
+            binding,
+            &mut control_read,
+            &mut control_write,
+            cancellation,
+        )
+        .await
+        .map(|()| code),
+        Err(error) => Err(error),
+    };
     let display_restore = if session.is_err() {
         frontend.restore_display()
     } else {
@@ -1134,6 +1146,61 @@ async fn read_remote_exit(
     let mut exit = [0_u8; 5];
     control_read.read_exact(&mut exit).await?;
     decode_terminal_exit(&exit)
+}
+
+async fn complete_terminal_control(
+    driver: &mut EndpointDriver,
+    binding: ConnectionBinding,
+    control_read: &mut (impl tokio::io::AsyncRead + Unpin),
+    control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<(), ControllerError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(ControllerError::Interrupted),
+        result = tokio::time::timeout(
+            REMOTE_COMPLETION_TIMEOUT,
+            drive_bound(
+                driver,
+                binding,
+                complete_terminal_control_io(control_read, control_write),
+            ),
+        ) => {
+            let result = result.map_err(|_| ControllerError::RemoteCompletionTimeout)?;
+            result.map_err(ControllerError::from)??;
+            Ok(())
+        }
+    }
+}
+
+async fn complete_terminal_control_io(
+    control_read: &mut (impl tokio::io::AsyncRead + Unpin),
+    control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<(), ControllerError> {
+    let acknowledge = async {
+        control_write.write_all(&TerminalComplete::ENCODED).await?;
+        control_write.flush().await?;
+        control_write.shutdown().await?;
+        Ok::<_, ControllerError>(())
+    };
+    let host_close = async {
+        let mut trailing = [0_u8; 1];
+        if control_read.read(&mut trailing).await? == 0 {
+            Ok(())
+        } else {
+            Err(ProtocolError::TrailingBytes.into())
+        }
+    };
+    tokio::pin!(acknowledge);
+    tokio::pin!(host_close);
+    tokio::select! {
+        biased;
+        result = &mut host_close => result,
+        result = &mut acknowledge => {
+            result?;
+            host_close.await
+        }
+    }
 }
 
 async fn copy_terminal_resizes(
@@ -1636,14 +1703,15 @@ mod tests {
         REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
         RemoteTerminalOutputMode, TerminalFrontend, active_terminal_connection_event,
         await_remote_completion, await_until, changed_terminal_size, complete_after_output_eof,
-        controller_fallback_required, copy_local_input, copy_remote_output, copy_terminal_resizes,
-        decode_terminal_exit, default_terminal_value, direct_fallback_required,
-        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
-        fallback_transport, finish_terminal, finish_terminal_output, local_terminal_hello,
-        local_terminal_hello_with, native_display_restore_commands, next_retry_delay,
-        read_auth_response, read_local_input, run_controller, run_controller_session,
-        run_until_interrupted, terminal_environment, terminal_environment_from,
-        wait_for_remote_completion_deadline, write_native_display_restore,
+        complete_terminal_control_io, controller_fallback_required, copy_local_input,
+        copy_remote_output, copy_terminal_resizes, decode_terminal_exit, default_terminal_value,
+        direct_fallback_required, enter_raw_mode_before, exchange_terminal_ready,
+        exchange_terminal_ready_timed, fallback_transport, finish_terminal, finish_terminal_output,
+        local_terminal_hello, local_terminal_hello_with, native_display_restore_commands,
+        next_retry_delay, read_auth_response, read_local_input, run_controller,
+        run_controller_session, run_until_interrupted, terminal_environment,
+        terminal_environment_from, wait_for_remote_completion_deadline,
+        write_native_display_restore,
     };
     use crate::progress::NoopProgress;
     use crate::terminal::TerminalChunk;
@@ -1656,10 +1724,10 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
     use tokio::sync::oneshot;
     use yonder_core::wire::auth::AuthServerResponse;
-    use yonder_core::wire::terminal::{TerminalHello, TerminalReady};
+    use yonder_core::wire::terminal::{TerminalComplete, TerminalHello, TerminalReady};
     use yonder_core::{
-        ConnectionCode, Locator, PakeSecret, RetryAfter, SecretDocument, TerminalSize,
-        TerminalValue,
+        ConnectionCode, Locator, PakeSecret, ProtocolError, RetryAfter, SecretDocument,
+        TerminalSize, TerminalValue,
     };
     use yonder_net::{
         ConnectedPoint, ConnectionId, EndpointRelayAddress, EndpointRelaySet, Keypair,
@@ -2650,6 +2718,41 @@ mod tests {
             exchange_terminal_ready(&mut controller_data, &mut controller_control, &hello);
         let (result, ()) = tokio::join!(controller, host);
         result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_ack_waits_for_host_control_close() {
+        let (controller_control, host_control) = tokio::io::duplex(1);
+        let (mut controller_read, mut controller_write) = tokio::io::split(controller_control);
+        let (mut host_read, mut host_write) = tokio::io::split(host_control);
+        let controller = complete_terminal_control_io(&mut controller_read, &mut controller_write);
+        let host = async {
+            let mut complete = [0_u8; 1];
+            host_read.read_exact(&mut complete).await.unwrap();
+            assert_eq!(TerminalComplete::decode(&complete), Ok(TerminalComplete));
+            host_write.shutdown().await.unwrap();
+        };
+
+        let (result, ()) = tokio::join!(controller, host);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_accepts_legacy_host_close_and_rejects_trailing_bytes() {
+        let (controller_control, host_control) = tokio::io::duplex(1);
+        let (mut controller_read, mut controller_write) = tokio::io::split(controller_control);
+        drop(host_control);
+        complete_terminal_control_io(&mut controller_read, &mut controller_write)
+            .await
+            .unwrap();
+
+        let (controller_control, mut host_control) = tokio::io::duplex(1);
+        let (mut controller_read, mut controller_write) = tokio::io::split(controller_control);
+        host_control.write_all(&[0xff]).await.unwrap();
+        assert!(matches!(
+            complete_terminal_control_io(&mut controller_read, &mut controller_write).await,
+            Err(ControllerError::Protocol(ProtocolError::TrailingBytes))
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

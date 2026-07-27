@@ -24,7 +24,7 @@ use yonder_core::wire::auth::{
     KE3_LEN, PakeContext,
 };
 use yonder_core::wire::terminal::{
-    MAX_HELLO_LEN, TerminalExit, TerminalHello, TerminalReady, TerminalResize,
+    MAX_HELLO_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalReady, TerminalResize,
 };
 use yonder_core::wire::{AUTH_PROTOCOL, TERMINAL_CONTROL_PROTOCOL, TERMINAL_DATA_PROTOCOL};
 use yonder_core::{
@@ -39,6 +39,7 @@ use yonder_net::{
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const PRE_AUTH_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(3);
+const TERMINAL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Complete input required to advertise one remote terminal.
 pub struct HostConfig {
@@ -92,12 +93,14 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
     use yonder_core::wire::auth::{AuthClientHello, AuthServerResponse, CLIENT_HELLO_LEN};
-    use yonder_core::wire::terminal::{MAX_HELLO_LEN, TerminalExit, TerminalHello, TerminalResize};
+    use yonder_core::wire::terminal::{
+        MAX_HELLO_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalResize,
+    };
     use yonder_core::{
         ConnectionCode, Locator, PakeSecret, SessionEvent, TerminalSize, TerminalValue,
     };
@@ -439,7 +442,7 @@ mod tests {
             tokio::io::split(controller_data);
         let (host_control, controller_control) = tokio::io::duplex(31);
         let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
-        let (mut controller_control_read, controller_control_write) =
+        let (mut controller_control_read, mut controller_control_write) =
             tokio::io::split(controller_control);
         let (pty_input, mut captured_input) = tokio::io::duplex(31);
         let mut pty_input = DuplexInput(pty_input);
@@ -463,13 +466,16 @@ mod tests {
             }
         };
         let controller = async {
-            let _control_writer = controller_control_write;
             controller_data_write.write_all(&controller_payload).await?;
             controller_data_write.shutdown().await?;
             let mut output = Vec::with_capacity(PAYLOAD_LEN);
             controller_data_read.read_to_end(&mut output).await?;
             let mut exit = [0_u8; 5];
             controller_control_read.read_exact(&mut exit).await?;
+            controller_control_write
+                .write_all(&TerminalComplete::ENCODED)
+                .await?;
+            controller_control_write.flush().await?;
             Ok::<_, std::io::Error>((output, TerminalExit::decode(&exit).unwrap()))
         };
         let capture = async {
@@ -523,6 +529,16 @@ mod tests {
                 .unwrap();
             let mut exit = [0_u8; 5];
             controller_control_read.read_exact(&mut exit).await.unwrap();
+            controller_control_write
+                .write_all(&TerminalComplete::ENCODED)
+                .await
+                .unwrap();
+            controller_control_write.flush().await.unwrap();
+            let mut trailing = [0_u8; 1];
+            assert_eq!(
+                controller_control_read.read(&mut trailing).await.unwrap(),
+                0
+            );
             (terminal_bytes, TerminalExit::decode(&exit).unwrap())
         };
         let (exit, (terminal_bytes, remote_exit)) = tokio::join!(host, controller);
@@ -531,6 +547,109 @@ mod tests {
         assert!(terminal_bytes.is_empty());
         assert_eq!(remote_exit.code(), EXIT_CODE);
         assert_eq!(session.resized, Some(resized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_waits_for_controller_to_observe_completion() {
+        const EXIT_CODE: u32 = 43;
+        let mut session = PumpSession {
+            events: VecDeque::from([PtyEvent::exited(EXIT_CODE)]),
+        };
+        let (host_data, mut controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        let (mut controller_control_read, mut controller_control_write) =
+            tokio::io::split(controller_control);
+        let controller_observed = Arc::new(AtomicBool::new(false));
+        let controller_observed_in_task = Arc::clone(&controller_observed);
+
+        let host = copy_terminal_output(
+            &mut session,
+            &mut host_data_write,
+            &mut host_control_read,
+            &mut host_control_write,
+        );
+        let controller = async {
+            let mut terminal_bytes = Vec::new();
+            controller_data
+                .read_to_end(&mut terminal_bytes)
+                .await
+                .unwrap();
+            let mut exit = [0_u8; 5];
+            controller_control_read.read_exact(&mut exit).await.unwrap();
+            controller_observed_in_task.store(true, Ordering::Relaxed);
+            controller_control_write.shutdown().await.unwrap();
+            (terminal_bytes, TerminalExit::decode(&exit).unwrap())
+        };
+        tokio::pin!(host);
+        tokio::pin!(controller);
+
+        let (host, terminal_bytes, remote_exit) = tokio::select! {
+            biased;
+            result = &mut host => {
+                assert!(
+                    controller_observed.load(Ordering::Relaxed),
+                    "host completed before the controller observed terminal completion: {result:?}"
+                );
+                let (terminal_bytes, remote_exit) = controller.await;
+                (result, terminal_bytes, remote_exit)
+            }
+            observed = &mut controller => {
+                let host = host.await;
+                (host, observed.0, observed.1)
+            }
+        };
+
+        assert!(terminal_bytes.is_empty());
+        assert_eq!(remote_exit.code(), EXIT_CODE);
+        assert_eq!(host.unwrap(), EXIT_CODE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_completion_ack_closes_the_host_control_half() {
+        const EXIT_CODE: u32 = 47;
+        let mut session = PumpSession {
+            events: VecDeque::from([PtyEvent::exited(EXIT_CODE)]),
+        };
+        let (host_data, mut controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        let (mut controller_control_read, mut controller_control_write) =
+            tokio::io::split(controller_control);
+
+        let host = copy_terminal_output(
+            &mut session,
+            &mut host_data_write,
+            &mut host_control_read,
+            &mut host_control_write,
+        );
+        let controller = async {
+            let mut terminal_bytes = Vec::new();
+            controller_data
+                .read_to_end(&mut terminal_bytes)
+                .await
+                .unwrap();
+            let mut exit = [0_u8; 5];
+            controller_control_read.read_exact(&mut exit).await.unwrap();
+            controller_control_write
+                .write_all(&TerminalComplete::ENCODED)
+                .await
+                .unwrap();
+            controller_control_write.flush().await.unwrap();
+            let mut trailing = [0_u8; 1];
+            assert_eq!(
+                controller_control_read.read(&mut trailing).await.unwrap(),
+                0
+            );
+            (terminal_bytes, TerminalExit::decode(&exit).unwrap())
+        };
+
+        let (host, (terminal_bytes, remote_exit)) = tokio::join!(host, controller);
+        assert_eq!(host.unwrap(), EXIT_CODE);
+        assert!(terminal_bytes.is_empty());
+        assert_eq!(remote_exit.code(), EXIT_CODE);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1916,13 +2035,47 @@ async fn copy_terminal_output<S: TerminalSession>(
                         control_write
                             .write_all(&TerminalExit::new(code).encode())
                             .await?;
-                        control_write.shutdown().await?;
+                        control_write.flush().await?;
+                        complete_terminal_exit_io(
+                            control_read,
+                            control_write,
+                            TERMINAL_COMPLETION_TIMEOUT,
+                        )
+                        .await?;
                         return Ok(code);
                     }
                 }
             }
         }
     }
+}
+
+async fn complete_terminal_exit_io(
+    control_read: &mut (impl tokio::io::AsyncRead + Unpin),
+    control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    timeout: Duration,
+) -> Result<(), HostError> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let mut tag = [0_u8; 1];
+            let length = control_read.read(&mut tag).await?;
+            if length == 0 {
+                return Ok(());
+            }
+            if tag == TerminalComplete::ENCODED {
+                TerminalComplete::decode(&tag)?;
+                control_write.shutdown().await?;
+                return Ok(());
+            }
+
+            let mut resize = [0_u8; 5];
+            resize[0] = tag[0];
+            control_read.read_exact(&mut resize[1..]).await?;
+            TerminalResize::decode(&resize)?;
+        }
+    })
+    .await
+    .map_err(|_| HostError::Timeout)?
 }
 
 fn binding_event(error: &EndpointError) -> SessionEvent {

@@ -17,14 +17,14 @@
 | R-013 | registry 纯内存、有界、宽限恢复 | relay registry owner | Registry Active/Suspended | 确定时钟集成、restart/reclaim/conflict E2E |
 | R-014 | 查询枚举和资源受控 | relay limiter owner | Resolve/Retry/Unavailable | governor unit/property、4096 容量压力 |
 | R-015 | 当前用户 shell/权限/环境 | `PtyBackend` | Terminal Hello/Ready | PTY E2E、cwd/env/权限/exit/resize |
-| R-016 | 终端像本地、控制序列逐字节透传且可本地脱离；Unix/重定向输出字节透明，Windows 原生控制台为 UTF-8 文本边界 | `TerminalFrontend` + fixed-capacity escape state + bridges | data/control streams；交互 `Ctrl+] .` | ANSI/Esc/方向键/Ctrl+C/跨块脱离 E2E、Windows 非 UTF-8 替换后续传、非交互透明、backpressure、吞吐/延迟 |
+| R-016 | 终端像本地、控制序列逐字节透传且可本地脱离；Unix/重定向输出字节透明，Windows 原生控制台为 UTF-8 文本边界 | `TerminalFrontend` + fixed-capacity escape state + bridges | data/control streams；交互 `Ctrl+] .`；TerminalComplete 半关闭 | ANSI/Esc/方向键/Ctrl+C/跨块脱离 E2E、Windows 非 UTF-8 替换后续传、EOF/Exit/确认乱序、非交互透明、backpressure、吞吐/延迟 |
 | R-017 | 线程安全、取消、无数据竞争 | single-owner actors | 所有状态 | TSan、10k stress、fault injection、task leak test |
 | R-018 | 零分配/低资源优先 | fixed duplex/buffers/newtypes | 热路径 | allocation profile、RSS/CPU/handle/FD/binary/criterion gates、10 次真实会话相对本地 PTY 吞吐中位数 |
 | R-019 | 输入/错误类型安全且不泄密 | core parsers/errors | 所有 decoder | 100% unit、fuzz、snapshot 脱敏、invalid input E2E |
 | R-020 | 全面测试和风险分级覆盖 | CI/release | 全部 | 五原生 target 独立 llvm-cov JSON 阈值、fuzz corpus、平台与性能报告 |
 | R-021 | 依赖最新、feature 最小且受审 | workspace dependencies | 无 | metadata/feature tree、audit/deny、MSRV builds |
 | R-022 | 无公共默认 relay，必须自建 | CLI validation | relay PeerId pin | 缺省参数失败、身份生成和自建 E2E |
-| R-023 | 0.1.0 实际体验可感知、终端零污染 | `OperationProgress<Stage>` + CLI renderer + file diagnostics | 配置先校验；首反馈同步；心跳 <=1s；动态单行宽度；Active tracing 隔离；路径可诊断 | renderer/unit、Unix PTY + Windows ConPTY E2E、`--log-file`、strict fallback、真实 namespace 时延门禁、错误/恢复回归 |
+| R-023 | 0.1.x 实际体验可感知、终端零污染 | `OperationProgress<Stage>` + CLI renderer + file diagnostics | 配置先校验；首反馈同步；心跳 <=1s；动态单行宽度；Active tracing 隔离；路径可诊断 | renderer/unit、Unix PTY + Windows ConPTY 原生清行 E2E、`--log-file`、strict fallback、真实 namespace 时延门禁、错误/恢复回归 |
 | R-024 | relay 秘密文件在受支持平台 fail-closed | `SecretFilePolicy` + `IdentityStore` | Unix 0600、可信且不可被 group/other 写入的直接父目录；Windows protected DACL/可信 owner | Unix mode/父目录/普通文件、Windows ACL 正反测试、原生 config check、空目录 identity smoke |
 | R-025 | relay 可生产托管且可低噪声观测 | relay root task + aggregate observations | 跨平台停止信号；2s shutdown；60s 低基数汇总 | Unix/Windows 原生信号 E2E、聚合计数、拓扑配置拒绝、停止期限 |
 | R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | 两个二进制 config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |

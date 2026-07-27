@@ -48,12 +48,12 @@
 
 ### 端到端测试
 
-- 真进程 `yon-relay + yon host + yon connect`，用伪终端执行交互 shell、ANSI、Ctrl+C、resize、退出码、工作目录和环境继承。
+- 真进程 `yon-relay + yon host + yon connect`，用伪终端执行交互 shell、ANSI、Ctrl+C、resize、退出码、工作目录和环境继承；快速 shell 退出与 relay 重启/定位码冲突路径必须证明 controller 完整消费 data EOF、Exit 和终端尾部后完成 TerminalComplete 半关闭，禁止用固定 sleep 掩盖关闭竞态。
 - 直连 QUIC、TCP、WS；仅 relay；UDP 被阻断自动落 TCP；普通 TCP 被代理限制时走 WS/WSS。
 - Linux network namespace 使用风险驱动的成对矩阵覆盖公网、单 NAT、严格双 NAT、IPv4-only、IPv6-only，以及代表性的端口受限/对称 NAT 和双栈环境；丢包、延迟、抖动、乱序、断连与重置分别和最敏感的代表拓扑组合。公网/单 NAT/IPv6 必须断言最终为 Direct，严格双 NAT 必须断言 Relayed；结合原生进程 E2E，QUIC/TCP/WS/WSS 每种 transport 都必须至少有一条成功路径和失败关闭证据。禁止用低价值的完整笛卡尔积拖慢发布，也不得用少数 happy path 冒充矩阵。
 - 不可信 relay 的内容篡改、截断与伪造由端到端认证流和传输身份认证的定向测试证明失败关闭；可用性攻击通过真实 netem、连接断开与重置验证错误有界、endpoint 不死锁且不泄漏 secret。官方 `libp2p-relay` 不暴露已建立 circuit 密文的内部修改钩子，因此不为测试目的 fork 或重写 relay 实现。
 - 连接码位置参数、配置先于 TTY 隐藏输入和 pipe 输入三条 CLI 路径；错误码必须精确统一且不得出现 OPAQUE、PeerId、locator 或完整连接码。
-- 交互进度在网络前出现、最长 `1s` 心跳、动态宽度、`TerminalReady` 前清行、Active 无诊断污染；`--log-file` 仍保留进度并写入选中 route/transport。
+- 交互进度在网络前出现、最长 `1s` 心跳、动态宽度、`TerminalReady` 前清行、Active 无诊断污染；`--log-file` 仍保留进度并写入选中 route/transport。Windows ConPTY 必须同时接受 crossterm 通过原生控制台 API 投影出的等价整行清除序列，并继续断言远端输出开始前屏幕语义已经清行。
 - Unix SIGINT/SIGTERM/SIGHUP 与 Windows Ctrl+C/Break/Close/Logoff/Shutdown 进入 relay `2s` 有界关闭；host 等待时 Ctrl+C 安静返回 `130`。
 - 六个发布 target 都运行原生 smoke；不能只交叉编译通过。
 

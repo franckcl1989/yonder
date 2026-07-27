@@ -748,6 +748,7 @@ fn assert_progress_precedes_terminal_output(
         b"\x1b[1G\x1b[2K".as_slice(),
         b"\x1b[H\x1b[K".as_slice(),
         b"\r\x1b[K".as_slice(),
+        b"\x1b[K\r".as_slice(),
     ]
     .into_iter()
     .any(|sequence| {
@@ -762,6 +763,19 @@ fn assert_progress_precedes_terminal_output(
         )));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn progress_accepts_conpty_native_clear_translation() {
+    let output = concat!(
+        "Connecting to relay...\r",
+        "Establishing the best available path...\r",
+        "Starting remote terminal...\x1b[K\r",
+        "YON_REMOTE_BEGIN",
+    );
+
+    assert_progress_precedes_terminal_output(output.as_bytes(), b"YON_REMOTE_BEGIN").unwrap();
 }
 
 #[cfg(any(unix, windows))]

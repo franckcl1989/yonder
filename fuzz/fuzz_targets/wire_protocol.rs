@@ -7,7 +7,9 @@ use yonder_core::wire::auth::{
 };
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
-use yonder_core::wire::terminal::{TerminalExit, TerminalHello, TerminalReady, TerminalResize};
+use yonder_core::wire::terminal::{
+    TerminalComplete, TerminalExit, TerminalHello, TerminalReady, TerminalResize,
+};
 use yonder_core::{Locator, PeerIdBytes};
 
 fuzz_target!(|input: &[u8]| {
@@ -22,6 +24,7 @@ fuzz_target!(|input: &[u8]| {
     let _ = TerminalHello::decode(input);
     let _ = TerminalResize::decode(input);
     let _ = TerminalExit::decode(input);
+    let _ = TerminalComplete::decode(input);
     let _ = TerminalReady::decode(input);
 
     let fallback = [0_u8];
