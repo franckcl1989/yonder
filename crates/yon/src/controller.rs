@@ -1701,17 +1701,17 @@ mod tests {
         ActiveTerminalConnectionEvent, ControllerConfig, ControllerError, CrosstermFrontend,
         DisplayModeGuard, EndpointError, EndpointEvent, LOCAL_ESCAPE, LocalInputEscape,
         REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
-        RemoteTerminalOutputMode, TerminalFrontend, active_terminal_connection_event,
-        await_remote_completion, await_until, changed_terminal_size, complete_after_output_eof,
-        complete_terminal_control_io, controller_fallback_required, copy_local_input,
-        copy_remote_output, copy_terminal_resizes, decode_terminal_exit, default_terminal_value,
-        direct_fallback_required, enter_raw_mode_before, exchange_terminal_ready,
-        exchange_terminal_ready_timed, fallback_transport, finish_terminal, finish_terminal_output,
-        local_terminal_hello, local_terminal_hello_with, native_display_restore_commands,
-        next_retry_delay, read_auth_response, read_local_input, run_controller,
-        run_controller_session, run_until_interrupted, terminal_environment,
-        terminal_environment_from, wait_for_remote_completion_deadline,
-        write_native_display_restore,
+        RemoteTerminalOutputMode, TerminalFrontend, UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch,
+        active_terminal_connection_event, await_remote_completion, await_until,
+        changed_terminal_size, complete_after_output_eof, complete_terminal_control_io,
+        controller_fallback_required, copy_local_input, copy_remote_output, copy_terminal_resizes,
+        decode_terminal_exit, default_terminal_value, direct_fallback_required,
+        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
+        fallback_transport, finish_terminal, finish_terminal_output, local_terminal_hello,
+        local_terminal_hello_with, native_display_restore_commands, next_retry_delay,
+        read_auth_response, read_local_input, run_controller, run_controller_session,
+        run_until_interrupted, terminal_environment, terminal_environment_from,
+        wait_for_remote_completion_deadline, write_native_display_restore,
     };
     use crate::progress::NoopProgress;
     use crate::terminal::TerminalChunk;
@@ -2417,6 +2417,24 @@ mod tests {
     struct CountingWriter {
         bytes: Vec<u8>,
         writes: usize,
+        fail_on_write: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl CountingWriter {
+        fn failing_first_write() -> Self {
+            Self {
+                fail_on_write: Some(1),
+                ..Self::default()
+            }
+        }
+
+        fn failing_flush() -> Self {
+            Self {
+                fail_flush: true,
+                ..Self::default()
+            }
+        }
     }
 
     impl AsyncWrite for CountingWriter {
@@ -2426,6 +2444,9 @@ mod tests {
             bytes: &[u8],
         ) -> Poll<Result<usize, io::Error>> {
             self.writes += 1;
+            if self.fail_on_write == Some(self.writes) {
+                return Poll::Ready(Err(io::Error::other("injected write failure")));
+            }
             self.bytes.extend_from_slice(bytes);
             Poll::Ready(Ok(bytes.len()))
         }
@@ -2434,7 +2455,11 @@ mod tests {
             self: Pin<&mut Self>,
             _context: &mut Context<'_>,
         ) -> Poll<Result<(), io::Error>> {
-            Poll::Ready(Ok(()))
+            if self.fail_flush {
+                Poll::Ready(Err(io::Error::other("injected flush failure")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
 
         fn poll_shutdown(
@@ -2443,6 +2468,10 @@ mod tests {
         ) -> Poll<Result<(), io::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    fn assert_injected_io(error: io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[test]
@@ -2489,6 +2518,82 @@ mod tests {
         terminal_output.finish(&mut output).await.unwrap();
         assert_eq!(output.bytes, String::from_utf8_lossy(&invalid).as_bytes());
         assert!(output.writes <= 16, "write count: {}", output.writes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn utf8_output_batch_propagates_every_write_failure() {
+        let oversized = vec![b'a'; UTF8_OUTPUT_BATCH_CAPACITY + 1];
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut batch = Utf8OutputBatch::new();
+        assert_injected_io(batch.append(&mut output, &oversized).await.unwrap_err());
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut batch = Utf8OutputBatch::new();
+        batch.append(&mut output, b"buffered").await.unwrap();
+        assert_injected_io(batch.append(&mut output, &oversized).await.unwrap_err());
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut batch = Utf8OutputBatch::new();
+        let full = vec![b'a'; UTF8_OUTPUT_BATCH_CAPACITY];
+        batch.append(&mut output, &full).await.unwrap();
+        assert_injected_io(batch.append(&mut output, b"overflow").await.unwrap_err());
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut batch = Utf8OutputBatch::new();
+        batch.append(&mut output, b"buffered").await.unwrap();
+        assert_injected_io(batch.flush(&mut output).await.unwrap_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_output_adapter_propagates_write_and_flush_failures() {
+        let mut output = CountingWriter::failing_first_write();
+        let mut bytes = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        assert_injected_io(bytes.write(&mut output, b"bytes").await.unwrap_err());
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut terminal_output =
+            RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
+        let oversized = vec![b'a'; UTF8_OUTPUT_BATCH_CAPACITY + 1];
+        assert_injected_io(
+            terminal_output
+                .write(&mut output, &oversized)
+                .await
+                .unwrap_err(),
+        );
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut terminal_output =
+            RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
+        let mut valid_then_invalid = vec![b'a'; UTF8_OUTPUT_BATCH_CAPACITY + 1];
+        valid_then_invalid.push(0xff);
+        assert_injected_io(
+            terminal_output
+                .write(&mut output, &valid_then_invalid)
+                .await
+                .unwrap_err(),
+        );
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut terminal_output =
+            RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
+        let invalid = vec![0xff; UTF8_OUTPUT_BATCH_CAPACITY];
+        assert_injected_io(
+            terminal_output
+                .write(&mut output, &invalid)
+                .await
+                .unwrap_err(),
+        );
+
+        let mut output = CountingWriter::failing_first_write();
+        let mut terminal_output =
+            RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
+        terminal_output.write(&mut output, b"\xf0").await.unwrap();
+        assert_injected_io(terminal_output.finish(&mut output).await.unwrap_err());
+
+        let mut output = CountingWriter::failing_flush();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        assert_injected_io(terminal_output.finish(&mut output).await.unwrap_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
