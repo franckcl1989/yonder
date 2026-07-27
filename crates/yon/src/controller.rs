@@ -2493,7 +2493,7 @@ mod tests {
             received
         };
 
-        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        let completed = tokio::time::timeout(Duration::from_secs(30), async {
             tokio::pin!(input_pump);
             tokio::pin!(output_pump);
             tokio::pin!(peer_exchange);

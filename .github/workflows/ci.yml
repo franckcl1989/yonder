@@ -18,7 +18,7 @@ jobs:
   workflow-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install actionlint 1.7.12
@@ -29,10 +29,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -49,10 +49,10 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy
@@ -93,12 +93,12 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
           components: llvm-tools-preview
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
@@ -113,11 +113,11 @@ jobs:
       - name: Generate first-party coverage report
         shell: bash
         run: |
-          cargo +nightly llvm-cov \
+          cargo +nightly-2026-07-22 llvm-cov \
             --locked --workspace --all-targets --all-features \
             --target "${{ matrix.target }}" \
             --branch --json --output-path coverage.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ matrix.target }}
           path: coverage.json
@@ -125,25 +125,7 @@ jobs:
           overwrite: true
       - name: Enforce risk-based first-party coverage
         shell: bash
-        run: |
-          jq --exit-status '
-            .data as $data
-            | ($data | length) > 0
-            and all($data[];
-              .totals.lines.count > 0
-              and (.totals.lines.covered * 100 >= .totals.lines.count * 95)
-              and .totals.functions.count > 0
-              and (.totals.functions.covered * 100 >= .totals.functions.count * 95)
-              and .totals.regions.count > 0
-              and (.totals.regions.covered * 100 >= .totals.regions.count * 90)
-              and .totals.branches.count > 0
-              and (.totals.branches.covered * 100 >= .totals.branches.count * 75)
-              and all(.files[];
-                .summary.lines.count == 0
-                or (.summary.lines.covered * 100 >= .summary.lines.count * 75)
-              )
-            )
-          ' coverage.json >/dev/null
+        run: bash .github/scripts/enforce-coverage.sh coverage.json
 
   msrv:
     name: MSRV ${{ matrix.target }}
@@ -165,10 +147,10 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # 1.88.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: 1.88.0
           targets: ${{ matrix.target }}
@@ -196,12 +178,12 @@ jobs:
         target: [connection_code, wire_protocol, session_state, network_address]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
         with:
           tool: cargo-fuzz@0.13.2
@@ -212,22 +194,22 @@ jobs:
           FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '60' }}
         run: |
           if [[ "$FUZZ_TARGET" == "network_address" ]]; then
-            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time="$FUZZ_SECONDS" -timeout=10
           else
-            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time="$FUZZ_SECONDS" -timeout=10
           fi
 
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
           components: miri
-      - run: cargo +nightly miri test --locked -p yonder-core
+      - run: cargo +nightly-2026-07-22 miri test --locked -p yonder-core
 
   sanitizer:
     strategy:
@@ -236,26 +218,26 @@ jobs:
         sanitizer: [address, thread]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
           components: rust-src
       - name: Run ${{ matrix.sanitizer }} sanitizer
         env:
           RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
           RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
         run: >-
-          cargo +nightly test --locked -Zbuild-std
+          cargo +nightly-2026-07-22 test --locked -Zbuild-std
           --target x86_64-unknown-linux-gnu
           --workspace --all-targets --all-features
 
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Reject unsafe first-party Rust

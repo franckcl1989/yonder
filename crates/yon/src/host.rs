@@ -1424,6 +1424,9 @@ impl<B: TerminalBackend> HostSession<'_, B> {
 
             let outcome =
                 bridge_terminal(driver, binding, &mut incoming, &mut pty, data, control).await;
+            if let Err(error) = &outcome {
+                tracing::debug!(%error, "terminal bridge failed before shell completion");
+            }
             let shutdown = pty.shutdown().await;
             match outcome {
                 Ok(code) => {

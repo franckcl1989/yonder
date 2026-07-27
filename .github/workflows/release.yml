@@ -22,10 +22,10 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -125,12 +125,12 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
           components: llvm-tools-preview
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
@@ -145,11 +145,11 @@ jobs:
       - name: Generate first-party coverage report
         shell: bash
         run: |
-          cargo +nightly llvm-cov \
+          cargo +nightly-2026-07-22 llvm-cov \
             --locked --workspace --all-targets --all-features \
             --target "${{ matrix.target }}" \
             --branch --json --output-path coverage.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ matrix.target }}
           path: coverage.json
@@ -157,35 +157,17 @@ jobs:
           overwrite: true
       - name: Enforce risk-based first-party coverage
         shell: bash
-        run: |
-          jq --exit-status '
-            .data as $data
-            | ($data | length) > 0
-            and all($data[];
-              .totals.lines.count > 0
-              and (.totals.lines.covered * 100 >= .totals.lines.count * 95)
-              and .totals.functions.count > 0
-              and (.totals.functions.covered * 100 >= .totals.functions.count * 95)
-              and .totals.regions.count > 0
-              and (.totals.regions.covered * 100 >= .totals.regions.count * 90)
-              and .totals.branches.count > 0
-              and (.totals.branches.covered * 100 >= .totals.branches.count * 75)
-              and all(.files[];
-                .summary.lines.count == 0
-                or (.summary.lines.covered * 100 >= .summary.lines.count * 75)
-              )
-            )
-          ' coverage.json >/dev/null
+        run: bash .github/scripts/enforce-coverage.sh coverage.json
 
   sbom:
     needs: quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
@@ -250,7 +232,7 @@ jobs:
           done
           test -s dist/yon.cdx.json
           test -s dist/yon-relay.cdx.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: yonder-sbom
           path: dist/*.cdx.json
@@ -261,10 +243,10 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - name: Install cargo-about 0.9.1
@@ -277,7 +259,7 @@ jobs:
             --output-file dist/THIRD-PARTY-LICENSES.html about.hbs
           cp LICENSE-MIT LICENSE-APACHE dist/
           test -s dist/THIRD-PARTY-LICENSES.html
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: yonder-licenses
           path: dist/*
@@ -305,10 +287,10 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # 1.88.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: 1.88.0
           targets: ${{ matrix.target }}
@@ -332,14 +314,14 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
           components: miri
-      - run: cargo +nightly miri test --locked -p yonder-core
+      - run: cargo +nightly-2026-07-22 miri test --locked -p yonder-core
 
   sanitizer:
     needs: quality
@@ -349,19 +331,19 @@ jobs:
         sanitizer: [address, thread]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
           components: rust-src
       - name: Run ${{ matrix.sanitizer }} sanitizer
         env:
           RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
           RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
         run: >-
-          cargo +nightly test --locked -Zbuild-std
+          cargo +nightly-2026-07-22 test --locked -Zbuild-std
           --target x86_64-unknown-linux-gnu
           --workspace --all-targets --all-features
 
@@ -375,12 +357,12 @@ jobs:
         shard: [1, 2, 3, 4, 5]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-22
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
         with:
           tool: cargo-fuzz@0.13.2
@@ -391,9 +373,9 @@ jobs:
           FUZZ_SEED: ${{ matrix.shard }}
         run: |
           if [[ "$FUZZ_TARGET" == "network_address" ]]; then
-            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
           else
-            cargo +nightly fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
           fi
 
   build:
@@ -429,10 +411,10 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy
@@ -639,7 +621,7 @@ jobs:
               $zip.Dispose()
             }
           }
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: yonder-${{ matrix.suffix }}
           path: dist/*
@@ -651,10 +633,10 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: yonder-linux-x86_64
           path: candidate
@@ -672,7 +654,7 @@ jobs:
           chmod +x stage/yon stage/yon-relay
           sudo bash .github/scripts/run-network-matrix.sh \
             stage/yon stage/yon-relay | tee network-matrix.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: yonder-network-matrix
           path: network-matrix.txt
@@ -689,10 +671,10 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - name: Run Criterion benchmarks
@@ -887,7 +869,7 @@ jobs:
             Remove-Item -Recurse -Force $relayRoot
           }
           Copy-Item -Recurse target/criterion performance/criterion
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: yonder-performance-${{ runner.os }}-${{ runner.arch }}
           path: performance
@@ -902,34 +884,34 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Download Linux release archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           pattern: yonder-linux-*
           merge-multiple: true
       - name: Download macOS release archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           pattern: yonder-macos-*
           merge-multiple: true
       - name: Download Windows release archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           pattern: yonder-windows-*
           merge-multiple: true
       - name: Download release SBOMs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: yonder-sbom
           path: dist
       - name: Download release licenses
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: yonder-licenses
           path: dist
@@ -948,7 +930,7 @@ jobs:
       - name: Verify release asset inventory
         shell: bash
         run: bash .github/scripts/verify-release-assets.sh dist
-      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: dist/*
       - name: Verify release provenance as a consumer
@@ -963,7 +945,7 @@ jobs:
               --source-digest "$GITHUB_SHA" \
               --source-ref "$GITHUB_REF"
           done < <(find dist -maxdepth 1 -type f -print0 | sort --zero-terminated)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-candidate-${{ env.CANDIDATE_VERSION }}
           path: dist/*

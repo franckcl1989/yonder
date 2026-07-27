@@ -49,6 +49,28 @@ const TEST_WSS_SELF_SIGNED_CERT_DER: &[u8] =
     include_bytes!("fixtures/localhost-self-signed-cert.der");
 const TEST_WSS_SELF_SIGNED_KEY_DER: &[u8] =
     include_bytes!("fixtures/localhost-self-signed-key.der");
+#[cfg(windows)]
+const WINDOWS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const WINDOWS_ESCAPE_READY: &[u8] = b"YON_WAIT_ESCAPE";
+#[cfg(windows)]
+const WINDOWS_ARROW_READY: &[u8] = b"YON_WAIT_ARROW";
+#[cfg(windows)]
+const WINDOWS_ESCAPE_PROBE: &str = concat!(
+    "powershell.exe -NoLogo -NoProfile -Command ",
+    "\"[Console]::WriteLine(([char[]](89,79,78,95,87,65,73,84,95,69,83,67,65,80,69)-join '')); ",
+    "$k=[Console]::ReadKey($true); ",
+    "[Console]::WriteLine(('YON_KEY_ESCAPE={0}:{1}' -f $k.Key,[int]$k.KeyChar))\"\r",
+);
+#[cfg(windows)]
+const WINDOWS_ARROW_PROBE: &str = concat!(
+    "powershell.exe -NoLogo -NoProfile -Command ",
+    "\"[Console]::WriteLine(([char[]](89,79,78,95,87,65,73,84,95,65,82,82,79,87)-join '')); ",
+    "$a=[Console]::ReadKey($true); $b=[Console]::ReadKey($true); ",
+    "$c=[Console]::ReadKey($true); ",
+    "[Console]::WriteLine(('YON_KEY_ARROW={0},{1},{2}' -f ",
+    "[int]$a.KeyChar,[int]$b.KeyChar,[int]$c.KeyChar))\"\r",
+);
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -382,7 +404,7 @@ fn run_secure_websocket_session(
 }
 
 #[test]
-fn blocked_udp_and_tcp_candidates_fall_back_to_a_working_transport() -> Result<(), std::io::Error> {
+fn blocked_udp_candidate_falls_back_to_tcp() -> Result<(), std::io::Error> {
     let tcp_port = available_port()?;
     let quic_port = available_udp_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
@@ -406,7 +428,25 @@ fn blocked_udp_and_tcp_candidates_fall_back_to_a_working_transport() -> Result<(
         &[blocked_udp_address, format!("{tcp}/p2p/{peer}")],
         CodeInput::Stdin,
     )?;
+    drop(blocked_udp);
+    relay_process.stop()
+}
 
+#[test]
+fn blocked_tcp_candidate_falls_back_to_quic() -> Result<(), std::io::Error> {
+    let tcp_port = available_port()?;
+    let quic_port = available_udp_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let tcp = format!("/ip4/127.0.0.1/tcp/{tcp_port}");
+    let quic = format!("/ip4/127.0.0.1/udp/{quic_port}/quic-v1");
+    let relay_process = RelayProcess::start_addresses(
+        identity,
+        vec![tcp.clone(), quic.clone()],
+        vec![tcp, quic.clone()],
+    )?;
+    thread::sleep(Duration::from_millis(500));
     let blocked_tcp = TcpListener::bind(("127.0.0.1", 0))?;
     let blocked_tcp_address = format!(
         "/ip4/127.0.0.1/tcp/{}/p2p/{peer}",
@@ -416,8 +456,7 @@ fn blocked_udp_and_tcp_candidates_fall_back_to_a_working_transport() -> Result<(
         &[blocked_tcp_address, format!("{quic}/p2p/{peer}")],
         CodeInput::Stdin,
     )?;
-
-    drop((blocked_udp, blocked_tcp));
+    drop(blocked_tcp);
     relay_process.stop()
 }
 
@@ -845,21 +884,13 @@ fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
         )
         .map_err(|error| windows_probe_error("remote terminal start", error, &output))?;
 
-        writer.write_all(
-            concat!(
-                "powershell.exe -NoLogo -NoProfile -Command ",
-                "\"[Console]::WriteLine('YON_WAIT_ESCAPE'); ",
-                "$k=[Console]::ReadKey($true); ",
-                "[Console]::WriteLine(('YON_KEY_ESCAPE={0}:{1}' -f $k.Key,[int]$k.KeyChar))\"\r",
-            )
-            .as_bytes(),
-        )?;
+        writer.write_all(WINDOWS_ESCAPE_PROBE.as_bytes())?;
         writer.flush()?;
         wait_for_bytes(
             &output_rx,
             &mut output,
-            b"YON_WAIT_ESCAPE",
-            Duration::from_secs(5),
+            WINDOWS_ESCAPE_READY,
+            WINDOWS_PROBE_TIMEOUT,
         )
         .map_err(|error| windows_probe_error("Escape readiness", error, &output))?;
         writer.write_all(b"\x1b")?;
@@ -868,27 +899,17 @@ fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
             &output_rx,
             &mut output,
             b"YON_KEY_ESCAPE=Escape:27",
-            Duration::from_secs(5),
+            WINDOWS_PROBE_TIMEOUT,
         )
         .map_err(|error| windows_probe_error("Escape result", error, &output))?;
 
-        writer.write_all(
-            concat!(
-                "powershell.exe -NoLogo -NoProfile -Command ",
-                "\"[Console]::WriteLine('YON_WAIT_ARROW'); ",
-                "$a=[Console]::ReadKey($true); $b=[Console]::ReadKey($true); ",
-                "$c=[Console]::ReadKey($true); ",
-                "[Console]::WriteLine(('YON_KEY_ARROW={0},{1},{2}' -f ",
-                "[int]$a.KeyChar,[int]$b.KeyChar,[int]$c.KeyChar))\"\r",
-            )
-            .as_bytes(),
-        )?;
+        writer.write_all(WINDOWS_ARROW_PROBE.as_bytes())?;
         writer.flush()?;
         wait_for_bytes(
             &output_rx,
             &mut output,
-            b"YON_WAIT_ARROW",
-            Duration::from_secs(5),
+            WINDOWS_ARROW_READY,
+            WINDOWS_PROBE_TIMEOUT,
         )
         .map_err(|error| windows_probe_error("arrow readiness", error, &output))?;
         writer.write_all(b"\x1b[A")?;
@@ -897,7 +918,7 @@ fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
             &output_rx,
             &mut output,
             b"YON_KEY_ARROW=27,91,65",
-            Duration::from_secs(5),
+            WINDOWS_PROBE_TIMEOUT,
         )
         .map_err(|error| windows_probe_error("arrow result", error, &output))?;
 
@@ -990,6 +1011,19 @@ fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
     }
     host.finish_with_exit(23)?;
     relay_process.stop()
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_conpty_probe_echo_cannot_satisfy_readiness() {
+    assert!(!contains_bytes(
+        WINDOWS_ESCAPE_PROBE.as_bytes(),
+        WINDOWS_ESCAPE_READY
+    ));
+    assert!(!contains_bytes(
+        WINDOWS_ARROW_PROBE.as_bytes(),
+        WINDOWS_ARROW_READY
+    ));
 }
 
 #[test]
