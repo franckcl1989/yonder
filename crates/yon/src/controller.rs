@@ -2491,6 +2491,36 @@ mod tests {
         assert!(output.writes <= 16, "write count: {}", output.writes);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_output_adapter_handles_every_streaming_utf8_boundary() {
+        let mut output = CountingWriter::default();
+        let mut bytes = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        bytes.write(&mut output, b"\xff").await.unwrap();
+        bytes.finish(&mut output).await.unwrap();
+        assert_eq!(output.bytes, b"\xff");
+
+        let mut output = CountingWriter::default();
+        let mut terminal_output =
+            RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
+        terminal_output.write(&mut output, b"valid").await.unwrap();
+        terminal_output.write(&mut output, b"\xe4").await.unwrap();
+        terminal_output.write(&mut output, b"").await.unwrap();
+        terminal_output.write(&mut output, b"\xb8").await.unwrap();
+        terminal_output.write(&mut output, b"\xad").await.unwrap();
+        terminal_output.write(&mut output, b"\xe4").await.unwrap();
+        terminal_output.write(&mut output, b"A").await.unwrap();
+        terminal_output
+            .write(&mut output, b"ok\xff\xf0\x90")
+            .await
+            .unwrap();
+        terminal_output.finish(&mut output).await.unwrap();
+
+        assert_eq!(
+            output.bytes,
+            "valid\u{4e2d}\u{fffd}Aok\u{fffd}\u{fffd}".as_bytes()
+        );
+    }
+
     #[test]
     fn windows_console_streaming_matches_lossy_utf8_for_arbitrary_chunking() {
         use proptest::prelude::*;
