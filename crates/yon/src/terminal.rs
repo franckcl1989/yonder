@@ -983,6 +983,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn synthetic_session_rejects_duplicate_input_and_cancelled_tasks() {
+        let (mut duplicate_input, _controls) = synthetic_session();
+        let input = duplicate_input.take_input().unwrap();
+        assert!(matches!(
+            duplicate_input.take_input(),
+            Err(TerminalError::TaskStopped)
+        ));
+        drop(input);
+
+        let (mut cancelled_exit, controls) = synthetic_session();
+        drop(controls.exit);
+        assert!(matches!(
+            cancelled_exit.next().await,
+            Err(TerminalError::TaskPanicked)
+        ));
+
+        let (mut cancelled_input, controls) = synthetic_session();
+        drop(controls.input_result);
+        assert!(matches!(
+            cancelled_input.next().await,
+            Err(TerminalError::TaskPanicked)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn synthetic_eof_and_shutdown_cover_deferred_terminal_failures() {
         let (mut eof_before_exit, mut controls) = synthetic_session();
         controls.output.shutdown().await.unwrap();

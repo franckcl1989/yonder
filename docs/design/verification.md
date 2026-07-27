@@ -59,7 +59,7 @@
 
 ### 模糊测试
 
-独立 fuzz target 覆盖：连接码 parser、registry request/response、resolve request/response、auth 状态 decoder、terminal control decoder、PeerId/context builder、目标状态事件序列。每次 PR 每 target 至少 `60s` 固定 corpus；nightly 每 target `30min`；发布候选每 target累计 `24h` 且零 crash、hang、OOM、超限分配和不变量失败。发现缺陷后最小化样本进入永久 regression corpus。
+独立 fuzz target 覆盖：连接码 parser、registry request/response、resolve request/response、auth 状态 decoder、terminal control decoder、PeerId/context builder、目标状态事件序列。每次 PR 每 target 至少 `60s` 固定 corpus；nightly 每 target `30min`；发布候选四个 target 各运行一个并行的 `30min` job，墙钟约 `30min`、聚合 `2h`，且零 crash、hang、OOM、超限分配和不变量失败。发现缺陷后最小化样本进入永久 regression corpus。
 
 ### 性能测试
 

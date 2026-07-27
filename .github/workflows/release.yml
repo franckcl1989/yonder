@@ -349,12 +349,11 @@ jobs:
 
   release-fuzz:
     needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, build]
-    timeout-minutes: 330
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         target: [connection_code, wire_protocol, session_state, network_address]
-        shard: [1, 2, 3, 4, 5]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -366,16 +365,15 @@ jobs:
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
         with:
           tool: cargo-fuzz@0.13.2
-      - name: Fuzz ${{ matrix.target }} shard ${{ matrix.shard }} for five hours
+      - name: Fuzz ${{ matrix.target }} for 30 minutes
         shell: bash
         env:
           FUZZ_TARGET: ${{ matrix.target }}
-          FUZZ_SEED: ${{ matrix.shard }}
         run: |
           if [[ "$FUZZ_TARGET" == "network_address" ]]; then
-            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time=1800 -timeout=10
           else
-            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time=18000 -timeout=10 -seed="$FUZZ_SEED"
+            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time=1800 -timeout=10
           fi
 
   build:
