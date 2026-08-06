@@ -254,3 +254,27 @@
 - 仓库采用 `LICENSE-MIT` 与 `LICENSE-APACHE` 双许可证文本。已批准发布工具 `cargo-about 0.9.1`，仅启用 `cli`，用于生成独立 `THIRD-PARTY-LICENSES.html`；许可证资产必须纳入 checksum 和 provenance，但不得放入单二进制归档。
 - 网络验证采用经批准的风险驱动成对矩阵：每种传输、关键 NAT/地址族拓扑、故障类别及 Direct/Relayed 结果都必须有真实代表组合和最终选路断言，不要求制造低价值的完整笛卡尔积。中继不可信行为通过端到端认证流的篡改/截断测试与真实网络延迟、丢包、乱序、断连和重置验证；禁止为注入中继内部明文钩子而 fork 或重写官方 `libp2p-relay`。
 - tag workflow 只有在性能、资源、四目标各 `30min` 的发布 fuzz、风险驱动网络与故障矩阵、五目标覆盖率和六目标原生发布证据全部通过后才允许自动创建正式 GitHub Release。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
+
+## 0.1.2 企业认证已确认决策
+
+项目所有者于 2026-08-06 对 0.1.2 Enterprise Authentication 实现决策逐项确认：
+
+- HTTP 技术栈：hyper 单一栈（服务端与 OAuth 客户端共用同一 HTTP 实现），不引入 axum/reqwest。
+- 回调证书：[enterprise_auth] 下独立配置 certificate/certificate_der + private_key/private_key_der，与 WSS 传输证书隔离；浏览器回调必须使用公网 CA 签发的证书。
+- Secret 文件：企业微信与飞书各一个独立敏感文件（enterprise_auth.secret_wecom / enterprise_auth.secret_feishu），复用 `SecretFilePolicy` 平台保护。
+- 平台选择交互：connect 收到平台列表后终端编号选择，随后打开系统浏览器跳转授权 URL。
+
+## 已确认的企业认证 HTTP 依赖
+
+0.1.2 企业认证需要 HTTPS 回调服务器（浏览器 OAuth 回调）与 OAuth API 客户端（企业微信/飞书 token 交换与成员校验）。版本于 2026-08-06 经 crates.io 核实均为各自全局最新稳定版：
+
+- 已批准直接依赖 `hyper 1.11.0`，`default-features = false`，仅启用 `client`、`http1`、`server`；关闭 `http2`，企业微信/飞书 API 与浏览器回调均为 HTTP/1.1。锁文件中 1.10.1 为 `igd-next` 传递引入，本次升级到 1.11.0 属 semver 兼容补丁升级。
+- 已批准直接依赖 `hyper-util 0.1.20`，`default-features = false`，仅启用 `client-legacy`、`http1`、`server`、`server-auto`、`tokio`；该版本与锁文件现有传递版本一致。`server-auto` 会连带启用 `http2`，接受该依赖成本以使用官方 auto builder。
+- 已批准直接依赖 `hyper-rustls 0.27.9`，`default-features = false`，仅启用 `http1`、`ring`、`tls12`、`webpki-tokio`；仅用于 OAuth 客户端 `HttpsConnector`（该版本线无服务端能力），`webpki-tokio` 内嵌 Mozilla 根证书，适配 musl 等无系统证书库的静态目标，不再单独声明 `webpki-roots` 直接依赖。
+- 已批准直接依赖 `tokio-rustls 0.26.4`，`default-features = false`，仅启用 `ring`、`tls12`；仅用于回调 HTTPS 监听器的 `TlsAcceptor`。`ring` 与锁文件现有 rustls 0.23.42 的 crypto provider 保持一致，不引入 `aws-lc-rs`。
+- 已批准直接依赖 `http-body-util 0.1.4`，`default-features = false`，不启用任何 feature；仅用于请求/响应 `Body` 工具类型。
+- 已批准直接依赖 `serde_json 1.0.151`，`default-features = false`，仅启用 `std`；锁文件 1.0.150 原为 `criterion`/`tinytemplate` 传递版本，本次补丁升级并转为直接依赖。
+- 已批准直接依赖 `url 2.5.8`，`default-features = false`，不启用任何 feature；仅用于 OAuth 授权 URL 构造，`query_pairs_mut` 承担百分号编码。锁文件已有同版本传递依赖。
+- 已批准 workspace `tokio` 依赖新增 `net` feature，用于回调监听器的 `TcpListener` 与 OAuth 客户端连接。
+- 经核实 base64（最新 0.23.1）与 form_urlencoded 对两个提供商的 OAuth 流程均无必要（token 交换与成员校验均为 JSON 承载），不引入。
+- 上述 crate 的 MSRV 均不高于 workspace `rust-version = 1.88`（最高为 hyper-rustls 1.85），许可证均位于 `deny.toml` 允许列表（MIT / Apache-2.0 OR ISC OR MIT / MIT OR Apache-2.0）。2026-08-06 在更新后的锁文件上运行 `cargo deny check` 全项通过、`cargo audit` 除既有三个已批准例外（RUSTSEC-2026-0118/0119/2024-0436）外无新增公告；后续升级与全矩阵验证仍须走既定流程。

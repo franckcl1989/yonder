@@ -10,12 +10,19 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 yonder-config = { version = "=0.1.1", path = "../yonder-config", default-features = false }
 yonder-core = { version = "=0.1.1", path = "../yonder-core", default-features = false }
 yonder-net = { version = "=0.1.1", path = "../yonder-net", default-features = false }
