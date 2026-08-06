@@ -1594,6 +1594,50 @@ fn relay_test_directory() -> Result<tempfile::TempDir, std::io::Error> {
         .tempdir_in(PathBuf::from(root))
 }
 
+#[cfg(not(windows))]
+fn secure_test_directory(_path: &Path) {}
+
+/// Replaces the directory ACL with the trusted-only policy (owner plus
+/// SYSTEM and Administrators with FullControl, no inheritance) so secret
+/// files created inside it pass the Windows parent-directory check.
+#[cfg(windows)]
+fn secure_test_directory(path: &Path) {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$path=$env:YONDER_TEST_DIRECTORY
+$current=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+$administrators=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+$acl=New-Object Security.AccessControl.DirectorySecurity
+$acl.SetOwner($current)
+$acl.SetAccessRuleProtection($true,$false)
+$rights=[Security.AccessControl.FileSystemRights]::FullControl
+$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+$propagate=[Security.AccessControl.PropagationFlags]::None
+$allow=[Security.AccessControl.AccessControlType]::Allow
+foreach($sid in @($current,$system,$administrators)){$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,$rights,$inherit,$propagate,$allow);[void]$acl.AddAccessRule($rule)}
+[IO.Directory]::SetAccessControl($path,$acl)
+exit 0
+"#;
+    let executable = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let status = Command::new(executable)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
+        .env("YONDER_TEST_DIRECTORY", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 impl RelayProcess {
     fn start(identity: Keypair, port: u16) -> Result<Self, std::io::Error> {
         Self::start_routed(identity, port, port)
@@ -1674,6 +1718,7 @@ impl RelayProcess {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let directory = relay_test_directory()?;
+        secure_test_directory(directory.path());
         let wecom_secret = directory.path().join("wecom.secret");
         std::fs::write(
             &wecom_secret,
@@ -1684,6 +1729,13 @@ impl RelayProcess {
             &feishu_secret,
             "app_id = \"cli_abc123\"\napp_secret = \"s3cret\"\n",
         )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for secret in [&wecom_secret, &feishu_secret] {
+                std::fs::set_permissions(secret, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
         #[cfg(windows)]
         {
             use yon_relay::{SecretFilePolicy as _, SystemSecretFilePolicy};
