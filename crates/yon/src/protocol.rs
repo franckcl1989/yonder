@@ -74,15 +74,24 @@ pub enum RelayProtocolError {
 }
 
 /// Interactive enterprise authentication steps provided by the client UI.
-pub trait EnterpriseResolveUi {
+///
+/// The methods are asynchronous because they run inside the endpoint
+/// `drive`: polling the swarm continues while the user reads the prompt,
+/// so the relay connection stays alive across human interaction.
+pub trait EnterpriseResolveUi: Send {
     /// Asks the user to choose one of the offered authentication platforms.
     fn select_provider(
         &mut self,
         providers: EnterpriseProviders,
-    ) -> Result<EnterpriseProvider, RelayProtocolError>;
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<EnterpriseProvider, RelayProtocolError>> + Send + '_>,
+    >;
 
     /// Opens the authorization URL in the user's browser.
-    fn open_authorization(&mut self, url: &str) -> Result<(), RelayProtocolError>;
+    fn open_authorization(
+        &mut self,
+        url: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), RelayProtocolError>> + Send + '_>>;
 }
 
 /// Allocates a locator, honoring the relay's retry hints within a fixed budget.
@@ -360,13 +369,13 @@ async fn enterprise_exchange_io(
         EnterpriseResolveResponse::Providers(providers) => providers,
         _ => return Err(RelayProtocolError::UnexpectedResponse),
     };
-    let provider = ui.select_provider(providers)?;
+    let provider = ui.select_provider(providers).await?;
     write_enterprise_step(stream, &EnterpriseSelect::new(provider).encode(), timeout).await?;
     let url = match read_enterprise_response(stream, timeout).await? {
         EnterpriseResolveResponse::Authenticate(url) => url,
         _ => return Err(RelayProtocolError::UnexpectedResponse),
     };
-    ui.open_authorization(url.as_str())?;
+    ui.open_authorization(url.as_str()).await?;
     match read_enterprise_response(stream, timeout).await? {
         EnterpriseResolveResponse::Resolved(peer) => PeerId::from_bytes(peer.as_bytes())
             .map(EnterpriseAttempt::Resolved)
@@ -1011,14 +1020,24 @@ mod tests {
         fn select_provider(
             &mut self,
             providers: EnterpriseProviders,
-        ) -> Result<EnterpriseProvider, RelayProtocolError> {
-            self.offered = Some(providers);
-            Ok(self.choice)
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<EnterpriseProvider, RelayProtocolError>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                self.offered = Some(providers);
+                Ok(self.choice)
+            })
         }
 
-        fn open_authorization(&mut self, url: &str) -> Result<(), RelayProtocolError> {
-            self.opened = Some(url.to_owned());
-            Ok(())
+        fn open_authorization(
+            &mut self,
+            url: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), RelayProtocolError>> + Send + '_>> {
+            let url = url.to_owned();
+            Box::pin(async move {
+                self.opened = Some(url);
+                Ok(())
+            })
         }
     }
 
