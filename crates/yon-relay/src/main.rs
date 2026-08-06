@@ -13,9 +13,10 @@ use thiserror::Error;
 use tracing_subscriber::filter::LevelFilter;
 use url::Url;
 use yon_relay::{
-    CallbackExternalUrl, EnterpriseAuthConfig, EnterpriseConfigError, FileIdentityStore,
-    IdentityError, IdentityStore, ProviderSecrets, RelayServeConfig, RelayServiceError,
-    SecretFileError, SecretFilePolicy, SystemSecretFilePolicy, run_relay,
+    CallbackExternalUrl, EnterpriseAuthConfig, EnterpriseConfigError, EnterpriseContext,
+    FileIdentityStore, IdentityError, IdentityStore, ProviderCredentials, ProviderError,
+    ProviderSecrets, RelayServeConfig, RelayServiceError, SecretFileError, SecretFilePolicy,
+    SystemSecretFilePolicy, run_relay,
 };
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
@@ -332,6 +333,8 @@ enum AppError {
     ConflictingEnterprisePrivateKey,
     #[error("enterprise authentication configuration is invalid: {0}")]
     EnterpriseConfig(#[from] EnterpriseConfigError),
+    #[error("enterprise provider credentials are invalid: {0}")]
+    EnterpriseProvider(#[from] ProviderError),
     #[error("the TLS {kind} document is too large: {path}")]
     TlsTooLarge {
         path: PathBuf,
@@ -560,7 +563,14 @@ fn serve_config_with(
         .map(|address| address.parse::<RelayExternalAddress>())
         .collect::<Result<Vec<_>, _>>()?;
     let resources = relay_resources(loaded.value())?;
-    let enterprise = enterprise_config(&loaded)?;
+    let enterprise = match enterprise_config(&loaded)? {
+        Some(config) => {
+            let credentials =
+                ProviderCredentials::load(&config).map_err(AppError::EnterpriseProvider)?;
+            Some(EnterpriseContext::new(config, credentials))
+        }
+        None => None,
+    };
     let identity = FileIdentityStore.read(&identity_path)?;
     let wss = match (certificate_paths, private_key_path) {
         (Some(certificates), Some(private_key)) => {
@@ -824,6 +834,23 @@ mod tests {
         include_bytes!("../../yon/tests/fixtures/localhost-self-signed-key.der");
 
     fn write_private_key(path: &std::path::Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use yon_relay::{SecretFilePolicy as _, SystemSecretFilePolicy};
+
+            let file = fs::File::open(path).unwrap();
+            SystemSecretFilePolicy.protect_new(path, &file).unwrap();
+        }
+    }
+
+    fn write_secret_document(path: &std::path::Path, contents: &[u8]) {
         fs::write(path, contents).unwrap();
         #[cfg(unix)]
         {
@@ -1635,6 +1662,41 @@ exit 0
             Err(AppError::Network(_))
         ));
         drop(relay_config());
+    }
+
+    #[test]
+    fn enterprise_mode_loads_provider_credentials_at_startup() {
+        let directory = test_directory();
+        let identity = directory.path().join("relay.identity");
+        initialize_identity(&identity).unwrap();
+        let certificate = directory.path().join("callback-cert.der");
+        fs::write(&certificate, TEST_WSS_CERTIFICATE_DER).unwrap();
+        let private_key = directory.path().join("callback-key.der");
+        write_private_key(&private_key, TEST_WSS_PRIVATE_KEY_DER);
+        let wecom_secret = directory.path().join("wecom.secret");
+        write_secret_document(
+            &wecom_secret,
+            b"corp_id = \"ww1234567890abcdef\"\nagent_id = 1000002\napp_secret = \"s3cret\"\n",
+        );
+        let enterprise = "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\n[enterprise_auth]\nsecret_wecom='wecom.secret'\ncertificate=['callback-cert.der']\nprivate_key='callback-key.der'\ncallback_listen='127.0.0.1:8443'\ncallback_external_url='https://relay.example.test'\n";
+        write_config(directory.path(), enterprise);
+        let loader = test_loader(directory.path().to_path_buf());
+        assert!(serve_config_with(&loader).is_ok());
+
+        write_secret_document(
+            &wecom_secret,
+            b"corp_id = \"ww1234567890abcdef\"\nagent_id = 7\napp_secret = \"not a secret\"\n",
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::EnterpriseProvider(_))
+        ));
+
+        fs::remove_file(&wecom_secret).unwrap();
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::EnterpriseProvider(_))
+        ));
     }
 
     #[test]

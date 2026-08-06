@@ -1,4 +1,5 @@
 use crate::enterprise::EnterpriseAuthConfig;
+use crate::provider::ProviderCredentials;
 use crate::registry::{Registry, RegistryError, ResolveLimiters};
 use std::collections::HashSet;
 use std::future::Future;
@@ -27,6 +28,38 @@ const REJECTED_CONNECTION_DRAIN: Duration = Duration::from_secs(1);
 const REGISTRY_READERS: usize = 16;
 const OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Enterprise-mode runtime context: the validated configuration and the
+/// provider credentials loaded once at startup. Both halves always exist
+/// together, so the mode invariant holds by construction.
+#[derive(Debug)]
+pub struct EnterpriseContext {
+    config: EnterpriseAuthConfig,
+    credentials: ProviderCredentials,
+}
+
+impl EnterpriseContext {
+    /// Bundles the validated enterprise configuration and credentials.
+    #[must_use]
+    pub const fn new(config: EnterpriseAuthConfig, credentials: ProviderCredentials) -> Self {
+        Self {
+            config,
+            credentials,
+        }
+    }
+
+    /// The validated enterprise-mode configuration.
+    #[must_use]
+    pub const fn config(&self) -> &EnterpriseAuthConfig {
+        &self.config
+    }
+
+    /// The provider credentials loaded once at startup.
+    #[must_use]
+    pub const fn credentials(&self) -> &ProviderCredentials {
+        &self.credentials
+    }
+}
+
 /// Fully validated inputs required to run a relay process.
 pub struct RelayServeConfig {
     identity: Keypair,
@@ -36,7 +69,7 @@ pub struct RelayServeConfig {
     resources: RelayResourceConfig,
     /// `None` is normal mode; `Some` is enterprise mode. The two modes are
     /// mutually exclusive and fixed for the process lifetime.
-    enterprise: Option<EnterpriseAuthConfig>,
+    enterprise: Option<EnterpriseContext>,
 }
 
 impl RelayServeConfig {
@@ -68,15 +101,15 @@ impl RelayServeConfig {
         Self::with_enterprise(identity, listen, external, wss, resources, None)
     }
 
-    /// Attaches an already validated enterprise-mode configuration; `None`
-    /// keeps the relay in normal mode.
+    /// Attaches an already validated enterprise-mode runtime context;
+    /// `None` keeps the relay in normal mode.
     pub fn with_enterprise(
         identity: Keypair,
         listen: Vec<RelayListenAddress>,
         external: Vec<RelayExternalAddress>,
         wss: WssTransportConfig,
         resources: RelayResourceConfig,
-        enterprise: Option<EnterpriseAuthConfig>,
+        enterprise: Option<EnterpriseContext>,
     ) -> Result<Self, RelayServiceError> {
         if listen.is_empty() || listen.len() > 8 || external.is_empty() || external.len() > 8 {
             return Err(RelayServiceError::InvalidConfiguration);
@@ -431,10 +464,10 @@ pub async fn run_relay_until(
     } = config;
     let relay_mode = match &enterprise {
         None => "normal",
-        Some(config) => {
+        Some(context) => {
             tracing::info!(
                 event = "relay_enterprise_mode",
-                providers = config.providers().len(),
+                providers = context.config().providers().len(),
                 "relay is running in enterprise authentication mode"
             );
             "enterprise"
