@@ -4,14 +4,19 @@ use crate::network::{
 };
 use crate::pake::{OpaquePake, OpaquePakeError};
 use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
-use crate::protocol::{RelayProtocolError, ResolveDeadline, resolve_peer};
+use crate::protocol::{
+    EnterpriseResolveUi, RelayProtocolError, ResolveDeadline, resolve_peer_auto,
+};
 use crate::terminal::TerminalChunk;
 use backon::{BackoffBuilder as _, ConstantBuilder};
 use std::convert::Infallible;
 use std::io::IsTerminal as _;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _,
+};
+use yonder_core::EnterpriseProvider;
 use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, PROCEED_LEN, PakeContext,
     RETRY_LEN,
@@ -258,6 +263,128 @@ impl TerminalFrontend for CrosstermFrontend {
     }
 }
 
+/// Interactive enterprise authentication prompts during the connect flow.
+///
+/// The methods run inside the endpoint drive loop, so the relay
+/// connection stays alive while the user reads the prompt or opens the
+/// browser. The URL is always printed; the platform browser opener is
+/// best effort and its failure never aborts the flow.
+pub struct EnterpriseControllerUi<I: AsyncRead + Unpin, O: AsyncWrite + Unpin> {
+    input: I,
+    output: O,
+    opener: Box<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+impl EnterpriseControllerUi<tokio::io::BufReader<tokio::io::Stdin>, tokio::io::Stdout> {
+    /// The production UI over the terminal and the platform browser.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            input: tokio::io::BufReader::new(tokio::io::stdin()),
+            output: tokio::io::stdout(),
+            opener: Box::new(platform_open),
+        }
+    }
+}
+
+impl Default
+    for EnterpriseControllerUi<tokio::io::BufReader<tokio::io::Stdin>, tokio::io::Stdout>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<I: tokio::io::AsyncBufRead + Unpin + Send, O: AsyncWrite + Unpin + Send> EnterpriseResolveUi
+    for EnterpriseControllerUi<I, O>
+{
+    fn select_provider(
+        &mut self,
+        providers: yonder_core::EnterpriseProviders,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<EnterpriseProvider, RelayProtocolError>> + Send + '_>,
+    > {
+        // A single configured platform is chosen without prompting.
+        let mut offered = providers.iter();
+        let first = offered.next().expect("the provider set is never empty");
+        if offered.next().is_none() {
+            let provider = first;
+            return Box::pin(async move { Ok(provider) });
+        }
+        let input = &mut self.input;
+        let output = &mut self.output;
+        Box::pin(async move {
+            output
+                .write_all("请选择企业认证平台（输入序号后回车）:\n1) 企业微信 (WeCom)\n2) 飞书 (Feishu)\n> ".as_bytes())
+                .await
+                .map_err(RelayProtocolError::Io)?;
+            output.flush().await.map_err(RelayProtocolError::Io)?;
+            let mut line = String::new();
+            input
+                .read_line(&mut line)
+                .await
+                .map_err(RelayProtocolError::Io)?;
+            match line.trim() {
+                "1" => Ok(EnterpriseProvider::WeCom),
+                "2" => Ok(EnterpriseProvider::Feishu),
+                _ => Err(RelayProtocolError::EnterpriseRejected),
+            }
+        })
+    }
+
+    fn open_authorization(
+        &mut self,
+        url: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), RelayProtocolError>> + Send + '_>> {
+        let url = url.to_owned();
+        let opener = &self.opener;
+        let output = &mut self.output;
+        Box::pin(async move {
+            output
+                .write_all(format!("\n请在浏览器中完成企业认证:\n{url}\n").as_bytes())
+                .await
+                .map_err(RelayProtocolError::Io)?;
+            if !opener(&url) {
+                output
+                    .write_all("无法自动打开浏览器，请手动打开上面的链接。\n".as_bytes())
+                    .await
+                    .map_err(RelayProtocolError::Io)?;
+            }
+            output.flush().await.map_err(RelayProtocolError::Io)?;
+            Ok(())
+        })
+    }
+}
+
+/// Opens the URL with the platform default browser, best effort.
+fn platform_open(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Complete input required to connect to one advertised remote terminal.
 pub struct ControllerConfig {
     identity: Keypair,
@@ -461,12 +588,13 @@ async fn prepare_controller_session(
     let target = wait_with_progress(
         progress,
         ControllerStage::ResolvingHost,
-        resolve_peer(
+        resolve_peer_auto(
             &mut driver,
             &mut streams,
             &relay,
             code.locator(),
             ResolveDeadline::controller(),
+            &mut EnterpriseControllerUi::new(),
         ),
     )
     .await?;
@@ -500,12 +628,13 @@ async fn prepare_controller_session(
             let target = wait_with_progress(
                 progress,
                 ControllerStage::ResolvingHost,
-                resolve_peer(
+                resolve_peer_auto(
                     &mut fallback_driver,
                     &mut fallback_streams,
                     &fallback_relay,
                     code.locator(),
                     ResolveDeadline::controller(),
+                    &mut EnterpriseControllerUi::new(),
                 ),
             )
             .await?;
@@ -1699,8 +1828,8 @@ mod tests {
     use super::RawModeGuard;
     use super::{
         ActiveTerminalConnectionEvent, ControllerConfig, ControllerError, CrosstermFrontend,
-        DisplayModeGuard, EndpointError, EndpointEvent, LOCAL_ESCAPE, LocalInputEscape,
-        REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
+        DisplayModeGuard, EndpointError, EndpointEvent, EnterpriseControllerUi, LOCAL_ESCAPE,
+        LocalInputEscape, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
         RemoteTerminalOutputMode, TerminalFrontend, UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch,
         active_terminal_connection_event, await_remote_completion, await_until,
         changed_terminal_size, complete_after_output_eof, complete_terminal_control_io,
@@ -1724,10 +1853,11 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
     use tokio::sync::oneshot;
     use yonder_core::wire::auth::AuthServerResponse;
+    use crate::protocol::EnterpriseResolveUi as _;
     use yonder_core::wire::terminal::{TerminalComplete, TerminalHello, TerminalReady};
     use yonder_core::{
-        ConnectionCode, Locator, PakeSecret, ProtocolError, RetryAfter, SecretDocument,
-        TerminalSize, TerminalValue,
+        ConnectionCode, EnterpriseProvider, EnterpriseProviders, Locator, PakeSecret,
+        ProtocolError, RetryAfter, SecretDocument, TerminalSize, TerminalValue,
     };
     use yonder_net::{
         ConnectedPoint, ConnectionId, EndpointRelayAddress, EndpointRelaySet, Keypair,
@@ -3145,5 +3275,122 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    // ---- enterprise controller UI ----
+
+    fn test_ui(
+    ) -> EnterpriseControllerUi<
+        tokio::io::BufReader<tokio::io::DuplexStream>,
+        tokio::io::DuplexStream,
+    > {
+        EnterpriseControllerUi {
+            input: tokio::io::BufReader::new(tokio::io::duplex(16).0),
+            output: tokio::io::duplex(256).1,
+            opener: Box::new(|_| false),
+        }
+    }
+
+    /// Reads whatever the UI writes, with a short window.
+    async fn read_ui_output(
+        mut output: tokio::io::DuplexStream,
+    ) -> String {
+        let mut text = Vec::new();
+        for _ in 0..4 {
+            let mut buffer = [0_u8; 256];
+            match tokio::time::timeout(
+                Duration::from_millis(200),
+                output.read(&mut buffer),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(read)) => text.extend_from_slice(&buffer[..read]),
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_ui_auto_picks_the_only_platform_without_prompting() {
+        let mut ui = test_ui();
+        let provider = ui
+            .select_provider(EnterpriseProviders::new(true, false).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(provider, EnterpriseProvider::WeCom);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_ui_prompts_and_reads_the_platform_choice() {
+        let (mut client_input, input) = tokio::io::duplex(16);
+        let (client_output, output) = tokio::io::duplex(256);
+        let mut ui = EnterpriseControllerUi {
+            input: tokio::io::BufReader::new(input),
+            output,
+            opener: Box::new(|_| false),
+        };
+        let selection = ui.select_provider(EnterpriseProviders::new(true, true).unwrap());
+        let (chosen, prompt) = tokio::join!(
+            async { selection.await.unwrap() },
+            async {
+                let prompt = read_ui_output(client_output).await;
+                client_input.write_all(b"2\n").await.unwrap();
+                prompt
+            },
+        );
+        assert_eq!(chosen, EnterpriseProvider::Feishu);
+        assert!(prompt.contains("企业微信 (WeCom)"));
+        assert!(prompt.contains("飞书 (Feishu)"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_ui_rejects_an_invalid_platform_choice() {
+        let (mut client_input, input) = tokio::io::duplex(16);
+        let (client_output, output) = tokio::io::duplex(256);
+        let mut ui = EnterpriseControllerUi {
+            input: tokio::io::BufReader::new(input),
+            output,
+            opener: Box::new(|_| false),
+        };
+        let selection = ui.select_provider(EnterpriseProviders::new(true, true).unwrap());
+        let (chosen, _) = tokio::join!(
+            selection,
+            async {
+                let _ = read_ui_output(client_output).await;
+                client_input.write_all(b"9\n").await.unwrap();
+            },
+        );
+        assert!(matches!(
+            chosen,
+            Err(crate::protocol::RelayProtocolError::EnterpriseRejected)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_ui_prints_the_authorization_url_and_calls_the_opener() {
+        let (input, _) = tokio::io::duplex(16);
+        let (client_output, output) = tokio::io::duplex(512);
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let opened_clone = std::sync::Arc::clone(&opened);
+        let mut ui = EnterpriseControllerUi {
+            input: tokio::io::BufReader::new(input),
+            output,
+            opener: Box::new(move |url| {
+                *opened_clone.lock().unwrap() = Some(url.to_owned());
+                false
+            }),
+        };
+        let (result, printed) = tokio::join!(
+            ui.open_authorization("https://relay.example.test/yonder/callback/wecom?code=x&state=y"),
+            read_ui_output(client_output),
+        );
+        result.unwrap();
+        assert!(printed.contains("https://relay.example.test/yonder/callback/wecom?code=x&state=y"));
+        assert_eq!(
+            opened.lock().unwrap().as_deref(),
+            Some("https://relay.example.test/yonder/callback/wecom?code=x&state=y")
+        );
     }
 }
