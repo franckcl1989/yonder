@@ -461,6 +461,93 @@ fn hosts_register_through_enterprise_relays() -> Result<(), std::io::Error> {
     relay_process.stop()
 }
 
+#[test]
+fn unauthenticated_connects_are_rejected_by_enterprise_relays() -> Result<(), std::io::Error> {
+    let port = available_port()?;
+    let callback_port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let relay_process = RelayProcess::start_enterprise(identity, port, callback_port)?;
+    thread::sleep(Duration::from_millis(500));
+    let relay = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}");
+    let config = EndpointConfigDirectory::new(&relay)?;
+    // A valid code still cannot connect: the enterprise relay requires a
+    // completed browser authentication, and with no terminal input the
+    // platform prompt ends, so the connect fails closed.
+    let generated = ConnectionCode::generate(Locator::new(7).unwrap(), &mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let code = generated.expose().to_string();
+    let mut controller = Command::new(env!("CARGO_BIN_EXE_yon"))
+        .args(["connect", code.as_str()])
+        .current_dir(config.path())
+        .env_remove("YON_RELAYS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = controller
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("controller stdout was not piped"))?;
+    let stderr = controller
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("controller stderr was not piped"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stdout)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let status = match wait_for_exit(&mut controller, SESSION_TIMEOUT) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = controller.kill();
+            let _ = controller.wait();
+            relay_process.stop()?;
+            return Err(error);
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| std::io::Error::other("controller stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| std::io::Error::other("controller stderr reader panicked"))??;
+    let relay_result = relay_process.stop();
+    if status.success() {
+        return Err(std::io::Error::other(
+            "controller connected without completing enterprise authentication",
+        ));
+    }
+    let stderr = String::from_utf8(stderr).map_err(std::io::Error::other)?;
+    if !stderr.contains("enterprise authentication was not completed") {
+        return Err(std::io::Error::other(format!(
+            "an enterprise relay exposed an unexpected public error: {stderr:?}"
+        )));
+    }
+    for forbidden in ["OPAQUE", "PeerId", "locator", &code.to_string()] {
+        if stderr.contains(forbidden) {
+            return Err(std::io::Error::other(format!(
+                "an enterprise rejection leaked {forbidden:?} in its public error"
+            )));
+        }
+    }
+    if !stdout.is_empty() && !String::from_utf8_lossy(&stdout).contains("请选择企业认证平台") {
+        return Err(std::io::Error::other(
+            "an enterprise rejection wrote unexpected output to stdout",
+        ));
+    }
+    relay_result
+}
+
 /// Executes one HTTPS request against the enterprise callback listener,
 /// trusting the fixture CA, and returns the response status line.
 fn enterprise_callback_request(
@@ -663,7 +750,7 @@ fn run_interactive_pty(diagnostic_log: bool) -> Result<(), std::io::Error> {
         command.args(["--log-level", "debug", "--log-file"]);
         command.arg(path.as_os_str());
     }
-    command.args(["connect", code.as_str()]);
+    command.args(["connect", &code.to_string()]);
     command.cwd(config.path());
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -1570,23 +1657,34 @@ impl RelayProcess {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let directory = relay_test_directory()?;
-        let secret = directory.path().join("wecom.secret");
+        let wecom_secret = directory.path().join("wecom.secret");
         std::fs::write(
-            &secret,
+            &wecom_secret,
             "corp_id = \"ww1234567890abcdef\"\nagent_id = 1000002\napp_secret = \"s3cret\"\n",
+        )?;
+        let feishu_secret = directory.path().join("feishu.secret");
+        std::fs::write(
+            &feishu_secret,
+            "app_id = \"cli_abc123\"\napp_secret = \"s3cret\"\n",
         )?;
         #[cfg(windows)]
         {
             use yon_relay::{SecretFilePolicy as _, SystemSecretFilePolicy};
-            let file = std::fs::File::open(&secret)?;
-            SystemSecretFilePolicy
-                .protect_new(&secret, &file)
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            for secret in [&wecom_secret, &feishu_secret] {
+                let file = std::fs::File::open(secret)?;
+                SystemSecretFilePolicy
+                    .protect_new(secret, &file)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
         }
-        let providers = yonder_core::EnterpriseProviders::new(true, false)
+        let providers = yonder_core::EnterpriseProviders::new(true, true)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let secrets = yon_relay::ProviderSecrets::new(providers, Some(secret), None)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let secrets = yon_relay::ProviderSecrets::new(
+            providers,
+            Some(wecom_secret),
+            Some(feishu_secret),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
         let config = yon_relay::EnterpriseAuthConfig::new(
             format!("127.0.0.1:{callback_port}")
                 .parse()
