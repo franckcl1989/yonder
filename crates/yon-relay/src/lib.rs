@@ -6,6 +6,7 @@
 pub mod callback;
 pub mod callback_session;
 pub mod enterprise;
+pub mod enterprise_resolve;
 pub mod exchange;
 pub mod identity;
 pub mod provider;
