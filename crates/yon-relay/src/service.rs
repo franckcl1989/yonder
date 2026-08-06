@@ -1520,8 +1520,15 @@ async fn enterprise_resolve_exchange<S: ProtocolIo>(
     let providers = credentials.providers()?;
     write_timeout(&mut stream, EnterpriseResolveResponse::Providers(providers).encode().as_slice()).await?;
 
-    let select =
-        EnterpriseSelect::decode(&read_timeout::<SELECT_LEN>(&mut stream).await?)?;
+    // The provider selection is a human interaction, so it is bounded by
+    // the session deadline rather than the message timeout.
+    let select_deadline = session
+        .deadline()
+        .duration_since(clock.now())
+        .unwrap_or(Duration::ZERO);
+    let select = EnterpriseSelect::decode(
+        &read_deadline::<SELECT_LEN>(&mut stream, select_deadline).await?,
+    )?;
     let provider = select.provider();
     if !providers.contains(provider) {
         let _ = session.fail(EnterpriseFailure::InvalidState);
@@ -1624,8 +1631,17 @@ async fn enterprise_resolve_exchange<S: ProtocolIo>(
 async fn read_timeout<const LENGTH: usize>(
     stream: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> Result<[u8; LENGTH], ProtocolTaskError> {
+    read_deadline::<LENGTH>(stream, MESSAGE_TIMEOUT).await
+}
+
+/// Reads one fixed-length message bounded by an explicit deadline, used
+/// for steps that wait on human interaction.
+async fn read_deadline<const LENGTH: usize>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    deadline: Duration,
+) -> Result<[u8; LENGTH], ProtocolTaskError> {
     let mut message = [0_u8; LENGTH];
-    tokio::time::timeout(MESSAGE_TIMEOUT, stream.read_exact(&mut message))
+    tokio::time::timeout(deadline, stream.read_exact(&mut message))
         .await
         .map_err(|_| ProtocolTaskError::Timeout)??;
     Ok(message)
