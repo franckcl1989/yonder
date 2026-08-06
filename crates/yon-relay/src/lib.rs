@@ -14,7 +14,10 @@ pub mod service;
 pub mod session;
 pub mod verifier;
 
-pub use callback::{CallbackHandler, CallbackResult, CallbackServer, CallbackServerError};
+pub use callback::{
+    CallbackEntry, CallbackHandler, CallbackRegistry, CallbackRegistryError, CallbackResult,
+    CallbackServer, CallbackServerError, CallbackSessionHandler,
+};
 pub use enterprise::{
     CallbackExternalUrl, EnterpriseAuthConfig, EnterpriseConfigError, ProviderSecrets,
 };

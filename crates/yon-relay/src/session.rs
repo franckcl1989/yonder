@@ -39,7 +39,7 @@ impl std::fmt::Display for RequestId {
 /// A single-use OAuth CSRF state created only after the provider is chosen.
 ///
 /// `Debug` is deliberately redacted: the design forbids logging state.
-#[derive(Clone, PartialEq, Eq, Zeroize)]
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize)]
 pub struct OAuthState([u8; Self::LEN]);
 
 impl OAuthState {
@@ -49,6 +49,15 @@ impl OAuthState {
     pub fn generate(random: &mut impl SecureRandom) -> Result<Self, TransitionError> {
         let mut bytes = [0_u8; Self::LEN];
         random.try_fill(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+
+    /// Reconstructs a state from its wire bytes; only an exact-length
+    /// state is accepted.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TransitionError> {
+        let Ok(bytes) = <[u8; Self::LEN]>::try_from(bytes) else {
+            return Err(TransitionError::InvalidState);
+        };
         Ok(Self(bytes))
     }
 
