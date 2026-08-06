@@ -71,6 +71,29 @@ PeerId 使用 `PeerId::to_bytes()`/`from_bytes()`。只有 Active 映射返回 R
 
 每个查询 PeerId 同时只处理一个查询，并且其 relay 本地连接名册必须恰好一条，来源前缀从该连接取得；无法由 `libp2p-stream` 可靠观察的“每物理连接”不作为协议不变量。处理顺序为固定长度校验、名册/并发校验、全局 governor、来源 governor、注册表。全局默认 burst `128`、恢复 `4/s`；来源默认 burst `32`、恢复 `1/s`。完整但 locator 编码非法的请求消耗全局额度；截断和超长直接关闭。来源状态 `10min` 空闲回收，硬上限 `4096`；满时新来源返回 Retry，不驱逐活跃项。
 
+## Enterprise Resolve
+
+`/yonder/enterprise-resolve/1.0.0` 只由企业模式 relay 提供；普通 relay 不注册该协议。子流按固定顺序承载多条消息，写侧在流程结束前不关闭：
+
+| 方向 | 消息 | 格式 | 语义 |
+| --- | --- | --- | --- |
+| client → relay | `EnterpriseStart` | `0x01 \|\| locator:u20` | 为 locator 打开一个企业会话 |
+| relay → client | `Providers` | `0x10 \|\| mask:u8` | 可用认证平台；mask `0x01` 企业微信、`0x02` 飞书、`0x03` 两者 |
+| relay → client | `Retry` | `0x11 \|\| retry_ms:u32` | 准入限流；client 等待后重开子流 |
+| client → relay | `EnterpriseSelect` | `0x02 \|\| provider_tag:u8` | 选择平台；一旦选择不可切换 |
+| relay → client | `Authenticate` | `0x12 \|\| url_len:u16 \|\| url[url_len]` | 浏览器 OAuth 授权 URL；`url_len=1..=2048` |
+| relay → client | `Resolved` | `0x13 \|\| peer_len:u8 \|\| peer_id[peer_len]` | 认证成功后内部 resolve 的结果 |
+| relay → client | `Cancelled` | `0x14` | 会话被取消 |
+| relay → client | `Expired` | `0x15` | 会话在完成前过期 |
+| relay → client | `Failed` | `0x16` | 认证失败或成员被拒绝 |
+| relay → client | `Unavailable` | `0x17` | 目标 locator 不可用 |
+
+状态机：`Created → ProviderSelection → Authenticating → Authenticated → Resolving → Completed`；失败态 `Cancelled/Expired/Failed/Unavailable`。provider 未选择前不创建 OAuth state；state 单次有效；`resolving` 阶段不携带企业身份。认证成功后用户身份立即销毁。
+
+会话与当前 connect 子流绑定：内存保存、不持久化、单次使用；断开立即失效、超时立即失效、relay 重启全部失效，禁止恢复、转移、重用。浏览器回调走独立 HTTPS listener，只服务 `/yonder/callback/wecom` 与 `/yonder/callback/feishu` 两个路径，携带 `code` 与 `state` 查询参数。
+
+准入处理顺序：固定长度校验、全局 governor、名册来源 governor；认证限流器为 `1/s`、burst `4`。事务容量上限 `64`；回调连接上限 `16`；回调按来源 IP 限流（同一 `1/s` burst `4`，表上限 `1024`，`10min` 空闲回收）。回调 state 单次消费，重放与重复回调一律拒绝。
+
 ## OPAQUE 注册与认证
 
 被控端在本地同时扮演一次性 OPAQUE 注册客户端和服务端，生成仅驻留内存的 `ServerSetup` 与 password file；网络认证时主控端是 client、被控端是 server。密码套件固定为 RFC 9807 OPAQUE、Ristretto255、TripleDH、SHA-512、Argon2id `v=0x13,m=19456 KiB,t=2,p=1`。`credential_identifier` 和 server identifier 都使用被控端 PeerId bytes，client identifier 为空；注册 finish、client login finish 和 server login 必须显式传入完全相同的 identifiers，不能依赖 crate 默认值。
