@@ -96,7 +96,9 @@
 - 进程级 e2e 覆盖：回调 HTTPS 监听器对未知路径/缺参/非 GET 返回 `404/400/405`；legacy resolve 对企业 relay 返回 `UnsupportedProtocol`（旧 connect 无法使用）；真实 host 通过企业 relay 完成注册（旧 host 兼容）；真实 `yon connect` 在未完成认证时失败关闭且公共错误不含 OPAQUE/PeerId/locator/连接码。
 - 多角色交叉审计修复轮（`b18f3d1`、`cbbf490`、`ebaa346`、`e2f6df6`、`e4190a3`、`bb7a823`、`7edf471`、`2003a91`）：组织重构（callback 拆分为服务器/会话两模块，企业 resolve 机制从 service.rs 提取为独立模块，PEM 标记检查去重到 yonder-net）；服务面资源修复（企业子流 permit 上限防无界任务、回调监听失败响亮传播到根循环、TLS 握手 10s 超时与禁用 keep-alive 防 16 连接耗尽全部回调槽）；安全相关正确性修复（限流回调先消费注册表条目并失败会话，阻断同 state 迟到放行）；可用性修复（客户端超时预算拆分——机器步骤 30s、人类认证步骤对齐 relay 会话期限 10min+30s）；卫生修复（OAuthState 增加 `ZeroizeOnDrop`、生产交换客户端 `https_only`、企业交换失败接入共享可观测计数）；依赖修复（回调查询解析改用 `url::form_urlencoded`，授权 URL 打开改用所有者批准的 `open 5.4.1`，`default-features=false` 保持 Windows 无 `dunce` 传递依赖）。
 - 第二轮对抗性复审与设计符合性终扫修复轮（`fe8389a`、`c96bc04`）：回调整连接生命周期纳入 10s 超时（完成 TLS 但不发请求的连接不再无限占用回调槽，防认证路径 DoS）；客户端机器阶段纳入控制器绝对期限（不再超支两个消息超时，附回归测试）；等待期子流 EOF 分支使"断开立即失效"字面成立（断连即取消会话并立即释放槽位，附测试）；会话后失败在交换内部按 §10 白名单携带 request_id/platform/phase 记录，会话前失败保持 spawn 站点 debug；企业会话/随机/提供商错误计入独立 `protocol_enterprise_failed` 观测计数（不再与注册表计数混淆）；`EnterpriseCallback` 错误消息覆盖运行时监听失败。
-- 待办：0.1.2 尚未执行候选/发布矩阵（五目标 coverage、六目标原生构建、Miri、sanitizer、供应链、长 fuzz、两平台真实进程性能、六平台归档、checksum、SBOM、许可证与 provenance 消费方验证），也未创建标签；这些证据由 CI/候选运行补齐后才能发布 `v0.1.2`。所有工作流中的 Windows 测试任务已配置受保护 Secret 根目录，候选运行可直接执行。
+- 自动 CI `31089089020` 对当前提交 `e8738b4` 的普通 Linux/Windows/macOS 测试、五目标 coverage、六目标 MSRV、Miri、ASan/TSan、供应链和四个 fuzz job 全部成功。五目标 coverage 均过风险分级门槛（lines `95.22-95.33%`、functions `97.68-97.69%`、regions `90.70-90.92%`、branches `83.47-83.73%`），Miri `4m54s`，每目标数值见各 job 日志。
+- CI 暴露并修复的装置缺陷：企业 e2e 秘密文件权限（Unix 0600 缺失与 Windows 继承 ACL 不可信写 SID）导致测试/coverage/sanitizer 六类 job 失败——测试装置未按产品 §7 秘密文件策略创建安全文件，已修复（`ebfb328`）并由最恶劣 ACL 场景复验；Miri 下 proptest 256 cases/测试的病理组合导致挂起——属性测试已移入 `#[cfg(not(miri))]` 模块（`626e9cb`），Miri 恢复 `4m54s` 基线。
+- 待办：0.1.2 尚未执行发布候选矩阵的其余部分（两平台真实进程性能、六平台归档、checksum、SBOM、许可证与 provenance 消费方验证），也未创建标签；候选流程可在当前全绿 CI 基础上执行。所有工作流中的 Windows 测试任务已配置受保护 Secret 根目录。
 
 ## 当前结论
 
