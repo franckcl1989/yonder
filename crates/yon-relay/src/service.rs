@@ -221,7 +221,7 @@ pub enum RelayServiceError {
     ProtocolTask(#[from] TaskFailure),
     #[error(transparent)]
     Registry(#[from] RegistryError),
-    #[error("enterprise mode failed to start the callback server: {0}")]
+    #[error("enterprise mode failed to start or serve the callback server: {0}")]
     EnterpriseCallback(#[from] CallbackServerError),
     #[error("failed to install the process signal handler")]
     Signal(#[source] std::io::Error),
@@ -367,6 +367,7 @@ struct RelayObservability {
     protocol_invalid: AtomicU64,
     protocol_owner_stopped: AtomicU64,
     protocol_registry: AtomicU64,
+    protocol_enterprise_failed: AtomicU64,
 }
 
 impl RelayObservability {
@@ -388,7 +389,7 @@ impl RelayObservability {
                 ProtocolTaskError::Random(_)
                 | ProtocolTaskError::Session(_)
                 | ProtocolTaskError::EnterpriseProvider(_),
-            ) => &self.protocol_registry,
+            ) => &self.protocol_enterprise_failed,
         };
         Self::increment(counter);
     }
@@ -407,6 +408,7 @@ impl RelayObservability {
         let protocol_invalid = self.protocol_invalid.swap(0, Ordering::Relaxed);
         let protocol_owner_stopped = self.protocol_owner_stopped.swap(0, Ordering::Relaxed);
         let protocol_registry = self.protocol_registry.swap(0, Ordering::Relaxed);
+        let protocol_enterprise_failed = self.protocol_enterprise_failed.swap(0, Ordering::Relaxed);
         tracing::info!(
             event = "relay_activity_summary",
             active_registrations,
@@ -423,6 +425,7 @@ impl RelayObservability {
             protocol_invalid,
             protocol_owner_stopped,
             protocol_registry,
+            protocol_enterprise_failed,
             "relay activity summary"
         );
     }
@@ -779,8 +782,14 @@ pub async fn run_relay_until(
                         );
                         tokio::select! {
                             result = exchange => {
+                                // Failures after session creation are
+                                // logged inside the exchange with the
+                                // request id; this site only sees
+                                // pre-session failures (start read,
+                                // admission channel), so it stays at
+                                // debug level.
                                 if let Err(error) = &result {
-                                    tracing::warn!(
+                                    tracing::debug!(
                                         event = "enterprise_resolve_failed",
                                         %error,
                                         "enterprise resolve exchange failed"
@@ -2210,6 +2219,14 @@ mod tests {
         observations.observe_protocol_result(Err(ProtocolTaskError::Registry(
             crate::registry::RegistryError::PeerIdTooLong,
         )));
+        observations
+            .observe_protocol_result(Err(ProtocolTaskError::Random(yonder_core::RandomError)));
+        observations.observe_protocol_result(Err(ProtocolTaskError::Session(
+            crate::session::TransitionError::Terminal,
+        )));
+        observations.observe_protocol_result(Err(ProtocolTaskError::EnterpriseProvider(
+            crate::provider::ProviderError::NoCredentials,
+        )));
         assert_eq!(observations.protocol_timeout.load(Ordering::Relaxed), 1);
         assert_eq!(observations.protocol_io.load(Ordering::Relaxed), 1);
         assert_eq!(observations.protocol_invalid.load(Ordering::Relaxed), 1);
@@ -2218,6 +2235,12 @@ mod tests {
             1
         );
         assert_eq!(observations.protocol_registry.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            observations
+                .protocol_enterprise_failed
+                .load(Ordering::Relaxed),
+            3
+        );
         observations.report_and_reset(3);
         assert_eq!(observations.protocol_timeout.load(Ordering::Relaxed), 0);
         assert_eq!(observations.protocol_io.load(Ordering::Relaxed), 0);
@@ -2227,6 +2250,12 @@ mod tests {
             0
         );
         assert_eq!(observations.protocol_registry.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observations
+                .protocol_enterprise_failed
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(retry_after().millis(), 250);
         assert_eq!(RegistryResponse::Retry(retry_after()).encode()[0], 0x82);
     }

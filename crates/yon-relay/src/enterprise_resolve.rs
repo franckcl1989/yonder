@@ -8,17 +8,21 @@ use crate::callback_session::{CallbackEntry, CallbackRegistry};
 use crate::enterprise::CallbackExternalUrl;
 use crate::provider::ProviderCredentials;
 use crate::service::{ProtocolIo, ProtocolTaskError, read_deadline, read_timeout, write_timeout};
-use crate::session::{EnterpriseFailure, EnterpriseResolveSession, OAuthState, RequestId};
+use crate::session::{
+    EnterpriseFailure, EnterpriseResolvePhase, EnterpriseResolveSession, OAuthState, RequestId,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
 use yonder_core::rate::{DirectRateLimiter, RateLimit};
 use yonder_core::wire::enterprise::{
     EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart, SELECT_LEN, START_LEN,
 };
 use yonder_core::{
-    Locator, MonotonicClock, MonotonicTime, OsSecureRandom, RetryAfter, SecureRandom,
+    EnterpriseProvider, Locator, MonotonicClock, MonotonicTime, OsSecureRandom, RetryAfter,
+    SecureRandom,
 };
 use yonder_net::{ConnectionBook, PeerId, SourcePrefix};
 
@@ -149,20 +153,95 @@ pub(crate) struct EnterpriseExchangeContext {
     pub(crate) callback_url: CallbackExternalUrl,
 }
 
+/// Redacted failure context shared between the exchange body and its
+/// logging wrapper (design section 10 whitelist: request id, platform,
+/// phase and redacted result only). The body records the session
+/// checkpoints; the wrapper logs them when the body fails after session
+/// creation, while pre-session failures keep no log inside the exchange.
+#[derive(Default)]
+struct EnterpriseFailureContext {
+    request_id: Option<RequestId>,
+    provider: Option<EnterpriseProvider>,
+    phase: Option<EnterpriseResolvePhase>,
+}
+
+/// Waits for the connect peer to close the substream while the browser
+/// callback is pending: reading zero bytes is EOF, so the transaction is
+/// invalidated immediately (design section 8: 断开立即失效). Stray bytes
+/// are a protocol violation at this point of the flow but do not count as
+/// a disconnect, so they are consumed and the wait continues.
+async fn wait_for_peer_close(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<(), ProtocolTaskError> {
+    let mut byte = [0_u8; 1];
+    loop {
+        match stream.read(&mut byte).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// One enterprise resolve transaction, owned by the substream task.
 ///
 /// Flow (design section 4): start request, provider offer, provider
 /// selection, single-use OAuth state and authorization URL, transaction
 /// registration, browser callback outcome, internal resolve, response.
 /// The owner task serializes admission and the final resolve; the
-/// transaction registry is shared with the callback server.
+/// transaction registry is shared with the callback server. Failures
+/// after session creation are logged here with the request id (design
+/// section 10); pre-session failures keep a debug log at the spawn site.
 pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock>(
     peer: PeerId,
     stream: S,
     calls: mpsc::Sender<EnterpriseResolveRequest>,
     context: EnterpriseExchangeContext,
     clock: C,
+    random: OsSecureRandom,
+) -> Result<(), ProtocolTaskError> {
+    let mut failure = EnterpriseFailureContext::default();
+    let result = enterprise_resolve_exchange_inner(
+        peer,
+        stream,
+        calls,
+        context,
+        clock,
+        random,
+        &mut failure,
+    )
+    .await;
+    if let Err(error) = &result
+        && let Some(request_id) = failure.request_id
+    {
+        let platform = failure
+            .provider
+            .map(EnterpriseProvider::as_str)
+            .unwrap_or("unknown");
+        let phase = failure
+            .phase
+            .map(|phase| format!("{phase:?}"))
+            .unwrap_or_else(|| "unknown".to_owned());
+        tracing::warn!(
+            event = "enterprise_resolve_failed",
+            request_id = %request_id,
+            platform,
+            phase,
+            result = %error,
+            "enterprise resolve exchange failed"
+        );
+    }
+    result
+}
+
+async fn enterprise_resolve_exchange_inner<S: ProtocolIo, C: MonotonicClock>(
+    peer: PeerId,
+    stream: S,
+    calls: mpsc::Sender<EnterpriseResolveRequest>,
+    context: EnterpriseExchangeContext,
+    clock: C,
     mut random: OsSecureRandom,
+    failure: &mut EnterpriseFailureContext,
 ) -> Result<(), ProtocolTaskError> {
     let EnterpriseExchangeContext {
         registry,
@@ -194,8 +273,11 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
     let mut id_bytes = [0_u8; 8];
     random.try_fill(&mut id_bytes)?;
     let request_id = RequestId::new(u64::from_be_bytes(id_bytes));
+    failure.request_id = Some(request_id);
+    failure.phase = Some(EnterpriseResolvePhase::Created);
     let mut session = EnterpriseResolveSession::new(request_id, start.locator(), now);
     session.offer_providers()?;
+    failure.phase = Some(EnterpriseResolvePhase::ProviderSelection);
     let providers = credentials.providers()?;
     write_timeout(
         &mut stream,
@@ -217,6 +299,9 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
     let provider = select.provider();
     if !providers.contains(provider) {
         let _ = session.fail(EnterpriseFailure::InvalidState);
+        failure.phase = Some(EnterpriseResolvePhase::Failed(
+            EnterpriseFailure::InvalidState,
+        ));
         return write_timeout(
             &mut stream,
             EnterpriseResolveResponse::Failed.encode().as_slice(),
@@ -224,6 +309,8 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
         .await;
     }
     let state = session.select(provider, &mut random)?;
+    failure.provider = Some(provider);
+    failure.phase = Some(EnterpriseResolvePhase::Authenticating);
     let url = credentials.authorization_url(provider, callback_url, &state)?;
 
     let (outcome_tx, outcome_rx) = oneshot::channel();
@@ -232,6 +319,7 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
     let entry = CallbackEntry::new(Arc::clone(&session), outcome_tx, request_id, deadline);
     if registry.insert(state.clone(), entry, clock.now()).is_err() {
         let _ = session.lock().unwrap().fail(EnterpriseFailure::Platform);
+        failure.phase = Some(EnterpriseResolvePhase::Failed(EnterpriseFailure::Platform));
         return write_timeout(
             &mut stream,
             EnterpriseResolveResponse::Failed.encode().as_slice(),
@@ -255,7 +343,20 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
         received = outcome_rx => received.unwrap_or(CallbackResult::Platform),
         () = tokio::time::sleep(remaining) => {
             let _ = session.lock().unwrap().expire();
+            failure.phase = Some(EnterpriseResolvePhase::Expired);
             return write_timeout(&mut stream, EnterpriseResolveResponse::Expired.encode().as_slice()).await;
+        }
+        closed = wait_for_peer_close(&mut stream) => {
+            // The connect peer closed the substream while the browser
+            // callback was pending: the transaction dies immediately
+            // (design section 8: 断开立即失效). Cancelling the session and
+            // dropping the still-armed guard release the registry slot at
+            // once. EOF is a client-initiated disconnect, so the exchange
+            // ends like the other exchanges do on stream close.
+            let _ = session.lock().unwrap().cancel();
+            failure.phase = Some(EnterpriseResolvePhase::Cancelled);
+            closed?;
+            return Ok(());
         }
     };
     transaction.disarm();
@@ -275,12 +376,14 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
                 }
             };
             if expired {
+                failure.phase = Some(EnterpriseResolvePhase::Expired);
                 return write_timeout(
                     &mut stream,
                     EnterpriseResolveResponse::Expired.encode().as_slice(),
                 )
                 .await;
             }
+            failure.phase = Some(EnterpriseResolvePhase::Resolving);
             let locator = session.lock().unwrap().locator();
             let (response_tx, response_rx) = oneshot::channel();
             calls
@@ -298,9 +401,11 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
                 match &target {
                     EnterpriseResolveResponse::Resolved(peer) => {
                         guard.complete(peer.clone())?;
+                        failure.phase = Some(EnterpriseResolvePhase::Completed);
                     }
                     _ => {
                         guard.unavailable()?;
+                        failure.phase = Some(EnterpriseResolvePhase::Unavailable);
                     }
                 }
             }
@@ -310,6 +415,12 @@ pub(crate) async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock
         | CallbackResult::InvalidState
         | CallbackResult::Platform
         | CallbackResult::Limited => {
+            failure.phase = Some(EnterpriseResolvePhase::Failed(match outcome {
+                CallbackResult::Rejected => EnterpriseFailure::UserRejected,
+                CallbackResult::InvalidState => EnterpriseFailure::InvalidState,
+                CallbackResult::Platform | CallbackResult::Limited => EnterpriseFailure::Platform,
+                CallbackResult::Admitted => unreachable!(),
+            }));
             write_timeout(
                 &mut stream,
                 EnterpriseResolveResponse::Failed.encode().as_slice(),
@@ -331,8 +442,8 @@ mod tests {
     use crate::enterprise::CallbackExternalUrl;
     use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
     use crate::session::{
-        EnterpriseFailure, EnterpriseResolveSession, MemberAdmission, MemberIdentity, OAuthState,
-        RequestId,
+        EnterpriseFailure, EnterpriseResolvePhase, EnterpriseResolveSession, MemberAdmission,
+        MemberIdentity, OAuthState, RequestId,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -919,6 +1030,77 @@ mod tests {
         );
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_cancels_the_transaction_on_disconnect() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            // The transaction is registered while the browser callback is
+            // pending. Take it to hold the session across the disconnect,
+            // then put it back so the exchange guard still releases the
+            // slot when it observes the closed substream.
+            let state = OAuthState::from_bytes(
+                &data_encoding::HEXLOWER
+                    .decode(state_hex.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            let entry = registry.take(&state, SystemClock::new().now()).unwrap();
+            let session = entry.session();
+            registry
+                .insert(state, entry, SystemClock::new().now())
+                .unwrap();
+            drop(client);
+            session
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        // The disconnect must end the exchange immediately, not at the
+        // session expiry (design section 8: 断开立即失效).
+        let (result, session, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), exchange),
+            client_side,
+            owner,
+        );
+        result
+            .expect("the exchange must return promptly on disconnect")
+            .unwrap();
+        assert!(registry.is_empty());
+        assert!(matches!(
+            session.lock().unwrap().phase(),
+            EnterpriseResolvePhase::Cancelled
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
