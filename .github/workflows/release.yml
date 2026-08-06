@@ -55,7 +55,12 @@ jobs:
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --workspace --all-targets --all-features
+      - name: Test workspace
+        env:
+          # Enterprise e2e tests keep provider secret files in a protected
+          # directory (design section 7: secrets never in plaintext places).
+          YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}
+        run: cargo test --locked --workspace --all-targets --all-features
       - name: Run 10,000-iteration lifecycle stress gates
         run: cargo test --locked --release --workspace stress_10000 -- --ignored --nocapture
       - name: Lint strict relay-only controller rebuild
@@ -143,6 +148,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
       - name: Generate first-party coverage report
+        env:
+          # Enterprise e2e tests keep provider secret files in a protected
+          # directory; required on Windows targets only, harmless elsewhere.
+          YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}
         shell: bash
         run: |
           cargo +nightly-2026-07-22 llvm-cov \
@@ -424,7 +433,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
       - run: cargo clippy --locked --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
-      - run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
+      - name: Test native target
+        env:
+          # Enterprise e2e tests keep provider secret files in a protected
+          # directory; required on Windows targets only, harmless elsewhere.
+          YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}
+        run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Stage Unix binaries
         if: runner.os != 'Windows'

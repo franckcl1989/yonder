@@ -116,6 +116,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
       - name: Generate first-party coverage report
+        env:
+          # Enterprise e2e tests keep provider secret files in a protected
+          # directory; required on Windows targets only, harmless elsewhere.
+          YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}
         shell: bash
         run: |
           cargo +nightly-2026-07-22 llvm-cov \
