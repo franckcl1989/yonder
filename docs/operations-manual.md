@@ -1,4 +1,4 @@
-# Yonder 0.1.1 运维与使用手册
+# Yonder 0.1.2 运维与使用手册
 
 本文档面向需要部署、维护和使用 Yonder 的系统管理员、网络管理员与终端用户。文中的命令、配置字段和行为均对应 Yonder `0.1.1`。
 
@@ -481,6 +481,12 @@ source_limiter_capacity >=
 | `circuit.capacity` | `YON_RELAY_CIRCUIT__CAPACITY` |
 | `circuit.duration_seconds` | `YON_RELAY_CIRCUIT__DURATION_SECONDS` |
 | `circuit.bytes` | `YON_RELAY_CIRCUIT__BYTES` |
+| `enterprise_auth.secret_wecom` | `YON_RELAY_ENTERPRISE_AUTH__SECRET_WECOM` |
+| `enterprise_auth.secret_feishu` | `YON_RELAY_ENTERPRISE_AUTH__SECRET_FEISHU` |
+| `enterprise_auth.certificate` | `YON_RELAY_ENTERPRISE_AUTH__CERTIFICATE` |
+| `enterprise_auth.private_key` | `YON_RELAY_ENTERPRISE_AUTH__PRIVATE_KEY` |
+| `enterprise_auth.callback_listen` | `YON_RELAY_ENTERPRISE_AUTH__CALLBACK_LISTEN` |
+| `enterprise_auth.callback_external_url` | `YON_RELAY_ENTERPRISE_AUTH__CALLBACK_EXTERNAL_URL` |
 
 列表环境变量用逗号分隔：
 
@@ -490,6 +496,56 @@ export YON_RELAY_EXTERNAL='/dns4/relay.example.com/tcp/4001,/dns4/relay.example.
 ```
 
 `wss_certificate` 也是列表字段：环境变量中的证书链路径按叶证书到中间证书顺序用逗号分隔。兼容键 `wss_certificate_der`、`wss_private_key_der` 及其 `_DER` 环境变量在 `0.1.1` 仍可读取；高优先级新键可覆盖低优先级旧键，同一配置层同时设置同组新旧键会失败。
+
+### 5.6 企业认证模式
+
+`0.1.2` 起 relay 可以要求发起连接的用户先证明自己仍是配置企业的有效内部成员。**配置存在即模式切换，没有 `enabled` 开关**：TOML 中存在 `[enterprise_auth]` 段即进入企业模式，进程生命周期内不可切换；一个 relay 要么是普通模式、要么是企业模式，不会混用。
+
+企业模式只提供 Enterprise Resolve 协议，不提供普通 Resolve；认证失败不会降级。兼容性：旧 host 仍可注册到企业 relay；旧 connect 无法使用企业 relay；`0.1.2` 及以后的 connect 自动识别普通或企业 relay。
+
+#### 5.6.1 配置示例
+
+```toml
+[enterprise_auth]
+secret_wecom = "/etc/yonder/wecom.secret"
+secret_feishu = "/etc/yonder/feishu.secret"
+certificate = ["/etc/yonder/callback-cert.pem"]
+private_key = "/etc/yonder/callback-key.pem"
+callback_listen = "0.0.0.0:8443"
+callback_external_url = "https://auth.relay.example.com"
+```
+
+- `secret_wecom` / `secret_feishu`：各平台企业自建应用的敏感凭据文件路径；两个平台可同时配置，也可以只配置一个；至少一个平台才能进入企业模式。
+- `certificate`（链，叶到中间，DER 或 PEM）与 `private_key`（DER 或 PEM）：回调 HTTPS 的 TLS 材料，由企业签发的公网可信证书组成。兼容键 `certificate_der`、`private_key_der` 与新键的关系与 `wss_*` 相同。
+- `callback_listen`：回调 HTTPS 监听地址。
+- `callback_external_url`：浏览器与 OAuth 平台都能访问的裸 HTTPS origin（带点域名或 IP，无路径/查询/片段），用作 OAuth `redirect_uri` 基址。
+
+#### 5.6.2 Secret 文件
+
+凭据文件是独立敏感文件，不允许写进配置正文：启动时读取一次，运行期间不热更新。格式为 TOML，大小上限 `16 KiB`：
+
+```toml
+# wecom.secret —— 企业微信自建应用
+corp_id = "ww1234567890abcdef"
+agent_id = 1000002
+app_secret = "企业微信应用的 secret"
+```
+
+```toml
+# feishu.secret —— 飞书企业自建应用
+app_id = "cli_abc123"
+app_secret = "飞书应用的 secret"
+```
+
+Secret 文件必须遵循与其他 relay 秘密文件相同的平台权限策略（Unix `0600` 与可信父目录；Windows 受保护 DACL）。任一启用平台的文件缺失、不可读、越权或格式非法都会让 relay 拒绝启动（失败关闭）。凭据在进程内按需零化销毁。
+
+#### 5.6.3 认证要求与回调
+
+认证要求：当前用户属于配置企业、且仍为有效内部成员。拒绝：外部用户、其他企业用户、离职、停用与无法确认状态的用户。企业微信需要自建应用在其可见范围内，应用 secret 用于换取应用 token；飞书需要自建应用具备 `authen:user.id:read` 与通讯录只读权限（`employee_status` 在职校验）。
+
+回调 HTTPS 只服务两个路径：`/yonder/callback/wecom` 与 `/yonder/callback/feishu`；不提供首页、管理页、状态查询或静态资源，未知路径与畸形请求返回最小错误页。结果页极简、`no-store` 不缓存、无外部资源。认证成功后用户身份立即销毁。
+
+日志只记录请求 ID、平台、阶段与脱敏结果；不记录用户身份、Token、OAuth state、locator 或 PeerId。
 
 ## 6. 配置 endpoint
 
