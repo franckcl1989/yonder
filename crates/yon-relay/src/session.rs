@@ -466,6 +466,25 @@ mod tests {
     }
 
     #[test]
+    fn oauth_state_round_trips_only_exact_length_bytes() {
+        let state = OAuthState::generate(&mut OsSecureRandom).unwrap();
+        let round_tripped = OAuthState::from_bytes(state.as_bytes()).unwrap();
+        assert_eq!(round_tripped, state);
+        assert!(matches!(
+            OAuthState::from_bytes(&state.as_bytes()[..31]),
+            Err(TransitionError::InvalidState)
+        ));
+        assert!(matches!(
+            OAuthState::from_bytes(&[0_u8; OAuthState::LEN + 1]),
+            Err(TransitionError::InvalidState)
+        ));
+        assert!(matches!(
+            OAuthState::from_bytes(&[]),
+            Err(TransitionError::InvalidState)
+        ));
+    }
+
+    #[test]
     fn oauth_state_is_created_only_after_provider_selection() {
         let mut session = new_session();
         assert!(session.oauth_state().is_none());
