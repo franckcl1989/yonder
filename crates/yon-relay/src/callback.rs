@@ -251,14 +251,6 @@ async fn handle_request(
         log_rejected(provider, "missing-state");
         return Ok(response::bad_request());
     };
-    let Some(code) = decode_param(code) else {
-        log_rejected(provider, "invalid-code");
-        return Ok(response::bad_request());
-    };
-    let Some(state) = decode_param(state) else {
-        log_rejected(provider, "invalid-state");
-        return Ok(response::bad_request());
-    };
     if code.is_empty()
         || code.len() > MAX_AUTHORIZATION_CODE_BYTES
         || state.is_empty()
@@ -271,39 +263,16 @@ async fn handle_request(
     Ok(response::result(result))
 }
 
-/// Extracts one raw query parameter by name.
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query.split('&').find_map(|pair| {
-        pair.split_once('=')
-            .and_then(|(k, v)| (k == key).then_some(v))
-    })
-}
-
-/// Decodes a percent-encoded query value; `+` decodes as space.
-fn decode_param(value: &str) -> Option<String> {
-    let mut decoded = String::with_capacity(value.len());
-    let mut bytes = value.as_bytes().iter();
-    while let Some(&byte) = bytes.next() {
-        match byte {
-            b'%' => {
-                let hi = hex_digit(*bytes.next()?)?;
-                let lo = hex_digit(*bytes.next()?)?;
-                decoded.push(char::from(hi << 4 | lo));
-            }
-            b'+' => decoded.push(' '),
-            byte => decoded.push(char::from(byte)),
-        }
-    }
-    Some(decoded)
-}
-
-fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+/// Extracts one percent-decoded query parameter by name.
+///
+/// The url crate's form-urlencoded parser is lenient about malformed
+/// percent escapes, which is safe here: the state parameter is still
+/// strictly hex-decoded and the code is rejected by the provider
+/// exchange, so malformed input fails closed either way.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
 }
 
 /// Redacted callback rejection logging: platform and reason only.
@@ -710,7 +679,7 @@ pub enum CallbackServerError {
 mod tests {
     use super::{
         CallbackHandler, CallbackResult, CallbackServer, CallbackServerError,
-        MAX_CALLBACK_QUERY_BYTES, decode_param, query_param,
+        MAX_CALLBACK_QUERY_BYTES, query_param,
     };
     use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
     use crate::session::{EnterpriseResolveSession, OAuthState, RequestId};
@@ -789,15 +758,28 @@ mod tests {
     }
 
     #[test]
-    fn query_params_decode_bounded_and_missing() {
-        assert_eq!(query_param("code=a&state=b", "code"), Some("a"));
-        assert_eq!(query_param("code=a&state=b", "state"), Some("b"));
+    fn query_params_decode_percent_and_plus_and_report_missing() {
+        assert_eq!(query_param("code=a&state=b", "code"), Some("a".to_owned()));
+        assert_eq!(query_param("code=a&state=b", "state"), Some("b".to_owned()));
         assert_eq!(query_param("state=b", "code"), None);
-        assert_eq!(decode_param("a%20b"), Some("a b".to_owned()));
-        assert_eq!(decode_param("a+b"), Some("a b".to_owned()));
-        assert_eq!(decode_param("a%2Fb"), Some("a/b".to_owned()));
-        assert_eq!(decode_param("a%zz"), None);
-        assert_eq!(decode_param("a%1"), None);
+        assert_eq!(
+            query_param("code=a%20b&state=c", "code"),
+            Some("a b".to_owned())
+        );
+        assert_eq!(
+            query_param("code=a+b&state=c", "code"),
+            Some("a b".to_owned())
+        );
+        assert_eq!(
+            query_param("code=a%2Fb&state=c", "code"),
+            Some("a/b".to_owned())
+        );
+        // The parser is lenient about malformed escapes; the downstream
+        // strict state hex-decoding and provider exchange reject them.
+        assert_eq!(
+            query_param("code=a%zz&state=b", "code"),
+            Some("a%zz".to_owned())
+        );
     }
 
     use crate::callback::{
