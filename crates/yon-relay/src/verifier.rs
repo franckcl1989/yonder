@@ -141,7 +141,12 @@ async fn wecom_access_token<T: ExchangeTransport>(
     url.query_pairs_mut()
         .append_pair("corpid", credentials.corp_id.as_str())
         .append_pair("corpsecret", credentials.app_secret.as_str());
-    let body = bounded_body(transport.get(&url, None).await.map_err(|_| VerifyError::Platform)?)?;
+    let body = bounded_body(
+        transport
+            .get(&url, None)
+            .await
+            .map_err(|_| VerifyError::Platform)?,
+    )?;
     let value = json(body)?;
     if !wecom_success(&value) {
         return Err(VerifyError::Platform);
@@ -156,13 +161,17 @@ async fn wecom_member_userid<T: ExchangeTransport>(
     token: &str,
     code: &str,
 ) -> Result<String, VerifyError> {
-    let mut url =
-        Url::parse("https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo")
-            .expect("fixed wecom endpoint");
+    let mut url = Url::parse("https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo")
+        .expect("fixed wecom endpoint");
     url.query_pairs_mut()
         .append_pair("access_token", token)
         .append_pair("code", code);
-    let body = bounded_body(transport.get(&url, None).await.map_err(|_| VerifyError::Platform)?)?;
+    let body = bounded_body(
+        transport
+            .get(&url, None)
+            .await
+            .map_err(|_| VerifyError::Platform)?,
+    )?;
     let value = json(body)?;
     match value.get("errcode").and_then(Value::as_i64) {
         Some(0) => {}
@@ -185,7 +194,12 @@ async fn wecom_active_member_status<T: ExchangeTransport>(
     url.query_pairs_mut()
         .append_pair("access_token", token)
         .append_pair("userid", userid);
-    let body = bounded_body(transport.get(&url, None).await.map_err(|_| VerifyError::Platform)?)?;
+    let body = bounded_body(
+        transport
+            .get(&url, None)
+            .await
+            .map_err(|_| VerifyError::Platform)?,
+    )?;
     let value = json(body)?;
     match value.get("errcode").and_then(Value::as_i64) {
         // Status 1 is an activated active member; disabled, not-activated,
@@ -207,9 +221,8 @@ async fn feishu_user_token<T: ExchangeTransport>(
     credentials: &FeishuCredentials,
     code: &str,
 ) -> Result<String, VerifyError> {
-    let url =
-        Url::parse("https://open.feishu.cn/open-apis/authen/v1/oidc/access_token")
-            .expect("fixed feishu endpoint");
+    let url = Url::parse("https://open.feishu.cn/open-apis/authen/v1/oidc/access_token")
+        .expect("fixed feishu endpoint");
     let body = serde_json::json!({
         "grant_type": "authorization_code",
         "code": code,
@@ -236,9 +249,8 @@ async fn feishu_employee_id<T: ExchangeTransport>(
     transport: &T,
     user_token: &str,
 ) -> Result<String, VerifyError> {
-    let url =
-        Url::parse("https://open.feishu.cn/open-apis/authen/v1/user_info")
-            .expect("fixed feishu endpoint");
+    let url = Url::parse("https://open.feishu.cn/open-apis/authen/v1/user_info")
+        .expect("fixed feishu endpoint");
     let body = bounded_body(
         transport
             .get(&url, Some(user_token))
@@ -259,9 +271,8 @@ async fn feishu_tenant_access_token<T: ExchangeTransport>(
     transport: &T,
     credentials: &FeishuCredentials,
 ) -> Result<String, VerifyError> {
-    let url =
-        Url::parse("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-            .expect("fixed feishu endpoint");
+    let url = Url::parse("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+        .expect("fixed feishu endpoint");
     let body = serde_json::json!({
         "app_id": credentials.app_id.as_str(),
         "app_secret": credentials.app_secret.as_str(),
@@ -287,9 +298,8 @@ async fn feishu_active_employee_status<T: ExchangeTransport>(
     tenant_token: &str,
     user_id: &str,
 ) -> Result<(), VerifyError> {
-    let mut url =
-        Url::parse("https://open.feishu.cn/open-apis/contact/v3/users")
-            .expect("fixed feishu endpoint");
+    let mut url = Url::parse("https://open.feishu.cn/open-apis/contact/v3/users")
+        .expect("fixed feishu endpoint");
     url.path_segments_mut()
         .expect("fixed feishu base path")
         .push(user_id);
@@ -437,8 +447,7 @@ mod tests {
         assert!(requests[0].starts_with("https://qyapi.weixin.qq.com/cgi-bin/gettoken?"));
         assert!(requests[0].contains("corpid=ww1234567890abcdef"));
         assert!(requests[0].contains("corpsecret=s3cret"));
-        assert!(requests[1]
-            .starts_with("https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo?"));
+        assert!(requests[1].starts_with("https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo?"));
         assert!(requests[1].contains("access_token=tok-1"));
         assert!(requests[1].contains("code=auth-code-1"));
         assert!(requests[2].starts_with("https://qyapi.weixin.qq.com/cgi-bin/user/get?"));
@@ -532,9 +541,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn wecom_platform_failure_is_fail_closed() {
-        let exchange = MockExchange::new(vec![
-            ok(r#"{"errcode":40013,"errmsg":"invalid corpid"}"#),
-        ]);
+        let exchange =
+            MockExchange::new(vec![ok(r#"{"errcode":40013,"errmsg":"invalid corpid"}"#)]);
         let error = verify_member(
             &exchange,
             EnterpriseProvider::WeCom,
@@ -548,7 +556,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn wecom_oversized_identity_is_fail_closed() {
-        let oversized_userid = format!(r#"{{"errcode":0,"errmsg":"ok","userid":"{}"}}"#, "x".repeat(300));
+        let oversized_userid = format!(
+            r#"{{"errcode":0,"errmsg":"ok","userid":"{}"}}"#,
+            "x".repeat(300)
+        );
         let exchange = MockExchange::new(vec![
             ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
             ok(&oversized_userid),
@@ -598,8 +609,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn feishu_happy_path_admits_active_member() {
         let exchange = MockExchange::new(vec![
-            ok(r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#),
-            ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7","enterprise_email":"u@corp.test"}}"#),
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(
+                r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7","enterprise_email":"u@corp.test"}}"#,
+            ),
             ok(r#"{"code":0,"tenant_access_token":"tnt-tok","expire":7200}"#),
             ok(r#"{"code":0,"data":{"user":{"user_id":"cli_user_7","employee_status":1}}}"#),
         ]);
@@ -614,14 +629,19 @@ mod tests {
         assert_eq!(identity.as_bytes(), b"cli_user_7");
         let requests = exchange.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert!(requests[0]
-            .starts_with("POST https://open.feishu.cn/open-apis/authen/v1/oidc/access_token "));
+        assert!(
+            requests[0]
+                .starts_with("POST https://open.feishu.cn/open-apis/authen/v1/oidc/access_token ")
+        );
         assert!(requests[0].contains("\"code\":\"auth-code-1\""));
         assert!(requests[0].contains("\"client_id\":\"cli_abc123\""));
-        assert!(requests[1]
-            .starts_with("Bearer usr-tok https://open.feishu.cn/open-apis/authen/v1/user_info"));
-        assert!(requests[2]
-            .starts_with("POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal "));
+        assert!(
+            requests[1]
+                .starts_with("Bearer usr-tok https://open.feishu.cn/open-apis/authen/v1/user_info")
+        );
+        assert!(requests[2].starts_with(
+            "POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal "
+        ));
         assert!(requests[3].starts_with("Bearer tnt-tok "));
         assert!(requests[3].contains("/contact/v3/users/cli_user_7?user_id_type=user_id"));
     }
@@ -629,7 +649,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn feishu_user_without_employee_id_is_rejected() {
         let exchange = MockExchange::new(vec![
-            ok(r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#),
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
             ok(r#"{"code":0,"data":{"open_id":"ou_123"}}"#),
         ]);
         let error = verify_member(
@@ -646,7 +668,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn feishu_departed_member_is_rejected() {
         let exchange = MockExchange::new(vec![
-            ok(r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#),
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
             ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
             ok(r#"{"code":0,"tenant_access_token":"tnt-tok","expire":7200}"#),
             ok(r#"{"code":0,"data":{"user":{"user_id":"cli_user_7","employee_status":2}}}"#),
@@ -665,7 +689,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn feishu_unconfirmable_status_is_rejected() {
         let exchange = MockExchange::new(vec![
-            ok(r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#),
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
             ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
             ok(r#"{"code":0,"tenant_access_token":"tnt-tok","expire":7200}"#),
             ok(r#"{"code":99991663,"msg":"user not found"}"#),
@@ -684,7 +710,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn feishu_tenant_token_failure_is_platform() {
         let exchange = MockExchange::new(vec![
-            ok(r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#),
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
             ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
             ok(r#"{"code":10003,"msg":"invalid app_secret"}"#),
         ]);

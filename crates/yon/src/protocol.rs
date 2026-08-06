@@ -6,19 +6,15 @@ use backon::{BackoffBuilder as _, ConstantBuilder};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use yonder_core::error::ProtocolField;
 use yonder_core::wire::enterprise::{
-    MAX_AUTHORIZATION_URL_LEN, EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart,
+    EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart, MAX_AUTHORIZATION_URL_LEN,
 };
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{MAX_RESPONSE_LEN, ResolveRequest, ResolveResponse};
 use yonder_core::wire::{ENTERPRISE_RESOLVE_PROTOCOL, REGISTRY_PROTOCOL, RESOLVE_PROTOCOL};
-use yonder_core::error::ProtocolField;
-use yonder_core::{
-    EnterpriseProvider, EnterpriseProviders, Locator, ProtocolError, RetryAfter,
-};
-use yonder_net::{
-    ApplicationStreamError, ApplicationStreams, Libp2pApplicationStreams, PeerId,
-};
+use yonder_core::{EnterpriseProvider, EnterpriseProviders, Locator, ProtocolError, RetryAfter};
+use yonder_net::{ApplicationStreamError, ApplicationStreams, Libp2pApplicationStreams, PeerId};
 
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_LIMIT: usize = 20;
@@ -328,13 +324,9 @@ pub async fn enterprise_resolve_peer(
         let mut backoff = std::iter::repeat(Duration::from_millis(250));
         loop {
             reconverge_relay(driver, relay).await?;
-            let stream = open_stream_timed(
-                driver,
-                streams,
-                relay.peer(),
-                ENTERPRISE_RESOLVE_PROTOCOL,
-            )
-            .await?;
+            let stream =
+                open_stream_timed(driver, streams, relay.peer(), ENTERPRISE_RESOLVE_PROTOCOL)
+                    .await?;
             let mut stream = stream.into_tokio();
             match drive(
                 driver,
@@ -429,9 +421,9 @@ async fn read_enterprise_response(
                 stream.read_exact(&mut prefix).await?;
                 let length = usize::from(u16::from_be_bytes(prefix));
                 if length > MAX_AUTHORIZATION_URL_LEN {
-                    return Err(RelayProtocolError::Protocol(
-                        ProtocolError::InvalidField(ProtocolField::AuthorizationUrl),
-                    ));
+                    return Err(RelayProtocolError::Protocol(ProtocolError::InvalidField(
+                        ProtocolField::AuthorizationUrl,
+                    )));
                 }
                 let mut url = vec![0_u8; length];
                 stream.read_exact(&mut url).await?;
@@ -626,8 +618,8 @@ async fn bounded_exchange_io<const CAPACITY: usize>(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AllocationResponse, BoundedResponse, CONTROLLER_RESOLVE_TIMEOUT, RETRY_LIMIT,
-        EnterpriseAttempt, EnterpriseResolveUi, ReclaimStep, RelayProtocolError, ResolveDeadline,
+        AllocationResponse, BoundedResponse, CONTROLLER_RESOLVE_TIMEOUT, EnterpriseAttempt,
+        EnterpriseResolveUi, RETRY_LIMIT, ReclaimStep, RelayProtocolError, ResolveDeadline,
         ResolvedResponse, RetryAfter, allocation_response, bounded_exchange_io,
         enterprise_exchange_io, exact_exchange_io, reclaim_response, release_response,
         resolve_response, retry_delay,
@@ -1032,7 +1024,8 @@ mod tests {
         fn open_authorization(
             &mut self,
             url: &str,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), RelayProtocolError>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), RelayProtocolError>> + Send + '_>>
+        {
             let url = url.to_owned();
             Box::pin(async move {
                 self.opened = Some(url);
@@ -1074,10 +1067,7 @@ mod tests {
             )
             .await
             .unwrap();
-        stream
-            .write_all(result.encode().as_slice())
-            .await
-            .unwrap();
+        stream.write_all(result.encode().as_slice()).await.unwrap();
     }
 
     /// One relay-side substream that answers the start with a rate-limit
@@ -1111,15 +1101,23 @@ mod tests {
         );
         let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
         let attempt = async {
-            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
-                .await
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_secs(2),
+            )
+            .await
         };
         let (attempt, ()) = tokio::join!(attempt, relay_side);
         match attempt.unwrap() {
             EnterpriseAttempt::Resolved(resolved) => assert_eq!(resolved, peer),
             EnterpriseAttempt::Retry(_) => panic!("expected resolved"),
         }
-        assert_eq!(ui.offered, Some(EnterpriseProviders::new(true, true).unwrap()));
+        assert_eq!(
+            ui.offered,
+            Some(EnterpriseProviders::new(true, true).unwrap())
+        );
         assert_eq!(
             ui.opened.as_deref(),
             Some("https://relay.example.test/yonder/callback/wecom?code=x&state=y")
@@ -1129,14 +1127,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn enterprise_exchange_retries_on_relay_limits() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let relay_side = relay_enterprise_retry(
-            server,
-            RetryAfter::from_millis(500).unwrap(),
-        );
+        let relay_side = relay_enterprise_retry(server, RetryAfter::from_millis(500).unwrap());
         let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
         let attempt = async {
-            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
-                .await
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_secs(2),
+            )
+            .await
         };
         let (attempt, ()) = tokio::join!(attempt, relay_side);
         assert!(matches!(
@@ -1163,17 +1163,20 @@ mod tests {
             );
             let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
             let attempt = async {
-                enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
-                    .await
+                enterprise_exchange_io(
+                    &mut client,
+                    Locator::new(7).unwrap(),
+                    &mut ui,
+                    Duration::from_secs(2),
+                )
+                .await
             };
             let (attempt, ()) = tokio::join!(attempt, relay_side);
             assert!(matches!(
                 attempt,
-                Err(
-                    RelayProtocolError::EnterpriseRejected
-                        | RelayProtocolError::EnterpriseExpired
-                        | RelayProtocolError::Unavailable
-                )
+                Err(RelayProtocolError::EnterpriseRejected
+                    | RelayProtocolError::EnterpriseExpired
+                    | RelayProtocolError::Unavailable)
             ));
         }
     }
@@ -1190,11 +1193,19 @@ mod tests {
         );
         let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
         let attempt = async {
-            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
-                .await
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_secs(2),
+            )
+            .await
         };
         let (attempt, ()) = tokio::join!(attempt, relay_side);
-        assert!(matches!(attempt, Err(RelayProtocolError::UnexpectedResponse)));
+        assert!(matches!(
+            attempt,
+            Err(RelayProtocolError::UnexpectedResponse)
+        ));
 
         // A resolved peer that is not a valid PeerId is rejected.
         let (mut client, server) = tokio::io::duplex(1024);
@@ -1206,8 +1217,13 @@ mod tests {
         );
         let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
         let attempt = async {
-            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
-                .await
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_secs(2),
+            )
+            .await
         };
         let (attempt, ()) = tokio::join!(attempt, relay_side);
         assert!(matches!(attempt, Err(RelayProtocolError::InvalidPeerId)));
@@ -1224,8 +1240,13 @@ mod tests {
         };
         let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
         let attempt = async {
-            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_millis(100))
-                .await
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_millis(100),
+            )
+            .await
         };
         let (attempt, ()) = tokio::join!(attempt, relay_side);
         assert!(matches!(attempt, Err(RelayProtocolError::Timeout)));

@@ -9,8 +9,8 @@
 use crate::verifier::{ExchangeTransport, MAX_EXCHANGE_RESPONSE_BYTES};
 use http_body_util::BodyExt as _;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use std::future::Future;
 use std::io;
@@ -93,10 +93,7 @@ fn build_get_request(
         .map_err(|error| io::Error::other(format!("invalid exchange request: {error}")))
 }
 
-fn build_post_request(
-    uri: String,
-    body: String,
-) -> Result<hyper::Request<String>, io::Error> {
+fn build_post_request(uri: String, body: String) -> Result<hyper::Request<String>, io::Error> {
     hyper::Request::builder()
         .method(hyper::Method::POST)
         .uri(uri)
@@ -120,22 +117,21 @@ async fn exchange(
         )));
     }
     let body = response.into_body();
-    let bytes =
-        http_body_util::Limited::new(body, MAX_EXCHANGE_RESPONSE_BYTES as usize)
-            .collect()
-            .await
-            .map_err(|error| {
-                let kind = if error
-                    .downcast_ref::<http_body_util::LengthLimitError>()
-                    .is_some()
-                {
-                    io::ErrorKind::InvalidData
-                } else {
-                    io::ErrorKind::UnexpectedEof
-                };
-                io::Error::new(kind, format!("exchange response read failed: {error}"))
-            })?
-            .to_bytes();
+    let bytes = http_body_util::Limited::new(body, MAX_EXCHANGE_RESPONSE_BYTES as usize)
+        .collect()
+        .await
+        .map_err(|error| {
+            let kind = if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                io::ErrorKind::InvalidData
+            } else {
+                io::ErrorKind::UnexpectedEof
+            };
+            io::Error::new(kind, format!("exchange response read failed: {error}"))
+        })?
+        .to_bytes();
     Ok(bytes.to_vec())
 }
 
@@ -177,17 +173,18 @@ mod tests {
                         .into_body()
                         .collect()
                         .await
-                        .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
+                        .map(|collected| {
+                            String::from_utf8_lossy(&collected.to_bytes()).into_owned()
+                        })
                         .unwrap_or_default();
                     *capture.lock().unwrap() = Some((method, uri, authorization, body));
                     Ok::<_, Infallible>(response)
                 }
             });
-            let _ = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection(io, service)
-            .await;
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
         });
         (address.to_string(), captured)
     }
@@ -224,7 +221,10 @@ mod tests {
         )
         .await;
         let url = Url::parse(&format!("http://{address}/yonder/oidc")).unwrap();
-        let body = client().post_json(&url, r#"{"grant_type":"authorization_code"}"#).await.unwrap();
+        let body = client()
+            .post_json(&url, r#"{"grant_type":"authorization_code"}"#)
+            .await
+            .unwrap();
         assert_eq!(body, br#"{"code":0}"#);
         let (method, uri, authorization, body) = captured.lock().unwrap().clone().unwrap();
         assert_eq!(method, "POST");
@@ -251,13 +251,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn oversized_bodies_fail_the_exchange() {
         let big = "x".repeat((crate::verifier::MAX_EXCHANGE_RESPONSE_BYTES + 1) as usize);
-        let (address, _) = serve_one(
-            hyper::Response::builder()
-                .status(200)
-                .body(big)
-                .unwrap(),
-        )
-        .await;
+        let (address, _) =
+            serve_one(hyper::Response::builder().status(200).body(big).unwrap()).await;
         let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
         let error = client().get(&url, None).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -265,8 +260,8 @@ mod tests {
 
     #[test]
     fn request_builders_set_method_uri_and_headers() {
-        let get = build_get_request("https://relay.example.test/x".to_owned(), Some("tok-1"))
-            .unwrap();
+        let get =
+            build_get_request("https://relay.example.test/x".to_owned(), Some("tok-1")).unwrap();
         assert_eq!(get.method(), hyper::Method::GET);
         assert_eq!(get.uri(), "https://relay.example.test/x");
         assert_eq!(
@@ -280,8 +275,8 @@ mod tests {
         let bare = build_get_request("https://relay.example.test/x".to_owned(), None).unwrap();
         assert!(bare.headers().get(hyper::header::AUTHORIZATION).is_none());
 
-        let post = build_post_request("https://relay.example.test/y".to_owned(), "{}".to_owned())
-            .unwrap();
+        let post =
+            build_post_request("https://relay.example.test/y".to_owned(), "{}".to_owned()).unwrap();
         assert_eq!(post.method(), hyper::Method::POST);
         assert_eq!(
             post.headers()

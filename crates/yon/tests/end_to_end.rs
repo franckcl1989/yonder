@@ -379,13 +379,25 @@ fn enterprise_relay_serves_callback_https_and_rejects_malformed_callbacks()
     let relay_process = RelayProcess::start_enterprise(identity, port, callback_port)?;
     thread::sleep(Duration::from_millis(500));
 
-    let status = enterprise_callback_request(callback_port, "GET / HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    let status = enterprise_callback_request(
+        callback_port,
+        "GET / HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
+    )?;
     assert!(status.starts_with("HTTP/1.1 404"), "{status}");
-    let status = enterprise_callback_request(callback_port, "GET /yonder/callback/wecom HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    let status = enterprise_callback_request(
+        callback_port,
+        "GET /yonder/callback/wecom HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
+    )?;
     assert!(status.starts_with("HTTP/1.1 400"), "{status}");
-    let status = enterprise_callback_request(callback_port, "GET /yonder/callback/wecom?code=a HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    let status = enterprise_callback_request(
+        callback_port,
+        "GET /yonder/callback/wecom?code=a HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
+    )?;
     assert!(status.starts_with("HTTP/1.1 400"), "{status}");
-    let status = enterprise_callback_request(callback_port, "POST /yonder/callback/wecom?code=a&state=b HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    let status = enterprise_callback_request(
+        callback_port,
+        "POST /yonder/callback/wecom?code=a&state=b HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
+    )?;
     assert!(status.starts_with("HTTP/1.1 405"), "{status}");
 
     relay_process.stop()
@@ -401,10 +413,9 @@ fn legacy_resolve_is_rejected_by_enterprise_relays() -> Result<(), std::io::Erro
     let relay_process = RelayProcess::start_enterprise(identity, port, callback_port)?;
     thread::sleep(Duration::from_millis(500));
 
-    let address: EndpointRelayAddress =
-        format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}")
-            .parse()
-            .map_err(|error: yonder_net::AddressError| std::io::Error::other(error.to_string()))?;
+    let address: EndpointRelayAddress = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}")
+        .parse()
+        .map_err(|error: yonder_net::AddressError| std::io::Error::other(error.to_string()))?;
     let relays = EndpointRelaySet::new(vec![address])
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let client_identity = generate_identity(&mut OsSecureRandom)
@@ -414,13 +425,10 @@ fn legacy_resolve_is_rejected_by_enterprise_relays() -> Result<(), std::io::Erro
         .build()
         .map_err(|error| std::io::Error::other(error.to_string()))?
         .block_on(async {
-            let (mut driver, mut streams, relay) = connect_relay(
-                client_identity,
-                &relays,
-                WssTransportConfig::client(None),
-            )
-            .await
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let (mut driver, mut streams, relay) =
+                connect_relay(client_identity, &relays, WssTransportConfig::client(None))
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
             resolve_peer(
                 &mut driver,
                 &mut streams,
@@ -540,7 +548,8 @@ fn unauthenticated_connects_are_rejected_by_enterprise_relays() -> Result<(), st
             )));
         }
     }
-    if !stdout.is_empty() && !String::from_utf8_lossy(&stdout).contains("请选择企业认证平台") {
+    if !stdout.is_empty() && !String::from_utf8_lossy(&stdout).contains("请选择企业认证平台")
+    {
         return Err(std::io::Error::other(
             "an enterprise rejection wrote unexpected output to stdout",
         ));
@@ -574,9 +583,12 @@ fn enterprise_callback_request(
         let stream = tokio::net::TcpStream::connect(("127.0.0.1", callback_port))
             .await
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let mut tls = connector.connect(server_name, stream).await.map_err(|error| {
-            std::io::Error::other(format!("callback TLS handshake failed: {error}"))
-        })?;
+        let mut tls = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("callback TLS handshake failed: {error}"))
+            })?;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         tls.write_all(request.as_bytes()).await?;
         let mut bytes = Vec::new();
@@ -1637,17 +1649,22 @@ impl RelayProcess {
 
     /// Starts an enterprise-mode relay with the callback TLS from the
     /// fixture certificate and a WeCom provider secret file.
-    fn start_enterprise(identity: Keypair, port: u16, callback_port: u16) -> Result<Self, std::io::Error> {
+    fn start_enterprise(
+        identity: Keypair,
+        port: u16,
+        callback_port: u16,
+    ) -> Result<Self, std::io::Error> {
         let listen = vec![format!("/ip4/127.0.0.1/tcp/{port}")];
         let external = vec![format!("/ip4/127.0.0.1/tcp/{port}")];
-        let listen = listen
-            .into_iter()
-            .map(|address| {
-                address.parse::<RelayListenAddress>().map_err(
-                    |error: yonder_net::AddressError| std::io::Error::other(error.to_string()),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let listen =
+            listen
+                .into_iter()
+                .map(|address| {
+                    address.parse::<RelayListenAddress>().map_err(
+                        |error: yonder_net::AddressError| std::io::Error::other(error.to_string()),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
         let external = external
             .into_iter()
             .map(|address| {
@@ -1679,16 +1696,13 @@ impl RelayProcess {
         }
         let providers = yonder_core::EnterpriseProviders::new(true, true)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let secrets = yon_relay::ProviderSecrets::new(
-            providers,
-            Some(wecom_secret),
-            Some(feishu_secret),
-        )
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let secrets =
+            yon_relay::ProviderSecrets::new(providers, Some(wecom_secret), Some(feishu_secret))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         let config = yon_relay::EnterpriseAuthConfig::new(
-            format!("127.0.0.1:{callback_port}")
-                .parse()
-                .map_err(|error: std::net::AddrParseError| std::io::Error::other(error.to_string()))?,
+            format!("127.0.0.1:{callback_port}").parse().map_err(
+                |error: std::net::AddrParseError| std::io::Error::other(error.to_string()),
+            )?,
             yon_relay::CallbackExternalUrl::new(
                 "https://relay.example.test"
                     .parse()

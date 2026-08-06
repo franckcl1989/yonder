@@ -287,9 +287,7 @@ impl EnterpriseControllerUi<tokio::io::BufReader<tokio::io::Stdin>, tokio::io::S
     }
 }
 
-impl Default
-    for EnterpriseControllerUi<tokio::io::BufReader<tokio::io::Stdin>, tokio::io::Stdout>
-{
+impl Default for EnterpriseControllerUi<tokio::io::BufReader<tokio::io::Stdin>, tokio::io::Stdout> {
     fn default() -> Self {
         Self::new()
     }
@@ -1843,6 +1841,7 @@ mod tests {
         wait_for_remote_completion_deadline, write_native_display_restore,
     };
     use crate::progress::NoopProgress;
+    use crate::protocol::EnterpriseResolveUi as _;
     use crate::terminal::TerminalChunk;
     use std::cell::Cell;
     use std::io;
@@ -1853,7 +1852,6 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
     use tokio::sync::oneshot;
     use yonder_core::wire::auth::AuthServerResponse;
-    use crate::protocol::EnterpriseResolveUi as _;
     use yonder_core::wire::terminal::{TerminalComplete, TerminalHello, TerminalReady};
     use yonder_core::{
         ConnectionCode, EnterpriseProvider, EnterpriseProviders, Locator, PakeSecret,
@@ -3279,8 +3277,7 @@ mod tests {
 
     // ---- enterprise controller UI ----
 
-    fn test_ui(
-    ) -> EnterpriseControllerUi<
+    fn test_ui() -> EnterpriseControllerUi<
         tokio::io::BufReader<tokio::io::DuplexStream>,
         tokio::io::DuplexStream,
     > {
@@ -3292,18 +3289,11 @@ mod tests {
     }
 
     /// Reads whatever the UI writes, with a short window.
-    async fn read_ui_output(
-        mut output: tokio::io::DuplexStream,
-    ) -> String {
+    async fn read_ui_output(mut output: tokio::io::DuplexStream) -> String {
         let mut text = Vec::new();
         for _ in 0..4 {
             let mut buffer = [0_u8; 256];
-            match tokio::time::timeout(
-                Duration::from_millis(200),
-                output.read(&mut buffer),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_millis(200), output.read(&mut buffer)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(read)) => text.extend_from_slice(&buffer[..read]),
                 _ => break,
@@ -3332,14 +3322,11 @@ mod tests {
             opener: Box::new(|_| false),
         };
         let selection = ui.select_provider(EnterpriseProviders::new(true, true).unwrap());
-        let (chosen, prompt) = tokio::join!(
-            async { selection.await.unwrap() },
-            async {
-                let prompt = read_ui_output(client_output).await;
-                client_input.write_all(b"2\n").await.unwrap();
-                prompt
-            },
-        );
+        let (chosen, prompt) = tokio::join!(async { selection.await.unwrap() }, async {
+            let prompt = read_ui_output(client_output).await;
+            client_input.write_all(b"2\n").await.unwrap();
+            prompt
+        },);
         assert_eq!(chosen, EnterpriseProvider::Feishu);
         assert!(prompt.contains("企业微信 (WeCom)"));
         assert!(prompt.contains("飞书 (Feishu)"));
@@ -3355,13 +3342,10 @@ mod tests {
             opener: Box::new(|_| false),
         };
         let selection = ui.select_provider(EnterpriseProviders::new(true, true).unwrap());
-        let (chosen, _) = tokio::join!(
-            selection,
-            async {
-                let _ = read_ui_output(client_output).await;
-                client_input.write_all(b"9\n").await.unwrap();
-            },
-        );
+        let (chosen, _) = tokio::join!(selection, async {
+            let _ = read_ui_output(client_output).await;
+            client_input.write_all(b"9\n").await.unwrap();
+        },);
         assert!(matches!(
             chosen,
             Err(crate::protocol::RelayProtocolError::EnterpriseRejected)
@@ -3383,11 +3367,15 @@ mod tests {
             }),
         };
         let (result, printed) = tokio::join!(
-            ui.open_authorization("https://relay.example.test/yonder/callback/wecom?code=x&state=y"),
+            ui.open_authorization(
+                "https://relay.example.test/yonder/callback/wecom?code=x&state=y"
+            ),
             read_ui_output(client_output),
         );
         result.unwrap();
-        assert!(printed.contains("https://relay.example.test/yonder/callback/wecom?code=x&state=y"));
+        assert!(
+            printed.contains("https://relay.example.test/yonder/callback/wecom?code=x&state=y")
+        );
         assert_eq!(
             opened.lock().unwrap().as_deref(),
             Some("https://relay.example.test/yonder/callback/wecom?code=x&state=y")

@@ -1,6 +1,6 @@
 use crate::callback::{
     CallbackEntry, CallbackHandler, CallbackRegistry, CallbackResult, CallbackServer,
-    CallbackSessionHandler, CallbackServerError,
+    CallbackServerError, CallbackSessionHandler,
 };
 use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig};
 use crate::exchange::ExchangeClient;
@@ -11,8 +11,8 @@ use crate::session::{
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -622,13 +622,9 @@ pub async fn run_relay_until(
         let cancellation = tasks.cancellation();
         tasks.spawn(async move {
             let _ = server
-                .serve_on(
-                    listener,
-                    handler,
-                    async move {
-                        cancellation.cancelled().await;
-                    },
-                )
+                .serve_on(listener, handler, async move {
+                    cancellation.cancelled().await;
+                })
                 .await;
         });
     }
@@ -1508,7 +1504,11 @@ async fn enterprise_resolve_exchange<S: ProtocolIo>(
         .await
         .map_err(|_| ProtocolTaskError::OwnerStopped)??;
     if let EnterpriseResolveAdmission::Retry(retry) = admission {
-        return write_timeout(&mut stream, EnterpriseResolveResponse::Retry(retry).encode().as_slice()).await;
+        return write_timeout(
+            &mut stream,
+            EnterpriseResolveResponse::Retry(retry).encode().as_slice(),
+        )
+        .await;
     }
 
     let now = clock.now();
@@ -1518,7 +1518,13 @@ async fn enterprise_resolve_exchange<S: ProtocolIo>(
     let mut session = EnterpriseResolveSession::new(request_id, start.locator(), now);
     session.offer_providers()?;
     let providers = credentials.providers()?;
-    write_timeout(&mut stream, EnterpriseResolveResponse::Providers(providers).encode().as_slice()).await?;
+    write_timeout(
+        &mut stream,
+        EnterpriseResolveResponse::Providers(providers)
+            .encode()
+            .as_slice(),
+    )
+    .await?;
 
     // The provider selection is a human interaction, so it is bounded by
     // the session deadline rather than the message timeout.
@@ -1532,7 +1538,11 @@ async fn enterprise_resolve_exchange<S: ProtocolIo>(
     let provider = select.provider();
     if !providers.contains(provider) {
         let _ = session.fail(EnterpriseFailure::InvalidState);
-        return write_timeout(&mut stream, EnterpriseResolveResponse::Failed.encode().as_slice()).await;
+        return write_timeout(
+            &mut stream,
+            EnterpriseResolveResponse::Failed.encode().as_slice(),
+        )
+        .await;
     }
     let state = session.select(provider, &mut random)?;
     let url = credentials.authorization_url(provider, callback_url, &state)?;
@@ -1540,21 +1550,22 @@ async fn enterprise_resolve_exchange<S: ProtocolIo>(
     let (outcome_tx, outcome_rx) = oneshot::channel();
     let deadline = session.deadline();
     let session = Arc::new(Mutex::new(session));
-    let entry = CallbackEntry::new(
-        Arc::clone(&session),
-        outcome_tx,
-        request_id,
-        deadline,
-    );
+    let entry = CallbackEntry::new(Arc::clone(&session), outcome_tx, request_id, deadline);
     if registry.insert(state.clone(), entry, clock.now()).is_err() {
         let _ = session.lock().unwrap().fail(EnterpriseFailure::Platform);
-        return write_timeout(&mut stream, EnterpriseResolveResponse::Failed.encode().as_slice()).await;
+        return write_timeout(
+            &mut stream,
+            EnterpriseResolveResponse::Failed.encode().as_slice(),
+        )
+        .await;
     }
     let mut transaction = TransactionGuard::new(Arc::clone(registry), state.clone());
 
     write_timeout(
         &mut stream,
-        EnterpriseResolveResponse::Authenticate(Box::new(url)).encode().as_slice(),
+        EnterpriseResolveResponse::Authenticate(Box::new(url))
+            .encode()
+            .as_slice(),
     )
     .await?;
 
@@ -1620,7 +1631,11 @@ async fn enterprise_resolve_exchange<S: ProtocolIo>(
         | CallbackResult::InvalidState
         | CallbackResult::Platform
         | CallbackResult::Limited => {
-            write_timeout(&mut stream, EnterpriseResolveResponse::Failed.encode().as_slice()).await
+            write_timeout(
+                &mut stream,
+                EnterpriseResolveResponse::Failed.encode().as_slice(),
+            )
+            .await
         }
     }
 }
@@ -1695,21 +1710,21 @@ mod tests {
         ProtocolIo, ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision,
         RelayObservability, RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall,
         ShutdownReason, TransactionGuard, completed_task_result, enterprise_resolve_exchange,
-        finish_relay_run, finish_relay_run_with_timeout, handle_registry_call,
-        handle_resolve_call, handle_resolve_call_observed,
-        handle_swarm_event as handle_swarm_event_inner, read_exact_eof, registry_exchange,
-        registry_immediate_retry, report_ready_to, resolve_exchange, resolve_immediate_retry,
-        run_relay, run_relay_until, run_relay_until_shutdown, with_timeout, write_close,
+        finish_relay_run, finish_relay_run_with_timeout, handle_registry_call, handle_resolve_call,
+        handle_resolve_call_observed, handle_swarm_event as handle_swarm_event_inner,
+        read_exact_eof, registry_exchange, registry_immediate_retry, report_ready_to,
+        resolve_exchange, resolve_immediate_retry, run_relay, run_relay_until,
+        run_relay_until_shutdown, with_timeout, write_close,
     };
     #[cfg(windows)]
     use super::{process_shutdown_signal, select_windows_shutdown};
-    use crate::callback::{
-        CallbackEntry, CallbackRegistry, CallbackResult,
-    };
+    use crate::callback::{CallbackEntry, CallbackRegistry, CallbackResult};
     use crate::enterprise::CallbackExternalUrl;
     use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
     use crate::registry::{Registry, ResolveLimiters};
-    use crate::session::{EnterpriseResolveSession, MemberAdmission, MemberIdentity, OAuthState, RequestId};
+    use crate::session::{
+        EnterpriseResolveSession, MemberAdmission, MemberIdentity, OAuthState, RequestId,
+    };
     use std::io;
     use std::num::NonZeroU32;
     use std::pin::Pin;
@@ -1725,10 +1740,10 @@ mod tests {
     };
     use yonder_core::{
         EnterpriseProvider, EnterpriseProviders, Locator, MonotonicClock, MonotonicTime,
-        OsSecureRandom,
-        ProtocolError, RegistrationCapacity, RegistrationLimits, RelayResourceConfig,
-        ReservationDuration, ResolveConcurrency, ResolveLimits, RetryAfter, SecretDocument,
-        SourceRegistrationCapacity, SystemClock, wire::registry::{RegistryRequest, RegistryResponse},
+        OsSecureRandom, ProtocolError, RegistrationCapacity, RegistrationLimits,
+        RelayResourceConfig, ReservationDuration, ResolveConcurrency, ResolveLimits, RetryAfter,
+        SecretDocument, SourceRegistrationCapacity, SystemClock,
+        wire::registry::{RegistryRequest, RegistryResponse},
         wire::resolve::{ResolveRequest, ResolveResponse},
     };
     use yonder_net::behaviour::RelayBehaviourEvent;
@@ -3793,7 +3808,10 @@ mod tests {
                 stream.read_exact(&mut peer_length).await.unwrap();
                 let mut peer = vec![0_u8; usize::from(peer_length[0])];
                 stream.read_exact(&mut peer).await.unwrap();
-                std::iter::once(0x13).chain(peer_length).chain(peer).collect()
+                std::iter::once(0x13)
+                    .chain(peer_length)
+                    .chain(peer)
+                    .collect()
             }
             tag => vec![tag],
         };
@@ -3866,10 +3884,8 @@ mod tests {
         let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
         let registry = Arc::new(CallbackRegistry::new());
         let context = enterprise_context(Arc::clone(&registry));
-        let resolved = yonder_net::peer_id_bytes(
-            Keypair::generate_ed25519().public().to_peer_id(),
-        )
-        .unwrap();
+        let resolved =
+            yonder_net::peer_id_bytes(Keypair::generate_ed25519().public().to_peer_id()).unwrap();
 
         let owner = async {
             let call = calls_rx.recv().await.expect("admission call");
@@ -3885,7 +3901,11 @@ mod tests {
                 .send(Ok(EnterpriseResolveAdmission::Admitted))
                 .expect("exchange waits for admission");
             let call = calls_rx.recv().await.expect("resolve call");
-            let EnterpriseResolveRequest::ResolveTarget { locator: target_locator, response } = call else {
+            let EnterpriseResolveRequest::ResolveTarget {
+                locator: target_locator,
+                response,
+            } = call
+            else {
                 panic!("expected resolve call");
             };
             assert_eq!(target_locator, locator());
@@ -3910,8 +3930,7 @@ mod tests {
             );
         };
 
-        let exchange =
-            enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -3946,8 +3965,7 @@ mod tests {
             );
         };
 
-        let exchange =
-            enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -3983,8 +4001,7 @@ mod tests {
             );
         };
 
-        let exchange =
-            enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -4021,8 +4038,7 @@ mod tests {
             );
         };
 
-        let exchange =
-            enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -4068,8 +4084,7 @@ mod tests {
             );
         };
 
-        let exchange =
-            enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -4090,9 +4105,7 @@ mod tests {
             RequestId::new(7),
             started.checked_add(Duration::from_secs(600)).unwrap(),
         );
-        registry
-            .insert(state.clone(), entry, started)
-            .unwrap();
+        registry.insert(state.clone(), entry, started).unwrap();
         assert_eq!(registry.len(), 1);
         {
             let guard = TransactionGuard::new(Arc::clone(&registry), state.clone());

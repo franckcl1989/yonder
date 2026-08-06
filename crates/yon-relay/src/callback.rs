@@ -12,7 +12,9 @@ use crate::enterprise::EnterpriseAuthConfig;
 use crate::session::{
     EnterpriseFailure, EnterpriseResolveSession, MemberAdmission, OAuthState, RequestId,
 };
-use crate::verifier::{ExchangeTransport, MAX_AUTHORIZATION_CODE_BYTES, VerifyError, verify_member};
+use crate::verifier::{
+    ExchangeTransport, MAX_AUTHORIZATION_CODE_BYTES, VerifyError, verify_member,
+};
 use hyper::body::Incoming;
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use yonder_core::rate::{DirectRateLimiter, RateLimit};
 use yonder_core::{EnterpriseProvider, MonotonicClock, MonotonicTime, SecretDocument};
 
@@ -114,18 +116,19 @@ impl CallbackServer {
 
     /// Binds the callback listener, reporting the bound address.
     pub async fn bind(&self) -> Result<(TcpListener, std::net::SocketAddr), CallbackServerError> {
-        let listener = TcpListener::bind(self.listen)
-            .await
+        let listener =
+            TcpListener::bind(self.listen)
+                .await
+                .map_err(|source| CallbackServerError::Bind {
+                    address: self.listen,
+                    source,
+                })?;
+        let address = listener
+            .local_addr()
             .map_err(|source| CallbackServerError::Bind {
                 address: self.listen,
                 source,
             })?;
-        let address = listener.local_addr().map_err(|source| {
-            CallbackServerError::Bind {
-                address: self.listen,
-                source,
-            }
-        })?;
         Ok((listener, address))
     }
 
@@ -204,8 +207,7 @@ fn parse_private_key(
     if contains_pem_marker(bytes) {
         PrivateKeyDer::from_pem_slice(bytes).map_err(|_| CallbackServerError::InvalidPrivateKey)
     } else {
-        PrivateKeyDer::try_from(bytes.to_vec())
-            .map_err(|_| CallbackServerError::InvalidPrivateKey)
+        PrivateKeyDer::try_from(bytes.to_vec()).map_err(|_| CallbackServerError::InvalidPrivateKey)
     }
 }
 
@@ -271,9 +273,10 @@ async fn handle_request(
 
 /// Extracts one raw query parameter by name.
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query
-        .split('&')
-        .find_map(|pair| pair.split_once('=').and_then(|(k, v)| (k == key).then_some(v)))
+    query.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .and_then(|(k, v)| (k == key).then_some(v))
+    })
 }
 
 /// Decodes a percent-encoded query value; `+` decodes as space.
@@ -333,7 +336,9 @@ mod response {
 
     pub(super) fn result(result: CallbackResult) -> Response<String> {
         match result {
-            CallbackResult::Admitted => page(hyper::StatusCode::OK, "认证成功，请返回 Yonder 客户端"),
+            CallbackResult::Admitted => {
+                page(hyper::StatusCode::OK, "认证成功，请返回 Yonder 客户端")
+            }
             CallbackResult::Rejected => {
                 page(hyper::StatusCode::OK, "认证未通过，请返回 Yonder 客户端")
             }
@@ -483,11 +488,7 @@ impl CallbackRegistry {
     /// Removes the transaction of one state without consuming it,
     /// used when the connect substream dies before any callback.
     pub fn remove(&self, state: &OAuthState) -> bool {
-        self.transactions
-            .lock()
-            .unwrap()
-            .remove(state)
-            .is_some()
+        self.transactions.lock().unwrap().remove(state).is_some()
     }
 
     /// The number of live transactions.
@@ -634,17 +635,13 @@ where
                 return CallbackResult::InvalidState;
             };
             let request_id = entry.request_id();
-            let outcome = match verify_member(&self.transport, provider, code, &credentials).await
-            {
+            let outcome = match verify_member(&self.transport, provider, code, &credentials).await {
                 Ok(identity) => {
                     let session = entry.session();
                     let mut guard = session.lock().unwrap();
                     if guard.callback(&state, identity).is_err() {
                         CallbackResult::InvalidState
-                    } else if matches!(
-                        guard.validate_member(true),
-                        Ok(MemberAdmission::Admitted)
-                    ) {
+                    } else if matches!(guard.validate_member(true), Ok(MemberAdmission::Admitted)) {
                         CallbackResult::Admitted
                     } else {
                         CallbackResult::Rejected
@@ -652,12 +649,18 @@ where
                 }
                 Err(VerifyError::InvalidCode) => {
                     let session = entry.session();
-                    let _ = session.lock().unwrap().fail(EnterpriseFailure::InvalidState);
+                    let _ = session
+                        .lock()
+                        .unwrap()
+                        .fail(EnterpriseFailure::InvalidState);
                     CallbackResult::InvalidState
                 }
                 Err(VerifyError::Rejected) => {
                     let session = entry.session();
-                    let _ = session.lock().unwrap().fail(EnterpriseFailure::UserRejected);
+                    let _ = session
+                        .lock()
+                        .unwrap()
+                        .fail(EnterpriseFailure::UserRejected);
                     CallbackResult::Rejected
                 }
                 Err(VerifyError::Platform | VerifyError::ResponseTooLarge) => {
@@ -706,8 +709,8 @@ pub enum CallbackServerError {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        CallbackHandler, CallbackResult, CallbackServer, CallbackServerError, MAX_CALLBACK_QUERY_BYTES,
-        decode_param, query_param,
+        CallbackHandler, CallbackResult, CallbackServer, CallbackServerError,
+        MAX_CALLBACK_QUERY_BYTES, decode_param, query_param,
     };
     use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
     use crate::session::{EnterpriseResolveSession, OAuthState, RequestId};
@@ -731,7 +734,8 @@ mod tests {
             _code: &'a str,
             _state: &'a str,
             _source: std::net::IpAddr,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CallbackResult> + Send + 'a>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CallbackResult> + Send + 'a>>
+        {
             let result = self.0;
             Box::pin(async move { result })
         }
@@ -759,10 +763,7 @@ mod tests {
 
     /// Executes one HTTP/1.1 request over a TLS connection trusting the
     /// fixture CA, and returns the status line and headers.
-    async fn tls_request(
-        address: std::net::SocketAddr,
-        request: &str,
-    ) -> (String, String) {
+    async fn tls_request(address: std::net::SocketAddr, request: &str) -> (String, String) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let mut roots = rustls::RootCertStore::empty();
@@ -819,14 +820,14 @@ mod tests {
         MonotonicTime::from_elapsed(std::time::Duration::ZERO)
     }
 
-    fn authenticating_session(now: MonotonicTime) -> (Arc<StdMutex<EnterpriseResolveSession>>, OAuthState) {
-        let mut session = EnterpriseResolveSession::new(
-            RequestId::new(7),
-            locator(),
-            now,
-        );
+    fn authenticating_session(
+        now: MonotonicTime,
+    ) -> (Arc<StdMutex<EnterpriseResolveSession>>, OAuthState) {
+        let mut session = EnterpriseResolveSession::new(RequestId::new(7), locator(), now);
         session.offer_providers().unwrap();
-        let state = session.select(EnterpriseProvider::WeCom, &mut OsSecureRandom).unwrap();
+        let state = session
+            .select(EnterpriseProvider::WeCom, &mut OsSecureRandom)
+            .unwrap();
         (Arc::new(StdMutex::new(session)), state)
     }
 
@@ -901,9 +902,7 @@ mod tests {
         }
     }
 
-    fn handler_with(
-        exchange: FakeExchange,
-    ) -> CallbackSessionHandler<FixedClock, FakeExchange> {
+    fn handler_with(exchange: FakeExchange) -> CallbackSessionHandler<FixedClock, FakeExchange> {
         CallbackSessionHandler::new(
             Arc::new(CallbackRegistry::new()),
             Arc::new(wecom_credentials()),
@@ -943,7 +942,9 @@ mod tests {
         let small = CallbackRegistry::with_capacity(1);
         let (session, state) = authenticating_session(started);
         let (callback_entry, _) = entry(session, started);
-        small.insert(state.clone(), callback_entry, started).unwrap();
+        small
+            .insert(state.clone(), callback_entry, started)
+            .unwrap();
         let (session, other_state) = authenticating_session(started);
         let (callback_entry, _) = entry(session, started);
         assert!(matches!(
@@ -955,7 +956,9 @@ mod tests {
         let expired = now().checked_add(crate::session::SESSION_LIFETIME).unwrap();
         let (session, state) = authenticating_session(now());
         let (callback_entry, _) = entry(session, now());
-        registry.insert(state.clone(), callback_entry, now()).unwrap();
+        registry
+            .insert(state.clone(), callback_entry, now())
+            .unwrap();
         assert!(registry.take(&state, expired).is_none());
         assert!(registry.is_empty());
     }
@@ -1134,8 +1137,20 @@ mod tests {
                     .await,
             );
         }
-        assert_eq!(results.iter().filter(|r| **r == CallbackResult::InvalidState).count(), 4);
-        assert_eq!(results.iter().filter(|r| **r == CallbackResult::Limited).count(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| **r == CallbackResult::InvalidState)
+                .count(),
+            4
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| **r == CallbackResult::Limited)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1164,8 +1179,7 @@ mod tests {
     async fn callback_requests_are_served_over_https() {
         let server = server_with("127.0.0.1:0".parse().unwrap());
         let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> =
-            Arc::new(StubHandler(CallbackResult::Admitted));
+        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
         let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
         let (status, headers) = tls_request(
             address,
@@ -1182,8 +1196,7 @@ mod tests {
     async fn unknown_paths_methods_and_missing_params_are_rejected() {
         let server = server_with("127.0.0.1:0".parse().unwrap());
         let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> =
-            Arc::new(StubHandler(CallbackResult::Rejected));
+        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Rejected));
         let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
         for request in [
             "GET / HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
@@ -1206,8 +1219,7 @@ mod tests {
     async fn oversized_queries_are_rejected() {
         let server = server_with("127.0.0.1:0".parse().unwrap());
         let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> =
-            Arc::new(StubHandler(CallbackResult::Admitted));
+        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
         let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
         let big = format!(
             "GET /yonder/callback/wecom?code={}&state=x HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",

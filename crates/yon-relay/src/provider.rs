@@ -6,8 +6,8 @@
 //! `SecretFilePolicy` used for the relay identity and WSS key.
 
 use crate::enterprise::CallbackExternalUrl;
-use crate::session::{OAuthState, TransitionError};
 use crate::secret_file::{SecretFileError, SecretFilePolicy, SystemSecretFilePolicy};
+use crate::session::{OAuthState, TransitionError};
 use config::FileFormat;
 use serde::Deserialize;
 use std::fs::File;
@@ -56,10 +56,7 @@ impl SecretText {
             ProviderField::CorpId | ProviderField::AppId => MAX_CREDENTIAL_ID_BYTES,
             ProviderField::AgentId | ProviderField::AppSecret => MAX_APP_SECRET_BYTES,
         };
-        if value.is_empty()
-            || value.len() > bound
-            || value.chars().any(char::is_whitespace)
-        {
+        if value.is_empty() || value.len() > bound || value.chars().any(char::is_whitespace) {
             return Err(ProviderError::InvalidCredential(kind));
         }
         Ok(Self(value))
@@ -80,9 +77,7 @@ pub struct ProviderCredentials {
 impl ProviderCredentials {
     /// Loads the secret file of every enabled provider and validates the
     /// credential documents. Fails closed on any enabled provider.
-    pub fn load(
-        config: &crate::enterprise::EnterpriseAuthConfig,
-    ) -> Result<Self, ProviderError> {
+    pub fn load(config: &crate::enterprise::EnterpriseAuthConfig) -> Result<Self, ProviderError> {
         let mut wecom = None;
         let mut feishu = None;
         for provider in config.providers().iter() {
@@ -192,9 +187,8 @@ fn feishu_authorization_url(
     callback: &CallbackExternalUrl,
     state: &OAuthState,
 ) -> Url {
-    let mut url =
-        Url::parse("https://open.feishu.cn/open-apis/authen/v1/authorize")
-            .expect("fixed feishu authorize endpoint");
+    let mut url = Url::parse("https://open.feishu.cn/open-apis/authen/v1/authorize")
+        .expect("fixed feishu authorize endpoint");
     url.query_pairs_mut()
         .append_pair("app_id", feishu.app_id.as_str())
         .append_pair(
@@ -214,9 +208,7 @@ fn encode_state(state: &OAuthState) -> String {
 /// A bounded provider secret document already parsed from its file.
 struct ProviderSecretDocument(String);
 
-fn load_secret_document(
-    path: &Path,
-) -> Result<ProviderSecretDocument, ProviderError> {
+fn load_secret_document(path: &Path) -> Result<ProviderSecretDocument, ProviderError> {
     let file = File::open(path).map_err(|source| ProviderError::Read {
         path: path.to_path_buf(),
         source,
@@ -359,9 +351,9 @@ pub enum ProviderError {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        FeishuCredentials, MAX_APP_SECRET_BYTES, MAX_CREDENTIAL_ID_BYTES, MAX_PROVIDER_SECRET_BYTES,
-        ProviderCredentials, ProviderError, ProviderField, SecretText, WeComCredentials,
-        callback_path, encode_state, redirect_uri,
+        FeishuCredentials, MAX_APP_SECRET_BYTES, MAX_CREDENTIAL_ID_BYTES,
+        MAX_PROVIDER_SECRET_BYTES, ProviderCredentials, ProviderError, ProviderField, SecretText,
+        WeComCredentials, callback_path, encode_state, redirect_uri,
     };
     use crate::enterprise::CallbackExternalUrl;
     use crate::session::OAuthState;
@@ -397,7 +389,10 @@ mod tests {
         path
     }
 
-    fn config_with(wecom_secret: Option<PathBuf>, feishu_secret: Option<PathBuf>) -> crate::enterprise::EnterpriseAuthConfig {
+    fn config_with(
+        wecom_secret: Option<PathBuf>,
+        feishu_secret: Option<PathBuf>,
+    ) -> crate::enterprise::EnterpriseAuthConfig {
         use crate::enterprise::{EnterpriseAuthConfig, ProviderSecrets};
         let providers =
             EnterpriseProviders::new(wecom_secret.is_some(), feishu_secret.is_some()).unwrap();
@@ -425,14 +420,15 @@ mod tests {
             Err(ProviderError::InvalidCredential(ProviderField::CorpId))
         ));
         assert!(matches!(
-            SecretText::new("x".repeat(MAX_CREDENTIAL_ID_BYTES + 1), ProviderField::CorpId),
+            SecretText::new(
+                "x".repeat(MAX_CREDENTIAL_ID_BYTES + 1),
+                ProviderField::CorpId
+            ),
             Err(ProviderError::InvalidCredential(ProviderField::CorpId))
         ));
-        assert!(SecretText::new(
-            "x".repeat(MAX_APP_SECRET_BYTES),
-            ProviderField::AppSecret
-        )
-        .is_ok());
+        assert!(
+            SecretText::new("x".repeat(MAX_APP_SECRET_BYTES), ProviderField::AppSecret).is_ok()
+        );
         assert!(matches!(
             SecretText::new(
                 "x".repeat(MAX_APP_SECRET_BYTES + 1),
@@ -450,13 +446,15 @@ mod tests {
             "wecom.secret",
             "corp_id = \"ww1234567890abcdef\"\nagent_id = 1000002\napp_secret = \"s3cret\"\n",
         );
-        let credentials =
-            ProviderCredentials::load(&config_with(Some(wecom), None)).unwrap();
+        let credentials = ProviderCredentials::load(&config_with(Some(wecom), None)).unwrap();
         assert_eq!(credentials.providers().unwrap().len(), 1);
         let url = credentials
             .authorization_url(EnterpriseProvider::WeCom, &callback_url(), &state())
             .unwrap();
-        assert!(url.as_str().starts_with("https://open.weixin.qq.com/connect/oauth2/authorize"));
+        assert!(
+            url.as_str()
+                .starts_with("https://open.weixin.qq.com/connect/oauth2/authorize")
+        );
 
         let malformed = write_secret(directory.path(), "bad.secret", "corp_id = 42\n");
         let error = ProviderCredentials::load(&config_with(Some(malformed), None)).unwrap_err();
@@ -517,9 +515,11 @@ mod tests {
         let feishu_url = credentials
             .authorization_url(EnterpriseProvider::Feishu, &callback_url(), &state)
             .unwrap();
-        assert!(feishu_url
-            .as_str()
-            .starts_with("https://open.feishu.cn/open-apis/authen/v1/authorize"));
+        assert!(
+            feishu_url
+                .as_str()
+                .starts_with("https://open.feishu.cn/open-apis/authen/v1/authorize")
+        );
         assert!(feishu_url.as_str().contains("app_id=cli_abc123"));
         assert!(feishu_url.as_str().contains(&encode_state(&state)));
         assert!(!feishu_url.as_str().contains('#'));
@@ -538,8 +538,7 @@ mod tests {
             "wecom.secret",
             "corp_id = \"ww1234567890abcdef\"\nagent_id = 7\napp_secret = \"s3cret\"\n",
         );
-        let credentials =
-            ProviderCredentials::load(&config_with(Some(wecom), None)).unwrap();
+        let credentials = ProviderCredentials::load(&config_with(Some(wecom), None)).unwrap();
         let error = credentials
             .authorization_url(EnterpriseProvider::Feishu, &callback_url(), &state())
             .unwrap_err();
@@ -560,8 +559,14 @@ mod tests {
             redirect_uri(&base, EnterpriseProvider::Feishu).as_str(),
             "https://relay.example.test/yonder/callback/feishu"
         );
-        assert_eq!(callback_path(EnterpriseProvider::WeCom), "/yonder/callback/wecom");
-        assert_eq!(callback_path(EnterpriseProvider::Feishu), "/yonder/callback/feishu");
+        assert_eq!(
+            callback_path(EnterpriseProvider::WeCom),
+            "/yonder/callback/wecom"
+        );
+        assert_eq!(
+            callback_path(EnterpriseProvider::Feishu),
+            "/yonder/callback/feishu"
+        );
     }
 
     #[test]
@@ -569,10 +574,17 @@ mod tests {
         let state = state();
         let encoded = encode_state(&state);
         assert_eq!(encoded.len(), 64);
-        assert!(encoded.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         let mut other = state.clone();
         other.zeroize();
-        assert_ne!(encoded, encode_state(&OAuthState::generate(&mut OsSecureRandom).unwrap()));
+        assert_ne!(
+            encoded,
+            encode_state(&OAuthState::generate(&mut OsSecureRandom).unwrap())
+        );
     }
 
     #[test]
