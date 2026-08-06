@@ -318,6 +318,9 @@ impl EnterpriseResolveSession {
     ) -> Result<(), TransitionError> {
         self.forward(EnterpriseResolvePhase::Authenticating, |session| {
             let Some(mut stored) = session.oauth_state.take() else {
+                // The state is missing or replayed: the session dies, so any
+                // held identity dies with it.
+                session.wipe_enterprise_state();
                 session.phase = EnterpriseResolvePhase::Failed(EnterpriseFailure::InvalidState);
                 return Err(TransitionError::InvalidState);
             };
@@ -408,8 +411,20 @@ impl EnterpriseResolveSession {
         if self.phase.is_terminal() {
             return Err(TransitionError::Terminal);
         }
+        self.wipe_enterprise_state();
         self.phase = phase;
         Ok(())
+    }
+
+    /// Destroys the single-use OAuth state and the member identity when
+    /// the session dies: a dead session carries no enterprise-held data.
+    fn wipe_enterprise_state(&mut self) {
+        if let Some(mut identity) = self.identity.take() {
+            identity.zeroize();
+        }
+        if let Some(mut state) = self.oauth_state.take() {
+            state.zeroize();
+        }
     }
 }
 
@@ -431,8 +446,12 @@ mod tests {
         EnterpriseFailure, EnterpriseResolvePhase, EnterpriseResolveSession, MemberAdmission,
         MemberIdentity, OAuthState, RequestId, SESSION_LIFETIME, TransitionError,
     };
+    use proptest::prelude::*;
     use std::time::Duration;
-    use yonder_core::{EnterpriseProvider, Locator, MonotonicTime, OsSecureRandom, PeerIdBytes};
+    use yonder_core::{
+        EnterpriseProvider, Locator, MonotonicTime, OsSecureRandom, PeerIdBytes, RandomError,
+        SecureRandom,
+    };
 
     fn locator() -> Locator {
         Locator::new(0x12345).unwrap()
@@ -731,6 +750,200 @@ mod tests {
     impl EnterpriseResolveSession {
         fn phase_for_test(&mut self, phase: EnterpriseResolvePhase) {
             self.phase = phase;
+        }
+    }
+
+    /// A deterministic CSPRNG-shaped source for property tests: the same
+    /// event bytes always drive the same run.
+    #[derive(Debug)]
+    struct DeterministicRandom(u64);
+
+    impl SecureRandom for DeterministicRandom {
+        fn try_fill(&mut self, destination: &mut [u8]) -> Result<(), RandomError> {
+            for chunk in destination.chunks_mut(8) {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                for (slot, byte) in chunk.iter_mut().zip(self.0.to_le_bytes()) {
+                    *slot = byte;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Every phase the session can be in; the exhaustive match pins the ten
+    /// documented values so a new phase cannot silently pass the driver.
+    fn is_valid_phase(phase: EnterpriseResolvePhase) -> bool {
+        matches!(
+            phase,
+            EnterpriseResolvePhase::Created
+                | EnterpriseResolvePhase::ProviderSelection
+                | EnterpriseResolvePhase::Authenticating
+                | EnterpriseResolvePhase::Authenticated
+                | EnterpriseResolvePhase::Resolving
+                | EnterpriseResolvePhase::Completed
+                | EnterpriseResolvePhase::Cancelled
+                | EnterpriseResolvePhase::Expired
+                | EnterpriseResolvePhase::Failed(_)
+                | EnterpriseResolvePhase::Unavailable
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// Drives a session with a random sequence of transitions, mirroring
+        /// the 0.1.1 session_state fuzz target: every byte selects one
+        /// transition, and every attempted transition is asserted against
+        /// the session invariants.
+        #[test]
+        fn random_transitions_preserve_invariants(events in prop::collection::vec(any::<u8>(), 1..=128)) {
+            let mut session = EnterpriseResolveSession::new(
+                RequestId::new(7),
+                Locator::new(0x12345).unwrap(),
+                MonotonicTime::from_elapsed(Duration::ZERO),
+            );
+            let mut random = DeterministicRandom(0x0123_4567_89AB_CDEF);
+            let mut last_state: Option<OAuthState> = None;
+            let mut selected: Option<EnterpriseProvider> = None;
+            let mut identity_expected = false;
+            let mut oauth_expected = false;
+            let mut terminal_seen = false;
+
+            for byte in events {
+                let before = session.phase();
+                let result = match usize::from(byte) % 10 {
+                    0 => session.offer_providers(),
+                    1 => {
+                        let provider = if (byte & 0x01) == 0 {
+                            EnterpriseProvider::WeCom
+                        } else {
+                            EnterpriseProvider::Feishu
+                        };
+                        match session.select(provider, &mut random) {
+                            Ok(state) => {
+                                if let Some(previous) = selected {
+                                    prop_assert_eq!(previous, provider, "the provider cannot change");
+                                }
+                                selected = Some(provider);
+                                last_state = Some(state);
+                                oauth_expected = true;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    2 => {
+                        let state = match &last_state {
+                            Some(state) => state.clone(),
+                            None => OAuthState::from_bytes(&[byte.wrapping_add(1); OAuthState::LEN])
+                                .expect("exact-length OAuth state"),
+                        };
+                        let identity =
+                            MemberIdentity::new(&[byte; 3]).expect("three-byte identity");
+                        match session.callback(&state, identity) {
+                            Ok(()) => {
+                                identity_expected = true;
+                                oauth_expected = false;
+                                Ok(())
+                            }
+                            Err(error) => {
+                                identity_expected = false;
+                                oauth_expected = false;
+                                Err(error)
+                            }
+                        }
+                    }
+                    3 => match session.validate_member((byte & 0x01) == 0) {
+                        Ok(_) => {
+                            identity_expected = false;
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    },
+                    4 => session.begin_resolve(),
+                    5 => {
+                        let peer = PeerIdBytes::new(&[byte, byte >> 4]).expect("two-byte peer");
+                        session.complete(peer)
+                    }
+                    6 => session.cancel().map(|_| {
+                        identity_expected = false;
+                        oauth_expected = false;
+                    }),
+                    7 => session.expire().map(|_| {
+                        identity_expected = false;
+                        oauth_expected = false;
+                    }),
+                    8 => {
+                        let failure = match byte % 3 {
+                            0 => EnterpriseFailure::Platform,
+                            1 => EnterpriseFailure::UserRejected,
+                            _ => EnterpriseFailure::InvalidState,
+                        };
+                        session.fail(failure).map(|_| {
+                            identity_expected = false;
+                            oauth_expected = false;
+                        })
+                    }
+                    9 => session.unavailable().map(|_| {
+                        identity_expected = false;
+                        oauth_expected = false;
+                    }),
+                    _ => unreachable!("event index is modulo ten"),
+                };
+
+                // A failed transition is atomic unless it fails the session.
+                if result.is_err() && session.phase() != before {
+                    prop_assert_eq!(
+                        session.phase(),
+                        EnterpriseResolvePhase::Failed(EnterpriseFailure::InvalidState)
+                    );
+                }
+                // Terminal phases are absorbing: every transition errors and
+                // the phase never moves.
+                if before.is_terminal() {
+                    prop_assert!(result.is_err());
+                    prop_assert_eq!(session.phase(), before);
+                }
+                prop_assert!(!terminal_seen || session.is_terminal());
+                terminal_seen |= session.is_terminal();
+
+                let phase = session.phase();
+                prop_assert!(is_valid_phase(phase));
+                prop_assert_eq!(
+                    session.is_terminal(),
+                    matches!(
+                        phase,
+                        EnterpriseResolvePhase::Completed
+                            | EnterpriseResolvePhase::Cancelled
+                            | EnterpriseResolvePhase::Expired
+                            | EnterpriseResolvePhase::Failed(_)
+                            | EnterpriseResolvePhase::Unavailable
+                    )
+                );
+                prop_assert_eq!(
+                    session.has_identity(),
+                    identity_expected,
+                    "identity is held only between callback and validate_member"
+                );
+                if session.has_identity() {
+                    prop_assert_eq!(phase, EnterpriseResolvePhase::Authenticating);
+                }
+                prop_assert_eq!(
+                    session.oauth_state().is_some(),
+                    oauth_expected,
+                    "the OAuth state is held only between select and callback"
+                );
+                if session.oauth_state().is_some() {
+                    prop_assert_eq!(phase, EnterpriseResolvePhase::Authenticating);
+                }
+                prop_assert_eq!(session.provider(), selected, "the provider never changes");
+            }
         }
     }
 }
