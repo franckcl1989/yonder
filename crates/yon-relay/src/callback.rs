@@ -1229,4 +1229,42 @@ mod tests {
         assert!(status.starts_with("HTTP/1.1 400"), "{status}");
         serving.abort();
     }
+
+    #[test]
+    fn result_pages_map_every_outcome_to_minimal_never_cached_responses() {
+        use crate::callback::response::result;
+        let cases = [
+            (CallbackResult::Admitted, "200"),
+            (CallbackResult::Rejected, "200"),
+            (CallbackResult::InvalidState, "400"),
+            (CallbackResult::Platform, "503"),
+            (CallbackResult::Limited, "429"),
+        ];
+        for (outcome, status) in cases {
+            let response = result(outcome);
+            assert_eq!(response.status().as_str(), status, "{outcome:?}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(hyper::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(hyper::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/html; charset=utf-8"),
+                "{outcome:?}"
+            );
+            let body = response.body();
+            assert!(body.contains("Yonder"), "{outcome:?}");
+            assert!(
+                !body.contains("http"),
+                "{outcome:?} has no external resources"
+            );
+        }
+    }
 }

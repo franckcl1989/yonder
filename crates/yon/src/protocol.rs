@@ -630,7 +630,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
     use yonder_core::wire::enterprise::{
-        EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart,
+        EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart, MAX_AUTHORIZATION_URL_LEN,
     };
     use yonder_core::wire::registry::RegistryResponse;
     use yonder_core::wire::resolve::ResolveResponse;
@@ -1227,6 +1227,54 @@ mod tests {
         };
         let (attempt, ()) = tokio::join!(attempt, relay_side);
         assert!(matches!(attempt, Err(RelayProtocolError::InvalidPeerId)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_rejects_oversized_authorization_urls() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let relay_side = async {
+            let mut expected_start = [0_u8; 4];
+            server.read_exact(&mut expected_start).await.unwrap();
+            server
+                .write_all(
+                    EnterpriseResolveResponse::Providers(
+                        EnterpriseProviders::new(true, false).unwrap(),
+                    )
+                    .encode()
+                    .as_slice(),
+                )
+                .await
+                .unwrap();
+            let mut select = [0_u8; 2];
+            server.read_exact(&mut select).await.unwrap();
+            // A declared URL length beyond the wire bound must be rejected
+            // before any payload is buffered.
+            let length = (MAX_AUTHORIZATION_URL_LEN + 1) as u16;
+            server
+                .write_all(&[0x12, (length >> 8) as u8, (length & 0xff) as u8])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let attempt = async {
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_secs(2),
+            )
+            .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        assert!(matches!(
+            attempt,
+            Err(RelayProtocolError::Protocol(
+                yonder_core::ProtocolError::InvalidField(
+                    yonder_core::error::ProtocolField::AuthorizationUrl
+                )
+            ))
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
