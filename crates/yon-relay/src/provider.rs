@@ -51,7 +51,7 @@ pub struct FeishuCredentials {
 pub struct SecretText(String);
 
 impl SecretText {
-    fn new(value: String, kind: ProviderField) -> Result<Self, ProviderError> {
+    pub(crate) fn new(value: String, kind: ProviderField) -> Result<Self, ProviderError> {
         let bound = match kind {
             ProviderField::CorpId | ProviderField::AppId => MAX_CREDENTIAL_ID_BYTES,
             ProviderField::AgentId | ProviderField::AppSecret => MAX_APP_SECRET_BYTES,
@@ -65,7 +65,7 @@ impl SecretText {
         Ok(Self(value))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -96,6 +96,25 @@ impl ProviderCredentials {
             }
         }
         Ok(Self { wecom, feishu })
+    }
+
+    /// The WeCom credentials when WeCom is configured.
+    pub(crate) const fn wecom(&self) -> Option<&WeComCredentials> {
+        self.wecom.as_ref()
+    }
+
+    /// The Feishu credentials when Feishu is configured.
+    pub(crate) const fn feishu(&self) -> Option<&FeishuCredentials> {
+        self.feishu.as_ref()
+    }
+
+    /// Constructs credentials directly for crate-internal tests.
+    #[cfg(test)]
+    pub(crate) fn from_credentials(
+        wecom: Option<WeComCredentials>,
+        feishu: Option<FeishuCredentials>,
+    ) -> Self {
+        Self { wecom, feishu }
     }
 
     /// The set of providers with loaded credentials.

@@ -10,6 +10,7 @@ pub mod registry;
 pub mod secret_file;
 pub mod service;
 pub mod session;
+pub mod verifier;
 
 pub use enterprise::{
     CallbackExternalUrl, EnterpriseAuthConfig, EnterpriseConfigError, ProviderSecrets,
@@ -23,3 +24,4 @@ pub use session::{
     EnterpriseFailure, EnterpriseResolvePhase, EnterpriseResolveSession, MemberAdmission,
     MemberIdentity, OAuthState, RequestId, TransitionError,
 };
+pub use verifier::{ExchangeTransport, VerifyError, verify_member};
