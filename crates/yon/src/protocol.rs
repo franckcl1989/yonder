@@ -20,6 +20,11 @@ const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_LIMIT: usize = 20;
 const CONTROLLER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on the human enterprise authentication steps, mirroring the
+/// relay's session lifetime (`SESSION_LIFETIME` in the relay is 10
+/// minutes) plus margin for the browser round trip.
+pub const ENTERPRISE_AUTH_STEPS_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
+
 /// The absolute controller discovery budget, shared across every relay retry.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveDeadline(tokio::time::Instant);
@@ -312,6 +317,12 @@ pub async fn resolve_peer_auto(
 /// A relay that does not offer the enterprise protocol fails with
 /// `UnsupportedProtocol` so the caller can fall back to the legacy
 /// resolve.
+///
+/// The budgets are split: the machine phase (reconverge, substream
+/// negotiation, and the admission retry loop) stays bounded by the
+/// controller `deadline`, while the human authentication steps (provider
+/// selection, authorization handoff, and the final callback wait) run
+/// with the relay session lifetime (`ENTERPRISE_AUTH_STEPS_TIMEOUT`).
 pub async fn enterprise_resolve_peer(
     driver: &mut EndpointDriver,
     streams: &mut Libp2pApplicationStreams,
@@ -320,40 +331,60 @@ pub async fn enterprise_resolve_peer(
     deadline: ResolveDeadline,
     ui: &mut impl EnterpriseResolveUi,
 ) -> Result<PeerId, RelayProtocolError> {
-    tokio::time::timeout_at(deadline.0, async {
-        let mut backoff = std::iter::repeat(Duration::from_millis(250));
-        loop {
+    let mut backoff = std::iter::repeat(Duration::from_millis(250));
+    loop {
+        // The machine phase stays bounded by the controller deadline;
+        // admission retries below reopen the substream within the same
+        // absolute budget.
+        let stream = tokio::time::timeout_at(deadline.0, async {
             reconverge_relay(driver, relay).await?;
-            let stream =
-                open_stream_timed(driver, streams, relay.peer(), ENTERPRISE_RESOLVE_PROTOCOL)
-                    .await?;
-            let mut stream = stream.into_tokio();
-            match drive(
-                driver,
-                enterprise_exchange_io(&mut stream, locator, ui, PROTOCOL_TIMEOUT),
-            )
-            .await?
-            {
-                EnterpriseAttempt::Resolved(peer) => return Ok(peer),
-                EnterpriseAttempt::Retry(after) => {
-                    drop(stream);
-                    retry(driver, relay.binding(), &mut backoff, after).await?;
-                }
+            open_stream_timed(driver, streams, relay.peer(), ENTERPRISE_RESOLVE_PROTOCOL).await
+        })
+        .await
+        .map_err(|_| RelayProtocolError::Timeout)??;
+        let mut stream = stream.into_tokio();
+        // The per-attempt exchange runs with its own budget: the machine
+        // messages keep the per-message timeout while the human
+        // authentication steps use the relay session lifetime.
+        let attempt = drive(
+            driver,
+            enterprise_exchange_io(
+                &mut stream,
+                locator,
+                ui,
+                PROTOCOL_TIMEOUT,
+                ENTERPRISE_AUTH_STEPS_TIMEOUT,
+            ),
+        )
+        .await?;
+        match attempt {
+            EnterpriseAttempt::Resolved(peer) => return Ok(peer),
+            EnterpriseAttempt::Retry(after) => {
+                drop(stream);
+                tokio::time::timeout_at(
+                    deadline.0,
+                    retry(driver, relay.binding(), &mut backoff, after),
+                )
+                .await
+                .map_err(|_| RelayProtocolError::Timeout)??;
             }
         }
-    })
-    .await
-    .map_err(|_| RelayProtocolError::Timeout)?
+    }
 }
 
 /// The enterprise substream exchange on plain tokio I/O, testable without
 /// the endpoint driver. The substream carries a sequence of messages and
-/// stays open across them; it never shuts down the write side.
+/// stays open across them; it never shuts down the write side. The
+/// machine messages are bounded by `timeout`; the human authentication
+/// steps (provider selection, authorization handoff, and the final
+/// callback wait) share the `wait_timeout` budget, mirroring the relay
+/// session lifetime.
 async fn enterprise_exchange_io(
     stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
     locator: Locator,
     ui: &mut impl EnterpriseResolveUi,
     timeout: Duration,
+    wait_timeout: Duration,
 ) -> Result<EnterpriseAttempt, RelayProtocolError> {
     write_enterprise_step(stream, &EnterpriseStart::new(locator).encode(), timeout).await?;
     let providers = match read_enterprise_response(stream, timeout).await? {
@@ -361,24 +392,28 @@ async fn enterprise_exchange_io(
         EnterpriseResolveResponse::Providers(providers) => providers,
         _ => return Err(RelayProtocolError::UnexpectedResponse),
     };
-    let provider = ui.select_provider(providers).await?;
-    write_enterprise_step(stream, &EnterpriseSelect::new(provider).encode(), timeout).await?;
-    let url = match read_enterprise_response(stream, timeout).await? {
-        EnterpriseResolveResponse::Authenticate(url) => url,
-        _ => return Err(RelayProtocolError::UnexpectedResponse),
-    };
-    ui.open_authorization(url.as_str()).await?;
-    match read_enterprise_response(stream, timeout).await? {
-        EnterpriseResolveResponse::Resolved(peer) => PeerId::from_bytes(peer.as_bytes())
-            .map(EnterpriseAttempt::Resolved)
-            .map_err(|_| RelayProtocolError::InvalidPeerId),
-        EnterpriseResolveResponse::Unavailable => Err(RelayProtocolError::Unavailable),
-        EnterpriseResolveResponse::Expired => Err(RelayProtocolError::EnterpriseExpired),
-        EnterpriseResolveResponse::Failed | EnterpriseResolveResponse::Cancelled => {
-            Err(RelayProtocolError::EnterpriseRejected)
+    tokio::time::timeout(wait_timeout, async {
+        let provider = ui.select_provider(providers).await?;
+        write_enterprise_step(stream, &EnterpriseSelect::new(provider).encode(), timeout).await?;
+        let url = match read_enterprise_response(stream, timeout).await? {
+            EnterpriseResolveResponse::Authenticate(url) => url,
+            _ => return Err(RelayProtocolError::UnexpectedResponse),
+        };
+        ui.open_authorization(url.as_str()).await?;
+        match read_enterprise_response(stream, wait_timeout).await? {
+            EnterpriseResolveResponse::Resolved(peer) => PeerId::from_bytes(peer.as_bytes())
+                .map(EnterpriseAttempt::Resolved)
+                .map_err(|_| RelayProtocolError::InvalidPeerId),
+            EnterpriseResolveResponse::Unavailable => Err(RelayProtocolError::Unavailable),
+            EnterpriseResolveResponse::Expired => Err(RelayProtocolError::EnterpriseExpired),
+            EnterpriseResolveResponse::Failed | EnterpriseResolveResponse::Cancelled => {
+                Err(RelayProtocolError::EnterpriseRejected)
+            }
+            _ => Err(RelayProtocolError::UnexpectedResponse),
         }
-        _ => Err(RelayProtocolError::UnexpectedResponse),
-    }
+    })
+    .await
+    .map_err(|_| RelayProtocolError::Timeout)?
 }
 
 async fn write_enterprise_step(
@@ -618,11 +653,11 @@ async fn bounded_exchange_io<const CAPACITY: usize>(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AllocationResponse, BoundedResponse, CONTROLLER_RESOLVE_TIMEOUT, EnterpriseAttempt,
-        EnterpriseResolveUi, RETRY_LIMIT, ReclaimStep, RelayProtocolError, ResolveDeadline,
-        ResolvedResponse, RetryAfter, allocation_response, bounded_exchange_io,
-        enterprise_exchange_io, exact_exchange_io, reclaim_response, release_response,
-        resolve_response, retry_delay,
+        AllocationResponse, BoundedResponse, CONTROLLER_RESOLVE_TIMEOUT,
+        ENTERPRISE_AUTH_STEPS_TIMEOUT, EnterpriseAttempt, EnterpriseResolveUi, RETRY_LIMIT,
+        ReclaimStep, RelayProtocolError, ResolveDeadline, ResolvedResponse, RetryAfter,
+        allocation_response, bounded_exchange_io, enterprise_exchange_io, exact_exchange_io,
+        reclaim_response, release_response, resolve_response, retry_delay,
     };
     use std::io;
     use std::pin::Pin;
@@ -649,6 +684,14 @@ mod tests {
         let deadline = ResolveDeadline::controller().instant();
         assert!(deadline >= now + CONTROLLER_RESOLVE_TIMEOUT);
         assert!(deadline <= tokio::time::Instant::now() + CONTROLLER_RESOLVE_TIMEOUT);
+    }
+
+    #[test]
+    fn enterprise_auth_steps_budget_mirrors_the_relay_session_lifetime() {
+        assert_eq!(
+            ENTERPRISE_AUTH_STEPS_TIMEOUT,
+            Duration::from_secs(10 * 60 + 30)
+        );
     }
 
     #[test]
@@ -1106,6 +1149,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                Duration::from_secs(2),
             )
             .await
         };
@@ -1134,6 +1178,7 @@ mod tests {
                 &mut client,
                 Locator::new(7).unwrap(),
                 &mut ui,
+                Duration::from_secs(2),
                 Duration::from_secs(2),
             )
             .await
@@ -1168,6 +1213,7 @@ mod tests {
                     Locator::new(7).unwrap(),
                     &mut ui,
                     Duration::from_secs(2),
+                    Duration::from_secs(2),
                 )
                 .await
             };
@@ -1198,6 +1244,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                Duration::from_secs(2),
             )
             .await
         };
@@ -1221,6 +1268,7 @@ mod tests {
                 &mut client,
                 Locator::new(7).unwrap(),
                 &mut ui,
+                Duration::from_secs(2),
                 Duration::from_secs(2),
             )
             .await
@@ -1263,6 +1311,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                Duration::from_secs(2),
             )
             .await
         };
@@ -1293,10 +1342,74 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_millis(100),
+                Duration::from_millis(500),
             )
             .await
         };
         let (attempt, ()) = tokio::join!(attempt, relay_side);
         assert!(matches!(attempt, Err(RelayProtocolError::Timeout)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_final_wait_uses_the_session_lifetime_budget() {
+        // The relay answers the start, receives the selection, sends the
+        // authorization URL, and then stays silent: only the final
+        // callback wait is pending. A short machine budget must not bound
+        // that wait; the injected wait budget must.
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let relay_side = async {
+            let mut expected_start = [0_u8; 4];
+            server.read_exact(&mut expected_start).await.unwrap();
+            server
+                .write_all(
+                    EnterpriseResolveResponse::Providers(
+                        EnterpriseProviders::new(true, false).unwrap(),
+                    )
+                    .encode()
+                    .as_slice(),
+                )
+                .await
+                .unwrap();
+            let mut select = [0_u8; 2];
+            server.read_exact(&mut select).await.unwrap();
+            server
+                .write_all(
+                    EnterpriseResolveResponse::Authenticate(Box::new(
+                        yonder_core::wire::enterprise::AuthorizationUrl::new(
+                            "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
+                        )
+                        .unwrap(),
+                    ))
+                    .encode()
+                    .as_slice(),
+                )
+                .await
+                .unwrap();
+            // Never send the terminal result; keep the stream open so the
+            // client stays in the callback wait.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        };
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let started = tokio::time::Instant::now();
+        let attempt = async {
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_millis(50),
+                Duration::from_millis(300),
+            )
+            .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        assert!(matches!(attempt, Err(RelayProtocolError::Timeout)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "the final callback wait must use the wait budget, not the machine budget"
+        );
+        assert_eq!(
+            ui.opened.as_deref(),
+            Some("https://relay.example.test/yonder/callback/wecom?code=x&state=y")
+        );
     }
 }
