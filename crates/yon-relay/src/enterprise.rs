@@ -54,6 +54,12 @@ impl EnterpriseAuthConfig {
         self.callback_url.as_url()
     }
 
+    /// The validated external callback origin, used to build redirect URIs.
+    #[must_use]
+    pub const fn callback_external(&self) -> &CallbackExternalUrl {
+        &self.callback_url
+    }
+
     /// The callback certificate chain documents.
     #[must_use]
     pub fn certificate_chain(&self) -> &[SecretDocument] {
