@@ -753,15 +753,16 @@ pub async fn run_relay_until(
                         registry: Arc::clone(&runtime.registry),
                         credentials: Arc::clone(&runtime.credentials),
                         callback_url: runtime.callback_url.clone(),
-                        clock: clock.clone(),
                     };
                     let cancellation = tasks.cancellation();
+                    let exchange_clock = clock.clone();
                     tasks.spawn(async move {
                         let exchange = enterprise_resolve_exchange(
                             peer,
                             stream,
                             calls,
                             context,
+                            exchange_clock,
                             OsSecureRandom,
                         );
                         tokio::select! {
@@ -1467,7 +1468,6 @@ struct EnterpriseExchangeContext {
     registry: Arc<CallbackRegistry>,
     credentials: Arc<ProviderCredentials>,
     callback_url: CallbackExternalUrl,
-    clock: SystemClock,
 }
 
 /// One enterprise resolve transaction, owned by the substream task.
@@ -1477,18 +1477,18 @@ struct EnterpriseExchangeContext {
 /// registration, browser callback outcome, internal resolve, response.
 /// The owner task serializes admission and the final resolve; the
 /// transaction registry is shared with the callback server.
-async fn enterprise_resolve_exchange<S: ProtocolIo>(
+async fn enterprise_resolve_exchange<S: ProtocolIo, C: MonotonicClock>(
     peer: PeerId,
     stream: S,
     calls: mpsc::Sender<EnterpriseResolveRequest>,
     context: EnterpriseExchangeContext,
+    clock: C,
     mut random: OsSecureRandom,
 ) -> Result<(), ProtocolTaskError> {
     let EnterpriseExchangeContext {
         registry,
         credentials,
         callback_url,
-        clock,
     } = &context;
     let mut stream = stream.into_protocol_io();
     let start = EnterpriseStart::decode(&read_timeout::<START_LEN>(&mut stream).await?)?;
@@ -3775,7 +3775,6 @@ mod tests {
                 Url::parse("https://relay.example.test").unwrap(),
             )
             .unwrap(),
-            clock: SystemClock::new(),
         }
     }
 
@@ -3877,6 +3876,26 @@ mod tests {
         Url::parse(url.as_str()).unwrap()
     }
 
+    /// A clock the test can advance to push a session past its deadline.
+    #[derive(Clone)]
+    struct AdvancingClock(Arc<std::sync::Mutex<MonotonicTime>>);
+
+    impl AdvancingClock {
+        fn at(now: MonotonicTime) -> Self {
+            Self(Arc::new(std::sync::Mutex::new(now)))
+        }
+
+        fn advance_to(&self, now: MonotonicTime) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
+
+    impl MonotonicClock for AdvancingClock {
+        fn now(&self) -> MonotonicTime {
+            *self.0.lock().unwrap()
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn enterprise_resolve_exchange_completes_after_callback() {
         let peer = Keypair::generate_ed25519().public().to_peer_id();
@@ -3930,7 +3949,133 @@ mod tests {
             );
         };
 
-        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_expires_waiting_callbacks() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+        let started = MonotonicTime::from_elapsed(Duration::ZERO);
+        let clock = AdvancingClock::at(started);
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            // Advance the clock past the session deadline before the
+            // selection arrives, so the remaining wait collapses to zero.
+            clock.advance_to(
+                started
+                    .checked_add(crate::session::SESSION_LIFETIME)
+                    .unwrap()
+                    .checked_add(Duration::from_secs(1))
+                    .unwrap(),
+            );
+            client
+                .write_all(&EnterpriseSelect::new(EnterpriseProvider::WeCom).encode())
+                .await
+                .unwrap();
+            // The exchange always sends the authorization URL before
+            // waiting; the collapsed deadline then answers Expired.
+            assert!(matches!(
+                read_enterprise_response(&mut client).await,
+                EnterpriseResolveResponse::Authenticate(_)
+            ));
+            assert_eq!(
+                read_enterprise_response(&mut client).await,
+                EnterpriseResolveResponse::Expired
+            );
+        };
+
+        let exchange_clock = clock.clone();
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            exchange_clock,
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_expires_after_a_late_callback() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+        let started = MonotonicTime::from_elapsed(Duration::ZERO);
+        let clock = AdvancingClock::at(started);
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            // The callback arrives, but the clock shows the session has
+            // expired, so the exchange answers Expired instead of resolving.
+            clock.advance_to(
+                started
+                    .checked_add(crate::session::SESSION_LIFETIME)
+                    .unwrap()
+                    .checked_add(Duration::from_secs(1))
+                    .unwrap(),
+            );
+            simulate_callback(&registry, &state_hex).await;
+            assert_eq!(
+                read_enterprise_response(&mut client).await,
+                EnterpriseResolveResponse::Expired
+            );
+        };
+
+        let exchange_clock = clock.clone();
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            exchange_clock,
+            OsSecureRandom,
+        );
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -3965,7 +4110,14 @@ mod tests {
             );
         };
 
-        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -4001,7 +4153,14 @@ mod tests {
             );
         };
 
-        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -4038,7 +4197,14 @@ mod tests {
             );
         };
 
-        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
@@ -4084,7 +4250,14 @@ mod tests {
             );
         };
 
-        let exchange = enterprise_resolve_exchange(peer, server, calls_tx, context, OsSecureRandom);
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
         let (result, (), ()) = tokio::join!(exchange, client_side, owner);
         result.unwrap();
     }
