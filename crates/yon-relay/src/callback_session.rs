@@ -177,7 +177,9 @@ pub const CALLBACK_SOURCE_IDLE: std::time::Duration = std::time::Duration::from_
 /// the session transitions and the redacted logging (design section 10):
 /// only the request id, platform, phase and redacted result are logged.
 /// Callback sources are rate limited per IP address using the shared
-/// authentication limiter; the source address is never logged.
+/// authentication limiter; the source address is never logged. A
+/// rate-limited callback still consumes its registry entry and fails
+/// the session, so the transaction cannot authenticate later.
 pub struct CallbackSessionHandler<C: MonotonicClock, T: ExchangeTransport> {
     registry: Arc<CallbackRegistry>,
     credentials: Arc<crate::provider::ProviderCredentials>,
@@ -247,16 +249,6 @@ where
         let credentials = Arc::clone(&self.credentials);
         Box::pin(async move {
             let now = self.clock.now();
-            if !self.check_source(source, now) {
-                tracing::info!(
-                    event = "enterprise_callback_rejected",
-                    platform = provider.as_str(),
-                    phase = "callback",
-                    result = "rate-limited",
-                    "enterprise callback rate limited"
-                );
-                return CallbackResult::Limited;
-            }
             let Some(state) = decode_state(state) else {
                 tracing::info!(
                     event = "enterprise_callback_rejected",
@@ -267,7 +259,21 @@ where
                 );
                 return CallbackResult::InvalidState;
             };
+            // The registry entry is consumed before the rate-limit
+            // decision on every path, so a limited callback cannot leave
+            // the transaction slot or the session behind.
+            let limited = !self.check_source(source, now);
             let Some(entry) = registry.take(&state, now) else {
+                if limited {
+                    tracing::info!(
+                        event = "enterprise_callback_rejected",
+                        platform = provider.as_str(),
+                        phase = "callback",
+                        result = "rate-limited",
+                        "enterprise callback rate limited"
+                    );
+                    return CallbackResult::Limited;
+                }
                 tracing::info!(
                     event = "enterprise_callback_rejected",
                     platform = provider.as_str(),
@@ -277,6 +283,26 @@ where
                 );
                 return CallbackResult::InvalidState;
             };
+            if limited {
+                // The callback could not be processed: fail the session
+                // so a later callback cannot authenticate the member
+                // after the exchange has already written its failure.
+                let request_id = entry.request_id();
+                let _ = entry
+                    .session()
+                    .lock()
+                    .unwrap()
+                    .fail(EnterpriseFailure::Platform);
+                tracing::info!(
+                    event = "enterprise_callback",
+                    request_id = %request_id,
+                    platform = provider.as_str(),
+                    phase = "callback",
+                    result = "rate-limited",
+                    "enterprise callback completed"
+                );
+                return CallbackResult::Limited;
+            }
             let request_id = entry.request_id();
             let outcome = match verify_member(&self.transport, provider, code, &credentials).await {
                 Ok(identity) => {
@@ -336,7 +362,9 @@ mod tests {
     use crate::callback::CallbackHandler as _;
     use crate::callback::CallbackResult;
     use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
-    use crate::session::{EnterpriseResolvePhase, EnterpriseResolveSession, OAuthState, RequestId};
+    use crate::session::{
+        EnterpriseFailure, EnterpriseResolvePhase, EnterpriseResolveSession, OAuthState, RequestId,
+    };
     use std::collections::VecDeque;
     use std::io;
     use std::net::IpAddr;
@@ -684,5 +712,47 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_rate_limited_callbacks_consume_the_entry_and_fail_the_session() {
+        let exchange = FakeExchange::new(vec![Err(io::Error::other("network unreachable"))]);
+        let handler = handler_with(exchange);
+        let started = now();
+        let (session, state) = authenticating_session(started);
+        let (callback_entry, _outcome) = entry(session.clone(), started);
+        handler
+            .registry
+            .insert(state.clone(), callback_entry, started)
+            .unwrap();
+        let source: IpAddr = "203.0.113.9".parse().unwrap();
+        let encoded = data_encoding::HEXLOWER.encode(state.as_bytes());
+        // Exhaust the per-source burst of 4 with unknown states.
+        for _ in 0..4 {
+            assert_eq!(
+                handler
+                    .handle(
+                        EnterpriseProvider::WeCom,
+                        "auth-code-1",
+                        "0f00000000000000000000000000000000000000000000000000000000000000",
+                        source,
+                    )
+                    .await,
+                CallbackResult::InvalidState
+            );
+        }
+        // The next callback from the source is rate-limited: the entry
+        // is consumed and the session is failed closed.
+        assert_eq!(
+            handler
+                .handle(EnterpriseProvider::WeCom, "auth-code-1", &encoded, source)
+                .await,
+            CallbackResult::Limited
+        );
+        assert!(handler.registry.is_empty());
+        assert!(matches!(
+            session.lock().unwrap().phase(),
+            EnterpriseResolvePhase::Failed(EnterpriseFailure::Platform)
+        ));
     }
 }
