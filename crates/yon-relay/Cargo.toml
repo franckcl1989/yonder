@@ -26,9 +26,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 zeroize.workspace = true
-yonder-config = { version = "=0.1.1", path = "../yonder-config", default-features = false }
-yonder-core = { version = "=0.1.1", path = "../yonder-core", default-features = false }
-yonder-net = { version = "=0.1.1", path = "../yonder-net", default-features = false }
+yonder-config = { version = "=0.1.2", path = "../yonder-config", default-features = false }
+yonder-core = { version = "=0.1.2", path = "../yonder-core", default-features = false }
+yonder-net = { version = "=0.1.2", path = "../yonder-net", default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true
