@@ -1,3 +1,4 @@
+use crate::enterprise::EnterpriseAuthConfig;
 use crate::registry::{Registry, RegistryError, ResolveLimiters};
 use std::collections::HashSet;
 use std::future::Future;
@@ -33,6 +34,9 @@ pub struct RelayServeConfig {
     external: Vec<RelayExternalAddress>,
     wss: WssTransportConfig,
     resources: RelayResourceConfig,
+    /// `None` is normal mode; `Some` is enterprise mode. The two modes are
+    /// mutually exclusive and fixed for the process lifetime.
+    enterprise: Option<EnterpriseAuthConfig>,
 }
 
 impl RelayServeConfig {
@@ -43,12 +47,13 @@ impl RelayServeConfig {
         external: Vec<RelayExternalAddress>,
         wss: WssTransportConfig,
     ) -> Result<Self, RelayServiceError> {
-        Self::with_resources(
+        Self::with_enterprise(
             identity,
             listen,
             external,
             wss,
             RelayResourceConfig::default(),
+            None,
         )
     }
 
@@ -59,6 +64,19 @@ impl RelayServeConfig {
         external: Vec<RelayExternalAddress>,
         wss: WssTransportConfig,
         resources: RelayResourceConfig,
+    ) -> Result<Self, RelayServiceError> {
+        Self::with_enterprise(identity, listen, external, wss, resources, None)
+    }
+
+    /// Attaches an already validated enterprise-mode configuration; `None`
+    /// keeps the relay in normal mode.
+    pub fn with_enterprise(
+        identity: Keypair,
+        listen: Vec<RelayListenAddress>,
+        external: Vec<RelayExternalAddress>,
+        wss: WssTransportConfig,
+        resources: RelayResourceConfig,
+        enterprise: Option<EnterpriseAuthConfig>,
     ) -> Result<Self, RelayServiceError> {
         if listen.is_empty() || listen.len() > 8 || external.is_empty() || external.len() > 8 {
             return Err(RelayServiceError::InvalidConfiguration);
@@ -103,6 +121,7 @@ impl RelayServeConfig {
             external,
             wss,
             resources,
+            enterprise,
         })
     }
 }
@@ -408,9 +427,22 @@ pub async fn run_relay_until(
         external,
         wss,
         resources,
+        enterprise,
     } = config;
+    let relay_mode = match &enterprise {
+        None => "normal",
+        Some(config) => {
+            tracing::info!(
+                event = "relay_enterprise_mode",
+                providers = config.providers().len(),
+                "relay is running in enterprise authentication mode"
+            );
+            "enterprise"
+        }
+    };
     tracing::info!(
         event = "relay_starting",
+        relay_mode,
         listen_count = listen.len(),
         external_count = external.len(),
         registration_capacity = resources.registration().capacity().get(),

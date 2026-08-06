@@ -6,24 +6,27 @@ use serde::Deserialize;
 use std::fmt;
 use std::fs::File;
 use std::io::{IsTerminal as _, Read as _};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use thiserror::Error;
 use tracing_subscriber::filter::LevelFilter;
+use url::Url;
 use yon_relay::{
-    FileIdentityStore, IdentityError, IdentityStore, RelayServeConfig, RelayServiceError,
+    CallbackExternalUrl, EnterpriseAuthConfig, EnterpriseConfigError, FileIdentityStore,
+    IdentityError, IdentityStore, ProviderSecrets, RelayServeConfig, RelayServiceError,
     SecretFileError, SecretFilePolicy, SystemSecretFilePolicy, run_relay,
 };
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
-    ConfigurationValues, LayeredConfigLoader,
+    ConfigurationValues, LayeredConfigLoader, LoadedConfiguration,
 };
 use yonder_core::{
     CircuitBytes, CircuitCapacity, CircuitDuration, CircuitRelayLimits, DomainError,
-    OsSecureRandom, RegistrationCapacity, RegistrationLimits, RelayResourceConfig,
-    RelayResourceError, ReservationDuration, ResolveConcurrency, ResolveLimits, ResolveRate,
-    RetryAfter, SecretDocument, SecureRandom, SourceLimiterCapacity, SourceLimiterIdle,
-    SourceRegistrationCapacity, write_error_report,
+    EnterpriseProviders, OsSecureRandom, RegistrationCapacity, RegistrationLimits,
+    RelayResourceConfig, RelayResourceError, ReservationDuration, ResolveConcurrency,
+    ResolveLimits, ResolveRate, RetryAfter, SecretDocument, SecureRandom, SourceLimiterCapacity,
+    SourceLimiterIdle, SourceRegistrationCapacity, write_error_report,
 };
 use yonder_net::{
     AddressError, NetworkBuildError, RelayExternalAddress, RelayListenAddress,
@@ -33,6 +36,7 @@ use yonder_net::{
 
 const MAX_WSS_CERTIFICATE_DOCUMENT: u64 = 1024 * 1024;
 const MAX_WSS_PRIVATE_KEY_DOCUMENT: u64 = 64 * 1024;
+const ENTERPRISE_CERTIFICATE_LIMIT: usize = 8;
 const IDENTITY_KEY: ConfigurationKey = ConfigurationKey::new("identity");
 const LISTEN_KEY: ConfigurationKey = ConfigurationKey::new("listen");
 const EXTERNAL_KEY: ConfigurationKey = ConfigurationKey::new("external");
@@ -59,6 +63,18 @@ const RESOLVE_RETRY_KEY: ConfigurationKey = ConfigurationKey::new("resolve.retry
 const CIRCUIT_CAPACITY_KEY: ConfigurationKey = ConfigurationKey::new("circuit.capacity");
 const CIRCUIT_DURATION_KEY: ConfigurationKey = ConfigurationKey::new("circuit.duration_seconds");
 const CIRCUIT_BYTES_KEY: ConfigurationKey = ConfigurationKey::new("circuit.bytes");
+const ENTERPRISE_CERTIFICATE_KEY: ConfigurationKey =
+    ConfigurationKey::new("enterprise_auth.certificate");
+const ENTERPRISE_CERTIFICATE_DER_KEY: ConfigurationKey =
+    ConfigurationKey::new("enterprise_auth.certificate_der");
+const ENTERPRISE_PRIVATE_KEY_KEY: ConfigurationKey =
+    ConfigurationKey::new("enterprise_auth.private_key");
+const ENTERPRISE_PRIVATE_KEY_DER_KEY: ConfigurationKey =
+    ConfigurationKey::new("enterprise_auth.private_key_der");
+const ENTERPRISE_SECRET_WECOM_KEY: ConfigurationKey =
+    ConfigurationKey::new("enterprise_auth.secret_wecom");
+const ENTERPRISE_SECRET_FEISHU_KEY: ConfigurationKey =
+    ConfigurationKey::new("enterprise_auth.secret_feishu");
 const RELAY_SCHEMA: ConfigurationSchema = ConfigurationSchema::new(
     Application::Relay,
     &[
@@ -66,6 +82,8 @@ const RELAY_SCHEMA: ConfigurationSchema = ConfigurationSchema::new(
         EXTERNAL_KEY,
         WSS_CERTIFICATE_KEY,
         WSS_CERTIFICATE_DER_KEY,
+        ENTERPRISE_CERTIFICATE_KEY,
+        ENTERPRISE_CERTIFICATE_DER_KEY,
     ],
     &[
         REGISTRY_CAPACITY_KEY,
@@ -89,6 +107,12 @@ const RELAY_SCHEMA: ConfigurationSchema = ConfigurationSchema::new(
         WSS_CERTIFICATE_DER_KEY,
         WSS_PRIVATE_KEY_KEY,
         WSS_PRIVATE_KEY_DER_KEY,
+        ENTERPRISE_CERTIFICATE_KEY,
+        ENTERPRISE_CERTIFICATE_DER_KEY,
+        ENTERPRISE_PRIVATE_KEY_KEY,
+        ENTERPRISE_PRIVATE_KEY_DER_KEY,
+        ENTERPRISE_SECRET_WECOM_KEY,
+        ENTERPRISE_SECRET_FEISHU_KEY,
     ],
 );
 
@@ -158,6 +182,23 @@ struct RelaySettings {
     resolve: ResolveSettings,
     #[serde(default)]
     circuit: CircuitSettings,
+    #[serde(default)]
+    enterprise_auth: Option<EnterpriseAuthSettings>,
+}
+
+/// The `[enterprise_auth]` section. Its presence switches the relay into
+/// enterprise mode; there is no `enabled` switch.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnterpriseAuthSettings {
+    callback_listen: Option<String>,
+    callback_external_url: Option<String>,
+    certificate: Option<ConfigurationValues<PathBuf>>,
+    certificate_der: Option<ConfigurationValues<PathBuf>>,
+    private_key: Option<PathBuf>,
+    private_key_der: Option<PathBuf>,
+    secret_wecom: Option<PathBuf>,
+    secret_feishu: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +318,20 @@ enum AppError {
     InvalidWssCertificateDocumentCount,
     #[error("wss_private_key and the legacy wss_private_key_der setting cannot both be configured")]
     ConflictingWssPrivateKey,
+    #[error(
+        "enterprise_auth.certificate must contain between 1 and {ENTERPRISE_CERTIFICATE_LIMIT} document paths"
+    )]
+    InvalidEnterpriseCertificateDocumentCount,
+    #[error(
+        "enterprise_auth.certificate and the legacy enterprise_auth.certificate_der setting cannot both be configured"
+    )]
+    ConflictingEnterpriseCertificate,
+    #[error(
+        "enterprise_auth.private_key and the legacy enterprise_auth.private_key_der setting cannot both be configured"
+    )]
+    ConflictingEnterprisePrivateKey,
+    #[error("enterprise authentication configuration is invalid: {0}")]
+    EnterpriseConfig(#[from] EnterpriseConfigError),
     #[error("the TLS {kind} document is too large: {path}")]
     TlsTooLarge {
         path: PathBuf,
@@ -505,6 +560,7 @@ fn serve_config_with(
         .map(|address| address.parse::<RelayExternalAddress>())
         .collect::<Result<Vec<_>, _>>()?;
     let resources = relay_resources(loaded.value())?;
+    let enterprise = enterprise_config(&loaded)?;
     let identity = FileIdentityStore.read(&identity_path)?;
     let wss = match (certificate_paths, private_key_path) {
         (Some(certificates), Some(private_key)) => {
@@ -521,8 +577,135 @@ fn serve_config_with(
         (None, None) => WssTransportConfig::client(None),
         _ => return Err(RelayServiceError::MissingWssCertificate.into()),
     };
-    RelayServeConfig::with_resources(identity, listen, external, wss, resources)
+    RelayServeConfig::with_enterprise(identity, listen, external, wss, resources, enterprise)
         .map_err(AppError::from)
+}
+
+/// Builds the validated enterprise-mode configuration, or `None` when the
+/// `[enterprise_auth]` section is absent (normal mode). Presence of the
+/// section is the mode switch; there is no `enabled` toggle and the mode
+/// cannot change during the process lifetime.
+fn enterprise_config(
+    loaded: &LoadedConfiguration<RelaySettings>,
+) -> Result<Option<EnterpriseAuthConfig>, AppError> {
+    let Some(settings) = &loaded.value().enterprise_auth else {
+        return Ok(None);
+    };
+    let providers = EnterpriseProviders::new(
+        settings.secret_wecom.is_some(),
+        settings.secret_feishu.is_some(),
+    )
+    .map_err(|_| EnterpriseConfigError::NoProvider)?;
+    let wecom_secret = settings
+        .secret_wecom
+        .as_deref()
+        .map(|path| loaded.resolve_path(ENTERPRISE_SECRET_WECOM_KEY, path))
+        .transpose()?;
+    let feishu_secret = settings
+        .secret_feishu
+        .as_deref()
+        .map(|path| loaded.resolve_path(ENTERPRISE_SECRET_FEISHU_KEY, path))
+        .transpose()?;
+    let secrets = ProviderSecrets::new(providers, wecom_secret, feishu_secret)?;
+    let certificate_paths = match (&settings.certificate, &settings.certificate_der) {
+        (Some(paths), Some(_))
+            if loaded.compare_source_precedence(
+                ENTERPRISE_CERTIFICATE_KEY,
+                ENTERPRISE_CERTIFICATE_DER_KEY,
+            ) == Some(std::cmp::Ordering::Greater) =>
+        {
+            Some((ENTERPRISE_CERTIFICATE_KEY, paths.as_slice()))
+        }
+        (Some(_), Some(paths))
+            if loaded.compare_source_precedence(
+                ENTERPRISE_CERTIFICATE_KEY,
+                ENTERPRISE_CERTIFICATE_DER_KEY,
+            ) == Some(std::cmp::Ordering::Less) =>
+        {
+            Some((ENTERPRISE_CERTIFICATE_DER_KEY, paths.as_slice()))
+        }
+        (Some(_), Some(_)) => return Err(AppError::ConflictingEnterpriseCertificate),
+        (Some(paths), None) => Some((ENTERPRISE_CERTIFICATE_KEY, paths.as_slice())),
+        (None, Some(paths)) => Some((ENTERPRISE_CERTIFICATE_DER_KEY, paths.as_slice())),
+        (None, None) => None,
+    };
+    if certificate_paths
+        .is_some_and(|(_, paths)| !(1..=ENTERPRISE_CERTIFICATE_LIMIT).contains(&paths.len()))
+    {
+        return Err(AppError::InvalidEnterpriseCertificateDocumentCount);
+    }
+    let private_key = match (
+        settings.private_key.as_deref(),
+        settings.private_key_der.as_deref(),
+    ) {
+        (Some(path), Some(_))
+            if loaded.compare_source_precedence(
+                ENTERPRISE_PRIVATE_KEY_KEY,
+                ENTERPRISE_PRIVATE_KEY_DER_KEY,
+            ) == Some(std::cmp::Ordering::Greater) =>
+        {
+            Some((ENTERPRISE_PRIVATE_KEY_KEY, path))
+        }
+        (Some(_), Some(path))
+            if loaded.compare_source_precedence(
+                ENTERPRISE_PRIVATE_KEY_KEY,
+                ENTERPRISE_PRIVATE_KEY_DER_KEY,
+            ) == Some(std::cmp::Ordering::Less) =>
+        {
+            Some((ENTERPRISE_PRIVATE_KEY_DER_KEY, path))
+        }
+        (Some(_), Some(_)) => return Err(AppError::ConflictingEnterprisePrivateKey),
+        (Some(path), None) => Some((ENTERPRISE_PRIVATE_KEY_KEY, path)),
+        (None, Some(path)) => Some((ENTERPRISE_PRIVATE_KEY_DER_KEY, path)),
+        (None, None) => None,
+    };
+    let certificate_paths = certificate_paths
+        .map(|(key, paths)| {
+            paths
+                .iter()
+                .map(|path| loaded.resolve_path(key, path))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let private_key_path = private_key
+        .map(|(key, path)| loaded.resolve_path(key, path))
+        .transpose()?;
+    let (certificate_chain, private_key) = match (certificate_paths, private_key_path) {
+        (Some(certificates), Some(private_key)) => {
+            let certificates = certificates
+                .iter()
+                .map(|certificate| read_tls_document(certificate, TlsDocumentKind::Certificate))
+                .collect::<Result<Vec<_>, _>>()?;
+            let private_key = read_tls_document(&private_key, TlsDocumentKind::PrivateKey)?;
+            (certificates, private_key)
+        }
+        (None, None) | (Some(_), None) | (None, Some(_)) => {
+            return Err(EnterpriseConfigError::MissingCallbackTls.into());
+        }
+    };
+    let listen = settings
+        .callback_listen
+        .as_deref()
+        .ok_or(EnterpriseConfigError::MissingCallbackListen)?
+        .parse::<SocketAddr>()
+        .map_err(EnterpriseConfigError::CallbackListen)?;
+    let callback_url = CallbackExternalUrl::new(
+        settings
+            .callback_external_url
+            .as_deref()
+            .ok_or(EnterpriseConfigError::MissingCallbackUrl)?
+            .parse::<Url>()
+            .map_err(EnterpriseConfigError::CallbackUrl)?,
+    )?;
+    let config = EnterpriseAuthConfig::new(
+        listen,
+        callback_url,
+        certificate_chain,
+        private_key,
+        providers,
+        secrets,
+    )?;
+    Ok(Some(config))
 }
 
 fn relay_resources(settings: &RelaySettings) -> Result<RelayResourceConfig, AppError> {

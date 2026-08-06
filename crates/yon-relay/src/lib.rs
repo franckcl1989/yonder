@@ -3,11 +3,15 @@
 
 //! Self-hosted Yonder relay application state.
 
+pub mod enterprise;
 pub mod identity;
 pub mod registry;
 pub mod secret_file;
 pub mod service;
 
+pub use enterprise::{
+    CallbackExternalUrl, EnterpriseAuthConfig, EnterpriseConfigError, ProviderSecrets,
+};
 pub use identity::{FileIdentityStore, IdentityError, IdentityStore};
 pub use registry::{Registry, RegistryError, ResolveLimiters};
 pub use secret_file::{SecretFileError, SecretFilePolicy, SystemSecretFilePolicy};
