@@ -29,6 +29,25 @@ impl EnterpriseProvider {
             _ => None,
         }
     }
+
+    /// The fixed wire tag of the platform.
+    #[must_use]
+    pub const fn wire_tag(self) -> u8 {
+        match self {
+            Self::WeCom => 0x01,
+            Self::Feishu => 0x02,
+        }
+    }
+
+    /// Parses a fixed wire tag.
+    #[must_use]
+    pub const fn from_wire_tag(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::WeCom),
+            0x02 => Some(Self::Feishu),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for EnterpriseProvider {
@@ -86,6 +105,32 @@ impl EnterpriseProviders {
             .into_iter()
             .filter(move |provider| self.contains(*provider))
     }
+
+    /// The fixed wire bitmask of the provider set.
+    #[must_use]
+    pub const fn wire_mask(self) -> u8 {
+        (self.wecom as u8) | ((self.feishu as u8) << 1)
+    }
+
+    /// Parses a fixed wire bitmask; only one or two providers are valid.
+    #[must_use]
+    pub const fn from_wire_mask(mask: u8) -> Option<Self> {
+        match mask {
+            0x01 => Some(Self {
+                wecom: true,
+                feishu: false,
+            }),
+            0x02 => Some(Self {
+                wecom: false,
+                feishu: true,
+            }),
+            0x03 => Some(Self {
+                wecom: true,
+                feishu: true,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +152,17 @@ mod tests {
         assert_eq!(EnterpriseProvider::from_name("WeCom"), None);
         assert_eq!(EnterpriseProvider::from_name(""), None);
         assert_eq!(EnterpriseProvider::from_name("aliyun"), None);
+        assert_eq!(EnterpriseProvider::from_wire_tag(0x00), None);
+        assert_eq!(
+            EnterpriseProvider::from_wire_tag(0x01),
+            Some(EnterpriseProvider::WeCom)
+        );
+        assert_eq!(
+            EnterpriseProvider::from_wire_tag(0x02),
+            Some(EnterpriseProvider::Feishu)
+        );
+        assert_eq!(EnterpriseProvider::from_wire_tag(0x03), None);
+        assert_eq!(EnterpriseProvider::Feishu.wire_tag(), 0x02);
     }
 
     #[test]
@@ -144,5 +200,18 @@ mod tests {
         let both = EnterpriseProviders::new(true, true).unwrap();
         assert_eq!(both, both);
         assert_ne!(both, EnterpriseProviders::new(true, false).unwrap());
+    }
+
+    #[test]
+    fn provider_set_wire_masks_round_trip() {
+        for (wecom, feishu, mask) in [(true, false, 0x01), (false, true, 0x02), (true, true, 0x03)]
+        {
+            let providers = EnterpriseProviders::new(wecom, feishu).unwrap();
+            assert_eq!(providers.wire_mask(), mask);
+            assert_eq!(EnterpriseProviders::from_wire_mask(mask), Some(providers));
+        }
+        for mask in [0x00, 0x04, 0xFF] {
+            assert_eq!(EnterpriseProviders::from_wire_mask(mask), None);
+        }
     }
 }

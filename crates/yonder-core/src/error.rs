@@ -43,6 +43,9 @@ pub enum ProtocolField {
     Reserved,
     TerminalDimension,
     TerminalValue,
+    EnterpriseProvider,
+    EnterpriseProviders,
+    AuthorizationUrl,
 }
 
 /// Errors returned by bounded wire decoders.
