@@ -90,9 +90,10 @@
 ## 0.1.2 企业认证实现证据
 
 - 设计基线 `d1b11e6` 记录 0.1.2 最终设计：企业 relay 要求发起连接的用户先证明自己仍是该企业有效成员；不包含企业权限系统、用户管理、IAM、审计平台与 host 身份改造。需求追踪矩阵新增 R-027..R-033 七个条目，每个实现任务关联需求 ID、责任 package 与验证项。
-- 实现提交链从基线后共 `17` 个原子提交：企业模式配置与互斥（`c55f4db`）、wire 协议与会话状态机（`7d3e4af`）、凭据加载与授权 URL（`fdb37f3`）、会员验证（`004054e`）、bounded hyper 交换客户端（`0ac57fc`）、启动失败关闭（`d231d9d`）、回调服务器（`4f631f0`）、回调会话处理器与单次事务注册表（`9a39617`）、模式互斥的企业 resolve 交换（`5365e0a`）、客户端自动识别与回退（`25628b5`）、异步 UI（`a24c0cd`）、会话期限选择窗口（`2de262e`）、控制器 UI 集成（`66313d5`），以及进程级 e2e（`f6f44df`、`08aa16d`）。
-- 本地全量验证：工作区 `403` 个测试通过（含企业模式新增 `53` 个单元测试与 `4` 个进程级 e2e）、`cargo clippy --workspace --all-targets` 零警告、全平台构建干净。进程级 e2e 覆盖：回调 HTTPS 监听器对未知路径/缺参/非 GET 返回 `404/400/405`；legacy resolve 对企业 relay 返回 `UnsupportedProtocol`（旧 connect 无法使用）；真实 host 通过企业 relay 完成注册（旧 host 兼容）；真实 `yon connect` 在未完成认证时失败关闭且公共错误不含 OPAQUE/PeerId/locator/连接码。
-- 待办：0.1.2 尚未执行候选/发布矩阵（五目标 coverage、六目标原生构建、Miri、sanitizer、供应链、长 fuzz、两平台真实进程性能、六平台归档、checksum、SBOM、许可证与 provenance 消费方验证），也未创建标签；这些证据由 CI/候选运行补齐后才能发布 `v0.1.2`。
+- 实现提交链从基线后共 `24` 个原子提交：企业模式配置与互斥（`c55f4db`）、wire 协议与会话状态机（`7d3e4af`）、凭据加载与授权 URL（`fdb37f3`）、会员验证（`004054e`）、bounded hyper 交换客户端（`0ac57fc`）、启动失败关闭（`d231d9d`）、回调服务器（`4f631f0`）、回调会话处理器与单次事务注册表（`9a39617`）、模式互斥的企业 resolve 交换（`5365e0a`）、客户端自动识别与回退（`25628b5`）、异步 UI（`a24c0cd`）、会话期限选择窗口（`2de262e`）、控制器 UI 集成（`66313d5`）、进程级 e2e（`f6f44df`、`08aa16d`）、文档与追踪（`8c8172a`、`8b02642`、`318e8ae`、`9735c41`、`8a8f648`、`d090a2e`）、fuzz 与格式（`9b68259`、`64ab51a`）、CI 根目录契约（`98f3129`）与覆盖补强（`b625247`、`013a94d`、`dfa94a9`）。
+- 本地全量验证：工作区 `408` 个测试通过（含企业模式 `57` 个单元测试与 `4` 个进程级 e2e）、`cargo clippy --workspace --all-targets` 零警告、`cargo fmt --check` 全绿（含 fuzz workspace）、全平台构建干净。企业覆盖补齐到每个验收项都有直接证据：会话期限超时用可推进假时钟驱动 wire 级 `Expired`（等待期与迟到回调两条路径）；结果页五态映射（200/400/503/429、no-store、无外部资源）；客户端对超长授权 URL 长度在缓冲前拒绝；OAuth state 往返构造器边界；企业 wire 解码器纳入 fuzz target。
+- 进程级 e2e 覆盖：回调 HTTPS 监听器对未知路径/缺参/非 GET 返回 `404/400/405`；legacy resolve 对企业 relay 返回 `UnsupportedProtocol`（旧 connect 无法使用）；真实 host 通过企业 relay 完成注册（旧 host 兼容）；真实 `yon connect` 在未完成认证时失败关闭且公共错误不含 OPAQUE/PeerId/locator/连接码。
+- 待办：0.1.2 尚未执行候选/发布矩阵（五目标 coverage、六目标原生构建、Miri、sanitizer、供应链、长 fuzz、两平台真实进程性能、六平台归档、checksum、SBOM、许可证与 provenance 消费方验证），也未创建标签；这些证据由 CI/候选运行补齐后才能发布 `v0.1.2`。所有工作流中的 Windows 测试任务已配置受保护 Secret 根目录，候选运行可直接执行。
 
 ## 当前结论
 
