@@ -382,11 +382,13 @@ pub enum CallbackServerError {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        CallbackHandler, CallbackResult, CallbackServer, CallbackServerError,
-        MAX_CALLBACK_QUERY_BYTES, parse_certificates, parse_private_key, query_param,
+        CALLBACK_HANDSHAKE_TIMEOUT, CallbackHandler, CallbackResult, CallbackServer,
+        CallbackServerError, MAX_CALLBACK_CONNECTIONS, MAX_CALLBACK_QUERY_BYTES,
+        parse_certificates, parse_private_key, query_param,
     };
     use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio_rustls::rustls;
     use tokio_rustls::rustls::pki_types::CertificateDer;
     use url::Url;
@@ -432,11 +434,11 @@ mod tests {
         CallbackServer::from_config(&config).unwrap()
     }
 
-    /// Executes one HTTP/1.1 request over a TLS connection trusting the
-    /// fixture CA, and returns the status line and headers.
-    async fn tls_request(address: std::net::SocketAddr, request: &str) -> (String, String) {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
+    /// Connects and completes the TLS handshake with the fixture CA
+    /// without sending any HTTP request.
+    async fn tls_connect(
+        address: std::net::SocketAddr,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
         let mut roots = rustls::RootCertStore::empty();
         let ca = include_bytes!("../../yon/tests/fixtures/localhost-test-ca.der");
         roots
@@ -448,7 +450,15 @@ mod tests {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let mut tls = connector.connect(server_name, stream).await.unwrap();
+        connector.connect(server_name, stream).await.unwrap()
+    }
+
+    /// Executes one HTTP/1.1 request over a TLS connection trusting the
+    /// fixture CA, and returns the status line and headers.
+    async fn tls_request(address: std::net::SocketAddr, request: &str) -> (String, String) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut tls = tls_connect(address).await;
         tls.write_all(request.as_bytes()).await.unwrap();
         let mut bytes = Vec::new();
         tls.read_to_end(&mut bytes).await.unwrap();
@@ -588,6 +598,49 @@ mod tests {
         );
         let (status, _) = tls_request(address, &big).await;
         assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+        serving.abort();
+    }
+
+    /// Regression test for the callback connection lifetime: a connection
+    /// that completes the TLS handshake but never sends an HTTP request
+    /// must release its permit after `CALLBACK_HANDSHAKE_TIMEOUT`.
+    ///
+    /// Real-time test: sleeps for the ten-second constant plus a margin,
+    /// so it takes about eleven seconds. This is deliberate — the whole
+    /// per-connection bound is a fixed ten-second constant used directly
+    /// by the server, so the release can only be proven with real time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_callback_connections_release_their_permit_after_the_timeout() {
+        let server = server_with("127.0.0.1:0".parse().unwrap());
+        let (listener, address) = server.bind().await.unwrap();
+        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
+        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
+
+        // The TLS handshake completes, but no HTTP request ever arrives.
+        use tokio::io::AsyncReadExt as _;
+        let mut stalled = tls_connect(address).await;
+        tokio::time::sleep(CALLBACK_HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+
+        // The server closed the stalled connection: its permit is released.
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte)).await;
+        match read {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("the stalled connection received data"),
+            Err(_) => panic!("the stalled connection was not closed by the server"),
+        }
+
+        // Every permit slot is available again: all MAX_CALLBACK_CONNECTIONS
+        // genuine callback requests are served. If the stalled connection
+        // had pinned its permit, the last request would have been dropped.
+        for _ in 0..MAX_CALLBACK_CONNECTIONS {
+            let (status, _) = tls_request(
+                address,
+                "GET /yonder/callback/wecom?code=auth-code-1&state=abcdef HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        }
         serving.abort();
     }
 

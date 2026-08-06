@@ -434,8 +434,9 @@ async fn enterprise_resolve_exchange_inner<S: ProtocolIo, C: MonotonicClock>(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        EnterpriseExchangeContext, EnterpriseResolveAdmission, EnterpriseResolveRequest,
-        TransactionGuard, enterprise_resolve_exchange,
+        ENTERPRISE_SOURCE_CAPACITY, ENTERPRISE_SOURCE_IDLE, EnterpriseExchangeContext,
+        EnterpriseLimiters, EnterpriseResolveAdmission, EnterpriseResolveRequest, TransactionGuard,
+        enterprise_resolve_exchange, handle_enterprise_admission,
     };
     use crate::callback::CallbackResult;
     use crate::callback_session::{CallbackEntry, CallbackRegistry};
@@ -457,7 +458,7 @@ mod tests {
         EnterpriseProvider, EnterpriseProviders, Locator, MonotonicClock, MonotonicTime,
         OsSecureRandom, RetryAfter, SystemClock,
     };
-    use yonder_net::Keypair;
+    use yonder_net::{ConnectedPoint, ConnectionBook, ConnectionId, Keypair, SourcePrefix};
 
     // ---- enterprise resolve exchange ----
 
@@ -1127,5 +1128,93 @@ mod tests {
             drop(guard);
         }
         assert!(registry.is_empty());
+    }
+
+    // ---- enterprise admission limiters ----
+
+    #[test]
+    fn source_table_accepts_sources_up_to_capacity_and_rejects_new_ones() {
+        // The source capacity is a fixed constant, so the table is filled
+        // with ENTERPRISE_SOURCE_CAPACITY distinct sources and the next
+        // new source fails closed while the table is full.
+        let mut limiters = EnterpriseLimiters::new();
+        let now = MonotonicTime::from_elapsed(Duration::ZERO);
+        for index in 0..ENTERPRISE_SOURCE_CAPACITY {
+            let source = SourcePrefix::Ipv4(std::net::Ipv4Addr::new(
+                10,
+                (index >> 8) as u8,
+                index as u8,
+                1,
+            ));
+            assert!(
+                limiters.check_source(source, now),
+                "source {index} admitted"
+            );
+        }
+        assert_eq!(limiters.sources.len(), ENTERPRISE_SOURCE_CAPACITY);
+        let overflow = SourcePrefix::Ipv4(std::net::Ipv4Addr::new(10, 255, 255, 2));
+        assert!(!limiters.check_source(overflow, now));
+        assert_eq!(limiters.sources.len(), ENTERPRISE_SOURCE_CAPACITY);
+    }
+
+    #[test]
+    fn idle_source_limiters_are_pruned_after_the_idle_window() {
+        let mut limiters = EnterpriseLimiters::new();
+        let started = MonotonicTime::from_elapsed(Duration::ZERO);
+        let old = SourcePrefix::Ipv4("192.0.2.1".parse().unwrap());
+        assert!(limiters.check_source(old, started));
+
+        // Within the idle window a check on another source keeps the entry.
+        let within = started
+            .checked_add(ENTERPRISE_SOURCE_IDLE - Duration::from_secs(1))
+            .unwrap();
+        let other = SourcePrefix::Ipv4("192.0.2.2".parse().unwrap());
+        assert!(limiters.check_source(other, within));
+        assert!(limiters.sources.contains_key(&old));
+
+        // Past the idle window the stale entry is pruned on the next check.
+        let past = started
+            .checked_add(ENTERPRISE_SOURCE_IDLE)
+            .unwrap()
+            .checked_add(Duration::from_secs(1))
+            .unwrap();
+        let fresh = SourcePrefix::Ipv4("192.0.2.3".parse().unwrap());
+        assert!(limiters.check_source(fresh, past));
+        assert!(!limiters.sources.contains_key(&old));
+        assert!(limiters.sources.contains_key(&other));
+        assert!(limiters.sources.contains_key(&fresh));
+    }
+
+    #[test]
+    fn global_limiter_fails_closed_after_its_burst() {
+        // The authentication rate limit is 1/s with a burst of four.
+        let mut limiters = EnterpriseLimiters::new();
+        for _ in 0..4 {
+            assert!(limiters.global.check());
+        }
+        assert!(!limiters.global.check());
+
+        // Admission behind the exhausted global limiter fails closed with
+        // a retry even for a healthy source.
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let mut connections = ConnectionBook::new();
+        connections
+            .established(
+                peer,
+                ConnectionId::new_unchecked(1),
+                ConnectedPoint::Listener {
+                    local_addr: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+                    send_back_addr: "/ip4/192.0.2.1/tcp/1".parse().unwrap(),
+                },
+            )
+            .unwrap();
+        let decision = handle_enterprise_admission(
+            peer,
+            &connections,
+            &SystemClock::new(),
+            &mut limiters,
+            RetryAfter::from_millis(250).unwrap(),
+        );
+        assert!(matches!(decision, Ok(EnterpriseResolveAdmission::Retry(_))));
     }
 }

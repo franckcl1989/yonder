@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use yonder_core::wire::enterprise::EnterpriseResolveResponse;
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
@@ -494,6 +494,21 @@ async fn run_relay_until_shutdown(
     .await
 }
 
+/// Acquires one enterprise exchange permit, counting an overload when the
+/// pool is exhausted. Returns `None` (fail closed: the caller drops the
+/// substream without spawning an exchange task) when all concurrent
+/// enterprise resolve transactions are in flight.
+fn try_acquire_enterprise_permit(
+    permits: &Arc<Semaphore>,
+    observations: &RelayObservability,
+) -> Option<OwnedSemaphorePermit> {
+    let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+        RelayObservability::increment(&observations.resolve_overload);
+        return None;
+    };
+    Some(permit)
+}
+
 /// Runs the relay until an injected shutdown signal completes.
 pub async fn run_relay_until(
     config: RelayServeConfig,
@@ -755,8 +770,9 @@ pub async fn run_relay_until(
                 // the enterprise resolve exchange; the same branch never
                 // serves the legacy resolve in enterprise mode.
                 if let Some(runtime) = enterprise_runtime.as_ref() {
-                    let Ok(permit) = Arc::clone(&enterprise_permits).try_acquire_owned() else {
-                        RelayObservability::increment(&observations.resolve_overload);
+                    // A full exchange pool drops the substream fail-closed
+                    // and counts the overload.
+                    let Some(permit) = try_acquire_enterprise_permit(&enterprise_permits, &observations) else {
                         continue;
                     };
                     let calls = enterprise_calls_tx
@@ -1455,29 +1471,37 @@ async fn write_close(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        ProtocolIo, ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision,
-        RelayObservability, RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall,
-        ShutdownReason, completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
+        CallbackServerError, ENTERPRISE_RESOLVE_READERS, EnterpriseContext, ProtocolIo,
+        ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision, RelayObservability,
+        RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall, ShutdownReason,
+        completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
         handle_registry_call, handle_resolve_call, handle_resolve_call_observed,
         handle_swarm_event as handle_swarm_event_inner, read_exact_eof, registry_exchange,
         registry_immediate_retry, report_ready_to, resolve_exchange, resolve_immediate_retry,
-        run_relay, run_relay_until, run_relay_until_shutdown, with_timeout, write_close,
+        run_relay, run_relay_until, run_relay_until_shutdown, try_acquire_enterprise_permit,
+        with_timeout, write_close,
     };
     #[cfg(windows)]
     use super::{process_shutdown_signal, select_windows_shutdown};
+    use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
+    use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
     use crate::registry::{Registry, ResolveLimiters};
     use std::io;
     use std::num::NonZeroU32;
+    use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{Semaphore, mpsc, oneshot};
+    use url::Url;
     use yonder_core::{
-        Locator, MonotonicClock, OsSecureRandom, ProtocolError, RegistrationCapacity,
-        RegistrationLimits, RelayResourceConfig, ReservationDuration, ResolveConcurrency,
-        ResolveLimits, RetryAfter, SecretDocument, SourceRegistrationCapacity, SystemClock,
+        EnterpriseProviders, Locator, MonotonicClock, OsSecureRandom, ProtocolError,
+        RegistrationCapacity, RegistrationLimits, RelayResourceConfig, ReservationDuration,
+        ResolveConcurrency, ResolveLimits, RetryAfter, SecretDocument, SourceRegistrationCapacity,
+        SystemClock,
         wire::registry::{RegistryRequest, RegistryResponse},
         wire::resolve::{ResolveRequest, ResolveResponse},
     };
@@ -1905,6 +1929,134 @@ mod tests {
         })
         .await
         .expect("the bounded live relay scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_enterprise_relay_drops_substreams_when_the_exchange_pool_is_full() {
+        // Regression test for the enterprise exchange permit bound: with
+        // the pool full, an additional substream is dropped fail-closed.
+        // The relay runs in enterprise mode and every idle substream pins
+        // one of the ENTERPRISE_RESOLVE_READERS exchange permits (the
+        // attack the bound was added for), so the pool is full by the time
+        // the last stream is opened.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::with_enterprise(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config("127.0.0.1:0".parse().unwrap()),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+
+            let mut enterprise_streams = Vec::with_capacity(ENTERPRISE_RESOLVE_READERS);
+            for _ in 0..ENTERPRISE_RESOLVE_READERS {
+                enterprise_streams.push(
+                    open_stream(
+                        &mut endpoint,
+                        &mut streams,
+                        relay_peer,
+                        yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+                    )
+                    .await,
+                );
+            }
+            tokio::task::yield_now().await;
+            let overflow = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+            )
+            .await;
+            assert_stream_closed(&mut endpoint, overflow).await;
+
+            drop(enterprise_streams);
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the bounded enterprise relay scenario must finish");
+    }
+
+    #[test]
+    fn enterprise_exchange_permits_count_overload_when_exhausted() {
+        // The permit acquisition is a pure function at the call site of
+        // the accept loop; a full pool returns None (the caller drops the
+        // substream) and counts the overload exactly once per rejection.
+        let permits = Arc::new(Semaphore::new(3));
+        let observations = RelayObservability::default();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let permit = try_acquire_enterprise_permit(&permits, &observations)
+                .expect("the first three acquisitions succeed");
+            held.push(permit);
+        }
+        assert!(try_acquire_enterprise_permit(&permits, &observations).is_none());
+        assert_eq!(observations.resolve_overload.load(Ordering::Relaxed), 1);
+        drop(held.pop());
+        assert!(try_acquire_enterprise_permit(&permits, &observations).is_some());
+        assert_eq!(observations.resolve_overload.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_callback_bind_failure_stops_the_relay() {
+        // Regression test for the callback listener failure escalation:
+        // the callback listener is occupied, so the startup bind fails and
+        // run_relay_until stops with the EnterpriseCallback error instead
+        // of serving without a callback listener. The runtime accept
+        // failure path reports through the same oneshot wiring inside the
+        // task group, but an accept error cannot be forced without the
+        // OS dropping the listener the serve task owns.
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let relay_config = RelayServeConfig::with_enterprise(
+            Keypair::generate_ed25519(),
+            vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
+            WssTransportConfig::client(None),
+            RelayResourceConfig::default(),
+            Some(EnterpriseContext::new(
+                enterprise_config(format!("127.0.0.1:{port}").parse().unwrap()),
+                enterprise_credentials(),
+            )),
+        )
+        .unwrap();
+        let error = run_relay_until(relay_config, async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RelayServiceError::EnterpriseCallback(CallbackServerError::Bind { .. })
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3503,6 +3655,35 @@ mod tests {
             vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
             WssTransportConfig::client(None),
+        )
+        .unwrap()
+    }
+
+    /// In-process enterprise credentials without any secret file: the
+    /// test-only constructor is crate-internal like the accept loop it
+    /// feeds.
+    fn enterprise_credentials() -> ProviderCredentials {
+        let wecom = WeComCredentials {
+            corp_id: SecretText::new("ww1234567890abcdef".into(), ProviderField::CorpId).unwrap(),
+            agent_id: 7,
+            app_secret: SecretText::new("s3cret".into(), ProviderField::AppSecret).unwrap(),
+        };
+        ProviderCredentials::from_credentials(Some(wecom), None)
+    }
+
+    /// An enterprise-mode configuration bound to the given callback
+    /// listener, using the same fixture TLS material as the WSS tests.
+    fn enterprise_config(callback_listen: std::net::SocketAddr) -> EnterpriseAuthConfig {
+        let providers = EnterpriseProviders::new(true, false).unwrap();
+        let secrets =
+            ProviderSecrets::new(providers, Some(PathBuf::from("wecom.secret")), None).unwrap();
+        EnterpriseAuthConfig::new(
+            callback_listen,
+            CallbackExternalUrl::new(Url::parse("https://relay.example.test").unwrap()).unwrap(),
+            vec![SecretDocument::new(TEST_WSS_CERTIFICATE_DER.to_vec())],
+            SecretDocument::new(TEST_WSS_PRIVATE_KEY_DER.to_vec()),
+            providers,
+            secrets,
         )
         .unwrap()
     }
