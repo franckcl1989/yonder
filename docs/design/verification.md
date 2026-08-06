@@ -56,6 +56,7 @@
 - 交互进度在网络前出现、最长 `1s` 心跳、动态宽度、`TerminalReady` 前清行、Active 无诊断污染；`--log-file` 仍保留进度并写入选中 route/transport。Windows ConPTY 必须同时接受 crossterm 通过原生控制台 API 投影出的等价整行清除序列，并继续断言远端输出开始前屏幕语义已经清行。
 - Unix SIGINT/SIGTERM/SIGHUP 与 Windows Ctrl+C/Break/Close/Logoff/Shutdown 进入 relay `2s` 有界关闭；host 等待时 Ctrl+C 安静返回 `130`。
 - 六个发布 target 都运行原生 smoke；不能只交叉编译通过。
+- 0.1.2 企业模式进程级 e2e：真实企业 relay 的 HTTPS 回调监听器对未知路径、缺参和非 GET 分别返回 `404`、`400`、`405`；legacy resolve 对企业 relay 返回 `UnsupportedProtocol`（旧 connect 无法使用）；真实 host 通过企业 relay 完成注册（旧 host 兼容）；未完成企业认证的真实 `yon connect` 失败关闭，公共错误只含统一的企业认证拒绝文案，泄露审计断言不含 OPAQUE、PeerId、locator 或连接码。进程内企业交换 wire 测试覆盖 `EnterpriseResolve` 消息往返与状态转换、等待期与迟到回调过期、准入限流、注册表满、未配置提供商和断开取消；TLS loopback 回调测试以真实证书握手验证 HTTPS 服务、`Cache-Control: no-store` 结果页和握手失败关闭。
 
 ### 模糊测试
 

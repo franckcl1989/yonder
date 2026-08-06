@@ -264,6 +264,17 @@
 - Secret 文件：企业微信与飞书各一个独立敏感文件（enterprise_auth.secret_wecom / enterprise_auth.secret_feishu），复用 `SecretFilePolicy` 平台保护。
 - 平台选择交互：connect 收到平台列表后终端编号选择，随后打开系统浏览器跳转授权 URL。
 
+## 0.1.2 审计轮实现阶段决定
+
+以下变更在 0.1.2 多角色交叉审计轮与第二轮对抗性复审中作出，均属于设计 §13「实现原则」允许的实现阶段决定（具体依赖、crate 版本、HTTP 参数、超时数字、性能参数等资源边界）或失败关闭修正，不改变已冻结的模式互斥、协议边界、状态机与安全语义。此处仅为发布评审记录；任何项目所有者认为超出 §13 纬度的行为变更，必须在发布前重新确认。
+
+- 企业子流 permit 上限：企业 resolve 子流在 spawn 交换任务前先取得 permit，并发硬上限 `64`，防无界空闲任务（`e4190a3`）；属 §13 资源上限/性能参数。
+- 回调监听器失败传播：监听器失败以 `EnterpriseCallback` 错误响亮传播到根循环，relay 停止而非静默继续（`e4190a3`）；属 §13 失败关闭修正。
+- 回调整连接生命周期：完成 TLS 但不发请求的连接同样纳入 `10s` 生命周期，防认证路径 DoS 耗尽回调槽（`fe8389a`）；属 §13 超时数字与资源上限。
+- 客户端预算拆分：企业 resolve 客户端机器步骤 `30s`、人类认证步骤对齐 relay 会话期限 `10min30s`（`bb7a823`）；属 §13 超时/预算参数。
+- 字面断开失效：等待期子流 EOF 使"断开立即失效"字面成立——断连即取消会话并立即释放槽位（`c96bc04`）；属 §13 失败关闭修正。
+- 限流回调会话失败：限流回调先消费注册表条目并失败会话，阻断同 state 迟到放行（`ebaa346`）；属 §13 失败关闭修正。
+
 ## 已确认的企业认证 HTTP 依赖
 
 0.1.2 企业认证需要 HTTPS 回调服务器（浏览器 OAuth 回调）与 OAuth API 客户端（企业微信/飞书 token 交换与成员校验）。版本于 2026-08-06 经 crates.io 核实均为各自全局最新稳定版：
@@ -278,3 +289,15 @@
 - 已批准 workspace `tokio` 依赖新增 `net` feature，用于回调监听器的 `TcpListener` 与 OAuth 客户端连接。
 - 经核实 base64（最新 0.23.1）与 form_urlencoded 对两个提供商的 OAuth 流程均无必要（token 交换与成员校验均为 JSON 承载），不引入。
 - 上述 crate 的 MSRV 均不高于 workspace `rust-version = 1.88`（最高为 hyper-rustls 1.85），许可证均位于 `deny.toml` 允许列表（MIT / Apache-2.0 OR ISC OR MIT / MIT OR Apache-2.0）。2026-08-06 在更新后的锁文件上运行 `cargo deny check` 全项通过、`cargo audit` 除既有三个已批准例外（RUSTSEC-2026-0118/0119/2024-0436）外无新增公告；后续升级与全矩阵验证仍须走既定流程。
+
+## 已确认的企业认证浏览器打开依赖
+
+connect 企业流程在终端编号选择平台后，需要用系统默认浏览器打开企业 OAuth 授权 URL。项目所有者于 2026-08-06 明确批准改用 `open` crate（该决定同时消除了审计轮对 `crates/yon` 既有手写平台启动命令的顾虑）：
+
+- 用途：仅承担把企业 OAuth 授权 URL 交给系统默认浏览器打开的动作；OAuth state、回调与凭证不经过该依赖。
+- 版本：`open 5.4.1`，2026-08-06 经 crates.io 核实的全局最新稳定版，直接依赖使用精确版本。
+- 成熟度与维护状态：MIT 许可证，约 45M 下载、维护活跃；MSRV 1.62，低于 workspace `rust-version = 1.88` 基线。
+- 替代方案：手写 `cmd start` / `open` / `xdg-open` 平台命令被拒绝——存在 cmd 元字符与引号、Linux 回退链、WSL 等边界问题；`webbrowser` crate 未采用——`open` 是该职责的标准选择。
+- 安全风险：无已知 RustSec 公告；Unix 目标的传递依赖为 `is-wsl` / `is-docker`（经 `libc` 与 `once_cell`），两者均已在锁文件树中；Windows 在 `default-features = false` 下零传递依赖。
+- feature 列表：`default-features = false`，不启用任何 feature；`shellexecute-on-windows` 关闭以避免引入 `dunce` 传递依赖。
+- best-effort 语义保留：授权 URL 始终先打印；打开器失败绝不中止认证流程。
