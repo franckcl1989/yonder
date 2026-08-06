@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use yonder_core::{EnterpriseProvider, SecretDocument};
+use yonder_net::contains_pem_marker;
 
 /// Bound on one callback request query string.
 pub const MAX_CALLBACK_QUERY_BYTES: usize = 1024;
@@ -219,12 +220,6 @@ fn parse_private_key(
     } else {
         PrivateKeyDer::try_from(bytes.to_vec()).map_err(|_| CallbackServerError::InvalidPrivateKey)
     }
-}
-
-fn contains_pem_marker(document: &[u8]) -> bool {
-    document
-        .windows(b"-----BEGIN".len())
-        .any(|window| window == b"-----BEGIN")
 }
 
 /// Dispatches one callback request: exact path match, GET only, bounded

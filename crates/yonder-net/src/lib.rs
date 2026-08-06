@@ -41,5 +41,5 @@ pub use tasks::{CancellationHandle, TaskFailure, TaskGroup, TaskShutdown};
 pub use transport::{
     TRANSPORT_TIMEOUT, WSS_CERTIFICATE_LIMIT, WssCertificateChain, WssPrivateKey,
     WssTransportConfig, WssTrustAnchors, build_endpoint_transport, build_relay_transport,
-    generate_identity,
+    contains_pem_marker, generate_identity,
 };

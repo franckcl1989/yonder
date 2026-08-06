@@ -767,6 +767,7 @@ pub async fn run_relay_until(
                     };
                     let cancellation = tasks.cancellation();
                     let exchange_clock = clock.clone();
+                    let task_observations = Arc::clone(&observations);
                     tasks.spawn(async move {
                         let exchange = enterprise_resolve_exchange(
                             peer,
@@ -778,13 +779,14 @@ pub async fn run_relay_until(
                         );
                         tokio::select! {
                             result = exchange => {
-                                if let Err(error) = result {
-                                    tracing::debug!(
+                                if let Err(error) = &result {
+                                    tracing::warn!(
                                         event = "enterprise_resolve_failed",
                                         %error,
                                         "enterprise resolve exchange failed"
                                     );
                                 }
+                                task_observations.observe_protocol_result(result);
                             }
                             () = cancellation.cancelled() => {}
                         }
