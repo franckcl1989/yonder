@@ -555,6 +555,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn wecom_status_unknown_errcode_is_fail_closed() {
+        // The member-status call answers a non-zero errcode other than
+        // 60111; the status is unconfirmable and the exchange fails closed.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            ok(r#"{"errcode":0,"errmsg":"ok","userid":"zhang-san"}"#),
+            ok(r#"{"errcode":40013,"errmsg":"invalid corpid"}"#),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn wecom_oversized_identity_is_fail_closed() {
         let oversized_userid = format!(
             r#"{{"errcode":0,"errmsg":"ok","userid":"{}"}}"#,

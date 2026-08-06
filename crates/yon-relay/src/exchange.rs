@@ -27,15 +27,37 @@ pub struct ExchangeClient {
 }
 
 impl ExchangeClient {
-    /// Builds the client over the webpki root store. Construction cannot
-    /// fail: the webpki root bundle is static and always installable.
+    /// Builds the production client over the webpki root store, HTTPS
+    /// only: exchange secrets are never sent over cleartext. Construction
+    /// cannot fail: the webpki root bundle is static and always
+    /// installable.
     #[must_use]
     pub fn new() -> Self {
-        let connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
+        Self::build(true)
+    }
+
+    /// Builds a client that also accepts plaintext HTTP, reserved for the
+    /// loopback transport tests. Never used in production.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_tests() -> Self {
+        Self::build(false)
+    }
+
+    fn build(https_only: bool) -> Self {
+        let connector = if https_only {
+            HttpsConnectorBuilder::new()
+                .with_webpki_roots()
+                .https_only()
+                .enable_http1()
+                .build()
+        } else {
+            HttpsConnectorBuilder::new()
+                .with_webpki_roots()
+                .https_or_http()
+                .enable_http1()
+                .build()
+        };
         Self {
             client: Client::builder(TokioExecutor::new()).build(connector),
         }
@@ -190,7 +212,7 @@ mod tests {
     }
 
     fn client() -> ExchangeClient {
-        ExchangeClient::new()
+        ExchangeClient::for_tests()
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -246,6 +268,26 @@ mod tests {
         let error = client().get(&url, None).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(error.to_string().contains("HTTP 500"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_client_refuses_plaintext_http() {
+        // A live loopback HTTP server that would answer any cleartext
+        // request; the https-only production client must reject the URL
+        // before ever contacting it.
+        let (address, captured) = serve_one(
+            hyper::Response::builder()
+                .status(200)
+                .body("ok".to_owned())
+                .unwrap(),
+        )
+        .await;
+        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
+        assert!(ExchangeClient::new().get(&url, None).await.is_err());
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "the production client must never send exchange data over cleartext"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

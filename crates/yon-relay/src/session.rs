@@ -39,7 +39,10 @@ impl std::fmt::Display for RequestId {
 /// A single-use OAuth CSRF state created only after the provider is chosen.
 ///
 /// `Debug` is deliberately redacted: the design forbids logging state.
-#[derive(Clone, PartialEq, Eq, Hash, Zeroize)]
+/// The bytes are zeroized when the state is dropped, so sessions that die
+/// on expiry, failure or the Limited path never free the state without
+/// wiping it.
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
 pub struct OAuthState([u8; Self::LEN]);
 
 impl OAuthState {

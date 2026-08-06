@@ -524,10 +524,11 @@ mod tests {
         assert!(feishu_url.as_str().contains(&encode_state(&state)));
         assert!(!feishu_url.as_str().contains('#'));
 
-        let built_again = credentials
-            .authorization_url(EnterpriseProvider::Feishu, &callback_url(), &state)
-            .ok();
-        assert!(built_again.is_some());
+        // The same state and credentials always build the same URL.
+        let wecom_built_again = credentials
+            .authorization_url(EnterpriseProvider::WeCom, &callback_url(), &state)
+            .unwrap();
+        assert_eq!(wecom_built_again, wecom_url);
     }
 
     #[test]

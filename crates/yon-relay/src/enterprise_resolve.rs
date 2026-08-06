@@ -331,7 +331,8 @@ mod tests {
     use crate::enterprise::CallbackExternalUrl;
     use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
     use crate::session::{
-        EnterpriseResolveSession, MemberAdmission, MemberIdentity, OAuthState, RequestId,
+        EnterpriseFailure, EnterpriseResolveSession, MemberAdmission, MemberIdentity, OAuthState,
+        RequestId,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -843,6 +844,69 @@ mod tests {
                 read_enterprise_response(&mut client).await,
                 EnterpriseResolveResponse::Unavailable
             );
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_fails_closed_on_a_limited_outcome() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            // Take the transaction and report the Limited outcome (the
+            // callback source exceeded the rate limit), failing the
+            // session closed first exactly like the callback handler does
+            // for the other failure outcomes.
+            let state = OAuthState::from_bytes(
+                &data_encoding::HEXLOWER
+                    .decode(state_hex.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            let entry = registry.take(&state, SystemClock::new().now()).unwrap();
+            let session = entry.session();
+            {
+                let mut guard = session.lock().unwrap();
+                guard.fail(EnterpriseFailure::Platform).unwrap();
+            }
+            entry.into_outcome().send(CallbackResult::Limited).unwrap();
+            assert_eq!(
+                read_enterprise_response(&mut client).await,
+                EnterpriseResolveResponse::Failed
+            );
+            assert!(session.lock().unwrap().is_terminal());
         };
 
         let exchange = enterprise_resolve_exchange(
