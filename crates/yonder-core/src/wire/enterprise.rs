@@ -292,7 +292,6 @@ mod tests {
     use crate::enterprise::{EnterpriseProvider, EnterpriseProviders};
     use crate::error::{ProtocolError, ProtocolField};
     use crate::{Locator, PeerIdBytes, RetryAfter};
-    use proptest::prelude::*;
 
     const LOCATOR: Locator = match Locator::new(0xABCDE) {
         Ok(locator) => locator,
@@ -473,90 +472,107 @@ mod tests {
         );
     }
 
-    /// An arbitrary valid relay response: every provider mask, retry hints
-    /// across the whole protocol range, authorization URLs of every length
-    /// up to the bound, peers of every length up to the bound, and the four
-    /// tag-only variants.
-    fn arbitrary_response() -> impl Strategy<Value = EnterpriseResolveResponse> {
-        prop_oneof![
-            (1_u8..=3).prop_map(|mask| {
-                EnterpriseResolveResponse::Providers(
-                    EnterpriseProviders::from_wire_mask(mask)
-                        .expect("masks one through three are legal"),
-                )
-            }),
-            (100_u32..=5_000).prop_map(|millis| {
-                EnterpriseResolveResponse::Retry(
-                    RetryAfter::from_millis(millis).expect("millis inside the retry range"),
-                )
-            }),
-            prop::collection::vec(prop::char::range('a', 'z'), 1..=2048).prop_map(|chars| {
-                let url = chars.into_iter().collect::<String>();
-                EnterpriseResolveResponse::Authenticate(Box::new(
-                    AuthorizationUrl::new(&url).expect("URL length inside the protocol bound"),
-                ))
-            }),
-            prop::collection::vec(any::<u8>(), 1..=64).prop_map(|peer| {
-                EnterpriseResolveResponse::Resolved(
-                    PeerIdBytes::new(&peer).expect("peer length inside the protocol bound"),
-                )
-            }),
-            Just(EnterpriseResolveResponse::Cancelled),
-            Just(EnterpriseResolveResponse::Expired),
-            Just(EnterpriseResolveResponse::Failed),
-            Just(EnterpriseResolveResponse::Unavailable),
-        ]
-    }
+    /// Property tests are compiled out under Miri: the proptest harness
+    /// expands each test to 256 cases, which runs pathologically slowly
+    /// under the Miri interpreter (the CI Miri job hangs for 38+ minutes).
+    /// The Miri gate exists to detect UB, which the deterministic tests and
+    /// the fuzz target already cover; the property tests remain fully
+    /// active in the normal test and coverage jobs. The `miri` cfg is set
+    /// automatically when the test binary is compiled by the miri toolchain.
+    #[cfg(not(miri))]
+    mod property_tests {
+        use super::{
+            AuthorizationUrl, EnterpriseResolveResponse, EnterpriseStart, MAX_RESPONSE_LEN,
+        };
+        use crate::enterprise::EnterpriseProviders;
+        use crate::{Locator, PeerIdBytes, RetryAfter};
+        use proptest::prelude::*;
 
-    /// The documented encoded length of every response variant.
-    fn documented_len(response: &EnterpriseResolveResponse) -> usize {
-        match response {
-            EnterpriseResolveResponse::Providers(_) => 2,
-            EnterpriseResolveResponse::Retry(_) => 5,
-            EnterpriseResolveResponse::Authenticate(url) => 3 + url.as_str().len(),
-            EnterpriseResolveResponse::Resolved(peer) => 2 + peer.as_bytes().len(),
-            EnterpriseResolveResponse::Cancelled
-            | EnterpriseResolveResponse::Expired
-            | EnterpriseResolveResponse::Failed
-            | EnterpriseResolveResponse::Unavailable => 1,
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn enterprise_start_round_trips_any_20bit_locator(wire in any::<[u8; 3]>()) {
-            let mut wire = wire;
-            wire[0] &= 0x0F;
-            let locator = Locator::from_wire(wire).expect("masked bytes are a legal locator");
-            let request = EnterpriseStart::new(locator);
-            prop_assert_eq!(
-                EnterpriseStart::decode(&request.encode()),
-                Ok(request)
-            );
+        /// An arbitrary valid relay response: every provider mask, retry hints
+        /// across the whole protocol range, authorization URLs of every length
+        /// up to the bound, peers of every length up to the bound, and the four
+        /// tag-only variants.
+        fn arbitrary_response() -> impl Strategy<Value = EnterpriseResolveResponse> {
+            prop_oneof![
+                (1_u8..=3).prop_map(|mask| {
+                    EnterpriseResolveResponse::Providers(
+                        EnterpriseProviders::from_wire_mask(mask)
+                            .expect("masks one through three are legal"),
+                    )
+                }),
+                (100_u32..=5_000).prop_map(|millis| {
+                    EnterpriseResolveResponse::Retry(
+                        RetryAfter::from_millis(millis).expect("millis inside the retry range"),
+                    )
+                }),
+                prop::collection::vec(prop::char::range('a', 'z'), 1..=2048).prop_map(|chars| {
+                    let url = chars.into_iter().collect::<String>();
+                    EnterpriseResolveResponse::Authenticate(Box::new(
+                        AuthorizationUrl::new(&url).expect("URL length inside the protocol bound"),
+                    ))
+                }),
+                prop::collection::vec(any::<u8>(), 1..=64).prop_map(|peer| {
+                    EnterpriseResolveResponse::Resolved(
+                        PeerIdBytes::new(&peer).expect("peer length inside the protocol bound"),
+                    )
+                }),
+                Just(EnterpriseResolveResponse::Cancelled),
+                Just(EnterpriseResolveResponse::Expired),
+                Just(EnterpriseResolveResponse::Failed),
+                Just(EnterpriseResolveResponse::Unavailable),
+            ]
         }
 
-        #[test]
-        fn enterprise_responses_round_trip_arbitrary_instances(
-            response in arbitrary_response(),
-        ) {
-            prop_assert_eq!(
-                EnterpriseResolveResponse::decode(response.encode().as_slice()),
-                Ok(response)
-            );
+        /// The documented encoded length of every response variant.
+        fn documented_len(response: &EnterpriseResolveResponse) -> usize {
+            match response {
+                EnterpriseResolveResponse::Providers(_) => 2,
+                EnterpriseResolveResponse::Retry(_) => 5,
+                EnterpriseResolveResponse::Authenticate(url) => 3 + url.as_str().len(),
+                EnterpriseResolveResponse::Resolved(peer) => 2 + peer.as_bytes().len(),
+                EnterpriseResolveResponse::Cancelled
+                | EnterpriseResolveResponse::Expired
+                | EnterpriseResolveResponse::Failed
+                | EnterpriseResolveResponse::Unavailable => 1,
+            }
         }
 
-        #[test]
-        fn enterprise_response_encodings_respect_length_bounds(
-            response in arbitrary_response(),
-        ) {
-            let encoded = response.encode();
-            prop_assert_eq!(encoded.as_slice().len(), documented_len(&response));
-            prop_assert!(encoded.as_slice().len() <= MAX_RESPONSE_LEN);
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn enterprise_start_round_trips_any_20bit_locator(wire in any::<[u8; 3]>()) {
+                let mut wire = wire;
+                wire[0] &= 0x0F;
+                let locator = Locator::from_wire(wire).expect("masked bytes are a legal locator");
+                let request = EnterpriseStart::new(locator);
+                prop_assert_eq!(
+                    EnterpriseStart::decode(&request.encode()),
+                    Ok(request)
+                );
+            }
+
+            #[test]
+            fn enterprise_responses_round_trip_arbitrary_instances(
+                response in arbitrary_response(),
+            ) {
+                prop_assert_eq!(
+                    EnterpriseResolveResponse::decode(response.encode().as_slice()),
+                    Ok(response)
+                );
+            }
+
+            #[test]
+            fn enterprise_response_encodings_respect_length_bounds(
+                response in arbitrary_response(),
+            ) {
+                let encoded = response.encode();
+                prop_assert_eq!(encoded.as_slice().len(), documented_len(&response));
+                prop_assert!(encoded.as_slice().len() <= MAX_RESPONSE_LEN);
+            }
         }
     }
 }
