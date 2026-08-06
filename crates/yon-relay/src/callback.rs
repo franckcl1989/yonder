@@ -29,8 +29,10 @@ pub const MAX_CALLBACK_QUERY_BYTES: usize = 1024;
 pub const MAX_CALLBACK_STATE_BYTES: usize = 128;
 /// Bound on concurrent callback connections; excess connections fail closed.
 pub const MAX_CALLBACK_CONNECTIONS: usize = 16;
-/// Bound on one callback TLS handshake; stalled handshakes release their
-/// connection permit (fail closed) instead of blocking the listener.
+/// Bound on one callback TLS handshake and on the whole per-connection
+/// request/response exchange: a stalled handshake, or a connection that
+/// completes the handshake but never sends a request, releases its
+/// connection permit (fail closed) instead of pinning it indefinitely.
 const CALLBACK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The outcome of one callback handling run, used for the result page and
@@ -136,7 +138,11 @@ impl CallbackServer {
     /// permit is held only for the TLS handshake (bounded by
     /// `CALLBACK_HANDSHAKE_TIMEOUT`) plus one request/response exchange:
     /// HTTP keep-alive is disabled so a connection releases its permit as
-    /// soon as the response is written.
+    /// soon as the response is written. The whole connection is
+    /// additionally bounded by `CALLBACK_HANDSHAKE_TIMEOUT`, so a
+    /// connection that completes the handshake but never sends a request
+    /// also releases its permit (fail closed) instead of pinning it
+    /// indefinitely.
     pub async fn serve_on(
         self,
         listener: TcpListener,
@@ -177,11 +183,17 @@ impl CallbackServer {
                             hyper_util::rt::TokioExecutor::new(),
                         );
                         // Callback connections are single-request: keep-alive
-                        // is disabled so a stalled connection cannot pin a
-                        // permit indefinitely and the connection closes once
-                        // the response is written.
+                        // is disabled so the connection closes once the
+                        // response is written. The whole connection is
+                        // additionally bounded by CALLBACK_HANDSHAKE_TIMEOUT
+                        // so a connection that never sends a request cannot
+                        // pin its permit indefinitely.
                         builder.http1().keep_alive(false);
-                        let _ = builder.serve_connection(io, service).await;
+                        let _ = tokio::time::timeout(
+                            CALLBACK_HANDSHAKE_TIMEOUT,
+                            builder.serve_connection(io, service),
+                        )
+                        .await;
                     });
                 }
             }

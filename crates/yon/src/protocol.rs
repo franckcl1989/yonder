@@ -319,8 +319,9 @@ pub async fn resolve_peer_auto(
 /// resolve.
 ///
 /// The budgets are split: the machine phase (reconverge, substream
-/// negotiation, and the admission retry loop) stays bounded by the
-/// controller `deadline`, while the human authentication steps (provider
+/// negotiation, the admission retry loop, and the per-attempt
+/// start/providers exchange) stays bounded by the controller
+/// `deadline`, while the human authentication steps (provider
 /// selection, authorization handoff, and the final callback wait) run
 /// with the relay session lifetime (`ENTERPRISE_AUTH_STEPS_TIMEOUT`).
 pub async fn enterprise_resolve_peer(
@@ -344,7 +345,8 @@ pub async fn enterprise_resolve_peer(
         .map_err(|_| RelayProtocolError::Timeout)??;
         let mut stream = stream.into_tokio();
         // The per-attempt exchange runs with its own budget: the machine
-        // messages keep the per-message timeout while the human
+        // messages (start, providers) are bounded by the controller
+        // deadline on top of the per-message timeout, while the human
         // authentication steps use the relay session lifetime.
         let attempt = drive(
             driver,
@@ -353,6 +355,7 @@ pub async fn enterprise_resolve_peer(
                 locator,
                 ui,
                 PROTOCOL_TIMEOUT,
+                deadline.0,
                 ENTERPRISE_AUTH_STEPS_TIMEOUT,
             ),
         )
@@ -375,19 +378,27 @@ pub async fn enterprise_resolve_peer(
 /// The enterprise substream exchange on plain tokio I/O, testable without
 /// the endpoint driver. The substream carries a sequence of messages and
 /// stays open across them; it never shuts down the write side. The
-/// machine messages are bounded by `timeout`; the human authentication
-/// steps (provider selection, authorization handoff, and the final
-/// callback wait) share the `wait_timeout` budget, mirroring the relay
-/// session lifetime.
+/// machine messages (start, providers) run under the absolute
+/// `machine_deadline` — the controller resolve deadline — on top of the
+/// per-message `timeout`, so a machine phase can never overshoot the
+/// controller budget; the human authentication steps (provider
+/// selection, authorization handoff, and the final callback wait) share
+/// the `wait_timeout` budget, mirroring the relay session lifetime.
 async fn enterprise_exchange_io(
     stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
     locator: Locator,
     ui: &mut impl EnterpriseResolveUi,
     timeout: Duration,
+    machine_deadline: tokio::time::Instant,
     wait_timeout: Duration,
 ) -> Result<EnterpriseAttempt, RelayProtocolError> {
-    write_enterprise_step(stream, &EnterpriseStart::new(locator).encode(), timeout).await?;
-    let providers = match read_enterprise_response(stream, timeout).await? {
+    let providers = match tokio::time::timeout_at(machine_deadline, async {
+        write_enterprise_step(stream, &EnterpriseStart::new(locator).encode(), timeout).await?;
+        read_enterprise_response(stream, timeout).await
+    })
+    .await
+    .map_err(|_| RelayProtocolError::Timeout)??
+    {
         EnterpriseResolveResponse::Retry(after) => return Ok(EnterpriseAttempt::Retry(after)),
         EnterpriseResolveResponse::Providers(providers) => providers,
         _ => return Err(RelayProtocolError::UnexpectedResponse),
@@ -1149,6 +1160,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(2),
                 Duration::from_secs(2),
             )
             .await
@@ -1179,6 +1191,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(2),
                 Duration::from_secs(2),
             )
             .await
@@ -1213,6 +1226,7 @@ mod tests {
                     Locator::new(7).unwrap(),
                     &mut ui,
                     Duration::from_secs(2),
+                    tokio::time::Instant::now() + Duration::from_secs(2),
                     Duration::from_secs(2),
                 )
                 .await
@@ -1244,6 +1258,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(2),
                 Duration::from_secs(2),
             )
             .await
@@ -1269,6 +1284,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(2),
                 Duration::from_secs(2),
             )
             .await
@@ -1311,6 +1327,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(2),
                 Duration::from_secs(2),
             )
             .await
@@ -1342,6 +1359,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_millis(100),
+                tokio::time::Instant::now() + Duration::from_secs(2),
                 Duration::from_millis(500),
             )
             .await
@@ -1397,6 +1415,7 @@ mod tests {
                 Locator::new(7).unwrap(),
                 &mut ui,
                 Duration::from_millis(50),
+                tokio::time::Instant::now() + Duration::from_secs(2),
                 Duration::from_millis(300),
             )
             .await
@@ -1410,6 +1429,39 @@ mod tests {
         assert_eq!(
             ui.opened.as_deref(),
             Some("https://relay.example.test/yonder/callback/wecom?code=x&state=y")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_machine_phase_respects_the_machine_deadline() {
+        // The relay never answers the start: the absolute machine
+        // deadline must terminate the machine phase before the coarser
+        // per-message budget would.
+        let (mut client, mut server) = tokio::io::duplex(8);
+        let relay_side = tokio::spawn(async move {
+            let mut expected_start = [0_u8; 4];
+            server.read_exact(&mut expected_start).await.unwrap();
+            // Hold the stream open without answering so the providers
+            // read stays pending.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let started = tokio::time::Instant::now();
+        let attempt = enterprise_exchange_io(
+            &mut client,
+            Locator::new(7).unwrap(),
+            &mut ui,
+            Duration::from_secs(5),
+            tokio::time::Instant::now() + Duration::from_millis(300),
+            Duration::from_secs(5),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        relay_side.abort();
+        assert!(matches!(attempt, Err(RelayProtocolError::Timeout)));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the machine phase must be bounded by the machine deadline, not the per-message budget"
         );
     }
 }
