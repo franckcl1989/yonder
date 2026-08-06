@@ -87,6 +87,13 @@
 - 正式 Release 已独立复核：恰好 `19` 个发布文件，`18` 条 SHA-256 全匹配，`SHA256SUMS` 自身摘要为 `bf99ae75bf155dba41cccde1b029b21d52f70890513b986673ef92fdbff54ef0`，`12` 个归档各恰好一个规范名称可执行文件，两个 SBOM 均为正确 component 的 CycloneDX `1.5`，`Cargo.lock` 与标签源码一致。正式入口为 `https://github.com/franckcl1989/yonder/releases/tag/v0.1.0`。
 - Rocky Linux 8.10 x86_64 对当前 relay 源码执行了真实进程生命周期门禁：新建 identity mode 为 `0600`；进程先同步安装 SIGINT/SIGTERM/SIGHUP 监听并记录 `relay_signal_handlers_installed`，再构造 libp2p 网络；测试逐项在该安装事件后立即发送三种真实信号，均在 `5s` 绝对上限内成功退出并分别记录一次 `relay_shutdown_requested` 与 `relay_stopped`。临时把 identity 放宽为 `0640` 后，`identity show` 以非零状态拒绝读取并报告不可信访问权限。最终审查另发现并修复 Unix 仅检查文件 mode、未验证直接父目录替换权限的不一致；当前实现还要求父目录禁止 group/other 写入且 owner 为 `root` 或文件 owner，并拒绝非普通文件，Rocky Linux relay 全包 `56/56` 与 workspace Clippy 通过。
 
+## 0.1.2 企业认证实现证据
+
+- 设计基线 `d1b11e6` 记录 0.1.2 最终设计：企业 relay 要求发起连接的用户先证明自己仍是该企业有效成员；不包含企业权限系统、用户管理、IAM、审计平台与 host 身份改造。需求追踪矩阵新增 R-027..R-033 七个条目，每个实现任务关联需求 ID、责任 package 与验证项。
+- 实现提交链从基线后共 `17` 个原子提交：企业模式配置与互斥（`c55f4db`）、wire 协议与会话状态机（`7d3e4af`）、凭据加载与授权 URL（`fdb37f3`）、会员验证（`004054e`）、bounded hyper 交换客户端（`0ac57fc`）、启动失败关闭（`d231d9d`）、回调服务器（`4f631f0`）、回调会话处理器与单次事务注册表（`9a39617`）、模式互斥的企业 resolve 交换（`5365e0a`）、客户端自动识别与回退（`25628b5`）、异步 UI（`a24c0cd`）、会话期限选择窗口（`2de262e`）、控制器 UI 集成（`66313d5`），以及进程级 e2e（`f6f44df`、`08aa16d`）。
+- 本地全量验证：工作区 `403` 个测试通过（含企业模式新增 `53` 个单元测试与 `4` 个进程级 e2e）、`cargo clippy --workspace --all-targets` 零警告、全平台构建干净。进程级 e2e 覆盖：回调 HTTPS 监听器对未知路径/缺参/非 GET 返回 `404/400/405`；legacy resolve 对企业 relay 返回 `UnsupportedProtocol`（旧 connect 无法使用）；真实 host 通过企业 relay 完成注册（旧 host 兼容）；真实 `yon connect` 在未完成认证时失败关闭且公共错误不含 OPAQUE/PeerId/locator/连接码。
+- 待办：0.1.2 尚未执行候选/发布矩阵（五目标 coverage、六目标原生构建、Miri、sanitizer、供应链、长 fuzz、两平台真实进程性能、六平台归档、checksum、SBOM、许可证与 provenance 消费方验证），也未创建标签；这些证据由 CI/候选运行补齐后才能发布 `v0.1.2`。
+
 ## 当前结论
 
-当前产品主路径、真实 PTY/ConPTY、四种 relay transport、自签 IP WSS、直连优先与严格 relay fallback、一次性 OPAQUE、relay restart/Reclaim/Conflict、不可信 relay 边界、资源限制、有界关闭、秘密文件和跨平台配置均已有定向、真实进程、跨平台候选和正式发布证据。`v0.1.1` 标签固定在 `5cc6ae828b45ed1c0c047d51d5e3d2ee69a97e04`；手动候选与正式标签矩阵各自完成四个 target 各 `30min` 的并行 fuzz、两平台真实进程性能、五目标 coverage、六目标原生构建、六平台单二进制归档、checksum、SBOM、许可证和 provenance 消费方验证，GitHub Release 已正式发布。历史 `v0.1.0` 标签仍固定在 `429a78dcaebd5ffd5aec792d0d468cf9e30257ab`；标签后的验证记录提交不移动任一标签，也不改变已发布产品二进制。
+当前产品主路径、真实 PTY/ConPTY、四种 relay transport、自签 IP WSS、直连优先与严格 relay fallback、一次性 OPAQUE、relay restart/Reclaim/Conflict、不可信 relay 边界、资源限制、有界关闭、秘密文件和跨平台配置均已有定向、真实进程、跨平台候选和正式发布证据。`v0.1.1` 标签固定在 `5cc6ae828b45ed1c0c047d51d5e3d2ee69a97e04`；手动候选与正式标签矩阵各自完成四个 target 各 `30min` 的并行 fuzz、两平台真实进程性能、五目标 coverage、六目标原生构建、六平台单二进制归档、checksum、SBOM、许可证和 provenance 消费方验证，GitHub Release 已正式发布。`0.1.2` 企业认证实现已完成并通过本地全量验证与进程级 e2e，候选/发布矩阵与标签待 CI 执行；历史 `v0.1.0` 标签仍固定在 `429a78dcaebd5ffd5aec792d0d468cf9e30257ab`；标签后的验证记录提交不移动任一标签，也不改变已发布产品二进制。

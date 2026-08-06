@@ -28,5 +28,12 @@
 | R-024 | relay 秘密文件在受支持平台 fail-closed | `SecretFilePolicy` + `IdentityStore` | Unix 0600、可信且不可被 group/other 写入的直接父目录；Windows protected DACL/可信 owner | Unix mode/父目录/普通文件、Windows ACL 正反测试、原生 config check、空目录 identity smoke |
 | R-025 | relay 可生产托管且可低噪声观测 | relay root task + aggregate observations | 跨平台停止信号；2s shutdown；60s 低基数汇总 | Unix/Windows 原生信号 E2E、聚合计数、拓扑配置拒绝、停止期限 |
 | R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | 两个二进制 config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |
+| R-027 | 企业模式与普通模式互斥且生命周期不可切换；企业 relay 只提供 Enterprise Resolve | yon-relay service 层 + `EnterpriseContext` | 模式由 `[enterprise_auth]` 存在性决定；`/yonder/enterprise-resolve/1.0.0` 与 legacy Resolve 二选一 accept | 模式隔离 wire 测试、进程级 e2e（旧 resolve 拒绝、旧 host 注册、未认证 connect 拒绝） |
+| R-028 | 企业会话：内存单次事务、与 connect 子流绑定、断开/超时/重启失效、防重放与重复创建 | yon-relay `session.rs` + `CallbackRegistry` | 状态机 Created..Completed + 失败态；单次 OAuth state 注册表 | 全转换 unit、单次消费/重放/容量/过期测试、TransactionGuard 断连清理 |
+| R-029 | 企业成员验证失败关闭：外部用户、离职、停用、无法确认状态一律拒绝 | yon-relay `verifier.rs` + `exchange.rs` | 企业微信 gettoken/getuserinfo/user/get；飞书 OIDC/user_info/tenant/contact | 双平台逐响应单元测试（mock 交换）、超界/传输失败/平台异常全部 fail-closed |
+| R-030 | 企业认证回调：独立 HTTPS、仅两个规范路径、极简不缓存结果页、无管理面 | yon-relay `callback.rs` | `/yonder/callback/wecom`、`/yonder/callback/feishu` | TLS 环回往返、404/400/405 拒绝、no-store 头、进程级 e2e |
+| R-031 | 认证准入资源保护：全局与按源限流、事务容量、回调连接上限、日志只记请求 ID/平台/阶段/脱敏结果 | yon-relay callback/enterprise resolve | 认证限流器 1/s burst 4；64 事务容量；16 回调连接 | 限流/容量/超时测试、e2e 泄露审计（无 OPAQUE/PeerId/locator/code） |
+| R-032 | 企业凭据：独立敏感文件、启动时一次加载、不热更新、zeroize、任一启用提供商失败即拒绝启动 | yon-relay `provider.rs` + main | 每平台一份 Secret 文档（TOML、16 KiB 上限） | 文档校验/越界/零化测试、启动失败关闭、Windows 受保护目录契约 |
+| R-033 | 新 connect 自动识别企业 relay 并完成平台选择与浏览器认证；旧 connect 无法使用企业 relay | yon protocol/controller | 先开企业子流，`UnsupportedProtocol` 回退 legacy；单平台免提示、双平台交互 | 客户端 wire 锁步测试、自动识别回退、未认证拒绝 e2e、泄露审计 |
 
 实现任务只有同时关联至少一个需求 ID、一个责任 package 和一个验证项才能进入开发。该矩阵是可追踪的当前基线，不是凌驾于产品目标之上的不可变规则；真实实现、网络或运维证据证明现有条目不合理时，应同时修订需求、设计、实现和验证，而不是为保持旧文本牺牲远程终端的正确性与可用性。发现需求没有可执行证据时视为设计缺口，不能用人工目测关闭。
