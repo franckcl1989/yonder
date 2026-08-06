@@ -1931,6 +1931,155 @@ mod tests {
         .expect("the bounded live relay scenario must finish");
     }
 
+    #[test]
+    fn enterprise_context_exposes_config_and_credentials() {
+        let config = enterprise_config("127.0.0.1:0".parse().unwrap());
+        let credentials = enterprise_credentials();
+        let context = EnterpriseContext::new(config, credentials);
+        assert_eq!(
+            context.config().providers(),
+            EnterpriseProviders::new(true, false).unwrap()
+        );
+        assert!(context.credentials().wecom().is_some());
+        assert!(context.credentials().feishu().is_none());
+        let (config, credentials) = context.into_parts();
+        assert_eq!(
+            config.providers(),
+            EnterpriseProviders::new(true, false).unwrap()
+        );
+        assert!(credentials.wecom().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_enterprise_relay_rejects_malformed_starts_without_disturbing_the_relay() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::with_enterprise(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config("127.0.0.1:0".parse().unwrap()),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+
+            // A start message with an unknown tag is rejected before any
+            // admission: the substream closes without a response and the
+            // relay keeps serving.
+            let stream = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+            )
+            .await;
+            let mut stream = stream.into_tokio();
+            stream.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await;
+            match read {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => panic!("the relay answered a malformed enterprise start"),
+                Err(_) => panic!("the relay did not close the malformed start substream"),
+            }
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the malformed enterprise start scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_relay_rejects_malformed_resolve_requests_without_a_response() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::new(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+
+            // A resolve request with an out-of-range locator is rejected:
+            // the substream closes without a response and the relay keeps
+            // serving.
+            let stream = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::RESOLVE_PROTOCOL,
+            )
+            .await;
+            let mut stream = stream.into_tokio();
+            stream.write_all(&[0xFF, 0xFF, 0xFF]).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                response.is_empty(),
+                "the relay answered a malformed resolve request"
+            );
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the malformed resolve request scenario must finish");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn live_enterprise_relay_drops_substreams_when_the_exchange_pool_is_full() {
         // Regression test for the enterprise exchange permit bound: with

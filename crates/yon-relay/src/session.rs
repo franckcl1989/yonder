@@ -725,6 +725,19 @@ mod tests {
     }
 
     #[test]
+    fn request_ids_display_as_fixed_width_hex_and_debug_never_leaks_identity() {
+        let request_id = RequestId::new(0x1234_ABCD);
+        assert_eq!(request_id.get(), 0x1234_ABCD);
+        assert_eq!(request_id.to_string(), "000000001234abcd");
+
+        // The identity debug output is redacted to the byte length only.
+        let debug = format!("{:?}", MemberIdentity::new(b"member-123").unwrap());
+        assert!(debug.contains("MemberIdentity"));
+        assert!(debug.contains("len: 10"));
+        assert!(!debug.contains("member-123"));
+    }
+
+    #[test]
     fn debug_never_leaks_identity_state_or_peer() {
         let mut session = new_session();
         session.offer_providers().unwrap();

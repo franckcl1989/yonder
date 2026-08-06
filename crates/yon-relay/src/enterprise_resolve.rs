@@ -442,6 +442,7 @@ mod tests {
     use crate::callback_session::{CallbackEntry, CallbackRegistry};
     use crate::enterprise::CallbackExternalUrl;
     use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
+    use crate::service::ProtocolTaskError;
     use crate::session::{
         EnterpriseFailure, EnterpriseResolvePhase, EnterpriseResolveSession, MemberAdmission,
         MemberIdentity, OAuthState, RequestId,
@@ -1104,6 +1105,579 @@ mod tests {
         ));
     }
 
+    /// Wraps a duplex so reads fail with an I/O error once the client has
+    /// signalled the failure, simulating a substream that dies with an
+    /// error instead of a clean EOF.
+    struct ReadErrorStream {
+        inner: tokio::io::DuplexStream,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for ReadErrorStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Ready(Err(std::io::Error::other("substream I/O failed")));
+            }
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ReadErrorStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    impl crate::service::ProtocolIo for ReadErrorStream {
+        fn into_protocol_io(self) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+            self
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_stops_when_the_owner_channel_is_gone() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(1);
+        drop(calls_rx);
+        let context = enterprise_context(Arc::new(CallbackRegistry::new()));
+
+        let client_side = async {
+            client
+                .write_all(&EnterpriseStart::new(locator()).encode())
+                .await
+                .unwrap();
+            // The exchange stops without writing anything: the substream
+            // closes and the client sees EOF.
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await;
+            match read {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => panic!("the exchange wrote data after the owner stopped"),
+                Err(_) => panic!("the exchange did not stop"),
+            }
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, ()) = tokio::join!(exchange, client_side);
+        assert!(matches!(result, Err(ProtocolTaskError::OwnerStopped)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_stops_when_the_owner_drops_the_admission() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(1);
+        let context = enterprise_context(Arc::new(CallbackRegistry::new()));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            drop(response);
+        };
+
+        let client_side = async {
+            client
+                .write_all(&EnterpriseStart::new(locator()).encode())
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await;
+            match read {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => panic!("the exchange did not stop after the dropped admission: {other:?}"),
+            }
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        assert!(matches!(result, Err(ProtocolTaskError::OwnerStopped)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_stops_when_the_owner_drops_the_resolution() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+            let call = calls_rx.recv().await.expect("resolve call");
+            let EnterpriseResolveRequest::ResolveTarget { response, .. } = call else {
+                panic!("expected resolve call");
+            };
+            drop(response);
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            simulate_callback(&registry, &state_hex).await;
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await;
+            match read {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => {
+                    panic!("the exchange did not stop after the dropped resolution: {other:?}")
+                }
+            }
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        assert!(matches!(result, Err(ProtocolTaskError::OwnerStopped)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_fails_closed_on_a_rejected_outcome() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            // The member was rejected: the session dies and the exchange
+            // answers Failed, exactly like the callback handler does.
+            let state = OAuthState::from_bytes(
+                &data_encoding::HEXLOWER
+                    .decode(state_hex.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            let entry = registry.take(&state, SystemClock::new().now()).unwrap();
+            let session = entry.session();
+            {
+                let mut guard = session.lock().unwrap();
+                guard.fail(EnterpriseFailure::UserRejected).unwrap();
+            }
+            entry.into_outcome().send(CallbackResult::Rejected).unwrap();
+            assert_eq!(
+                read_enterprise_response(&mut client).await,
+                EnterpriseResolveResponse::Failed
+            );
+            assert!(session.lock().unwrap().is_terminal());
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_fails_closed_on_an_invalid_state_outcome() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            // The state was spent or mismatched: the session dies and the
+            // exchange answers Failed.
+            let state = OAuthState::from_bytes(
+                &data_encoding::HEXLOWER
+                    .decode(state_hex.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            let entry = registry.take(&state, SystemClock::new().now()).unwrap();
+            let session = entry.session();
+            {
+                let mut guard = session.lock().unwrap();
+                guard.fail(EnterpriseFailure::InvalidState).unwrap();
+            }
+            entry
+                .into_outcome()
+                .send(CallbackResult::InvalidState)
+                .unwrap();
+            assert_eq!(
+                read_enterprise_response(&mut client).await,
+                EnterpriseResolveResponse::Failed
+            );
+            assert!(session.lock().unwrap().is_terminal());
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_fails_closed_on_invalid_selection_bytes() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(1);
+        let context = enterprise_context(Arc::new(CallbackRegistry::new()));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            // A selection with an unknown tag is a protocol violation.
+            client.write_all(&[0xFF, 0x00]).await.unwrap();
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await;
+            match read {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => panic!("the exchange answered a malformed selection: {other:?}"),
+            }
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_stops_when_the_client_drops_after_start() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(1);
+        let context = enterprise_context(Arc::new(CallbackRegistry::new()));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            client
+                .write_all(&EnterpriseStart::new(locator()).encode())
+                .await
+                .unwrap();
+            // The client disappears before the providers offer is sent:
+            // the exchange's write fails and the exchange ends.
+            drop(client);
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        assert!(matches!(result, Err(ProtocolTaskError::Io(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_stops_when_the_client_drops_after_selection() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(1);
+        let context = enterprise_context(Arc::new(CallbackRegistry::new()));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            client
+                .write_all(&EnterpriseSelect::new(EnterpriseProvider::WeCom).encode())
+                .await
+                .unwrap();
+            // The client disappears before the authorization URL is sent.
+            drop(client);
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, (), ()) = tokio::join!(exchange, client_side, owner);
+        assert!(matches!(result, Err(ProtocolTaskError::Io(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_consumes_stray_bytes_before_the_close() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            // Hold the transaction, then write stray bytes and close: the
+            // exchange consumes the stray bytes and treats the close as a
+            // disconnect (design section 8).
+            let state = OAuthState::from_bytes(
+                &data_encoding::HEXLOWER
+                    .decode(state_hex.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            let entry = registry.take(&state, SystemClock::new().now()).unwrap();
+            let session = entry.session();
+            registry
+                .insert(state, entry, SystemClock::new().now())
+                .unwrap();
+            client.write_all(b"stray bytes").await.unwrap();
+            drop(client);
+            session
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, session, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), exchange),
+            client_side,
+            owner,
+        );
+        result
+            .expect("the exchange must return promptly on disconnect")
+            .unwrap();
+        assert!(registry.is_empty());
+        assert!(matches!(
+            session.lock().unwrap().phase(),
+            EnterpriseResolvePhase::Cancelled
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_resolve_exchange_propagates_substream_read_errors() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let (client, server) = tokio::io::duplex(1024);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = ReadErrorStream {
+            inner: server,
+            fail: Arc::clone(&fail),
+        };
+        let (calls_tx, mut calls_rx) = mpsc::channel::<EnterpriseResolveRequest>(4);
+        let registry = Arc::new(CallbackRegistry::new());
+        let context = enterprise_context(Arc::clone(&registry));
+
+        let owner = async {
+            let call = calls_rx.recv().await.expect("admission call");
+            let EnterpriseResolveRequest::AdmitStart { response, .. } = call else {
+                panic!("expected admission call");
+            };
+            response
+                .send(Ok(EnterpriseResolveAdmission::Admitted))
+                .expect("exchange waits");
+        };
+
+        let client_side = async {
+            let mut client = client;
+            let providers = client_offer_providers(&mut client).await;
+            assert_eq!(providers, EnterpriseProviders::new(true, false).unwrap());
+            let url = client_select_provider(&mut client, EnterpriseProvider::WeCom).await;
+            let state_hex = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            // The transaction is registered while the callback is pending.
+            let state = OAuthState::from_bytes(
+                &data_encoding::HEXLOWER
+                    .decode(state_hex.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            let entry = registry.take(&state, SystemClock::new().now()).unwrap();
+            let session = entry.session();
+            registry
+                .insert(state, entry, SystemClock::new().now())
+                .unwrap();
+            // The substream dies with an I/O error instead of a clean
+            // close: the exchange propagates it fail-closed.
+            fail.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(client);
+            session
+        };
+
+        let exchange = enterprise_resolve_exchange(
+            peer,
+            server,
+            calls_tx,
+            context,
+            SystemClock::new(),
+            OsSecureRandom,
+        );
+        let (result, session, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), exchange),
+            client_side,
+            owner,
+        );
+        let result = result
+            .expect("the exchange must return promptly on the read error")
+            .unwrap_err();
+        assert!(matches!(result, ProtocolTaskError::Io(_)));
+        assert!(registry.is_empty());
+        assert!(matches!(
+            session.lock().unwrap().phase(),
+            EnterpriseResolvePhase::Cancelled
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn transaction_guard_frees_the_registry_slot_on_drop() {
         let registry = Arc::new(CallbackRegistry::new());
@@ -1183,6 +1757,61 @@ mod tests {
         assert!(!limiters.sources.contains_key(&old));
         assert!(limiters.sources.contains_key(&other));
         assert!(limiters.sources.contains_key(&fresh));
+    }
+
+    #[test]
+    fn admission_retries_when_the_peer_has_no_unique_connection() {
+        let mut limiters = EnterpriseLimiters::new();
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        // The peer has no established connection at all: the admission
+        // cannot be attributed to a source and fails closed with a retry.
+        let connections = ConnectionBook::new();
+        let decision = handle_enterprise_admission(
+            peer,
+            &connections,
+            &SystemClock::new(),
+            &mut limiters,
+            RetryAfter::from_millis(250).unwrap(),
+        );
+        assert!(matches!(decision, Ok(EnterpriseResolveAdmission::Retry(_))));
+    }
+
+    #[test]
+    fn admission_retries_when_the_source_limiter_is_exhausted() {
+        let mut limiters = EnterpriseLimiters::new();
+        let started = MonotonicTime::from_elapsed(Duration::ZERO);
+        let source = SourcePrefix::Ipv4("192.0.2.1".parse().unwrap());
+        // The authentication limiter allows a burst of four; the fifth
+        // check on the same source fails. The first check also creates
+        // the source entry, so the later checks exercise the existing
+        // entry branch of the table.
+        for _ in 0..4 {
+            assert!(limiters.check_source(source, started));
+        }
+        assert!(!limiters.check_source(source, started));
+
+        // The global limiter still has capacity, so the admission fails
+        // at the per-source check.
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let mut connections = ConnectionBook::new();
+        connections
+            .established(
+                peer,
+                ConnectionId::new_unchecked(1),
+                ConnectedPoint::Listener {
+                    local_addr: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+                    send_back_addr: "/ip4/192.0.2.1/tcp/1".parse().unwrap(),
+                },
+            )
+            .unwrap();
+        let decision = handle_enterprise_admission(
+            peer,
+            &connections,
+            &SystemClock::new(),
+            &mut limiters,
+            RetryAfter::from_millis(250).unwrap(),
+        );
+        assert!(matches!(decision, Ok(EnterpriseResolveAdmission::Retry(_))));
     }
 
     #[test]

@@ -353,7 +353,7 @@ mod tests {
     use super::{
         FeishuCredentials, MAX_APP_SECRET_BYTES, MAX_CREDENTIAL_ID_BYTES,
         MAX_PROVIDER_SECRET_BYTES, ProviderCredentials, ProviderError, ProviderField, SecretText,
-        WeComCredentials, callback_path, encode_state, redirect_uri,
+        WeComCredentials, callback_path, encode_state, map_secret_policy_error, redirect_uri,
     };
     use crate::enterprise::CallbackExternalUrl;
     use crate::session::OAuthState;
@@ -605,5 +605,100 @@ mod tests {
         assert!(wecom.app_secret.as_str().is_empty());
         assert!(feishu.app_id.as_str().is_empty());
         assert!(feishu.app_secret.as_str().is_empty());
+    }
+
+    #[test]
+    fn wecom_agent_ids_are_bounded_to_the_documented_range() {
+        let directory = tempfile::tempdir().unwrap();
+        for agent_id in ["0", "-1", "4294967296"] {
+            let secret = write_secret(
+                directory.path(),
+                &format!("wecom-{agent_id}.secret"),
+                &format!(
+                    "corp_id = \"ww1234567890abcdef\"\nagent_id = {agent_id}\napp_secret = \"s3cret\"\n"
+                ),
+            );
+            assert!(matches!(
+                ProviderCredentials::load(&config_with(Some(secret), None)),
+                Err(ProviderError::InvalidCredential(ProviderField::AgentId))
+            ));
+        }
+    }
+
+    #[test]
+    fn secret_policy_failures_map_to_provider_errors() {
+        // The mapping is a pure fail-closed boundary: every policy failure
+        // becomes the matching provider error.
+        let path = std::path::Path::new("wecom.secret");
+        assert!(matches!(
+            map_secret_policy_error(
+                path,
+                crate::secret_file::SecretFileError::Insecure
+            ),
+            ProviderError::Insecure(mapped) if mapped == path
+        ));
+        assert!(matches!(
+            map_secret_policy_error(
+                path,
+                crate::secret_file::SecretFileError::Platform(std::io::Error::other("platform"))
+            ),
+            ProviderError::Read { source, .. } if source.kind() == std::io::ErrorKind::Other
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_secret_files_fail_closed_at_load() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let secret = directory.path().join("wecom.secret");
+        fs::write(
+            &secret,
+            "corp_id = \"ww1234567890abcdef\"\nagent_id = 7\napp_secret = \"s3cret\"\n",
+        )
+        .unwrap();
+        // The secret file keeps the default group-readable mode: the
+        // policy rejects it and the load fails closed.
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            ProviderCredentials::load(&config_with(Some(secret), None)),
+            Err(ProviderError::Insecure(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn untrusted_secret_files_fail_closed_at_load() {
+        use crate::secret_file::{SecretFilePolicy as _, SystemSecretFilePolicy};
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::tempdir().unwrap();
+        let secret = directory.path().join("wecom.secret");
+        fs::write(
+            &secret,
+            "corp_id = \"ww1234567890abcdef\"\nagent_id = 7\napp_secret = \"s3cret\"\n",
+        )
+        .unwrap();
+        crate::secret_file::secure_test_directory(directory.path());
+        let file = fs::File::open(&secret).unwrap();
+        SystemSecretFilePolicy.protect_new(&secret, &file).unwrap();
+        // Re-enable ACL inheritance: the protected DACL is lost and the
+        // policy rejects the file at load.
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        let status =
+            Command::new(std::path::PathBuf::from(system_root).join("System32/icacls.exe"))
+                .arg(&secret)
+                .arg("/inheritance:e")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+        assert!(status.success());
+        assert!(matches!(
+            ProviderCredentials::load(&config_with(Some(secret), None)),
+            Err(ProviderError::Insecure(_))
+        ));
     }
 }

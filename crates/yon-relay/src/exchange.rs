@@ -329,5 +329,60 @@ mod tests {
             "application/json"
         );
         assert_eq!(post.body(), "{}");
+
+        // An unparsable URI fails the request construction fail-closed.
+        let error = build_get_request("not a uri".to_owned(), None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("invalid exchange request"));
+        let error = build_post_request("not a uri".to_owned(), "{}".to_owned()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("invalid exchange request"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_client_is_the_https_only_production_client() {
+        // The Default impl is the production client: it must refuse
+        // cleartext exchange URLs just like `new`.
+        let (address, captured) = serve_one(
+            hyper::Response::builder()
+                .status(200)
+                .body("ok".to_owned())
+                .unwrap(),
+        )
+        .await;
+        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
+        assert!(ExchangeClient::default().get(&url, None).await.is_err());
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "the default client must never send exchange data over cleartext"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncated_response_bodies_fail_the_exchange() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // A raw HTTP/1.1 server announces a 100-byte body but sends only
+        // five bytes and closes the connection: the exchange fails with an
+        // EOF-style read error, never with InvalidData (the size limit was
+        // not reached).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .await
+                .unwrap();
+            // Dropping the stream closes the connection mid-body.
+        });
+        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
+        let error = client().get(&url, None).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("exchange response read failed"));
     }
 }

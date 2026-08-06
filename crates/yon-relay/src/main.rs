@@ -807,11 +807,11 @@ fn read_tls_document_from(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppError, Cli, Command, ConfigCommand, IdentityCommand, LogLevel, RELAY_SCHEMA,
-        TlsDocumentKind, execute_command, initialize_identity, initialize_identity_with,
-        map_tls_policy_error, read_tls_document, read_tls_document_from, relay_runtime,
-        report_configuration_valid_to, report_peer_id_to, run, serve_config_with, show_identity,
-        write_error_report,
+        AppError, Cli, Command, ConfigCommand, EnterpriseConfigError, IdentityCommand, LogLevel,
+        RELAY_SCHEMA, TlsDocumentKind, execute_command, initialize_identity,
+        initialize_identity_with, map_tls_policy_error, read_tls_document, read_tls_document_from,
+        relay_runtime, report_configuration_valid_to, report_peer_id_to, run, serve_config_with,
+        serve_relay, show_identity, write_error_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -1697,6 +1697,202 @@ exit 0
             serve_config_with(&loader),
             Err(AppError::EnterpriseProvider(_))
         ));
+    }
+
+    /// Writes the full enterprise-mode settings and the shared fixture
+    /// files, returning the loader and the settings prefix.
+    fn enterprise_fixture(
+        directory: &std::path::Path,
+    ) -> (LayeredConfigLoader<TestSources>, String) {
+        let identity = directory.join("relay.identity");
+        initialize_identity(&identity).unwrap();
+        let certificate = directory.join("callback-cert.der");
+        fs::write(&certificate, TEST_WSS_CERTIFICATE_DER).unwrap();
+        let private_key = directory.join("callback-key.der");
+        write_private_key(&private_key, TEST_WSS_PRIVATE_KEY_DER);
+        let wecom_secret = directory.join("wecom.secret");
+        write_secret_document(
+            &wecom_secret,
+            b"corp_id = \"ww1234567890abcdef\"\nagent_id = 1000002\napp_secret = \"s3cret\"\n",
+        );
+        let prefix = "identity='relay.identity'\nlisten=['/ip4/127.0.0.1/tcp/0']\nexternal=['/ip4/127.0.0.1/tcp/1']\n[enterprise_auth]\nsecret_wecom='wecom.secret'\n";
+        (test_loader(directory.to_path_buf()), prefix.to_owned())
+    }
+
+    #[test]
+    fn enterprise_tls_settings_respect_layer_precedence_and_conflicts() {
+        let directory = test_directory();
+        let (loader, prefix) = enterprise_fixture(directory.path());
+        let system = directory.path().join("system").join("yon-relay.toml");
+        fs::create_dir_all(directory.path().join("system")).unwrap();
+        let callback = "callback_listen='127.0.0.1:8443'\ncallback_external_url='https://relay.example.test'\n";
+
+        // New-style keys in the working file win over legacy keys in the
+        // system file (higher-precedence source).
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}{callback}certificate=['callback-cert.der']\nprivate_key='callback-key.der'\n"
+            ),
+        );
+        fs::write(
+            &system,
+            "[enterprise_auth]\ncertificate_der=['legacy.der']\nprivate_key_der='legacy.der'\n",
+        )
+        .unwrap();
+        assert!(serve_config_with(&loader).is_ok());
+
+        // Legacy keys in the working file win over new-style keys in the
+        // system file (lower-precedence source).
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}{callback}certificate_der=['callback-cert.der']\nprivate_key_der='callback-key.der'\n"
+            ),
+        );
+        fs::write(
+            &system,
+            "[enterprise_auth]\ncertificate=['callback-cert.der']\nprivate_key='callback-key.der'\n",
+        )
+        .unwrap();
+        assert!(serve_config_with(&loader).is_ok());
+
+        // The same-layer conflicts fail closed.
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}{callback}certificate=['callback-cert.der']\ncertificate_der=['callback-cert.der']\nprivate_key='callback-key.der'\n"
+            ),
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::ConflictingEnterpriseCertificate)
+        ));
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}{callback}certificate=['callback-cert.der']\nprivate_key='callback-key.der'\nprivate_key_der='callback-key.der'\n"
+            ),
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::ConflictingEnterprisePrivateKey)
+        ));
+
+        // The legacy der-only forms are accepted (with no other-layer
+        // key to compare against).
+        fs::remove_file(&system).unwrap();
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}{callback}certificate_der=['callback-cert.der']\nprivate_key_der='callback-key.der'\n"
+            ),
+        );
+        assert!(serve_config_with(&loader).is_ok());
+
+        // The certificate document count is bounded.
+        write_config(
+            directory.path(),
+            &format!("{prefix}{callback}certificate=[]\nprivate_key='callback-key.der'\n"),
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::InvalidEnterpriseCertificateDocumentCount)
+        ));
+    }
+
+    #[test]
+    fn enterprise_config_requires_callback_listen_url_and_tls() {
+        let directory = test_directory();
+        let (loader, prefix) = enterprise_fixture(directory.path());
+
+        // The certificate and private key are required together.
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}callback_listen='127.0.0.1:8443'\ncallback_external_url='https://relay.example.test'\n"
+            ),
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::EnterpriseConfig(
+                EnterpriseConfigError::MissingCallbackTls
+            ))
+        ));
+
+        // The callback listener is required.
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}certificate=['callback-cert.der']\nprivate_key='callback-key.der'\ncallback_external_url='https://relay.example.test'\n"
+            ),
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::EnterpriseConfig(
+                EnterpriseConfigError::MissingCallbackListen
+            ))
+        ));
+
+        // The callback external URL is required.
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}certificate=['callback-cert.der']\nprivate_key='callback-key.der'\ncallback_listen='127.0.0.1:8443'\n"
+            ),
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::EnterpriseConfig(
+                EnterpriseConfigError::MissingCallbackUrl
+            ))
+        ));
+
+        // The callback URL must be a bare https origin.
+        write_config(
+            directory.path(),
+            &format!(
+                "{prefix}certificate=['callback-cert.der']\nprivate_key='callback-key.der'\ncallback_listen='127.0.0.1:8443'\ncallback_external_url='http://relay.example.test'\n"
+            ),
+        );
+        assert!(matches!(
+            serve_config_with(&loader),
+            Err(AppError::EnterpriseConfig(
+                EnterpriseConfigError::CallbackUrlScheme
+            ))
+        ));
+    }
+
+    #[test]
+    fn serve_command_propagates_relay_startup_failures_fail_closed() {
+        // A listen address that is already bound fails the relay startup;
+        // serve_relay maps the runtime failure into the AppError chain.
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let result = execute_command(
+            Command::Serve,
+            || {
+                yon_relay::RelayServeConfig::new(
+                    yonder_net::Keypair::generate_ed25519(),
+                    vec![format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap()],
+                    vec![format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap()],
+                    yonder_net::WssTransportConfig::client(None),
+                )
+                .map_err(AppError::from)
+            },
+            serve_relay,
+        );
+        assert!(matches!(result, Err(AppError::Service(_))));
+    }
+
+    #[test]
+    fn app_error_output_reports_the_failure_chain() {
+        let error = AppError::Output(io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed"));
+        let mut report = Vec::new();
+        write_error_report(&mut report, &error).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.starts_with("error: failed to write command output\n"));
+        assert!(report.contains("caused by: stdout closed"));
     }
 
     #[test]

@@ -238,11 +238,47 @@ mod tests {
         assert!(CallbackExternalUrl::new(url("https://relay.example.test/cb")).is_err());
         assert!(CallbackExternalUrl::new(url("https://relay.example.test?x=1")).is_err());
         assert!(CallbackExternalUrl::new(url("https://relay.example.test#f")).is_err());
+        // IP-literal hosts are public callback targets too.
+        assert!(CallbackExternalUrl::new(url("https://127.0.0.1")).is_ok());
+        assert!(CallbackExternalUrl::new(url("https://[::1]")).is_ok());
         // `https://` is rejected at parse time with a structured error.
         assert!(matches!(
             Url::parse("https://"),
             Err(url::ParseError::EmptyHost)
         ));
+    }
+
+    #[test]
+    fn config_accessors_expose_every_validated_part() {
+        let listen: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let callback = CallbackExternalUrl::new(url("https://relay.example.test")).unwrap();
+        let providers = EnterpriseProviders::new(true, true).unwrap();
+        let secrets = ProviderSecrets::new(
+            providers,
+            Some(PathBuf::from("wecom.secret")),
+            Some(PathBuf::from("feishu.secret")),
+        )
+        .unwrap();
+        let config = EnterpriseAuthConfig::new(
+            listen,
+            callback.clone(),
+            vec![SecretDocument::new(vec![1, 2, 3])],
+            SecretDocument::new(vec![4, 5, 6]),
+            providers,
+            secrets,
+        )
+        .unwrap();
+        assert_eq!(config.listen(), listen);
+        assert_eq!(config.callback_url(), callback.as_url());
+        assert_eq!(config.callback_external(), &callback);
+        assert_eq!(config.certificate_chain().len(), 1);
+        assert_eq!(config.certificate_chain()[0].as_bytes(), &[1, 2, 3]);
+        assert_eq!(config.private_key().as_bytes(), &[4, 5, 6]);
+        assert_eq!(config.providers(), providers);
+        assert_eq!(
+            config.secret_path(EnterpriseProvider::WeCom),
+            Some(Path::new("wecom.secret"))
+        );
     }
 
     #[test]
@@ -265,6 +301,15 @@ mod tests {
             config(
                 true,
                 false,
+                Some(PathBuf::from("wecom.secret")),
+                Some(PathBuf::from("feishu.secret"))
+            ),
+            Err(EnterpriseConfigError::UnexpectedProviderSecret)
+        ));
+        assert!(matches!(
+            config(
+                false,
+                true,
                 Some(PathBuf::from("wecom.secret")),
                 Some(PathBuf::from("feishu.secret"))
             ),

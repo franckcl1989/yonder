@@ -681,4 +681,123 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn callback_result_labels_are_low_cardinality_and_stable() {
+        let cases = [
+            (CallbackResult::Admitted, "admitted"),
+            (CallbackResult::Rejected, "rejected"),
+            (CallbackResult::InvalidState, "invalid-state"),
+            (CallbackResult::Platform, "platform"),
+            (CallbackResult::Limited, "limited"),
+        ];
+        for (outcome, label) in cases {
+            assert_eq!(outcome.as_str(), label);
+        }
+    }
+
+    #[test]
+    fn callback_server_reports_its_configured_listener() {
+        let listen: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = server_with(listen);
+        assert_eq!(server.listen(), listen);
+    }
+
+    #[test]
+    fn malformed_pem_certificate_sections_are_rejected() {
+        // A PEM document whose certificate section is not valid base64
+        // fails the certificate filter fail-closed.
+        let garbage = b"-----BEGIN CERTIFICATE-----\nnot-base64!\n-----END CERTIFICATE-----\n";
+        assert!(matches!(
+            parse_certificates(&[SecretDocument::new(garbage.to_vec())]),
+            Err(CallbackServerError::InvalidCertificate)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn excess_callback_connections_are_dropped_fail_closed() {
+        use tokio::io::AsyncReadExt as _;
+
+        let server = server_with("127.0.0.1:0".parse().unwrap());
+        let (listener, address) = server.bind().await.unwrap();
+        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
+        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
+
+        // Every connection holds its permit during the TLS handshake, so
+        // the connection capacity is exhausted; the next connection is
+        // dropped immediately (fail closed).
+        let mut held = Vec::new();
+        for _ in 0..MAX_CALLBACK_CONNECTIONS {
+            held.push(tokio::net::TcpStream::connect(address).await.unwrap());
+        }
+        tokio::task::yield_now().await;
+        let mut overflow = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut byte = [0_u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), overflow.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("the overflow connection received data"),
+            Err(_) => panic!("the overflow connection was not dropped by the server"),
+        }
+        serving.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_tls_handshakes_close_the_connection_immediately() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let server = server_with("127.0.0.1:0".parse().unwrap());
+        let (listener, address) = server.bind().await.unwrap();
+        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
+        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
+
+        // Plain bytes are not a TLS handshake: the server rejects the
+        // connection instead of pinning its permit until the timeout. The
+        // rejection may include a TLS alert before the close, so the test
+        // accepts bytes and only requires the connection to end promptly.
+        let mut raw = tokio::net::TcpStream::connect(address).await.unwrap();
+        raw.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buffer = [0_u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match raw.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the failed handshake connection was not closed by the server"
+        );
+        serving.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_code_and_oversized_parameters_are_rejected() {
+        let server = server_with("127.0.0.1:0".parse().unwrap());
+        let (listener, address) = server.bind().await.unwrap();
+        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
+        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
+
+        // The state parameter is present but the code is missing.
+        let (status, _) = tls_request(
+            address,
+            "GET /yonder/callback/wecom?state=abcdef HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+
+        // The authorization code exceeds the wire bound.
+        let oversized = format!(
+            "GET /yonder/callback/wecom?code={}&state=abcdef HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
+            "a".repeat(crate::verifier::MAX_AUTHORIZATION_CODE_BYTES + 1)
+        );
+        let (status, _) = tls_request(address, &oversized).await;
+        assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+
+        serving.abort();
+    }
 }

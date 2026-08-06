@@ -780,4 +780,429 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, VerifyError::Platform));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wecom_stepwise_transport_failures_are_fail_closed() {
+        // The member-userid exchange fails at the transport.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            Err(io::Error::other("network unreachable")),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The member-status exchange fails at the transport.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            ok(r#"{"errcode":0,"errmsg":"ok","userid":"zhang-san"}"#),
+            Err(io::Error::other("network unreachable")),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wecom_unknown_userid_errcode_is_fail_closed() {
+        // The member-userid call answers an errcode other than zero and
+        // 60111; the identity is unconfirmable and the exchange fails
+        // closed.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            ok(r#"{"errcode":40013,"errmsg":"invalid corpid"}"#),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wecom_stepwise_unparsable_responses_are_fail_closed() {
+        // The member-userid call answers bytes that are not JSON.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            Ok(b"<html>not json</html>".to_vec()),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The member-status call answers bytes that are not JSON.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            ok(r#"{"errcode":0,"errmsg":"ok","userid":"zhang-san"}"#),
+            Ok(b"<html>not json</html>".to_vec()),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wecom_stepwise_oversized_responses_are_fail_closed() {
+        let oversized = || {
+            let mut body = br#"{"errcode":0,"errmsg":"ok","access_token":""#.to_vec();
+            body.extend(vec![b'x'; (MAX_EXCHANGE_RESPONSE_BYTES + 1) as usize]);
+            body.extend_from_slice(b"\"}");
+            Ok(body)
+        };
+        // The member-userid call exceeds the bounded body size.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            oversized(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::ResponseTooLarge));
+
+        // The member-status call exceeds the bounded body size.
+        let exchange = MockExchange::new(vec![
+            ok(r#"{"errcode":0,"errmsg":"ok","access_token":"tok-1","expires_in":7200}"#),
+            ok(r#"{"errcode":0,"errmsg":"ok","userid":"zhang-san"}"#),
+            oversized(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::ResponseTooLarge));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn feishu_stepwise_failures_are_fail_closed() {
+        // The user-token exchange fails at the transport.
+        let exchange = MockExchange::new(vec![Err(io::Error::other("network unreachable"))]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The user-token call answers a non-zero code.
+        let exchange = MockExchange::new(vec![ok(r#"{"code":10003,"msg":"invalid app_secret"}"#)]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The employee-id exchange fails at the transport.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            Err(io::Error::other("network unreachable")),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The employee-id call answers a non-zero code.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(r#"{"code":99991663,"msg":"token invalid"}"#),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The tenant-token exchange fails at the transport.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
+            Err(io::Error::other("network unreachable")),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The employee-status exchange fails at the transport.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
+            ok(r#"{"code":0,"tenant_access_token":"tnt-tok","expire":7200}"#),
+            Err(io::Error::other("network unreachable")),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn feishu_stepwise_unparsable_responses_are_fail_closed() {
+        let not_json = || Ok(b"<html>not json</html>".to_vec());
+        // The user-token call answers bytes that are not JSON.
+        let exchange = MockExchange::new(vec![not_json()]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The employee-id call answers bytes that are not JSON.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            not_json(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The tenant-token call answers bytes that are not JSON.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
+            not_json(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // The employee-status call answers bytes that are not JSON.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
+            ok(r#"{"code":0,"tenant_access_token":"tnt-tok","expire":7200}"#),
+            not_json(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn feishu_stepwise_oversized_responses_are_fail_closed() {
+        let oversized = || {
+            let mut body = br#"{"code":0,"data":{"access_token":""#.to_vec();
+            body.extend(vec![b'x'; (MAX_EXCHANGE_RESPONSE_BYTES + 1) as usize]);
+            body.extend_from_slice(b"\"}}");
+            Ok(body)
+        };
+        // The user-token call exceeds the bounded body size.
+        let exchange = MockExchange::new(vec![oversized()]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::ResponseTooLarge));
+
+        // The employee-id call exceeds the bounded body size.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            oversized(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::ResponseTooLarge));
+
+        // The tenant-token call exceeds the bounded body size.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
+            oversized(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::ResponseTooLarge));
+
+        // The employee-status call exceeds the bounded body size.
+        let exchange = MockExchange::new(vec![
+            ok(
+                r#"{"code":0,"data":{"access_token":"usr-tok","expires_in":7200,"refresh_token":"r","token_type":"Bearer"}}"#,
+            ),
+            ok(r#"{"code":0,"data":{"open_id":"ou_123","user_id":"cli_user_7"}}"#),
+            ok(r#"{"code":0,"tenant_access_token":"tnt-tok","expire":7200}"#),
+            oversized(),
+        ]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::Feishu,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::ResponseTooLarge));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_json_responses_are_fail_closed() {
+        // The access-token call answers bytes that are not JSON at all;
+        // the exchange cannot confirm anything and fails closed.
+        let exchange = MockExchange::new(vec![Ok(b"<html>not json</html>".to_vec())]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+
+        // A well-formed envelope that omits the access token is
+        // unconfirmable and fails closed the same way.
+        let exchange = MockExchange::new(vec![ok(r#"{"errcode":0,"errmsg":"ok"}"#)]);
+        let error = verify_member(
+            &exchange,
+            EnterpriseProvider::WeCom,
+            "auth-code-1",
+            &credentials(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Platform));
+    }
+
+    #[test]
+    fn verify_error_displays_are_stable_and_fail_closed() {
+        let cases = [
+            (
+                VerifyError::Platform,
+                "the enterprise provider exchange failed or was unconfirmable",
+            ),
+            (
+                VerifyError::Rejected,
+                "the authorizing user is not an active member of the enterprise",
+            ),
+            (
+                VerifyError::ResponseTooLarge,
+                "the enterprise provider response exceeded the bounded size",
+            ),
+            (
+                VerifyError::InvalidCode,
+                "the enterprise authorization code is malformed or too large",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), message);
+        }
+    }
 }

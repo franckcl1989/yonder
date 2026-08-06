@@ -356,8 +356,8 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        CallbackEntry, CallbackRegistry, CallbackRegistryError, CallbackSessionHandler,
-        decode_state,
+        CALLBACK_SOURCE_CAPACITY, CallbackEntry, CallbackRegistry, CallbackRegistryError,
+        CallbackSessionHandler, decode_state,
     };
     use crate::callback::CallbackHandler as _;
     use crate::callback::CallbackResult;
@@ -712,6 +712,66 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn registry_default_uses_the_documented_capacity() {
+        let registry = CallbackRegistry::default();
+        assert_eq!(registry.len(), 0);
+        let started = now();
+        let (session, state) = authenticating_session(started);
+        let (callback_entry, _outcome) = entry(session, started);
+        registry.insert(state, callback_entry, started).unwrap();
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn source_table_rejects_new_sources_beyond_capacity() {
+        // The per-source callback table is bounded by
+        // CALLBACK_SOURCE_CAPACITY; a new source beyond the bound fails
+        // closed while existing sources keep their entries.
+        let handler = handler_with(FakeExchange::new(Vec::new()));
+        let started = now();
+        for index in 0..CALLBACK_SOURCE_CAPACITY {
+            let source: IpAddr = format!("10.{}.{}.9", index >> 8, index & 0xFF)
+                .parse()
+                .unwrap();
+            assert!(
+                handler.check_source(source, started),
+                "source {index} admitted"
+            );
+        }
+        assert_eq!(
+            handler.sources.lock().unwrap().len(),
+            CALLBACK_SOURCE_CAPACITY
+        );
+        let overflow: IpAddr = "10.255.255.9".parse().unwrap();
+        assert!(!handler.check_source(overflow, started));
+        assert_eq!(
+            handler.sources.lock().unwrap().len(),
+            CALLBACK_SOURCE_CAPACITY
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_rejects_malformed_states_before_looking_up_transactions() {
+        let exchange = FakeExchange::new(Vec::new());
+        let handler = handler_with(exchange);
+        let source: IpAddr = "203.0.113.9".parse().unwrap();
+        // A state that is not lowercase hex fails closed as malformed
+        // without touching the registry.
+        assert_eq!(
+            handler
+                .handle(
+                    EnterpriseProvider::WeCom,
+                    "auth-code-1",
+                    "not-hex-state!",
+                    source,
+                )
+                .await,
+            CallbackResult::InvalidState
+        );
+        assert!(handler.registry.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
