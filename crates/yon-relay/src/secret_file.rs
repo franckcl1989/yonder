@@ -202,10 +202,57 @@ foreach($sid in @($current,$system,$administrators)){$rule=New-Object Security.A
 exit 0
 "#;
 
+/// Replaces a test directory ACL with the trusted-only policy so secret
+/// files created inside it pass the Windows parent-directory check.
+#[cfg(all(test, windows))]
+pub(crate) fn secure_test_directory(path: &std::path::Path) {
+    use std::process::{Command, Stdio};
+
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$path=$env:YONDER_TEST_DIRECTORY
+$current=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+$administrators=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+$acl=New-Object Security.AccessControl.DirectorySecurity
+$acl.SetOwner($current)
+$acl.SetAccessRuleProtection($true,$false)
+$rights=[Security.AccessControl.FileSystemRights]::FullControl
+$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+$propagate=[Security.AccessControl.PropagationFlags]::None
+$allow=[Security.AccessControl.AccessControlType]::Allow
+foreach($sid in @($current,$system,$administrators)){$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,$rights,$inherit,$propagate,$allow);[void]$acl.AddAccessRule($rule)}
+[IO.Directory]::SetAccessControl($path,$acl)
+exit 0
+"#;
+    let system_root = std::env::var_os("SystemRoot").unwrap();
+    let status = Command::new(
+        std::path::PathBuf::from(system_root)
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+    )
+    .args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        SCRIPT,
+    ])
+    .env("YONDER_TEST_DIRECTORY", path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(all(test, not(windows)))]
+pub(crate) fn secure_test_directory(_path: &std::path::Path) {}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{SecretFileError, SecretFilePolicy, SystemSecretFilePolicy};
+    use super::{SecretFileError, SecretFilePolicy, SystemSecretFilePolicy, secure_test_directory};
     #[cfg(windows)]
     use super::{windows_policy_status, windows_powershell_executable};
     use std::fs::File;
@@ -359,50 +406,5 @@ mod tests {
                 .status()
                 .is_ok_and(|status| status.success())
         }
-    }
-
-    #[cfg(not(windows))]
-    fn secure_test_directory(_path: &std::path::Path) {}
-
-    #[cfg(windows)]
-    fn secure_test_directory(path: &std::path::Path) {
-        use std::process::{Command, Stdio};
-
-        const SCRIPT: &str = r#"
-$ErrorActionPreference='Stop'
-$path=$env:YONDER_TEST_DIRECTORY
-$current=[Security.Principal.WindowsIdentity]::GetCurrent().User
-$system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
-$administrators=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
-$acl=New-Object Security.AccessControl.DirectorySecurity
-$acl.SetOwner($current)
-$acl.SetAccessRuleProtection($true,$false)
-$rights=[Security.AccessControl.FileSystemRights]::FullControl
-$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-$propagate=[Security.AccessControl.PropagationFlags]::None
-$allow=[Security.AccessControl.AccessControlType]::Allow
-foreach($sid in @($current,$system,$administrators)){$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,$rights,$inherit,$propagate,$allow);[void]$acl.AddAccessRule($rule)}
-[IO.Directory]::SetAccessControl($path,$acl)
-exit 0
-"#;
-        let system_root = std::env::var_os("SystemRoot").unwrap();
-        let status = Command::new(
-            std::path::PathBuf::from(system_root)
-                .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
-        )
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            SCRIPT,
-        ])
-        .env("YONDER_TEST_DIRECTORY", path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-        assert!(status.success());
     }
 }
