@@ -40,12 +40,16 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | --- | --- | --- | --- |
 | `backon` | `1.6.0`; `std,tokio-sleep` | `yon`; controller 重连、查询与认证退避 | Apache-2.0，维护活跃；替代手写退避。冷路径，小型 fastrand jitter，无原生库；不让共享网络 crate 或 fuzz 构建承担未使用依赖 |
 | `clap` | `4.6.4`; `color,derive,error-context,help,std,suggestions,usage` | 两个 binary；CLI | MIT/Apache-2.0，事实标准；替代手写解析。主要增加启动/体积，不在数据热路径 |
-| `config` | `0.15.25`; `toml` | `yonder-config`；严格分层配置 | MIT/Apache-2.0，成熟；替代手写 TOML、环境变量嵌套与合并。只在启动冷路径，禁用 async/json/yaml 等未使用能力 |
+| `config` | `0.15.25`; `toml` | `yonder-config`；严格分层配置；`yon-relay` 企业 Secret 文档解析 | MIT/Apache-2.0，成熟；替代手写 TOML、环境变量嵌套与合并。只在启动冷路径，禁用 async/json/yaml 等未使用能力 |
 | `crossterm` | `0.29.0`; `bracketed-paste,events,windows` | `yon`; raw mode、尺寸、显示恢复与终端事件控制序列 | MIT，成熟跨平台；替代平台终端 FFI 及手写 ANSI 序列。只在 controller 链接 |
 | `crossterm_winapi` | `0.9.1`; 无 feature | `yon` Windows；console input/output mode 保存与恢复 | MIT，Crossterm 同生态的 safe wrapper，已是锁定树中的传递依赖；替代第一方 Win32 FFI/`unsafe`，只在 Windows controller 链接，不新增 package |
-| `data-encoding` | `2.11.0`; `std` | `yonder-core`; Crockford Base32 | MIT，成熟、零拷贝 API；替代手写编码表。影响极小 |
+| `data-encoding` | `2.11.0`; `std` | `yonder-core`; Crockford Base32；`yon-relay` OAuth state 十六进制编解码 | MIT，成熟、零拷贝 API；替代手写编码表。影响极小 |
 | `futures` | `0.3.33`; `async-await,std` | `yonder-net`; libp2p stream I/O | MIT/Apache-2.0，Rust 异步基础库；不引入 executor |
 | `governor` | `0.10.4`; `std` | `yonder-core`; relay/query/auth GCRA | MIT，成熟；替代手写令牌桶。只用 direct limiter，不用 keyed store/等待队列；已测 direct limiter 40 B、调用约 30 ns |
+| `http-body-util` | `0.1.4`; 无 feature | `yon-relay`; 企业 OAuth 响应有界读取 | MIT/Apache-2.0，hyper 官方工具；`Limited` 在读取层强制 64 KiB 响应上限，替代手写长度检查 |
+| `hyper` | `1.11.0`; `client,http1,server` | `yon-relay`; 企业回调 HTTPS 与 OAuth API 客户端 | MIT/Apache-2.0，事实标准；单一 HTTP 栈同时服务回调服务器与外部 API 客户端，不引入第二套 HTTP 实现。只在企业模式冷路径 |
+| `hyper-rustls` | `0.27.9`; `http1,ring,tls12,webpki-tokio` | `yon-relay`; OAuth API 客户端 TLS | MIT/Apache-2.0，rustls 官方集成；webpki 根库静态、无系统 CA 依赖，与锁定树 rustls/ring 后端一致 |
+| `hyper-util` | `0.1.20`; `client-legacy,http1,server,server-auto,tokio` | `yon-relay`; hyper 运行时适配 | MIT/Apache-2.0，hyper 官方工具；client legacy 连接池与 server auto 适配器 |
 | `libp2p` | `0.56.0`; `autonat,dcutr,dns,ed25519,identify,macros,memory-connection-limits,noise,ping,quic,relay,tcp,tokio,upnp,websocket,yamux` | `yonder-net`; 完整网络栈 | MIT，官方 rust-libp2p；替代自研传输、NAT、加密、relay。是主要体积/编译成本，纯单二进制可分发 |
 | `libp2p-stream` | `0.4.0-alpha`; 无 feature | `yonder-net`; 应用子流 | MIT，rust-libp2p 官方 alpha；替代手写 ConnectionHandler/multistream。API 被 trait 隔离，存在受限预发布例外 |
 | `opaque-ke` | `4.0.1`; `argon2,ristretto255` | `yon`; RFC 9807 PAKE adapter | MIT/Apache-2.0，RustCrypto/Meta 实现；替代自研密码协议。认证冷路径约 19 MiB 临时内存，不让 relay 编译该依赖 |
@@ -55,13 +59,16 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | `rustls-pki-types` | `1.15.0`; `alloc` | `yonder-net`; DER/PEM 证书链、信任锚与私钥边界解析 | MIT/Apache-2.0，rustls 官方类型；拒绝混合 PEM 块，先校验再调用 libp2p websocket 避免无效 key 触发其 panic API |
 | `rustls-webpki` (`webpki`) | `0.103.13`; 无 feature | `yonder-net`; WSS external DNS/IP SAN 启动校验 | ISC，rustls 官方 Web PKI 实现，维护活跃、MSRV 1.71；替代自研 X.509/SAN 解析和名称匹配。已存在于锁定的 rustls 传递树，本次只增加直接依赖边，不增加包、原生库或运行时热路径成本 |
 | `serde` | `1.0.229`; `derive,std` | 两个 binary；类型安全配置 schema | MIT/Apache-2.0，事实标准；只为启动配置反序列化启用 derive/std，不进入终端数据热路径 |
+| `serde_json` | `1.0.151`; `std` | `yon-relay`; 企业 OAuth 响应解析 | MIT/Apache-2.0，事实标准；只解析受有界响应保护的提供商 JSON，不进入数据热路径 |
 | `sha2` | `0.10.9`; 无 feature | `yon`; OPAQUE SHA-512 | MIT/Apache-2.0；因 opaque-ke Digest 0.10 公开约束使用兼容主版本最新补丁，不让 relay 编译该依赖 |
 | `tempfile` | `3.27.0`; `getrandom` | `yon-relay` 身份原子写入、`yon` CLI 集成测试 | MIT/Apache-2.0，成熟；替代跨平台临时文件/rename 竞态手写。只在 init 冷路径或测试构建 |
 | `thiserror` | `2.0.19`; `std` | 所有 package；结构化错误 | MIT/Apache-2.0，成熟 derive；替代重复 Display/Error 样板，无运行时分配要求 |
 | `tokio` | `1.53.1`; `io-std,io-util,macros,rt,signal,sync,time` | 网络库和 binaries；runtime/I/O | MIT，成熟；current-thread runtime，避免手写 reactor。阻塞池上限 4 |
+| `tokio-rustls` | `0.26.4`; `ring,tls12` | `yon-relay` 回调 TlsAcceptor；`yon` dev 测试 TLS 客户端 | MIT/Apache-2.0，rustls 官方 Tokio 集成；与锁定树 rustls/ring 后端一致，无 aws-lc-rs/OpenSSL |
 | `tokio-util` | `0.7.18`; `compat,io-util,rt` | `yonder-net`/`yon`; I/O 适配、取消、任务跟踪 | MIT，Tokio 官方；替代手写 bridge/cancellation。duplex 固定容量一次分配 |
 | `tracing` | `0.1.44`; `std` | `yon`、`yon-relay`、`yonder-net`；结构化诊断 | MIT，生态标准；字段白名单确保秘密和终端数据不记录，纯领域 package 不承担未使用依赖 |
 | `tracing-subscriber` | `0.3.23`; `ansi,fmt` | 两个 binary；文本日志 | MIT，官方 subscriber；只在进程边界，默认简洁 stderr |
+| `url` | `2.5.8`; 无 feature | `yon-relay`; 企业授权 URL 构建与解析 | MIT/Apache-2.0，事实标准；替代手写 query 编码与 percent 解码，只用解析/构建能力 |
 | `zeroize` | `1.9.0`; `alloc,derive` | `yonder-core`; 小型秘密清除 | MIT/Apache-2.0，RustCrypto；`alloc` 用于立即包裹 rpassword/Clap 交出的 code String，避免手写 volatile 清除。不承诺 swap/core dump 清除 |
 
 `governor` 同时用于 relay 查询和被控端认证启动限速。此前“只允许链接 relay”的约束被本冻结替换：不用它就只能手写 auth 限速，违反不造轮子目标。`yon` 增加的已测最小静态体积约 13.5 KiB，收益大于该成本。
