@@ -15,6 +15,7 @@ use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::ServerConfig;
@@ -27,6 +28,9 @@ pub const MAX_CALLBACK_QUERY_BYTES: usize = 1024;
 pub const MAX_CALLBACK_STATE_BYTES: usize = 128;
 /// Bound on concurrent callback connections; excess connections fail closed.
 pub const MAX_CALLBACK_CONNECTIONS: usize = 16;
+/// Bound on one callback TLS handshake; stalled handshakes release their
+/// connection permit (fail closed) instead of blocking the listener.
+const CALLBACK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The outcome of one callback handling run, used for the result page and
 /// the redacted logs.
@@ -127,7 +131,11 @@ impl CallbackServer {
     /// Serves the callback HTTPS until the shutdown signal completes.
     ///
     /// Connections are accepted until `MAX_CALLBACK_CONNECTIONS`; excess
-    /// connections are dropped immediately (fail closed).
+    /// connections are dropped immediately (fail closed). One connection
+    /// permit is held only for the TLS handshake (bounded by
+    /// `CALLBACK_HANDSHAKE_TIMEOUT`) plus one request/response exchange:
+    /// HTTP keep-alive is disabled so a connection releases its permit as
+    /// soon as the response is written.
     pub async fn serve_on(
         self,
         listener: TcpListener,
@@ -151,18 +159,28 @@ impl CallbackServer {
                     let handler = Arc::clone(&handler);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let Ok(tls) = acceptor.accept(stream).await else {
-                            return;
+                        let tls = match tokio::time::timeout(
+                            CALLBACK_HANDSHAKE_TIMEOUT,
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(_)) | Err(_) => return,
                         };
                         let io = hyper_util::rt::TokioIo::new(tls);
                         let service = hyper::service::service_fn(move |request| {
                             handle_request(Arc::clone(&handler), request, source)
                         });
-                        let _ = hyper_util::server::conn::auto::Builder::new(
+                        let mut builder = hyper_util::server::conn::auto::Builder::new(
                             hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection(io, service)
-                        .await;
+                        );
+                        // Callback connections are single-request: keep-alive
+                        // is disabled so a stalled connection cannot pin a
+                        // permit indefinitely and the connection closes once
+                        // the response is written.
+                        builder.http1().keep_alive(false);
+                        let _ = builder.serve_connection(io, service).await;
                     });
                 }
             }
@@ -358,7 +376,7 @@ pub enum CallbackServerError {
 mod tests {
     use super::{
         CallbackHandler, CallbackResult, CallbackServer, CallbackServerError,
-        MAX_CALLBACK_QUERY_BYTES, query_param,
+        MAX_CALLBACK_QUERY_BYTES, parse_certificates, parse_private_key, query_param,
     };
     use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
     use std::sync::Arc;
@@ -481,6 +499,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn private_key_pem_documents_are_rejected_as_certificates() {
+        // A PEM private key document is not a certificate chain: every
+        // section fails the certificate filter, leaving an empty chain.
+        let key_pem = b"-----BEGIN PRIVATE KEY-----\naGVsbG8gd29ybGQ=\n-----END PRIVATE KEY-----\n";
+        assert!(matches!(
+            parse_certificates(&[SecretDocument::new(key_pem.to_vec())]),
+            Err(CallbackServerError::InvalidCertificate)
+        ));
+    }
+
+    #[test]
+    fn invalid_private_key_documents_fail_closed() {
+        // Garbage DER bytes are not a usable private key.
+        assert!(matches!(
+            parse_private_key(&SecretDocument::new(vec![1, 2, 3, 4])),
+            Err(CallbackServerError::InvalidPrivateKey)
+        ));
+        // A PEM certificate is not a private key document.
+        let certificate_pem =
+            b"-----BEGIN CERTIFICATE-----\naGVsbG8gd29ybGQ=\n-----END CERTIFICATE-----\n";
+        assert!(matches!(
+            parse_private_key(&SecretDocument::new(certificate_pem.to_vec())),
+            Err(CallbackServerError::InvalidPrivateKey)
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn callback_requests_are_served_over_https() {
         let server = server_with("127.0.0.1:0".parse().unwrap());
@@ -495,6 +540,9 @@ mod tests {
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
         assert!(headers.to_lowercase().contains("cache-control: no-store"));
         assert!(headers.to_lowercase().contains("content-type: text/html"));
+        // Keep-alive is disabled so the connection releases its permit as
+        // soon as the response is written.
+        assert!(headers.to_lowercase().contains("connection: close"));
         serving.abort();
     }
 

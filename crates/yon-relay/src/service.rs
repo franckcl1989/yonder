@@ -39,7 +39,8 @@ const REJECTED_CONNECTION_DRAIN: Duration = Duration::from_secs(1);
 const REGISTRY_READERS: usize = 16;
 const OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
 /// Bounded concurrent enterprise resolve transactions, matching the
-/// default transaction registry capacity.
+/// default transaction registry capacity. Used both as the calls-channel
+/// capacity and as the concurrent exchange permit bound.
 const ENTERPRISE_RESOLVE_READERS: usize = 64;
 
 /// Enterprise-mode runtime context: the validated configuration and the
@@ -580,6 +581,7 @@ pub async fn run_relay_until(
     let (resolve_done_tx, mut resolve_done_rx) = mpsc::channel(resolve_concurrency);
     let registry_permits = Arc::new(Semaphore::new(REGISTRY_READERS));
     let resolve_permits = Arc::new(Semaphore::new(resolve_concurrency));
+    let enterprise_permits = Arc::new(Semaphore::new(ENTERPRISE_RESOLVE_READERS));
     let mut registry_active = HashSet::with_capacity(REGISTRY_READERS);
     let mut rejected_peers = HashSet::with_capacity(REGISTRY_READERS);
     let mut resolve_active = HashSet::with_capacity(resolve_concurrency);
@@ -601,7 +603,10 @@ pub async fn run_relay_until(
     );
     observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Enterprise mode serves the dedicated HTTPS callback listener until
-    // the task group is cancelled (design section 9).
+    // the task group is cancelled (design section 9). A listener failure
+    // is escalated through this channel instead of silently closing the
+    // callback port for the process lifetime.
+    let mut callback_failure_rx: Option<oneshot::Receiver<CallbackServerError>> = None;
     if let Some(runtime) = &enterprise_runtime {
         let (listener, _bound) = runtime.callback_server.bind().await?;
         let server = runtime.callback_server.clone();
@@ -612,12 +617,22 @@ pub async fn run_relay_until(
             clock.clone(),
         ));
         let cancellation = tasks.cancellation();
+        let (callback_failure_tx, callback_failure_rx_owned) = oneshot::channel();
+        callback_failure_rx = Some(callback_failure_rx_owned);
         tasks.spawn(async move {
-            let _ = server
+            let served = server
                 .serve_on(listener, handler, async move {
                     cancellation.cancelled().await;
                 })
                 .await;
+            if let Err(error) = served {
+                tracing::error!(
+                    event = "enterprise_callback_listener_failed",
+                    %error,
+                    "the enterprise callback listener failed"
+                );
+                let _ = callback_failure_tx.send(error);
+            }
         });
     }
     tokio::pin!(shutdown);
@@ -737,6 +752,10 @@ pub async fn run_relay_until(
                 // the enterprise resolve exchange; the same branch never
                 // serves the legacy resolve in enterprise mode.
                 if let Some(runtime) = enterprise_runtime.as_ref() {
+                    let Ok(permit) = Arc::clone(&enterprise_permits).try_acquire_owned() else {
+                        RelayObservability::increment(&observations.resolve_overload);
+                        continue;
+                    };
                     let calls = enterprise_calls_tx
                         .as_ref()
                         .expect("enterprise mode owns a calls channel")
@@ -769,6 +788,7 @@ pub async fn run_relay_until(
                             }
                             () = cancellation.cancelled() => {}
                         }
+                        drop(permit);
                     });
                     continue;
                 }
@@ -878,6 +898,24 @@ pub async fn run_relay_until(
                             Err(error) => Err(ProtocolTaskError::Registry(error)),
                         };
                         let _ = response.send(result);
+                    }
+                }
+            }
+            callback_failed = async {
+                match callback_failure_rx.as_mut() {
+                    Some(receiver) => receiver.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match callback_failed {
+                    Ok(error) => break Err(RelayServiceError::EnterpriseCallback(error)),
+                    Err(_) => {
+                        // The callback task ended without reporting a
+                        // failure, only reachable if it was aborted or
+                        // panicked; the task-group reap escalates any
+                        // panic. Stop polling the closed channel.
+                        callback_failure_rx = None;
+                        continue;
                     }
                 }
             }
