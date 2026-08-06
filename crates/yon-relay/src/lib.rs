@@ -3,6 +3,7 @@
 
 //! Self-hosted Yonder relay application state.
 
+pub mod callback;
 pub mod enterprise;
 pub mod exchange;
 pub mod identity;
@@ -13,6 +14,7 @@ pub mod service;
 pub mod session;
 pub mod verifier;
 
+pub use callback::{CallbackHandler, CallbackResult, CallbackServer, CallbackServerError};
 pub use enterprise::{
     CallbackExternalUrl, EnterpriseAuthConfig, EnterpriseConfigError, ProviderSecrets,
 };
