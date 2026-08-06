@@ -35,6 +35,8 @@ crossterm_winapi.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+tokio-rustls.workspace = true
+url.workspace = true
 yon-relay = { version = "=0.1.1", path = "../yon-relay", default-features = false }
 
 [[bench]]

@@ -12,7 +12,9 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use yon::network::{EndpointDriver, ReservationLease, connect_relay, wait_for_reservation};
+use yon::network::{
+    EndpointDriver, EndpointError, ReservationLease, connect_relay, wait_for_reservation,
+};
 use yon::protocol::{
     ReclaimResponse, RelayProtocolError, ResolveDeadline, reclaim_locator, resolve_peer,
 };
@@ -365,6 +367,136 @@ fn secure_websocket_accepts_an_explicitly_trusted_self_signed_ip_certificate()
         TEST_WSS_SELF_SIGNED_CERT_DER,
         None,
     )
+}
+
+#[test]
+fn enterprise_relay_serves_callback_https_and_rejects_malformed_callbacks()
+-> Result<(), std::io::Error> {
+    let port = available_port()?;
+    let callback_port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let relay_process = RelayProcess::start_enterprise(identity, port, callback_port)?;
+    thread::sleep(Duration::from_millis(500));
+
+    let status = enterprise_callback_request(callback_port, "GET / HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    assert!(status.starts_with("HTTP/1.1 404"), "{status}");
+    let status = enterprise_callback_request(callback_port, "GET /yonder/callback/wecom HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+    let status = enterprise_callback_request(callback_port, "GET /yonder/callback/wecom?code=a HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+    let status = enterprise_callback_request(callback_port, "POST /yonder/callback/wecom?code=a&state=b HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n")?;
+    assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+
+    relay_process.stop()
+}
+
+#[test]
+fn legacy_resolve_is_rejected_by_enterprise_relays() -> Result<(), std::io::Error> {
+    let port = available_port()?;
+    let callback_port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let relay_process = RelayProcess::start_enterprise(identity, port, callback_port)?;
+    thread::sleep(Duration::from_millis(500));
+
+    let address: EndpointRelayAddress =
+        format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}")
+            .parse()
+            .map_err(|error: yonder_net::AddressError| std::io::Error::other(error.to_string()))?;
+    let relays = EndpointRelaySet::new(vec![address])
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let client_identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .block_on(async {
+            let (mut driver, mut streams, relay) = connect_relay(
+                client_identity,
+                &relays,
+                WssTransportConfig::client(None),
+            )
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            resolve_peer(
+                &mut driver,
+                &mut streams,
+                &relay,
+                Locator::new(7).unwrap(),
+                ResolveDeadline::controller(),
+            )
+            .await
+        });
+    let relay_result = relay_process.stop();
+    assert!(matches!(
+        outcome,
+        Err(RelayProtocolError::Endpoint(EndpointError::Application(
+            yonder_net::ApplicationStreamError::UnsupportedProtocol
+        )))
+    ));
+    relay_result
+}
+
+#[test]
+fn hosts_register_through_enterprise_relays() -> Result<(), std::io::Error> {
+    let port = available_port()?;
+    let callback_port = available_port()?;
+    let identity = generate_identity(&mut OsSecureRandom)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let peer = identity.public().to_peer_id();
+    let relay_process = RelayProcess::start_enterprise(identity, port, callback_port)?;
+    thread::sleep(Duration::from_millis(500));
+    let relay = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}");
+    let config = EndpointConfigDirectory::new(&relay)?;
+
+    let host = HostProcess::start(&config)?;
+    let code = receive_code(&host.lines)
+        .map_err(|error| std::io::Error::other(format!("host did not register: {error}")))?;
+    assert!(!code.is_empty());
+    host.terminate();
+
+    relay_process.stop()
+}
+
+/// Executes one HTTPS request against the enterprise callback listener,
+/// trusting the fixture CA, and returns the response status line.
+fn enterprise_callback_request(
+    callback_port: u16,
+    request: &str,
+) -> Result<String, std::io::Error> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    runtime.block_on(async {
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots
+            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(
+                TEST_WSS_CA_DER.to_vec(),
+            ))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let client = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client));
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", callback_port))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut tls = connector.connect(server_name, stream).await.map_err(|error| {
+            std::io::Error::other(format!("callback TLS handshake failed: {error}"))
+        })?;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        tls.write_all(request.as_bytes()).await?;
+        let mut bytes = Vec::new();
+        tls.read_to_end(&mut bytes).await?;
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(text.lines().next().unwrap_or_default().to_owned())
+    })
 }
 
 fn run_secure_websocket_session(
@@ -1413,6 +1545,80 @@ impl RelayProcess {
             .collect::<Result<Vec<_>, _>>()?;
         let config = RelayServeConfig::new(identity, listen, external, wss)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Self::start_with_config(config)
+    }
+
+    /// Starts an enterprise-mode relay with the callback TLS from the
+    /// fixture certificate and a WeCom provider secret file.
+    fn start_enterprise(identity: Keypair, port: u16, callback_port: u16) -> Result<Self, std::io::Error> {
+        let listen = vec![format!("/ip4/127.0.0.1/tcp/{port}")];
+        let external = vec![format!("/ip4/127.0.0.1/tcp/{port}")];
+        let listen = listen
+            .into_iter()
+            .map(|address| {
+                address.parse::<RelayListenAddress>().map_err(
+                    |error: yonder_net::AddressError| std::io::Error::other(error.to_string()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let external = external
+            .into_iter()
+            .map(|address| {
+                address.parse::<RelayExternalAddress>().map_err(
+                    |error: yonder_net::AddressError| std::io::Error::other(error.to_string()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let directory = relay_test_directory()?;
+        let secret = directory.path().join("wecom.secret");
+        std::fs::write(
+            &secret,
+            "corp_id = \"ww1234567890abcdef\"\nagent_id = 1000002\napp_secret = \"s3cret\"\n",
+        )?;
+        #[cfg(windows)]
+        {
+            use yon_relay::{SecretFilePolicy as _, SystemSecretFilePolicy};
+            let file = std::fs::File::open(&secret)?;
+            SystemSecretFilePolicy
+                .protect_new(&secret, &file)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        let providers = yonder_core::EnterpriseProviders::new(true, false)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let secrets = yon_relay::ProviderSecrets::new(providers, Some(secret), None)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let config = yon_relay::EnterpriseAuthConfig::new(
+            format!("127.0.0.1:{callback_port}")
+                .parse()
+                .map_err(|error: std::net::AddrParseError| std::io::Error::other(error.to_string()))?,
+            yon_relay::CallbackExternalUrl::new(
+                "https://relay.example.test"
+                    .parse()
+                    .map_err(|error: url::ParseError| std::io::Error::other(error.to_string()))?,
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?,
+            vec![SecretDocument::new(TEST_WSS_CERT_DER.to_vec())],
+            SecretDocument::new(TEST_WSS_KEY_DER.to_vec()),
+            providers,
+            secrets,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let credentials = yon_relay::ProviderCredentials::load(&config)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let context = yon_relay::EnterpriseContext::new(config, credentials);
+        let config = RelayServeConfig::with_enterprise(
+            identity,
+            listen,
+            external,
+            WssTransportConfig::client(None),
+            yonder_core::RelayResourceConfig::default(),
+            Some(context),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Self::start_with_config(config)
+    }
+
+    fn start_with_config(config: RelayServeConfig) -> Result<Self, std::io::Error> {
         let (shutdown, shutdown_rx) = oneshot::channel();
         let thread = thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()

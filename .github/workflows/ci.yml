@@ -57,7 +57,12 @@ jobs:
           toolchain: stable
           components: clippy
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --workspace --all-targets --all-features
+      - name: Test workspace
+        env:
+          # Enterprise e2e tests keep provider secret files in a protected
+          # directory (design section 7: secrets never in plaintext places).
+          YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}
+        run: cargo test --locked --workspace --all-targets --all-features
       - name: Lint strict relay-only controller rebuild
         env:
           RUSTFLAGS: --cfg yonder_e2e_rebuild
