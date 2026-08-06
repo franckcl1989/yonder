@@ -4,6 +4,7 @@
 //! Self-hosted Yonder relay application state.
 
 pub mod enterprise;
+pub mod exchange;
 pub mod identity;
 pub mod provider;
 pub mod registry;
@@ -24,4 +25,5 @@ pub use session::{
     EnterpriseFailure, EnterpriseResolvePhase, EnterpriseResolveSession, MemberAdmission,
     MemberIdentity, OAuthState, RequestId, TransitionError,
 };
+pub use exchange::ExchangeClient;
 pub use verifier::{ExchangeTransport, VerifyError, verify_member};
