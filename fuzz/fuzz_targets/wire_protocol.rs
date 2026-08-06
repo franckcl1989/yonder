@@ -5,6 +5,7 @@ use libfuzzer_sys::fuzz_target;
 use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, PakeContext,
 };
+use yonder_core::wire::enterprise::{EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart};
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
 use yonder_core::wire::terminal::{
@@ -17,6 +18,9 @@ fuzz_target!(|input: &[u8]| {
     let _ = RegistryResponse::decode(input);
     let _ = ResolveRequest::decode(input);
     let _ = ResolveResponse::decode(input);
+    let _ = EnterpriseStart::decode(input);
+    let _ = EnterpriseSelect::decode(input);
+    let _ = EnterpriseResolveResponse::decode(input);
     let _ = AuthClientHello::decode(input);
     let _ = AuthServerResponse::decode(input);
     let _ = AuthClientFinish::decode(input);
