@@ -6,11 +6,19 @@ use backon::{BackoffBuilder as _, ConstantBuilder};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use yonder_core::wire::enterprise::{
+    MAX_AUTHORIZATION_URL_LEN, EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart,
+};
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{MAX_RESPONSE_LEN, ResolveRequest, ResolveResponse};
-use yonder_core::wire::{REGISTRY_PROTOCOL, RESOLVE_PROTOCOL};
-use yonder_core::{Locator, ProtocolError, RetryAfter};
-use yonder_net::{ApplicationStreams, Libp2pApplicationStreams, PeerId};
+use yonder_core::wire::{ENTERPRISE_RESOLVE_PROTOCOL, REGISTRY_PROTOCOL, RESOLVE_PROTOCOL};
+use yonder_core::error::ProtocolField;
+use yonder_core::{
+    EnterpriseProvider, EnterpriseProviders, Locator, ProtocolError, RetryAfter,
+};
+use yonder_net::{
+    ApplicationStreamError, ApplicationStreams, Libp2pApplicationStreams, PeerId,
+};
 
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_LIMIT: usize = 20;
@@ -59,6 +67,22 @@ pub enum RelayProtocolError {
     RetryExhausted,
     #[error("the relay returned a response that is invalid for this request")]
     UnexpectedResponse,
+    #[error("enterprise authentication was not completed")]
+    EnterpriseRejected,
+    #[error("enterprise authentication expired")]
+    EnterpriseExpired,
+}
+
+/// Interactive enterprise authentication steps provided by the client UI.
+pub trait EnterpriseResolveUi {
+    /// Asks the user to choose one of the offered authentication platforms.
+    fn select_provider(
+        &mut self,
+        providers: EnterpriseProviders,
+    ) -> Result<EnterpriseProvider, RelayProtocolError>;
+
+    /// Opens the authorization URL in the user's browser.
+    fn open_authorization(&mut self, url: &str) -> Result<(), RelayProtocolError>;
 }
 
 /// Allocates a locator, honoring the relay's retry hints within a fixed budget.
@@ -251,6 +275,175 @@ pub async fn resolve_peer(
     .map_err(|_| RelayProtocolError::Timeout)?
 }
 
+/// The outcome of one enterprise resolve attempt on a substream.
+enum EnterpriseAttempt {
+    Resolved(PeerId),
+    Retry(RetryAfter),
+}
+
+/// Resolves the locator through the relay, automatically detecting
+/// enterprise mode (design section 3): the enterprise resolve substream
+/// is tried first, and a normal relay, which does not offer it, falls
+/// back to the legacy resolve protocol.
+pub async fn resolve_peer_auto(
+    driver: &mut EndpointDriver,
+    streams: &mut Libp2pApplicationStreams,
+    relay: &RelayConnection,
+    locator: Locator,
+    deadline: ResolveDeadline,
+    ui: &mut impl EnterpriseResolveUi,
+) -> Result<PeerId, RelayProtocolError> {
+    match enterprise_resolve_peer(driver, streams, relay, locator, deadline, ui).await {
+        Err(RelayProtocolError::Endpoint(EndpointError::Application(
+            ApplicationStreamError::UnsupportedProtocol,
+        ))) => resolve_peer(driver, streams, relay, locator, deadline).await,
+        result => result,
+    }
+}
+
+/// Resolves the locator through an enterprise relay (design section 4):
+/// start request, platform offer, user selection, authorization URL,
+/// browser authentication, and the relay's post-authentication result.
+/// A relay that does not offer the enterprise protocol fails with
+/// `UnsupportedProtocol` so the caller can fall back to the legacy
+/// resolve.
+pub async fn enterprise_resolve_peer(
+    driver: &mut EndpointDriver,
+    streams: &mut Libp2pApplicationStreams,
+    relay: &RelayConnection,
+    locator: Locator,
+    deadline: ResolveDeadline,
+    ui: &mut impl EnterpriseResolveUi,
+) -> Result<PeerId, RelayProtocolError> {
+    tokio::time::timeout_at(deadline.0, async {
+        let mut backoff = std::iter::repeat(Duration::from_millis(250));
+        loop {
+            reconverge_relay(driver, relay).await?;
+            let stream = open_stream_timed(
+                driver,
+                streams,
+                relay.peer(),
+                ENTERPRISE_RESOLVE_PROTOCOL,
+            )
+            .await?;
+            let mut stream = stream.into_tokio();
+            match drive(
+                driver,
+                enterprise_exchange_io(&mut stream, locator, ui, PROTOCOL_TIMEOUT),
+            )
+            .await?
+            {
+                EnterpriseAttempt::Resolved(peer) => return Ok(peer),
+                EnterpriseAttempt::Retry(after) => {
+                    drop(stream);
+                    retry(driver, relay.binding(), &mut backoff, after).await?;
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| RelayProtocolError::Timeout)?
+}
+
+/// The enterprise substream exchange on plain tokio I/O, testable without
+/// the endpoint driver. The substream carries a sequence of messages and
+/// stays open across them; it never shuts down the write side.
+async fn enterprise_exchange_io(
+    stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    locator: Locator,
+    ui: &mut impl EnterpriseResolveUi,
+    timeout: Duration,
+) -> Result<EnterpriseAttempt, RelayProtocolError> {
+    write_enterprise_step(stream, &EnterpriseStart::new(locator).encode(), timeout).await?;
+    let providers = match read_enterprise_response(stream, timeout).await? {
+        EnterpriseResolveResponse::Retry(after) => return Ok(EnterpriseAttempt::Retry(after)),
+        EnterpriseResolveResponse::Providers(providers) => providers,
+        _ => return Err(RelayProtocolError::UnexpectedResponse),
+    };
+    let provider = ui.select_provider(providers)?;
+    write_enterprise_step(stream, &EnterpriseSelect::new(provider).encode(), timeout).await?;
+    let url = match read_enterprise_response(stream, timeout).await? {
+        EnterpriseResolveResponse::Authenticate(url) => url,
+        _ => return Err(RelayProtocolError::UnexpectedResponse),
+    };
+    ui.open_authorization(url.as_str())?;
+    match read_enterprise_response(stream, timeout).await? {
+        EnterpriseResolveResponse::Resolved(peer) => PeerId::from_bytes(peer.as_bytes())
+            .map(EnterpriseAttempt::Resolved)
+            .map_err(|_| RelayProtocolError::InvalidPeerId),
+        EnterpriseResolveResponse::Unavailable => Err(RelayProtocolError::Unavailable),
+        EnterpriseResolveResponse::Expired => Err(RelayProtocolError::EnterpriseExpired),
+        EnterpriseResolveResponse::Failed | EnterpriseResolveResponse::Cancelled => {
+            Err(RelayProtocolError::EnterpriseRejected)
+        }
+        _ => Err(RelayProtocolError::UnexpectedResponse),
+    }
+}
+
+async fn write_enterprise_step(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &[u8],
+    timeout: Duration,
+) -> Result<(), RelayProtocolError> {
+    tokio::time::timeout(timeout, async {
+        stream.write_all(message).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| RelayProtocolError::Timeout)?
+    .map_err(RelayProtocolError::from)
+}
+
+/// Reads one bounded enterprise response. Lengths are validated before
+/// the payload is read, so a malformed relay cannot make the client
+/// buffer unbounded data.
+async fn read_enterprise_response(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    timeout: Duration,
+) -> Result<EnterpriseResolveResponse, RelayProtocolError> {
+    tokio::time::timeout(timeout, async {
+        let mut tag = [0_u8; 1];
+        stream.read_exact(&mut tag).await?;
+        let message = match tag[0] {
+            0x10 => {
+                let mut payload = [0_u8; 1];
+                stream.read_exact(&mut payload).await?;
+                vec![0x10, payload[0]]
+            }
+            0x11 => {
+                let mut payload = [0_u8; 4];
+                stream.read_exact(&mut payload).await?;
+                std::iter::once(0x11).chain(payload).collect()
+            }
+            0x12 => {
+                let mut prefix = [0_u8; 2];
+                stream.read_exact(&mut prefix).await?;
+                let length = usize::from(u16::from_be_bytes(prefix));
+                if length > MAX_AUTHORIZATION_URL_LEN {
+                    return Err(RelayProtocolError::Protocol(
+                        ProtocolError::InvalidField(ProtocolField::AuthorizationUrl),
+                    ));
+                }
+                let mut url = vec![0_u8; length];
+                stream.read_exact(&mut url).await?;
+                std::iter::once(0x12).chain(prefix).chain(url).collect()
+            }
+            0x13 => {
+                let mut prefix = [0_u8; 1];
+                stream.read_exact(&mut prefix).await?;
+                let length = usize::from(prefix[0]);
+                let mut peer = vec![0_u8; length];
+                stream.read_exact(&mut peer).await?;
+                std::iter::once(0x13).chain(prefix).chain(peer).collect()
+            }
+            tag => vec![tag],
+        };
+        EnterpriseResolveResponse::decode(&message).map_err(RelayProtocolError::from)
+    })
+    .await
+    .map_err(|_| RelayProtocolError::Timeout)?
+}
+
 enum ResolvedResponse {
     Resolved(PeerId),
     Retry(RetryAfter),
@@ -424,9 +617,10 @@ async fn bounded_exchange_io<const CAPACITY: usize>(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AllocationResponse, BoundedResponse, CONTROLLER_RESOLVE_TIMEOUT, RETRY_LIMIT, ReclaimStep,
-        RelayProtocolError, ResolveDeadline, ResolvedResponse, RetryAfter, allocation_response,
-        bounded_exchange_io, exact_exchange_io, reclaim_response, release_response,
+        AllocationResponse, BoundedResponse, CONTROLLER_RESOLVE_TIMEOUT, RETRY_LIMIT,
+        EnterpriseAttempt, EnterpriseResolveUi, ReclaimStep, RelayProtocolError, ResolveDeadline,
+        ResolvedResponse, RetryAfter, allocation_response, bounded_exchange_io,
+        enterprise_exchange_io, exact_exchange_io, reclaim_response, release_response,
         resolve_response, retry_delay,
     };
     use std::io;
@@ -434,10 +628,13 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+    use yonder_core::wire::enterprise::{
+        EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart,
+    };
     use yonder_core::wire::registry::RegistryResponse;
     use yonder_core::wire::resolve::ResolveResponse;
-    use yonder_core::{Locator, PeerIdBytes};
-    use yonder_net::Keypair;
+    use yonder_core::{EnterpriseProvider, EnterpriseProviders, Locator, PeerIdBytes};
+    use yonder_net::{Keypair, PeerId};
 
     #[test]
     fn retry_budget_and_wire_hint_are_bounded() {
@@ -790,5 +987,228 @@ mod tests {
             .map(|response| response.as_slice().to_vec());
         peer.await.unwrap();
         result
+    }
+
+    // ---- enterprise resolve exchange ----
+
+    struct StubUi {
+        offered: Option<EnterpriseProviders>,
+        opened: Option<String>,
+        choice: EnterpriseProvider,
+    }
+
+    impl StubUi {
+        fn with_choice(choice: EnterpriseProvider) -> Self {
+            Self {
+                offered: None,
+                opened: None,
+                choice,
+            }
+        }
+    }
+
+    impl EnterpriseResolveUi for StubUi {
+        fn select_provider(
+            &mut self,
+            providers: EnterpriseProviders,
+        ) -> Result<EnterpriseProvider, RelayProtocolError> {
+            self.offered = Some(providers);
+            Ok(self.choice)
+        }
+
+        fn open_authorization(&mut self, url: &str) -> Result<(), RelayProtocolError> {
+            self.opened = Some(url.to_owned());
+            Ok(())
+        }
+    }
+
+    /// One relay-side substream answering the enterprise resolve flow in
+    /// lockstep with the client: start, providers, selection, authorize,
+    /// then the terminal response. Mirrors the real relay message order.
+    async fn relay_enterprise_side(
+        mut stream: impl AsyncRead + AsyncWrite + Unpin,
+        providers: EnterpriseProviders,
+        url: &str,
+        result: EnterpriseResolveResponse,
+    ) {
+        let mut expected_start = [0_u8; 4];
+        stream.read_exact(&mut expected_start).await.unwrap();
+        assert!(EnterpriseStart::decode(&expected_start).is_ok());
+        stream
+            .write_all(
+                EnterpriseResolveResponse::Providers(providers)
+                    .encode()
+                    .as_slice(),
+            )
+            .await
+            .unwrap();
+        let mut select = [0_u8; 2];
+        stream.read_exact(&mut select).await.unwrap();
+        assert!(EnterpriseSelect::decode(&select).is_ok());
+        stream
+            .write_all(
+                EnterpriseResolveResponse::Authenticate(Box::new(
+                    yonder_core::wire::enterprise::AuthorizationUrl::new(url).unwrap(),
+                ))
+                .encode()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(result.encode().as_slice())
+            .await
+            .unwrap();
+    }
+
+    /// One relay-side substream that answers the start with a rate-limit
+    /// retry and then stops.
+    async fn relay_enterprise_retry(
+        mut stream: impl AsyncRead + AsyncWrite + Unpin,
+        after: RetryAfter,
+    ) {
+        let mut expected_start = [0_u8; 4];
+        stream.read_exact(&mut expected_start).await.unwrap();
+        stream
+            .write_all(EnterpriseResolveResponse::Retry(after).encode().as_slice())
+            .await
+            .unwrap();
+    }
+
+    fn resolved_peer() -> PeerId {
+        Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_resolves_after_the_full_flow() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let peer = resolved_peer();
+        let wire_peer = PeerIdBytes::new(&peer.to_bytes()).unwrap();
+        let relay_side = relay_enterprise_side(
+            server,
+            EnterpriseProviders::new(true, true).unwrap(),
+            "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
+            EnterpriseResolveResponse::Resolved(wire_peer),
+        );
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let attempt = async {
+            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
+                .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        match attempt.unwrap() {
+            EnterpriseAttempt::Resolved(resolved) => assert_eq!(resolved, peer),
+            EnterpriseAttempt::Retry(_) => panic!("expected resolved"),
+        }
+        assert_eq!(ui.offered, Some(EnterpriseProviders::new(true, true).unwrap()));
+        assert_eq!(
+            ui.opened.as_deref(),
+            Some("https://relay.example.test/yonder/callback/wecom?code=x&state=y")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_retries_on_relay_limits() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let relay_side = relay_enterprise_retry(
+            server,
+            RetryAfter::from_millis(500).unwrap(),
+        );
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let attempt = async {
+            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
+                .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        assert!(matches!(
+            attempt.unwrap(),
+            EnterpriseAttempt::Retry(after) if after.millis() == 500
+        ));
+        assert!(ui.offered.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_reports_terminal_outcomes() {
+        for response in [
+            EnterpriseResolveResponse::Failed,
+            EnterpriseResolveResponse::Cancelled,
+            EnterpriseResolveResponse::Expired,
+            EnterpriseResolveResponse::Unavailable,
+        ] {
+            let (mut client, server) = tokio::io::duplex(1024);
+            let relay_side = relay_enterprise_side(
+                server,
+                EnterpriseProviders::new(true, false).unwrap(),
+                "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
+                response,
+            );
+            let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+            let attempt = async {
+                enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
+                    .await
+            };
+            let (attempt, ()) = tokio::join!(attempt, relay_side);
+            assert!(matches!(
+                attempt,
+                Err(
+                    RelayProtocolError::EnterpriseRejected
+                        | RelayProtocolError::EnterpriseExpired
+                        | RelayProtocolError::Unavailable
+                )
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_rejects_unexpected_responses_and_invalid_peers() {
+        // A final Providers response instead of a result is unexpected.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let relay_side = relay_enterprise_side(
+            server,
+            EnterpriseProviders::new(true, false).unwrap(),
+            "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
+            EnterpriseResolveResponse::Providers(EnterpriseProviders::new(true, false).unwrap()),
+        );
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let attempt = async {
+            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
+                .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        assert!(matches!(attempt, Err(RelayProtocolError::UnexpectedResponse)));
+
+        // A resolved peer that is not a valid PeerId is rejected.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let relay_side = relay_enterprise_side(
+            server,
+            EnterpriseProviders::new(true, false).unwrap(),
+            "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
+            EnterpriseResolveResponse::Resolved(PeerIdBytes::new(&[0xff]).unwrap()),
+        );
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let attempt = async {
+            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_secs(2))
+                .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        assert!(matches!(attempt, Err(RelayProtocolError::InvalidPeerId)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_times_out_on_a_silent_relay() {
+        let (mut client, mut server) = tokio::io::duplex(8);
+        let relay_side = async {
+            let mut expected_start = [0_u8; 4];
+            server.read_exact(&mut expected_start).await.unwrap();
+            // Never answer.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let attempt = async {
+            enterprise_exchange_io(&mut client, Locator::new(7).unwrap(), &mut ui, Duration::from_millis(100))
+                .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        assert!(matches!(attempt, Err(RelayProtocolError::Timeout)));
     }
 }
