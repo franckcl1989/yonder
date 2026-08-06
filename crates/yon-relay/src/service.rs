@@ -1,7 +1,5 @@
-use crate::callback::{
-    CallbackEntry, CallbackHandler, CallbackRegistry, CallbackResult, CallbackServer,
-    CallbackServerError, CallbackSessionHandler,
-};
+use crate::callback::{CallbackHandler, CallbackResult, CallbackServer, CallbackServerError};
+use crate::callback_session::{CallbackEntry, CallbackRegistry, CallbackSessionHandler};
 use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig};
 use crate::exchange::ExchangeClient;
 use crate::provider::{ProviderCredentials, ProviderError};
@@ -1718,7 +1716,8 @@ mod tests {
     };
     #[cfg(windows)]
     use super::{process_shutdown_signal, select_windows_shutdown};
-    use crate::callback::{CallbackEntry, CallbackRegistry, CallbackResult};
+    use crate::callback::CallbackResult;
+    use crate::callback_session::{CallbackEntry, CallbackRegistry};
     use crate::enterprise::CallbackExternalUrl;
     use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
     use crate::registry::{Registry, ResolveLimiters};
