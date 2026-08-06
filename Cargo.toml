@@ -36,6 +36,7 @@ libp2p = { version = "=0.56.0", default-features = false, features = ["autonat",
 libp2p-stream = { version = "=0.4.0-alpha", default-features = false }
 libp2p-swarm-test = { version = "=0.6.0", default-features = false, features = ["tokio"] }
 opaque-ke = { version = "=4.0.1", default-features = false, features = ["argon2", "ristretto255"] }
+open = { version = "=5.4.1", default-features = false }
 portable-pty = { version = "=0.9.0", default-features = false }
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 rand = { version = "=0.8.7", default-features = false, features = ["getrandom"] }

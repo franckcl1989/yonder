@@ -13,6 +13,7 @@ backon.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 opaque-ke.workspace = true
+open.workspace = true
 portable-pty.workspace = true
 rand.workspace = true
 rpassword.workspace = true

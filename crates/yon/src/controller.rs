@@ -356,31 +356,7 @@ impl<I: tokio::io::AsyncBufRead + Unpin + Send, O: AsyncWrite + Unpin + Send> En
 
 /// Opens the URL with the platform default browser, best effort.
 fn platform_open(url: &str) -> bool {
-    use std::process::{Command, Stdio};
-
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    open::that(url).is_ok()
 }
 
 /// Complete input required to connect to one advertised remote terminal.

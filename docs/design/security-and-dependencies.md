@@ -53,6 +53,7 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | `libp2p` | `0.56.0`; `autonat,dcutr,dns,ed25519,identify,macros,memory-connection-limits,noise,ping,quic,relay,tcp,tokio,upnp,websocket,yamux` | `yonder-net`; 完整网络栈 | MIT，官方 rust-libp2p；替代自研传输、NAT、加密、relay。是主要体积/编译成本，纯单二进制可分发 |
 | `libp2p-stream` | `0.4.0-alpha`; 无 feature | `yonder-net`; 应用子流 | MIT，rust-libp2p 官方 alpha；替代手写 ConnectionHandler/multistream。API 被 trait 隔离，存在受限预发布例外 |
 | `opaque-ke` | `4.0.1`; `argon2,ristretto255` | `yon`; RFC 9807 PAKE adapter | MIT/Apache-2.0，RustCrypto/Meta 实现；替代自研密码协议。认证冷路径约 19 MiB 临时内存，不让 relay 编译该依赖 |
+| `open` | `5.4.1`; 无 feature | `yon`; 企业认证授权 URL 默认浏览器打开 | MIT，成熟（约 45M 下载、维护活跃）；替代手写 cmd start/open/xdg-open 平台命令，避免 cmd 元字符/引号/Linux 回退链等平台边界问题。仅在企业认证浏览器步骤冷路径。`default-features = false` 关闭 `shellexecute-on-windows`（避免引入 `dunce`），Windows 走 shell 打开路径，与既有行为一致，依赖最小化 |
 | `portable-pty` | `0.9.0`; 无 feature | `yon`; PTY 和 child | MIT，WezTerm 使用的跨平台实现；替代 Unix/ConPTY FFI。第三方含平台 unsafe，只在 `yon` 链接 |
 | `rand` | `0.8.7`; `getrandom` | `yonder-core`; OPAQUE 兼容 CSPRNG | MIT/Apache-2.0；0.8 最新修复补丁，因 opaque-ke Rand 0.8 约束不能用全局 0.10。系统熵路径无额外运行时 |
 | `rpassword` | `7.5.4`; 无 feature | `yon`; 隐藏 code 输入 | Apache-2.0，成熟跨平台；替代平台 console 手写。仅启动冷路径 |
