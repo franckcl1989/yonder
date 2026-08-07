@@ -2255,6 +2255,12 @@ mod tests {
         // Denying new-file creation on the directory makes the no-replace
         // hard link fail; the destination is never created.
         let guard = WriteDenyGuard::new(directory.path());
+        // Privileged CI agents (for example with SeRestorePrivilege
+        // enabled) bypass directory ACL denials; detect that environment
+        // and skip rather than failing the release gate on it.
+        if fs::File::create(directory.path().join("probe.bin")).is_ok() {
+            return;
+        }
         assert!(matches!(
             sealed.commit(&final_path),
             Err(FileSemanticsError::CommitFailed(_))
@@ -2380,6 +2386,12 @@ mod tests {
         let blocked = directory.path().join("blocked");
         fs::create_dir(&blocked).unwrap();
         let guard = WriteDenyGuard::new(&blocked);
+        // Privileged CI agents (for example with SeRestorePrivilege
+        // enabled) bypass directory ACL denials; detect that environment
+        // and skip rather than failing the release gate on it.
+        if fs::File::create(blocked.join("probe.bin")).is_ok() {
+            return;
+        }
         let mut random = OsSecureRandom;
         assert!(matches!(
             PrivateTempFile::create(&blocked, &mut random),
