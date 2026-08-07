@@ -313,3 +313,4 @@ connect 企业流程在终端编号选择平台后，需要用系统默认浏览
 - 共享 core 包 `yonder-core` 新增已批准的 `sha2 0.10.9` 依赖（workspace 既有直接依赖复用），用于审计哈希链；不新增 digest 主版本。
 - 全部候选的许可证均位于 deny.toml 允许列表（hmac/hkdf/vte 为 MIT OR Apache-2.0，ed25519-dalek 为 BSD-3-Clause，BSD-3-Clause 已在白名单），MSRV 均不高于 workspace `rust-version = 1.88`。实施时锁文件变更后仍须运行完整依赖、安全与许可证审计。
 - 审计容器与线协议编解码（wire::audit / audit_container）为纯字节结构，不依赖上述加密 crate；密码学运算只发生在 session、ledger 与 verify 层。
+- 已批准直接依赖 `fs4 1.1.0`，`default-features = false`；唯一用于本地账本 `ledger.lock` 的跨进程排他文件锁（设计 §12.2）。2026-08-07 经 crates.io 核实为全局最新稳定版，MIT OR Apache-2.0，MSRV 1.75，2026-04 维护活跃（fs2 0.4.3 自 2018 年起未维护，未采用）；锁只在首次初始化、崩溃恢复与最终账本提交三个短阶段持有，不得在整个会话期间持锁。
