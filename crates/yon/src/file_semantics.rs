@@ -2255,10 +2255,15 @@ mod tests {
         // Denying new-file creation on the directory makes the no-replace
         // hard link fail; the destination is never created.
         let guard = WriteDenyGuard::new(directory.path());
-        // Privileged CI agents (for example with SeRestorePrivilege
-        // enabled) bypass directory ACL denials; detect that environment
-        // and skip rather than failing the release gate on it.
-        if fs::File::create(directory.path().join("probe.bin")).is_ok() {
+        // Two environments defeat this expectation and must be detected
+        // rather than failing the release gate: privileged CI agents
+        // (for example with SeRestorePrivilege enabled) bypass directory
+        // ACL denials entirely, and Windows CreateHardLinkW checks only
+        // the target file's FILE_ADD_LINK right — not the directory's
+        // add-file ACL — so the deny may not block the link at all.
+        if fs::File::create(directory.path().join("probe.bin")).is_ok()
+            || fs::hard_link(&temp_path, directory.path().join("probe-link.bin")).is_ok()
+        {
             return;
         }
         assert!(matches!(
