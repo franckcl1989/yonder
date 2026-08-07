@@ -577,19 +577,24 @@ fn write_u64(
 
 /// Validates a protocol path: UTF-8, at most [`MAX_PATH_LEN`] bytes, without
 /// NUL, C0/C1 control characters or DEL.
+///
+/// The control check is applied to decoded code points, not raw bytes:
+/// UTF-8 continuation bytes legitimately fall in the `0x80..=0x9f` byte
+/// range while the forbidden C1 controls are the code points
+/// U+0080–U+009F.
 pub fn validate_protocol_path(bytes: &[u8]) -> Result<(), ProtocolError> {
     if bytes.len() > MAX_PATH_LEN {
         return Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath));
     }
-    if bytes
-        .iter()
-        .any(|&byte| byte == 0x00 || byte <= 0x1f || byte == 0x7f || (0x80..=0x9f).contains(&byte))
-    {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ProtocolError::InvalidField(ProtocolField::FileTransferPath))?;
+    if text.chars().any(|character| {
+        let code = u32::from(character);
+        code <= 0x1f || code == 0x7f || (0x80..=0x9f).contains(&code)
+    }) {
         return Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath));
     }
-    std::str::from_utf8(bytes)
-        .map(|_| ())
-        .map_err(|_| ProtocolError::InvalidField(ProtocolField::FileTransferPath))
+    Ok(())
 }
 
 /// Validates a peer-provided base file name on the receiving platform.
@@ -616,8 +621,8 @@ pub fn validate_default_file_name(name: &str) -> Result<(), ProtocolError> {
             || (byte == b'\\')
             || byte <= 0x1f
             || byte == 0x7f
-            || (0x80..=0x9f).contains(&byte)
-    }) {
+    }) || name.chars().any(|character| (0x80..=0x9f).contains(&u32::from(character)))
+    {
         return Err(ProtocolError::InvalidField(
             ProtocolField::FileTransferFileName,
         ));
@@ -1291,6 +1296,14 @@ mod tests {
         assert!(validate_protocol_path(b"bad\x01").is_err());
         assert!(validate_protocol_path(b"bad\x7f").is_err());
         assert!(validate_protocol_path(b"bad\x9f").is_err());
+        // C1 control code points are forbidden even as valid UTF-8.
+        assert!(validate_protocol_path("\u{80}".as_bytes()).is_err());
+        assert!(validate_protocol_path("\u{9f}".as_bytes()).is_err());
+        // Multi-byte UTF-8 whose continuation bytes fall in 0x80..=0x9f is a
+        // legitimate path: the C1 check is code-point based, not byte based.
+        for path in ["語", "文", "目", "當", "🚀", "π", "中/漢/頭/說", "é/文/🚀"] {
+            assert!(validate_protocol_path(path.as_bytes()).is_ok(), "{path}");
+        }
         let long = vec![b'a'; MAX_PATH_LEN + 1];
         assert!(validate_protocol_path(&long).is_err());
         let ok = vec![b'a'; MAX_PATH_LEN];
@@ -1299,7 +1312,7 @@ mod tests {
 
     #[test]
     fn default_file_names_are_validated() {
-        for name in ["a.txt", "name", "with space", "üñï", "a.b.c"] {
+        for name in ["a.txt", "name", "with space", "üñï", "a.b.c", "語.txt", "🚀"] {
             assert!(validate_default_file_name(name).is_ok(), "{name}");
         }
         for name in [
