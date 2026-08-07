@@ -46,6 +46,12 @@ pub enum ProtocolField {
     EnterpriseProvider,
     EnterpriseProviders,
     AuthorizationUrl,
+    FileTransferPath,
+    FileTransferFileName,
+    FileTransferSize,
+    FileTransferDigest,
+    FileTransferErrorCode,
+    FileTransferData,
 }
 
 /// Errors returned by bounded wire decoders.

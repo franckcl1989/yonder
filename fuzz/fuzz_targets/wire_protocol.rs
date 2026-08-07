@@ -6,6 +6,7 @@ use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, PakeContext,
 };
 use yonder_core::wire::enterprise::{EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart};
+use yonder_core::wire::file_transfer::FileTransferMessage;
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
 use yonder_core::wire::terminal::{
@@ -28,6 +29,7 @@ fuzz_target!(|input: &[u8]| {
     let _ = TerminalHello::decode(input);
     let _ = TerminalResize::decode(input);
     let _ = TerminalExit::decode(input);
+    let _ = FileTransferMessage::decode_frame(input);
     let _ = TerminalComplete::decode(input);
     let _ = TerminalReady::decode(input);
 
