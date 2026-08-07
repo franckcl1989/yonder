@@ -3554,9 +3554,11 @@ fn real_upload_transfers_a_pattern_file_between_processes() -> Result<(), std::i
         // The upload source is local to the controller: it lives in the
         // controller's connect directory, while the destination lands in
         // the remote session start directory (the host working directory).
+        // The local base directory is created by start_controller, so the
+        // source is written after it.
         let payload = transfer_pattern_bytes(TRANSFER_PATTERN_SIZE);
-        std::fs::write(session.local_base().join(FILE_NAME), &payload)?;
         let mut pty = session.start_controller()?;
+        std::fs::write(session.local_base().join(FILE_NAME), &payload)?;
         pty.shell_ready()?;
         drive_upload_to_default(&mut pty, FILE_NAME, TRANSFER_PATTERN_SIZE)?;
         let (_, output) = detach_and_verify(pty)?;
@@ -3584,8 +3586,8 @@ fn real_upload_transfers_an_empty_file_between_processes() -> Result<(), std::io
     const FILE_NAME: &str = "empty.bin";
     let mut session = RealTransferSession::start()?;
     let outcome = (|| -> Result<(), std::io::Error> {
-        std::fs::write(session.local_base().join(FILE_NAME), [])?;
         let mut pty = session.start_controller()?;
+        std::fs::write(session.local_base().join(FILE_NAME), [])?;
         pty.shell_ready()?;
         drive_upload_to_default(&mut pty, FILE_NAME, 0)?;
         let (_, output) = detach_and_verify(pty)?;
@@ -3646,8 +3648,8 @@ fn upload_to_an_explicit_remote_destination_rejects_a_missing_parent_and_recover
     let mut session = RealTransferSession::start()?;
     let outcome = (|| -> Result<(), std::io::Error> {
         let payload = transfer_pattern_bytes(TRANSFER_PATTERN_SIZE);
-        std::fs::write(session.local_base().join(SOURCE_NAME), &payload)?;
         let mut pty = session.start_controller()?;
+        std::fs::write(session.local_base().join(SOURCE_NAME), &payload)?;
         pty.shell_ready()?;
         // The explicit destination's parent does not exist: the host
         // rejects the upload (§8.3: destination parents are never created
@@ -3696,9 +3698,9 @@ fn upload_to_an_existing_remote_destination_is_rejected_without_overwrite()
     let mut session = RealTransferSession::start()?;
     let outcome = (|| -> Result<(), std::io::Error> {
         let payload = transfer_pattern_bytes(TRANSFER_PATTERN_SIZE);
+        let mut pty = session.start_controller()?;
         std::fs::write(session.local_base().join(SOURCE_NAME), &payload)?;
         std::fs::write(session.remote_base().join(TARGET), EXISTING)?;
-        let mut pty = session.start_controller()?;
         pty.shell_ready()?;
         // §8.3: a final target that already exists is rejected before any
         // byte is written.
