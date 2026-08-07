@@ -16,4 +16,5 @@ pub mod progress;
 pub mod protocol;
 pub mod shutdown;
 pub mod terminal;
+pub mod transfer;
 pub mod transfer_prompt;

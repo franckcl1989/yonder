@@ -301,3 +301,15 @@ connect 企业流程在终端编号选择平台后，需要用系统默认浏览
 - 安全风险：无已知 RustSec 公告；Unix 目标的传递依赖为 `is-wsl` / `is-docker`（经 `libc` 与 `once_cell`），两者均已在锁文件树中；Windows 在 `default-features = false` 下零传递依赖。
 - feature 列表：`default-features = false`，不启用任何 feature；`shellexecute-on-windows` 关闭以避免引入 `dunce` 传递依赖。
 - best-effort 语义保留：授权 URL 始终先打印；打开器失败绝不中止认证流程。
+
+## 已确认的 0.1.4 会话审计依赖
+
+项目所有者于 2026-08-07 批准 0.1.4 会话审计的加密与重放依赖，采用「对齐现有树」路线（与 0.1.2/0.1.3 的 digest 0.10 / curve25519-dalek 4.x 单一主版本树一致，加密树零新增）：
+
+- 已批准直接依赖 `hmac 0.12.1`，`default-features = false`；绑定 digest ^0.10，用于输入承诺的 HMAC-SHA-256。0.13 线（2026-03 发布）绑定 digest 0.11，会引入第二个 SHA-2 主版本树，未采用。
+- 已批准直接依赖 `hkdf 0.12.4`，`default-features = false`；绑定 digest ^0.10 与 hmac ^0.12.1，用于会话私有输入承诺密钥的 HKDF-SHA-256 派生。0.13 线同样绑定 digest 0.11，未采用。
+- 已批准直接依赖 `ed25519-dalek 2.2.0`，`default-features = false`；锁文件已有同版本（libp2p ed25519 feature 引入并经 0.1.2 发布审计），本次转为直接依赖，用于持久审计身份与会话临时签名密钥。3.0.0（2026-07-06 发布的新主版本）绑定 digest 0.11 与 curve25519-dalek 5.0，未采用。
+- 已批准直接依赖 `vte 0.15.0`，`default-features = false`；唯一新增依赖，用于 `yon audit replay` 的内置安全 VT 解析（设计 §26.1）。2026-08-07 经 crates.io 核实为全局最新稳定版，Apache-2.0 OR MIT，MSRV 1.62.1，2025-02 发布、维护活跃，是标准 VT 解析器（无已知 RustSec 公告，实际锁文件审计仍须执行）。
+- 共享 core 包 `yonder-core` 新增已批准的 `sha2 0.10.9` 依赖（workspace 既有直接依赖复用），用于审计哈希链；不新增 digest 主版本。
+- 全部候选的许可证均位于 deny.toml 允许列表（hmac/hkdf/vte 为 MIT OR Apache-2.0，ed25519-dalek 为 BSD-3-Clause，BSD-3-Clause 已在白名单），MSRV 均不高于 workspace `rust-version = 1.88`。实施时锁文件变更后仍须运行完整依赖、安全与许可证审计。
+- 审计容器与线协议编解码（wire::audit / audit_container）为纯字节结构，不依赖上述加密 crate；密码学运算只发生在 session、ledger 与 verify 层。
