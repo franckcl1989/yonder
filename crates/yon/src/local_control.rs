@@ -484,7 +484,12 @@ impl LocalControlInput {
         }
     }
 
-    fn process_modal(&mut self, input: LocalInputChunk, phase: ModalPhase, result: &mut ProcessedInput) {
+    fn process_modal(
+        &mut self,
+        input: LocalInputChunk,
+        phase: ModalPhase,
+        result: &mut ProcessedInput,
+    ) {
         for &byte in input.as_slice() {
             if self.pending_prefix {
                 self.pending_prefix = false;
@@ -712,7 +717,11 @@ mod tests {
         let cases: &[(&[u8], LocalAction, Option<ModalPhase>)] = &[
             (b".", LocalAction::Detach, None),
             (b"\x1d", LocalAction::None, None),
-            (b"u", LocalAction::StartUpload, Some(ModalPhase::UploadPrompt)),
+            (
+                b"u",
+                LocalAction::StartUpload,
+                Some(ModalPhase::UploadPrompt),
+            ),
             (
                 b"d",
                 LocalAction::StartDownload,
@@ -1096,7 +1105,10 @@ mod tests {
     #[test]
     fn enter_transfer_requires_an_active_prompt() {
         let mut machine = LocalControlInput::new(true, false);
-        assert_eq!(machine.enter_transfer(), Err(LocalControlError::NoActiveModal));
+        assert_eq!(
+            machine.enter_transfer(),
+            Err(LocalControlError::NoActiveModal)
+        );
 
         let started = machine.process(chunk(b"\x1du"));
         assert_eq!(started.action, LocalAction::StartUpload);
@@ -1105,7 +1117,10 @@ mod tests {
         assert_eq!(machine.enter_transfer(), Ok(())); // idempotent
 
         assert_eq!(machine.leave_modal(), LocalAction::None);
-        assert_eq!(machine.enter_transfer(), Err(LocalControlError::NoActiveModal));
+        assert_eq!(
+            machine.enter_transfer(),
+            Err(LocalControlError::NoActiveModal)
+        );
 
         let mut download = LocalControlInput::new(true, false);
         let started = download.process(chunk(b"\x1dd"));
@@ -1230,10 +1245,22 @@ mod tests {
                 if second.action != LocalAction::None {
                     action = second.action;
                 }
-                assert_eq!(remote, expected.remote_bytes.as_slice(), "{sequence:?} split {split}");
-                assert_eq!(op_input, expected.remainder.as_slice(), "{sequence:?} split {split}");
+                assert_eq!(
+                    remote,
+                    expected.remote_bytes.as_slice(),
+                    "{sequence:?} split {split}"
+                );
+                assert_eq!(
+                    op_input,
+                    expected.remainder.as_slice(),
+                    "{sequence:?} split {split}"
+                );
                 assert_eq!(action, expected.action, "{sequence:?} split {split}");
-                assert_eq!(machine.modal_phase(), expected_phase, "{sequence:?} split {split}");
+                assert_eq!(
+                    machine.modal_phase(),
+                    expected_phase,
+                    "{sequence:?} split {split}"
+                );
             }
         }
     }

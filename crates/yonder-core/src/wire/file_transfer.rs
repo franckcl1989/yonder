@@ -615,13 +615,12 @@ pub fn validate_default_file_name(name: &str) -> Result<(), ProtocolError> {
             ProtocolField::FileTransferFileName,
         ));
     }
-    if name.bytes().any(|byte| {
-        byte == 0x00
-            || byte == b'/'
-            || (byte == b'\\')
-            || byte <= 0x1f
-            || byte == 0x7f
-    }) || name.chars().any(|character| (0x80..=0x9f).contains(&u32::from(character)))
+    if name
+        .bytes()
+        .any(|byte| byte == 0x00 || byte == b'/' || (byte == b'\\') || byte <= 0x1f || byte == 0x7f)
+        || name
+            .chars()
+            .any(|character| (0x80..=0x9f).contains(&u32::from(character)))
     {
         return Err(ProtocolError::InvalidField(
             ProtocolField::FileTransferFileName,
@@ -1312,7 +1311,15 @@ mod tests {
 
     #[test]
     fn default_file_names_are_validated() {
-        for name in ["a.txt", "name", "with space", "üñï", "a.b.c", "語.txt", "🚀"] {
+        for name in [
+            "a.txt",
+            "name",
+            "with space",
+            "üñï",
+            "a.b.c",
+            "語.txt",
+            "🚀",
+        ] {
             assert!(validate_default_file_name(name).is_ok(), "{name}");
         }
         for name in [
