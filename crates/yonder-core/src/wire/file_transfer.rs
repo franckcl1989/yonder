@@ -1327,8 +1327,7 @@ mod tests {
         #[cfg(windows)]
         {
             for name in [
-                "CON", "con.txt", "prn", "AUX", "NUL", "COM1", "lpt9.x", "a ", "a.",
-                "a\\b",
+                "CON", "con.txt", "prn", "AUX", "NUL", "COM1", "lpt9.x", "a ", "a.", "a\\b",
             ] {
                 assert!(validate_default_file_name(name).is_err(), "{name:?}");
             }
