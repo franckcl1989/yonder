@@ -1700,16 +1700,26 @@ impl PathPromptFlow {
         self.prompt.current_line()
     }
 
-    /// Feeds one processed input chunk: the first call consumes the
-    /// selector-chunk remainder via `feed_initial` (§6.2), later calls the
-    /// modal path bytes.
+    /// Feeds one processed input chunk.
+    ///
+    /// The first call consumes the selector-chunk remainder via
+    /// `feed_initial` (§6.2) — that remainder is only non-empty when the
+    /// selector and the first path bytes share one read block. Interactive
+    /// typing delivers the path in later chunks as `path_bytes`, so every
+    /// call additionally feeds the modal path bytes unless the remainder
+    /// already produced a terminal outcome (trailing bytes of a terminal
+    /// outcome belong to the dead input of the finished operation, §6.2).
     fn feed(&mut self, processed: &ProcessedInput) -> PromptProgress {
-        let result = if self.initial {
+        let mut result = PromptResult::Continue;
+        if self.initial {
             self.initial = false;
-            self.prompt.feed_initial(processed.remainder.as_slice())
-        } else {
-            self.prompt.feed(processed.path_bytes.as_slice())
-        };
+            result = self.prompt.feed_initial(processed.remainder.as_slice());
+        }
+        if matches!(result, PromptResult::Continue | PromptResult::Bell)
+            && !processed.path_bytes.is_empty()
+        {
+            result = self.prompt.feed(processed.path_bytes.as_slice());
+        }
         self.advance(result)
     }
 
@@ -4002,6 +4012,37 @@ mod tests {
         assert_eq!(flow.current_line(), "src/file");
         // The rest of the line completes and submits the required field.
         let processed = machine.process(local_chunk(b".txt\r\n"));
+        match flow.feed(&processed) {
+            PromptProgress::NextField => {}
+            other => panic!("expected NextField, got {other:?}"),
+        }
+        assert_eq!(
+            flow.label(),
+            "remote destination [remote session start directory]:"
+        );
+    }
+
+    #[test]
+    fn prompt_flow_feeds_path_bytes_when_the_selector_chunk_carries_no_remainder() {
+        // Interactive typing delivers the selector and the path in separate
+        // read chunks: the selector chunk has an empty remainder and the
+        // path arrives later as modal path_bytes. The first feed must not
+        // consume the initial flag on the empty remainder alone, or the
+        // first path chunk would be silently dropped.
+        let mut flow = PathPromptFlow::new(TransferDirection::Upload);
+        let mut machine = LocalControlInput::new(true, false);
+        let started = machine.process(local_chunk(b"\x1du"));
+        assert_eq!(started.action, LocalAction::StartUpload);
+        assert!(started.remainder.is_empty());
+        match flow.feed(&started) {
+            PromptProgress::Active { bell: false } => {}
+            other => panic!("expected Active, got {other:?}"),
+        }
+        let processed = machine.process(local_chunk(b"payload.bin\r"));
+        assert!(processed.remainder.is_empty());
+        // The modal machine routes editor bytes too; the prompt submits on
+        // the trailing carriage return.
+        assert_eq!(processed.path_bytes.as_slice(), b"payload.bin\r");
         match flow.feed(&processed) {
             PromptProgress::NextField => {}
             other => panic!("expected NextField, got {other:?}"),

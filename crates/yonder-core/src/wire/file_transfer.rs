@@ -671,11 +671,6 @@ fn is_windows_reserved_name(name: &str) -> bool {
     )
 }
 
-#[cfg(not(windows))]
-fn is_windows_reserved_name(_name: &str) -> bool {
-    false
-}
-
 /// One side of a transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferSide {
