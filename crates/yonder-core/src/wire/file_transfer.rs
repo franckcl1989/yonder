@@ -1320,7 +1320,7 @@ mod tests {
             assert!(validate_default_file_name(name).is_ok(), "{name}");
         }
         for name in [
-            "", ".", "..", "a/b", "a\\b", "a\x00b", "a\x1fb", "a\x7fb", "a\u{9f}b",
+            "", ".", "..", "a/b", "a\x00b", "a\x1fb", "a\x7fb", "a\u{9f}b",
         ] {
             assert!(validate_default_file_name(name).is_err(), "{name:?}");
         }
@@ -1328,6 +1328,7 @@ mod tests {
         {
             for name in [
                 "CON", "con.txt", "prn", "AUX", "NUL", "COM1", "lpt9.x", "a ", "a.",
+                "a\\b",
             ] {
                 assert!(validate_default_file_name(name).is_err(), "{name:?}");
             }
