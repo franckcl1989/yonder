@@ -601,9 +601,9 @@ pub fn validate_protocol_path(bytes: &[u8]) -> Result<(), ProtocolError> {
 ///
 /// The name must be a single ordinary name component: non-empty UTF-8, not
 /// `.` or `..`, without path separators, roots, drive or UNC prefixes, and on
-/// Windows also without trailing dots/spaces or reserved device names. The
-/// receiving endpoint performs this check before joining the name to an
-/// existing destination directory.
+/// Windows also without backslashes, trailing dots/spaces or reserved device
+/// names. The receiving endpoint performs this check before joining the name
+/// to an existing destination directory.
 pub fn validate_default_file_name(name: &str) -> Result<(), ProtocolError> {
     if name.is_empty() || name == "." || name == ".." {
         return Err(ProtocolError::InvalidField(
@@ -617,7 +617,7 @@ pub fn validate_default_file_name(name: &str) -> Result<(), ProtocolError> {
     }
     if name
         .bytes()
-        .any(|byte| byte == 0x00 || byte == b'/' || (byte == b'\\') || byte <= 0x1f || byte == 0x7f)
+        .any(|byte| byte == 0x00 || byte == b'/' || byte <= 0x1f || byte == 0x7f)
         || name
             .chars()
             .any(|character| (0x80..=0x9f).contains(&u32::from(character)))
@@ -628,7 +628,9 @@ pub fn validate_default_file_name(name: &str) -> Result<(), ProtocolError> {
     }
     #[cfg(windows)]
     {
-        if is_windows_reserved_name(name) {
+        // Backslash is a path separator on Windows; on Unix it is an
+        // ordinary file name character.
+        if name.bytes().any(|byte| byte == b'\\') || is_windows_reserved_name(name) {
             return Err(ProtocolError::InvalidField(
                 ProtocolField::FileTransferFileName,
             ));
