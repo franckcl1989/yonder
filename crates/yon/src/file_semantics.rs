@@ -504,12 +504,23 @@ fn ensure_destination_free(final_path: &Path) -> Result<(), FileSemanticsError> 
 /// streamed SHA-256 running in lock-step. The file is removed on `Drop`,
 /// covering failures, cancellation and process exit as far as best-effort
 /// cleanup can (design section 13).
-#[derive(Debug)]
 pub struct PrivateTempFile {
     file: fs::File,
     written: u64,
     hasher: Sha256,
     guard: TempFileGuard,
+}
+
+impl std::fmt::Debug for PrivateTempFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The derived Debug would print the underlying `File`, whose Unix
+        // representation includes the temporary path; the design forbids
+        // logging temporary file names (section 18.4).
+        formatter
+            .debug_struct("PrivateTempFile")
+            .field("written", &self.written)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PrivateTempFile {
