@@ -756,10 +756,10 @@ mod tests {
     use super::{
         AppError, Cli, Command, ConfigCommand, ConnectionCodeArgument, ENDPOINT_SCHEMA,
         LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
-        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, execute_command,
-        map_controller_error, open_diagnostic_log, portable_process_exit, process_result, read_ca,
-        read_ca_document, read_connection_code_from, run, terminal_supports_progress,
-        validate_diagnostic_output, write_remote_exit_warning,
+        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, map_controller_error,
+        open_diagnostic_log, portable_process_exit, process_result, read_ca, read_ca_document,
+        read_connection_code_from, run, terminal_supports_progress, validate_diagnostic_output,
+        write_remote_exit_warning,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -1070,18 +1070,30 @@ mod tests {
 
     #[test]
     fn config_check_validates_and_reports_the_effective_configuration() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = execute_command(
-            &runtime,
-            Command::Config {
-                command: ConfigCommand::Check,
-            },
+        // The system loader depends on the machine's real config files, so
+        // the check is driven against a deterministic test directory: a
+        // valid relay set passes, and an empty config fails the schema.
+        let directory = test_directory("config-check");
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        fs::write(
+            directory.join("yon.toml"),
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\n"),
+        )
+        .unwrap();
+        let loader = test_loader(directory.clone());
+        assert!(
+            endpoint_config_with(&loader).is_ok(),
+            "a valid relay set must pass the check"
         );
-        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-        assert_eq!(result.unwrap(), 0);
+
+        fs::write(directory.join("yon.toml"), "").unwrap();
+        assert!(
+            matches!(
+                endpoint_config_with(&loader),
+                Err(AppError::Configuration(_))
+            ),
+            "an empty config must fail the schema"
+        );
     }
 
     #[test]

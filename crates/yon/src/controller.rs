@@ -5089,6 +5089,7 @@ mod tests {
         let Ok(Some(guard)) = DisplayModeGuard::enter(true) else {
             #[cfg(not(windows))]
             panic!("non-Windows enter(true) cannot fail");
+            #[cfg(windows)]
             return;
         };
         DisplayModeGuard::restore_optional(Some(guard)).unwrap();
