@@ -1,3 +1,5 @@
+use crate::file_semantics::{BaseDirectory, SourceFile};
+use crate::local_control::{LocalAction, LocalControlInput, LocalInputChunk, ProcessedInput};
 use crate::network::{
     ConnectionBinding, EndpointDriver, EndpointError, EndpointEvent, connect_relay,
     connect_relay_with_policy, connect_target, connect_target_via_relay, drive_bound,
@@ -8,9 +10,16 @@ use crate::protocol::{
     EnterpriseResolveUi, RelayProtocolError, ResolveDeadline, resolve_peer_auto,
 };
 use crate::terminal::TerminalChunk;
+use crate::transfer::{TransferConfig, TransferOutcome, run_download, run_upload};
+use crate::transfer_prompt::{
+    AppendOutcome, DELAYED_OUTPUT_CAP, DelayedOutputBuffer, PROMPT_PATH_LIMIT, PathPrompt,
+    PromptResult,
+};
 use backon::{BackoffBuilder as _, ConstantBuilder};
 use std::convert::Infallible;
 use std::io::IsTerminal as _;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{
@@ -21,6 +30,7 @@ use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, PROCEED_LEN, PakeContext,
     RETRY_LEN,
 };
+use yonder_core::wire::file_transfer::{FILE_TRANSFER_PROTOCOL, TransferDirection};
 use yonder_core::wire::terminal::{
     CONTROL_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalReady, TerminalResize,
 };
@@ -30,19 +40,40 @@ use yonder_core::{
     SecureRandom, TerminalSize, TerminalValue,
 };
 use yonder_net::{
-    ApplicationStream, ApplicationStreams, ConnectionId, DirectUpgradePolicy, EndpointRelayAddress,
-    EndpointRelaySet, Keypair, Libp2pApplicationStreams, PeerId, WssTransportConfig,
-    generate_identity, peer_id_bytes,
+    ApplicationStream, ApplicationStreamError, ApplicationStreams, ConnectionId,
+    DirectUpgradePolicy, EndpointRelayAddress, EndpointRelaySet, Keypair, Libp2pApplicationStreams,
+    PeerId, WssTransportConfig, generate_identity, peer_id_bytes,
 };
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_LIMIT: usize = 20;
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const REMOTE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
-const LOCAL_ESCAPE: u8 = 0x1d;
 const UTF8_SEQUENCE_CAPACITY: usize = 4;
 const UTF8_OUTPUT_BATCH_CAPACITY: usize = 4 * 1024;
 const UTF8_REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
+
+// Fixed controller-local texts of the 0.1.3 file-transfer UI. The prompt
+// labels, the "already active" line (design §15.3) and the paused-input
+// phrase (design §7.5) are frozen; the remaining texts are fixed
+// implementation strings (the design requires fixed errors, §7.1/§9.3).
+const PROMPT_BANNER_UPLOAD: &str = "[yonder upload]";
+const PROMPT_BANNER_DOWNLOAD: &str = "[yonder download]";
+const PROMPT_UPLOAD_SOURCE: &str = "local source:";
+const PROMPT_UPLOAD_DESTINATION: &str = "remote destination [remote session start directory]:";
+const PROMPT_DOWNLOAD_SOURCE: &str = "remote source:";
+const PROMPT_DOWNLOAD_DESTINATION: &str = "local destination [local connect start directory]:";
+const FILE_TRANSFER_ALREADY_ACTIVE: &str = "file transfer already active";
+const FILE_TRANSFER_UNAVAILABLE: &str = "file transfer is unavailable in this session";
+const FILE_TRANSFER_UNSUPPORTED: &str = "file transfer is not supported by the remote peer";
+const FILE_TRANSFER_PROBE_FAILED: &str = "file transfer capability check failed";
+const FILE_TRANSFER_OPEN_FAILED: &str = "the file transfer substream could not be opened";
+const TRANSFER_STATUS_PAUSED: &str = "传输期间终端输入暂停，Ctrl+C 取消";
+const LOCAL_CONTROL_HELP: &str = "Ctrl+] .      end the session\r\n\
+    Ctrl+] Ctrl+] send a literal Ctrl+]\r\n\
+    Ctrl+] u      upload a file\r\n\
+    Ctrl+] d      download a file\r\n\
+    Ctrl+] ?      show this help";
 
 trait TerminalFrontend {
     type Input: tokio::io::AsyncRead + Unpin;
@@ -643,7 +674,7 @@ async fn prepare_controller_session(
 
 struct PreparedController {
     driver: EndpointDriver,
-    _streams: Libp2pApplicationStreams,
+    streams: Libp2pApplicationStreams,
     binding: ConnectionBinding,
     control: ApplicationStream,
     data: ApplicationStream,
@@ -704,7 +735,7 @@ async fn prepare_controller(
     .await?;
     Ok(PreparedController {
         driver,
-        _streams: streams,
+        streams,
         binding,
         control,
         data,
@@ -944,7 +975,7 @@ async fn run_terminal(
 ) -> Result<u32, ControllerError> {
     let PreparedController {
         mut driver,
-        _streams,
+        mut streams,
         binding,
         control,
         data,
@@ -984,16 +1015,36 @@ async fn run_terminal(
     let mut input = frontend.input();
     let mut output = frontend.output();
     let mut terminal_output = RemoteTerminalOutput::new(output_mode);
-    let mut local_escape = LocalInputEscape::new(interactive);
+    // The local base directory is captured once per session (design §8.7);
+    // relative local paths resolve against it for the whole session.
+    let base = match BaseDirectory::capture() {
+        Ok(base) => Some(base),
+        Err(error) => {
+            tracing::debug!(%error, "file transfer base directory unavailable");
+            None
+        }
+    };
+    let transfer_cancel = AtomicBool::new(false);
+    // The running transfer is a pump branch (design §7.5, §15.2): terminal
+    // output, control, resizes and cancellation keep flowing while the file
+    // substream is active. The future owns the substream, the opened source
+    // and the transfer parameters; it is one fixed-size allocation.
+    let mut transfer: Option<Pin<Box<dyn Future<Output = TransferOutcome> + '_>>> = None;
+    let mut session_ui = TransferUi::new(
+        interactive,
+        frontend.output_is_terminal(),
+        frontend.output_is_terminal() || std::io::stderr().is_terminal(),
+    );
     let mut remote = RemoteCompletion::new();
     let session = {
-        let local_input = copy_local_input(&mut input, &mut data_write, &mut local_escape);
-        let remote_output = copy_remote_output(&mut data_read, &mut output, &mut terminal_output);
+        // The remote-exit reader and the resize poller keep state across
+        // pump iterations and are pinned once; the local-input and
+        // remote-output steps are re-armed per iteration (their state lives
+        // in `session_ui`), so the modal flows can borrow the same streams
+        // between events.
         let remote_exit = read_remote_exit(&mut control_read);
         let terminal_resizes =
             copy_terminal_resizes(&frontend, &mut control_write, hello.size(), interactive);
-        tokio::pin!(local_input);
-        tokio::pin!(remote_output);
         tokio::pin!(remote_exit);
         tokio::pin!(terminal_resizes);
         loop {
@@ -1007,14 +1058,30 @@ async fn run_terminal(
                     tokio::select! {
                         () = cancellation.cancelled() => TerminalPumpEvent::Cancelled,
                         event = driver.next() => TerminalPumpEvent::Driver(event),
-                        result = &mut local_input => TerminalPumpEvent::LocalInput(result),
-                        result = &mut remote_output, if remote.output_open() => {
+                        result = process_local_input_chunk(
+                            &mut input,
+                            &mut data_write,
+                            &mut session_ui.control,
+                            &mut session_ui.pending_input,
+                        ), if !session_ui.local_ended => TerminalPumpEvent::LocalInput(result),
+                        result = copy_remote_output(
+                            &mut data_read,
+                            &mut output,
+                            &mut terminal_output,
+                            &mut session_ui.delayed,
+                            &mut session_ui.delayed_overflow,
+                            &session_ui.flow,
+                        ), if remote.output_open() => {
                             TerminalPumpEvent::RemoteOutput(result)
                         }
                         result = &mut remote_exit, if remote.exit_pending() => {
                             TerminalPumpEvent::RemoteExit(result)
                         }
                         result = &mut terminal_resizes => TerminalPumpEvent::Resize(result),
+                        result = poll_inflight_transfer(&mut transfer),
+                            if session_ui.direction.is_some() => {
+                            TerminalPumpEvent::Transfer(result)
+                        }
                     }
                 } => {
                     let completion = match event {
@@ -1042,7 +1109,78 @@ async fn run_terminal(
                             None
                         }
                         TerminalPumpEvent::LocalInput(result) => match result {
-                            Ok(never) => match never {},
+                            Ok(LocalInputSignal::ChunkPending) => {
+                                let processed = session_ui.pending_input.take().expect(
+                                    "the pump stores one processed chunk before signalling",
+                                );
+                                match handle_processed_input(
+                                    processed,
+                                    &mut output,
+                                    &mut terminal_output,
+                                    &mut session_ui,
+                                    &transfer_cancel,
+                                )
+                                .await
+                                {
+                                    Ok(LocalInputHandling::Done) => None,
+                                    Ok(LocalInputHandling::StartModal(direction)) => {
+                                        match begin_file_transfer_modal(
+                                            direction,
+                                            driver,
+                                            &mut streams,
+                                            binding,
+                                            &mut output,
+                                            &mut session_ui,
+                                            &base,
+                                            cancellation,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => None,
+                                            Err(error) => break Err(error),
+                                        }
+                                    }
+                                    Ok(LocalInputHandling::RunTransfer {
+                                        direction,
+                                        first,
+                                        second,
+                                    }) => {
+                                        match begin_transfer(
+                                            direction,
+                                            first,
+                                            second,
+                                            driver,
+                                            &mut streams,
+                                            binding,
+                                            &mut output,
+                                            &mut session_ui,
+                                            cancellation,
+                                            &base,
+                                            &transfer_cancel,
+                                            &mut transfer,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => None,
+                                            Err(error) => break Err(error),
+                                        }
+                                    }
+                                    Err(error) => break Err(error),
+                                }
+                            }
+                            Ok(LocalInputSignal::Eof) => {
+                                match finish_local_input_eof(
+                                    &mut data_write,
+                                    &mut output,
+                                    &mut terminal_output,
+                                    &mut session_ui,
+                                )
+                                .await
+                                {
+                                    Ok(()) => None,
+                                    Err(error) => break Err(error),
+                                }
+                            }
                             Err(error) => break Err(error),
                         },
                         TerminalPumpEvent::RemoteOutput(result) => {
@@ -1062,8 +1200,50 @@ async fn run_terminal(
                             Ok(never) => match never {},
                             Err(error) => break Err(error),
                         },
+                        TerminalPumpEvent::Transfer(outcome) => {
+                            match handle_transfer_event(
+                                outcome,
+                                &mut output,
+                                &mut session_ui,
+                                &transfer_cancel,
+                                &mut transfer,
+                            )
+                            .await
+                            {
+                                Ok(completion) => completion,
+                                Err(error) => break Err(error),
+                            }
+                        }
                     };
+                    // §7.4.5: a delayed-buffer overflow cancels the
+                    // not-yet-started operation and flushes the buffer
+                    // immediately; the remote terminal stays open.
+                    if session_ui.take_delayed_overflow() {
+                        match abort_prompt_for_overflow(
+                            &mut session_ui,
+                            &mut output,
+                            &mut terminal_output,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     if let Some(code) = completion {
+                        // The session is ending; write any still-delayed
+                        // remote output so the remote's final lines appear
+                        // in order (§7.4.4).
+                        match flush_delayed_output(
+                            &mut session_ui,
+                            &mut output,
+                            &mut terminal_output,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(error) => break Err(error),
+                        }
                         break Ok(code);
                     }
                 }
@@ -1103,10 +1283,11 @@ async fn run_terminal(
 enum TerminalPumpEvent {
     Cancelled,
     Driver(EndpointEvent),
-    LocalInput(Result<Infallible, ControllerError>),
+    LocalInput(Result<LocalInputSignal, ControllerError>),
     RemoteOutput(Result<(), ControllerError>),
     RemoteExit(Result<u32, ControllerError>),
     Resize(Result<Infallible, ControllerError>),
+    Transfer(TransferOutcome),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1186,40 +1367,80 @@ fn native_display_restore_commands() -> Result<String, std::io::Error> {
     Ok(commands)
 }
 
-async fn copy_local_input(
-    input: &mut (impl tokio::io::AsyncRead + Unpin),
-    data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
-    local_escape: &mut LocalInputEscape,
-) -> Result<Infallible, ControllerError> {
-    loop {
-        let Some(local_input) = read_local_input(input, local_escape.read_reserve()).await? else {
-            if let Some(pending_escape) = local_escape.finish()? {
-                write_local_input_io(data_write, &pending_escape).await?;
-            }
-            data_write.shutdown().await?;
-            return std::future::pending().await;
-        };
-        tracing::debug!(
-            length = local_input.as_slice().len(),
-            "local terminal input read completed"
-        );
-        let filtered = local_escape.filter(local_input)?;
-        if !filtered.chunk.as_slice().is_empty() {
-            write_local_input_io(data_write, &filtered.chunk).await?;
-        }
-        if filtered.detach {
-            return Err(ControllerError::Interrupted);
-        }
-        tokio::task::yield_now().await;
-    }
+/// The outcome of one local input pump step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalInputSignal {
+    /// A processed chunk is waiting in the session state.
+    ChunkPending,
+    /// Local input reached EOF.
+    Eof,
 }
 
-async fn write_local_input_io(
+/// Reads one local input chunk and processes it through the local control
+/// machine, forwarding the chunk's remote bytes to the terminal-data
+/// stream and storing the processed chunk for the pump loop. The machine
+/// keeps its state across calls and the chunk never exceeds the fixed
+/// input capacity (design §6, §15.1).
+///
+/// The pump borrows only disjoint parts of the session state, so the
+/// pump-loop branches can run at the same time, and the chunk data stays
+/// in the session state instead of a large pump event.
+async fn process_local_input_chunk(
+    input: &mut (impl tokio::io::AsyncRead + Unpin),
     data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
-    input: &TerminalChunk,
+    control: &mut LocalControlInput,
+    pending_input: &mut Option<ProcessedInput>,
+) -> Result<LocalInputSignal, ControllerError> {
+    let reserve = if control.enabled() && control.pending_prefix() {
+        1
+    } else {
+        0
+    };
+    let Some(chunk) = read_local_input(input, reserve).await? else {
+        return Ok(LocalInputSignal::Eof);
+    };
+    tracing::debug!(
+        length = chunk.as_slice().len(),
+        "local terminal input read completed"
+    );
+    let processed = control.process(chunk);
+    if !processed.remote_bytes.is_empty() {
+        data_write
+            .write_all(processed.remote_bytes.as_slice())
+            .await?;
+        data_write.flush().await?;
+    }
+    *pending_input = Some(processed);
+    tokio::task::yield_now().await;
+    Ok(LocalInputSignal::ChunkPending)
+}
+
+/// Handles local input EOF (the session is ending): the machine flushes an
+/// orphaned prefix, the active file operation is dropped together with its
+/// unconsumed remainder — which is never replayed to the remote (§6.2,
+/// §16.4) — and the remote data stream shuts down.
+async fn finish_local_input_eof(
+    data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    terminal_output: &mut RemoteTerminalOutput,
+    session_ui: &mut TransferUi,
 ) -> Result<(), ControllerError> {
-    data_write.write_all(input.as_slice()).await?;
-    data_write.flush().await?;
+    session_ui.local_ended = true;
+    let finished = session_ui.control.finish();
+    if !finished.remote_bytes.is_empty() {
+        data_write
+            .write_all(finished.remote_bytes.as_slice())
+            .await?;
+        data_write.flush().await?;
+    }
+    if finished.action == LocalAction::Bell {
+        write_local_ui(output, session_ui.ui_to_display, b"\x07").await?;
+    }
+    if session_ui.flow.is_some() {
+        end_transfer_modal(session_ui, output).await?;
+        flush_delayed_output(session_ui, output, terminal_output).await?;
+    }
+    data_write.shutdown().await?;
     Ok(())
 }
 
@@ -1227,6 +1448,9 @@ async fn copy_remote_output(
     data_read: &mut (impl tokio::io::AsyncRead + Unpin),
     output: &mut (impl tokio::io::AsyncWrite + Unpin),
     terminal_output: &mut RemoteTerminalOutput,
+    delayed: &mut DelayedOutputBuffer,
+    delayed_overflow: &mut bool,
+    prompt_active: &Option<PathPromptFlow>,
 ) -> Result<(), ControllerError> {
     loop {
         let mut chunk = TerminalChunk::new();
@@ -1237,8 +1461,17 @@ async fn copy_remote_output(
         chunk
             .set_len(length)
             .map_err(|_| ControllerError::ConnectionLost)?;
-        terminal_output.write(output, chunk.as_slice()).await?;
-        output.flush().await?;
+        if prompt_active.is_some() {
+            // §7.4: while a path prompt is active the display is paused but
+            // the remote output keeps being read into the bounded delayed
+            // buffer, so the remote PTY never blocks.
+            if delayed.append(chunk.as_slice()) == AppendOutcome::Overflow {
+                *delayed_overflow = true;
+            }
+        } else {
+            terminal_output.write(output, chunk.as_slice()).await?;
+            output.flush().await?;
+        }
         tokio::task::yield_now().await;
     }
 }
@@ -1331,99 +1564,801 @@ async fn copy_terminal_resizes(
     }
 }
 
-struct FilteredLocalInput {
-    chunk: TerminalChunk,
-    detach: bool,
+/// The three-state file-transfer capability cache of the active connection
+/// (design §9.3). Session-local; a rebuilt connection ends the session in
+/// the current architecture, so the cache always restarts at `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CapabilityCache {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LocalInputEscape {
-    enabled: bool,
-    pending: bool,
+/// Why the file-transfer modal cannot start (design §7.1, §9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferNotReady {
+    /// No terminal output for the local UI, or no session base directory.
+    Unavailable,
+    /// The peer does not support the protocol; the result is cached and
+    /// never re-probed (§9.3).
+    Unsupported,
+    /// The capability is unknown; the caller must probe first (§9.3).
+    Probe,
 }
 
-impl LocalInputEscape {
-    const fn new(enabled: bool) -> Self {
+/// The pre-prompt decision of one file operation: the local availability
+/// check and the three-state capability cache (design §7.1, §9.3).
+fn file_transfer_ready(
+    session_ui: &TransferUi,
+    base: Option<&BaseDirectory>,
+) -> Result<CapabilityCache, TransferNotReady> {
+    if !session_ui.ui_terminal || base.is_none() {
+        return Err(TransferNotReady::Unavailable);
+    }
+    match session_ui.capability {
+        CapabilityCache::Unknown => Err(TransferNotReady::Probe),
+        CapabilityCache::Supported => Ok(CapabilityCache::Supported),
+        CapabilityCache::Unsupported => Err(TransferNotReady::Unsupported),
+    }
+}
+
+/// Runs one capability probe (design §9.3): the file-transfer protocol
+/// substream is opened and closed immediately without any message on
+/// success (the peer treats a pre-frame EOF as a side-effect-free probe).
+/// Only an explicit unsupported-protocol result is cached; timeouts,
+/// connection errors and transient I/O failures propagate and are never
+/// cached, so the user may retry.
+async fn probe_file_transfer_capability<S>(
+    open: impl Future<Output = Result<S, ControllerError>>,
+) -> Result<CapabilityCache, ControllerError> {
+    match open.await {
+        Ok(stream) => {
+            // §9.3: close the probe substream without any message.
+            drop(stream);
+            Ok(CapabilityCache::Supported)
+        }
+        Err(ControllerError::Endpoint(EndpointError::Application(
+            ApplicationStreamError::UnsupportedProtocol,
+        ))) => Ok(CapabilityCache::Unsupported),
+        Err(error) => Err(error),
+    }
+}
+
+/// The progress of one [`PathPromptFlow::feed`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptProgress {
+    /// The active field continues; `bell` reports rejected bytes.
+    Active { bell: bool },
+    /// The active field was reset (invalid input); the caller must reprint
+    /// its label.
+    Reprompt,
+    /// The required field completed; the caller must print the destination
+    /// label.
+    NextField,
+    /// Both fields completed.
+    Completed {
+        first: String,
+        second: Option<String>,
+    },
+    /// `Ctrl+C` cancelled the operation (design §16.1).
+    Cancelled,
+}
+
+/// The two-field path prompt of one upload or download (design §7.2, §7.3).
+///
+/// Pure controller-local UI state: it never parses or normalizes a path,
+/// never performs remote I/O and never logs. The `echoed` field tracks the
+/// line already rendered on the local display, so the raw-mode controller
+/// can render the delta as the user types.
+struct PathPromptFlow {
+    direction: TransferDirection,
+    /// The submitted required field (local source / remote source).
+    first: Option<String>,
+    /// The editor of the active field.
+    prompt: PathPrompt,
+    /// 0 = required field, 1 = defaultable destination field.
+    field: usize,
+    /// Whether the next feed is the selector-chunk remainder (§6.2).
+    initial: bool,
+    /// The line currently echoed on the local display.
+    echoed: String,
+}
+
+impl PathPromptFlow {
+    fn new(direction: TransferDirection) -> Self {
         Self {
-            enabled,
-            pending: false,
+            direction,
+            first: None,
+            prompt: PathPrompt::required(PROMPT_PATH_LIMIT),
+            field: 0,
+            initial: true,
+            echoed: String::new(),
         }
     }
 
-    const fn read_reserve(self) -> usize {
-        if self.enabled && self.pending { 1 } else { 0 }
+    const fn banner(&self) -> &'static str {
+        match self.direction {
+            TransferDirection::Upload => PROMPT_BANNER_UPLOAD,
+            TransferDirection::Download => PROMPT_BANNER_DOWNLOAD,
+        }
     }
 
-    fn filter(&mut self, input: TerminalChunk) -> Result<FilteredLocalInput, ControllerError> {
-        if !self.enabled {
-            return Ok(FilteredLocalInput {
-                chunk: input,
-                detach: false,
-            });
+    const fn label(&self) -> &'static str {
+        match (self.direction, self.field) {
+            (TransferDirection::Upload, 0) => PROMPT_UPLOAD_SOURCE,
+            (TransferDirection::Upload, 1) => PROMPT_UPLOAD_DESTINATION,
+            (TransferDirection::Download, 0) => PROMPT_DOWNLOAD_SOURCE,
+            (TransferDirection::Download, 1) => PROMPT_DOWNLOAD_DESTINATION,
+            // The field index is 0 or 1 by construction; a defensive arm
+            // keeps the match total without a panic.
+            (_, _) => PROMPT_UPLOAD_SOURCE,
         }
+    }
 
-        let mut output = TerminalChunk::new();
-        let mut length = 0;
-        let mut detach = false;
-        for &byte in input.as_slice() {
-            if self.pending {
-                self.pending = false;
-                match byte {
-                    b'.' => {
-                        detach = true;
-                        break;
-                    }
-                    LOCAL_ESCAPE => {
-                        push_local_byte(&mut output, &mut length, LOCAL_ESCAPE)?;
-                        continue;
-                    }
-                    _ => {
-                        push_local_byte(&mut output, &mut length, LOCAL_ESCAPE)?;
+    fn current_line(&self) -> &str {
+        self.prompt.current_line()
+    }
+
+    /// Feeds one processed input chunk: the first call consumes the
+    /// selector-chunk remainder via `feed_initial` (§6.2), later calls the
+    /// modal path bytes.
+    fn feed(&mut self, processed: &ProcessedInput) -> PromptProgress {
+        let result = if self.initial {
+            self.initial = false;
+            self.prompt.feed_initial(processed.remainder.as_slice())
+        } else {
+            self.prompt.feed(processed.path_bytes.as_slice())
+        };
+        self.advance(result)
+    }
+
+    fn advance(&mut self, result: PromptResult) -> PromptProgress {
+        match result {
+            PromptResult::Submitted(path) => {
+                if self.field == 0 {
+                    self.first = Some(path.into());
+                    self.prompt = PathPrompt::with_default(PROMPT_PATH_LIMIT);
+                    self.field = 1;
+                    self.echoed.clear();
+                    PromptProgress::NextField
+                } else {
+                    self.echoed.clear();
+                    PromptProgress::Completed {
+                        first: self
+                            .first
+                            .take()
+                            .expect("the required field completed before the destination"),
+                        second: Some(path.into()),
                     }
                 }
             }
-
-            if byte == LOCAL_ESCAPE {
-                self.pending = true;
-            } else {
-                push_local_byte(&mut output, &mut length, byte)?;
+            PromptResult::Empty => {
+                // Only the defaultable destination field can submit empty.
+                self.echoed.clear();
+                PromptProgress::Completed {
+                    first: self
+                        .first
+                        .take()
+                        .expect("the required field completed before the destination"),
+                    second: None,
+                }
             }
+            PromptResult::Cancelled => {
+                self.echoed.clear();
+                PromptProgress::Cancelled
+            }
+            PromptResult::Reprompt => {
+                self.echoed.clear();
+                PromptProgress::Reprompt
+            }
+            PromptResult::Bell => PromptProgress::Active { bell: true },
+            PromptResult::Continue => PromptProgress::Active { bell: false },
         }
-        output
-            .set_len(length)
-            .map_err(|_| ControllerError::ConnectionLost)?;
-        Ok(FilteredLocalInput {
-            chunk: output,
-            detach,
-        })
     }
 
-    fn finish(&mut self) -> Result<Option<TerminalChunk>, ControllerError> {
-        if !self.enabled || !self.pending {
-            return Ok(None);
+    /// Renders the echo delta of the active field: the controller is in raw
+    /// mode, so the prompt line is rendered locally — accepted characters
+    /// echo as they arrive, backspace erases one column, and the caller
+    /// rings the bell for rejected bytes (the exact rendering is an
+    /// implementation decision; the frozen design fixes only the labels).
+    async fn echo_delta(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<(), ControllerError> {
+        let line = self.prompt.current_line();
+        let common = self
+            .echoed
+            .as_bytes()
+            .iter()
+            .zip(line.as_bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        for _ in self.echoed[common..].chars() {
+            output.write_all(b"\x08 \x08").await?;
         }
-        self.pending = false;
-        let mut output = TerminalChunk::new();
-        output.writable()[0] = LOCAL_ESCAPE;
-        output
-            .set_len(1)
-            .map_err(|_| ControllerError::ConnectionLost)?;
-        Ok(Some(output))
+        let added = &line[common..];
+        if !added.is_empty() {
+            output.write_all(added.as_bytes()).await?;
+        }
+        output.flush().await?;
+        self.echoed.clear();
+        self.echoed.push_str(line);
+        Ok(())
     }
 }
 
-fn push_local_byte(
-    output: &mut TerminalChunk,
-    length: &mut usize,
-    byte: u8,
+/// Session-local controller state of the 0.1.3 file-transfer interaction
+/// (design §6–§9, §15, §16).
+struct TransferUi {
+    /// The local control input machine (disabled for non-interactive
+    /// stdin: full byte transparency, §6.4).
+    control: LocalControlInput,
+    /// The active two-field path prompt, when one is open.
+    flow: Option<PathPromptFlow>,
+    /// The direction of the active file operation.
+    direction: Option<TransferDirection>,
+    /// Delayed remote terminal output while a prompt is active (§7.4).
+    delayed: DelayedOutputBuffer,
+    /// The three-state capability cache of the active connection (§9.3).
+    capability: CapabilityCache,
+    /// Whether the local UI has a terminal to write to (design §7.1).
+    ui_terminal: bool,
+    /// Whether the local UI shares the remote display (stdout terminal);
+    /// otherwise it writes to stderr (design §7.1).
+    ui_to_display: bool,
+    /// Delayed-buffer overflow pending the pump's abort (§7.4.5).
+    delayed_overflow: bool,
+    /// Local input EOF was observed; the read branch stays disabled.
+    local_ended: bool,
+    /// The processed chunk the pump stored for the loop body, so the pump
+    /// event stays small while the chunk data never leaves the session
+    /// state (design §15.1: the fixed 4096-byte input bound).
+    pending_input: Option<ProcessedInput>,
+}
+
+impl TransferUi {
+    fn new(interactive: bool, ui_to_display: bool, ui_terminal: bool) -> Self {
+        Self {
+            control: LocalControlInput::new(interactive, false),
+            flow: None,
+            direction: None,
+            delayed: DelayedOutputBuffer::new(DELAYED_OUTPUT_CAP),
+            capability: CapabilityCache::Unknown,
+            ui_terminal,
+            ui_to_display,
+            delayed_overflow: false,
+            local_ended: false,
+            pending_input: None,
+        }
+    }
+
+    fn take_delayed_overflow(&mut self) -> bool {
+        std::mem::take(&mut self.delayed_overflow)
+    }
+
+    /// Ends the active file operation and returns the machine to
+    /// pass-through; the returned action reports an abandoned `Ctrl+]`
+    /// prefix that the caller must render as a bell (§6.3).
+    fn leave_modal(&mut self) -> LocalAction {
+        self.flow = None;
+        self.direction = None;
+        self.delayed_overflow = false;
+        self.control.leave_modal()
+    }
+}
+
+/// What the pump loop must do after one processed local input chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalInputHandling {
+    /// Nothing further.
+    Done,
+    /// A new file operation must start (pass-through `u`/`d`).
+    StartModal(TransferDirection),
+    /// The prompt completed; the transfer substream must be opened.
+    RunTransfer {
+        direction: TransferDirection,
+        first: String,
+        second: Option<String>,
+    },
+}
+
+/// Writes one local UI message: to the remote display when stdout is a
+/// terminal, else to stderr (design §7.1). Local UI never enters
+/// terminal-data and never logs.
+async fn write_local_ui(
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    to_display: bool,
+    bytes: &[u8],
 ) -> Result<(), ControllerError> {
-    let slot = output
-        .writable()
-        .get_mut(*length)
-        .ok_or(ControllerError::ConnectionLost)?;
-    *slot = byte;
-    *length += 1;
+    if to_display {
+        output.write_all(bytes).await?;
+        output.flush().await?;
+    } else {
+        tokio::io::stderr().write_all(bytes).await?;
+        tokio::io::stderr().flush().await?;
+    }
     Ok(())
+}
+
+/// Writes the delayed remote output in original order (design §7.4.4):
+/// the prompt has ended, the terminal is in its session mode, and the
+/// buffered bytes now stream to the local display.
+async fn flush_delayed_output(
+    session_ui: &mut TransferUi,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    terminal_output: &mut RemoteTerminalOutput,
+) -> Result<(), ControllerError> {
+    if session_ui.delayed.is_empty() {
+        return Ok(());
+    }
+    let bytes = session_ui.delayed.take_all();
+    terminal_output.write(output, &bytes).await?;
+    output.flush().await?;
+    Ok(())
+}
+
+/// Ends the active file operation, returning the machine to pass-through,
+/// and rings the bell when the machine reports an abandoned prefix (§6.3).
+async fn end_transfer_modal(
+    session_ui: &mut TransferUi,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<(), ControllerError> {
+    if session_ui.leave_modal() == LocalAction::Bell {
+        write_local_ui(output, session_ui.ui_to_display, b"\x07").await?;
+    }
+    Ok(())
+}
+
+/// Aborts the active prompt because the delayed output buffer reached its
+/// capacity (design §7.4.5): the not-yet-started file operation is
+/// cancelled, the terminal stays in its session mode, and the buffered
+/// remote output is written out immediately. The remote terminal stays
+/// open.
+async fn abort_prompt_for_overflow(
+    session_ui: &mut TransferUi,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    terminal_output: &mut RemoteTerminalOutput,
+) -> Result<(), ControllerError> {
+    end_transfer_modal(session_ui, output).await?;
+    flush_delayed_output(session_ui, output, terminal_output).await
+}
+
+/// Handles one processed local input chunk: the active prompt consumes its
+/// path bytes, and the chunk's local action is applied with modal rules
+/// (design §6.3, §7.4, §16).
+async fn handle_processed_input(
+    processed: ProcessedInput,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    terminal_output: &mut RemoteTerminalOutput,
+    session_ui: &mut TransferUi,
+    cancel: &AtomicBool,
+) -> Result<LocalInputHandling, ControllerError> {
+    let mut run_transfer = None;
+    if let Some(flow) = session_ui.flow.as_mut() {
+        match flow.feed(&processed) {
+            PromptProgress::Active { bell } => {
+                flow.echo_delta(output).await?;
+                if bell {
+                    write_local_ui(output, session_ui.ui_to_display, b"\x07").await?;
+                }
+            }
+            PromptProgress::Reprompt => {
+                // §7.2/§7.3: an empty required field, an over-long line or
+                // an invalid encoding re-prompts the same field.
+                write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                write_local_ui(output, session_ui.ui_to_display, flow.label().as_bytes()).await?;
+            }
+            PromptProgress::NextField => {
+                write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                write_local_ui(output, session_ui.ui_to_display, flow.label().as_bytes()).await?;
+            }
+            PromptProgress::Completed { first, second } => {
+                write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                session_ui.flow = None;
+                // §7.4.4: the delayed remote output is flushed in order
+                // once the prompt has ended.
+                flush_delayed_output(session_ui, output, terminal_output).await?;
+                run_transfer = Some((
+                    session_ui
+                        .direction
+                        .expect("an active prompt keeps its direction"),
+                    first,
+                    second,
+                ));
+            }
+            PromptProgress::Cancelled => {
+                write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                // §16.1: no file substream is opened and nothing is sent to
+                // the remote PTY.
+                end_transfer_modal(session_ui, output).await?;
+                flush_delayed_output(session_ui, output, terminal_output).await?;
+            }
+        }
+    }
+    // The chunk's local action, interpreted with modal rules (§6.3).
+    match processed.action {
+        LocalAction::None => {}
+        LocalAction::Detach => {
+            // §6.2/§16.3: end the whole session; an active operation is
+            // cancelled by dropping it (its substream closes, the peer
+            // cleans up best-effort).
+            return Err(ControllerError::Interrupted);
+        }
+        LocalAction::ShowHelp => {
+            if session_ui.ui_terminal {
+                write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                write_local_ui(
+                    output,
+                    session_ui.ui_to_display,
+                    LOCAL_CONTROL_HELP.as_bytes(),
+                )
+                .await?;
+                if let Some(flow) = session_ui.flow.as_ref() {
+                    // §6.3: the prompt continues after the help.
+                    write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                    write_local_ui(output, session_ui.ui_to_display, flow.label().as_bytes())
+                        .await?;
+                    write_local_ui(
+                        output,
+                        session_ui.ui_to_display,
+                        flow.current_line().as_bytes(),
+                    )
+                    .await?;
+                }
+            } else {
+                // §7.1: without a terminal output the fixed unavailable
+                // error is shown for `u`, `d` and `?`.
+                write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                write_local_ui(
+                    output,
+                    session_ui.ui_to_display,
+                    FILE_TRANSFER_UNAVAILABLE.as_bytes(),
+                )
+                .await?;
+            }
+        }
+        LocalAction::AlreadyActive => {
+            // §15.3: a second operation is never started.
+            write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+            write_local_ui(
+                output,
+                session_ui.ui_to_display,
+                FILE_TRANSFER_ALREADY_ACTIVE.as_bytes(),
+            )
+            .await?;
+        }
+        LocalAction::Bell => {
+            write_local_ui(output, session_ui.ui_to_display, b"\x07").await?;
+        }
+        LocalAction::CancelOp => {
+            if session_ui.flow.is_some() {
+                // §16.1: Ctrl+C cancels the path prompt; the terminal is
+                // restored and the delayed remote output is written out.
+                write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                end_transfer_modal(session_ui, output).await?;
+                flush_delayed_output(session_ui, output, terminal_output).await?;
+            } else {
+                // §16.2: Ctrl+C cancels the running transfer; the flag is
+                // observed by the transfer between bounded blocks.
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        LocalAction::StartUpload | LocalAction::StartDownload => {
+            // Pass-through only: the machine never starts an operation
+            // while modal; the pump loop runs the modal entry.
+            let direction = if processed.action == LocalAction::StartUpload {
+                TransferDirection::Upload
+            } else {
+                TransferDirection::Download
+            };
+            return Ok(LocalInputHandling::StartModal(direction));
+        }
+    }
+    if let Some((direction, first, second)) = run_transfer {
+        return Ok(LocalInputHandling::RunTransfer {
+            direction,
+            first,
+            second,
+        });
+    }
+    Ok(LocalInputHandling::Done)
+}
+
+/// Enters the file-transfer modal for one direction (design §7.1, §9.3):
+/// local availability, capability probing, then the two-field path prompt.
+#[allow(clippy::too_many_arguments)]
+async fn begin_file_transfer_modal(
+    direction: TransferDirection,
+    driver: &mut EndpointDriver,
+    streams: &mut Libp2pApplicationStreams,
+    binding: ConnectionBinding,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    session_ui: &mut TransferUi,
+    base: &Option<BaseDirectory>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<(), ControllerError> {
+    let capability = match file_transfer_ready(session_ui, base.as_ref()) {
+        Ok(capability) => capability,
+        Err(TransferNotReady::Unavailable) => {
+            write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+            write_local_ui(
+                output,
+                session_ui.ui_to_display,
+                FILE_TRANSFER_UNAVAILABLE.as_bytes(),
+            )
+            .await?;
+            end_transfer_modal(session_ui, output).await?;
+            return Ok(());
+        }
+        Err(TransferNotReady::Unsupported) => {
+            // §9.3: cached unsupported — the fixed error is shown and no
+            // path prompt is entered; later shortcuts do not re-probe.
+            write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+            write_local_ui(
+                output,
+                session_ui.ui_to_display,
+                FILE_TRANSFER_UNSUPPORTED.as_bytes(),
+            )
+            .await?;
+            end_transfer_modal(session_ui, output).await?;
+            return Ok(());
+        }
+        Err(TransferNotReady::Probe) => {
+            // §9.3: first trigger probes the protocol on a dedicated
+            // substream that is closed without a message on success.
+            let probe = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(ControllerError::Interrupted),
+                result = async {
+                    probe_file_transfer_capability(open_until(
+                        driver,
+                        streams,
+                        binding,
+                        FILE_TRANSFER_PROTOCOL,
+                        tokio::time::Instant::now() + EXCHANGE_TIMEOUT,
+                    ))
+                    .await
+                } => result,
+            };
+            match probe {
+                Ok(capability) => {
+                    session_ui.capability = capability;
+                    capability
+                }
+                Err(_) => {
+                    // §9.3: timeouts, connection errors and transient I/O
+                    // failures are not cached; the user may retry.
+                    tracing::debug!("file transfer capability probe failed");
+                    write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+                    write_local_ui(
+                        output,
+                        session_ui.ui_to_display,
+                        FILE_TRANSFER_PROBE_FAILED.as_bytes(),
+                    )
+                    .await?;
+                    end_transfer_modal(session_ui, output).await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    debug_assert_eq!(capability, CapabilityCache::Supported);
+    // §7.1: the local UI starts on a fresh line, away from the remote
+    // application's current line.
+    let flow = PathPromptFlow::new(direction);
+    write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+    write_local_ui(output, session_ui.ui_to_display, flow.banner().as_bytes()).await?;
+    write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+    write_local_ui(output, session_ui.ui_to_display, flow.label().as_bytes()).await?;
+    session_ui.direction = Some(direction);
+    session_ui.flow = Some(flow);
+    Ok(())
+}
+
+/// Reports a local initialization failure of the transfer and returns to
+/// pass-through (design §17.2: ordinary file errors never end the session).
+async fn fail_transfer_startup(
+    direction: TransferDirection,
+    reason: &str,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    session_ui: &mut TransferUi,
+) -> Result<(), ControllerError> {
+    let summary = format!("{} failed: {reason}", transfer_direction_verb(direction));
+    write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+    write_local_ui(output, session_ui.ui_to_display, summary.as_bytes()).await?;
+    end_transfer_modal(session_ui, output).await
+}
+
+/// Starts the real transfer after both prompt fields completed (design
+/// §7.4.7, §7.5, §9.3): the transfer substream is opened only now, the
+/// local source is opened for uploads, one status line is written, and the
+/// transfer future is armed as a pump branch (§15.2). The future owns the
+/// substream, the opened source and the (Copy) transfer parameters; it
+/// borrows only the shared session base directory and cancel flag, so the
+/// pump loop can re-arm it across iterations.
+#[allow(clippy::too_many_arguments)]
+async fn begin_transfer<'a>(
+    direction: TransferDirection,
+    first: String,
+    second: Option<String>,
+    driver: &mut EndpointDriver,
+    streams: &mut Libp2pApplicationStreams,
+    binding: ConnectionBinding,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    session_ui: &mut TransferUi,
+    cancellation: &tokio_util::sync::CancellationToken,
+    base: &'a Option<BaseDirectory>,
+    cancel: &'a AtomicBool,
+    transfer: &mut Option<Pin<Box<dyn Future<Output = TransferOutcome> + 'a>>>,
+) -> Result<(), ControllerError> {
+    let Some(base) = base.as_ref() else {
+        // The base directory became unavailable after the session started:
+        // the operation fails locally and the session continues (§17.2).
+        write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+        write_local_ui(
+            output,
+            session_ui.ui_to_display,
+            FILE_TRANSFER_UNAVAILABLE.as_bytes(),
+        )
+        .await?;
+        end_transfer_modal(session_ui, output).await?;
+        return Ok(());
+    };
+    // §7.5: the machine pauses ordinary input for the transfer phase.
+    session_ui
+        .control
+        .enter_transfer()
+        .expect("a completed prompt implies an active prompt phase");
+    // §7.4.7: the real substream opens only after all prompts completed.
+    let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+    let stream = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(ControllerError::Interrupted),
+        result = open_until(driver, streams, binding, FILE_TRANSFER_PROTOCOL, deadline) => match result {
+            Ok(stream) => stream,
+            // §15.4: a bounded open failure cancels the operation and
+            // returns to the terminal; the session stays alive (§17.2).
+            Err(_) => {
+                return fail_transfer_startup(
+                    direction,
+                    FILE_TRANSFER_OPEN_FAILED,
+                    output,
+                    session_ui,
+                )
+                .await;
+            }
+        },
+    };
+    if cancel.load(Ordering::Relaxed) {
+        // The user cancelled before the transfer began (§16.2): nothing was
+        // sent on the substream.
+        drop(stream);
+        let summary = format!("{} cancelled", transfer_direction_verb(direction));
+        write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+        write_local_ui(output, session_ui.ui_to_display, summary.as_bytes()).await?;
+        end_transfer_modal(session_ui, output).await?;
+        return Ok(());
+    }
+    if direction == TransferDirection::Upload {
+        // §8.2: the local source is opened and judged through its handle.
+        let path = match base.resolve(&first) {
+            Ok(path) => path,
+            Err(error) => {
+                return fail_transfer_startup(direction, &error.to_string(), output, session_ui)
+                    .await;
+            }
+        };
+        let mut source = match SourceFile::open(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                return fail_transfer_startup(direction, &error.to_string(), output, session_ui)
+                    .await;
+            }
+        };
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let destination = second.unwrap_or_default();
+        // §7.5: one status line at the start.
+        let status = format!(
+            "{}: {TRANSFER_STATUS_PAUSED}",
+            transfer_direction_verb(direction)
+        );
+        write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+        write_local_ui(output, session_ui.ui_to_display, status.as_bytes()).await?;
+        *transfer = Some(Box::pin(async move {
+            let mut random = OsSecureRandom;
+            let mut stream = stream.into_tokio();
+            run_upload(
+                &mut stream,
+                &TransferConfig::defaults(),
+                &mut random,
+                base,
+                &mut source,
+                &destination,
+                &file_name,
+                cancel,
+            )
+            .await
+        }));
+    } else {
+        // §7.5: one status line at the start.
+        let status = format!(
+            "{}: {TRANSFER_STATUS_PAUSED}",
+            transfer_direction_verb(direction)
+        );
+        write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+        write_local_ui(output, session_ui.ui_to_display, status.as_bytes()).await?;
+        *transfer = Some(Box::pin(async move {
+            let local_target = second.as_deref();
+            let mut random = OsSecureRandom;
+            let mut stream = stream.into_tokio();
+            run_download(
+                &mut stream,
+                &TransferConfig::defaults(),
+                &mut random,
+                base,
+                &first,
+                local_target,
+                cancel,
+            )
+            .await
+        }));
+    }
+    Ok(())
+}
+
+/// Polls the running transfer as one pump branch (design §7.5, §15.2).
+async fn poll_inflight_transfer(
+    transfer: &mut Option<Pin<Box<dyn Future<Output = TransferOutcome> + '_>>>,
+) -> TransferOutcome {
+    match transfer.as_mut() {
+        Some(future) => future.await,
+        // Unreachable: the pump gates the branch on `transfer.is_some()`.
+        None => std::future::pending().await,
+    }
+}
+
+/// Handles the completion of the running transfer (design §7.5): one
+/// completion summary is written and the session returns to pass-through
+/// (§17.2 — ordinary file errors never end the remote shell).
+async fn handle_transfer_event(
+    outcome: TransferOutcome,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    session_ui: &mut TransferUi,
+    cancel: &AtomicBool,
+    transfer: &mut Option<Pin<Box<dyn Future<Output = TransferOutcome> + '_>>>,
+) -> Result<Option<u32>, ControllerError> {
+    let direction = session_ui
+        .direction
+        .expect("a running transfer keeps its direction");
+    let summary = transfer_summary_line(direction, outcome);
+    write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
+    write_local_ui(output, session_ui.ui_to_display, summary.as_bytes()).await?;
+    end_transfer_modal(session_ui, output).await?;
+    *transfer = None;
+    cancel.store(false, Ordering::Relaxed);
+    Ok(None)
+}
+
+/// The direction verb of the local UI texts.
+const fn transfer_direction_verb(direction: TransferDirection) -> &'static str {
+    match direction {
+        TransferDirection::Upload => "upload",
+        TransferDirection::Download => "download",
+    }
+}
+
+/// The single completion summary of one transfer (design §7.5).
+fn transfer_summary_line(direction: TransferDirection, outcome: TransferOutcome) -> String {
+    let verb = transfer_direction_verb(direction);
+    match outcome {
+        TransferOutcome::Committed { bytes } => format!("{verb} complete: {bytes} bytes"),
+        TransferOutcome::Cancelled => format!("{verb} cancelled"),
+        TransferOutcome::Failed(code) => format!("{verb} failed: {code:?}"),
+    }
 }
 
 fn finish_terminal<T>(
@@ -1503,8 +2438,8 @@ async fn complete_after_output_eof(
 async fn read_local_input(
     input: &mut (impl tokio::io::AsyncRead + Unpin),
     reserve: usize,
-) -> Result<Option<TerminalChunk>, ControllerError> {
-    let mut chunk = TerminalChunk::new();
+) -> Result<Option<LocalInputChunk>, ControllerError> {
+    let mut chunk = LocalInputChunk::new();
     let capacity = chunk.writable().len().saturating_sub(reserve);
     let length = input.read(&mut chunk.writable()[..capacity]).await?;
     if length == 0 {
@@ -1801,41 +2736,50 @@ mod tests {
     #[cfg(not(windows))]
     use super::RawModeGuard;
     use super::{
-        ActiveTerminalConnectionEvent, ControllerConfig, ControllerError, CrosstermFrontend,
-        DisplayModeGuard, EndpointError, EndpointEvent, EnterpriseControllerUi, LOCAL_ESCAPE,
-        LocalInputEscape, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
-        RemoteTerminalOutputMode, TerminalFrontend, UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch,
+        ActiveTerminalConnectionEvent, CapabilityCache, ControllerConfig, ControllerError,
+        CrosstermFrontend, DisplayModeGuard, EndpointError, EndpointEvent, EnterpriseControllerUi,
+        FILE_TRANSFER_ALREADY_ACTIVE, LOCAL_CONTROL_HELP, LocalInputHandling, LocalInputSignal,
+        PathPromptFlow, PromptProgress, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion,
+        RemoteTerminalOutput, RemoteTerminalOutputMode, TerminalFrontend, TransferNotReady,
+        TransferUi, UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch, abort_prompt_for_overflow,
         active_terminal_connection_event, await_remote_completion, await_until,
         changed_terminal_size, complete_after_output_eof, complete_terminal_control_io,
-        controller_fallback_required, copy_local_input, copy_remote_output, copy_terminal_resizes,
+        controller_fallback_required, copy_remote_output, copy_terminal_resizes,
         decode_terminal_exit, default_terminal_value, direct_fallback_required,
         enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
-        fallback_transport, finish_terminal, finish_terminal_output, local_terminal_hello,
-        local_terminal_hello_with, native_display_restore_commands, next_retry_delay,
+        fallback_transport, file_transfer_ready, finish_local_input_eof, finish_terminal,
+        finish_terminal_output, handle_processed_input, handle_transfer_event,
+        local_terminal_hello, local_terminal_hello_with, native_display_restore_commands,
+        next_retry_delay, probe_file_transfer_capability, process_local_input_chunk,
         read_auth_response, read_local_input, run_controller, run_controller_session,
         run_until_interrupted, terminal_environment, terminal_environment_from,
-        wait_for_remote_completion_deadline, write_native_display_restore,
+        transfer_summary_line, wait_for_remote_completion_deadline, write_native_display_restore,
     };
+    use crate::file_semantics::BaseDirectory;
+    use crate::local_control::{LocalAction, LocalControlInput, LocalInputChunk, ModalPhase};
     use crate::progress::NoopProgress;
     use crate::protocol::EnterpriseResolveUi as _;
-    use crate::terminal::TerminalChunk;
+    use crate::transfer::TransferOutcome;
+    use crate::transfer_prompt::AppendOutcome;
     use std::cell::Cell;
     use std::io;
     use std::pin::Pin;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
     use tokio::sync::oneshot;
     use yonder_core::wire::auth::AuthServerResponse;
+    use yonder_core::wire::file_transfer::{FileTransferErrorCode, TransferDirection};
     use yonder_core::wire::terminal::{TerminalComplete, TerminalHello, TerminalReady};
     use yonder_core::{
         ConnectionCode, EnterpriseProvider, EnterpriseProviders, Locator, PakeSecret,
         ProtocolError, RetryAfter, SecretDocument, TerminalSize, TerminalValue,
     };
     use yonder_net::{
-        ConnectedPoint, ConnectionId, EndpointRelayAddress, EndpointRelaySet, Keypair,
-        NetworkBuildError, WssTransportConfig,
+        ApplicationStreamError, ConnectedPoint, ConnectionId, EndpointRelayAddress,
+        EndpointRelaySet, Keypair, NetworkBuildError, WssTransportConfig,
     };
 
     const CONTROLLER_SESSION_HEAP_LIMIT: usize = 128 * 1024;
@@ -2783,14 +3727,37 @@ mod tests {
         let (mut peer_read, mut peer_write) = tokio::io::split(peer);
         let mut local_input = local_payload.as_slice();
         let mut local_output = Vec::new();
-        let mut escape = LocalInputEscape::new(false);
         let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
-
-        let input_pump = copy_local_input(&mut local_input, &mut controller_write, &mut escape);
+        // Non-interactive input: the pump is fully transparent (§6.4).
+        let mut session_ui = TransferUi::new(false, false, false);
+        let input_pump = async {
+            loop {
+                match process_local_input_chunk(
+                    &mut local_input,
+                    &mut controller_write,
+                    &mut session_ui.control,
+                    &mut session_ui.pending_input,
+                )
+                .await
+                {
+                    Ok(LocalInputSignal::ChunkPending) => {
+                        let _ = session_ui.pending_input.take();
+                    }
+                    Ok(LocalInputSignal::Eof) => {
+                        controller_write.shutdown().await.unwrap();
+                        break;
+                    }
+                    Err(error) => panic!("input pump failed: {error}"),
+                }
+            }
+        };
         let output_pump = copy_remote_output(
             &mut controller_read,
             &mut local_output,
             &mut terminal_output,
+            &mut session_ui.delayed,
+            &mut session_ui.delayed_overflow,
+            &session_ui.flow,
         );
         let peer_exchange = async {
             peer_write.write_all(&remote_payload).await.unwrap();
@@ -2804,14 +3771,14 @@ mod tests {
             tokio::pin!(input_pump);
             tokio::pin!(output_pump);
             tokio::pin!(peer_exchange);
+            let mut input_complete = false;
             let mut output_complete = false;
             let mut received = None;
             loop {
                 tokio::select! {
-                    result = &mut input_pump => match result {
-                        Ok(never) => match never {},
-                        Err(error) => panic!("input pump failed: {error}"),
-                    },
+                    _ = &mut input_pump, if !input_complete => {
+                        input_complete = true;
+                    }
                     result = &mut output_pump, if !output_complete => {
                         result.unwrap();
                         output_complete = true;
@@ -2820,7 +3787,10 @@ mod tests {
                         received = Some(result);
                     }
                 }
-                if output_complete && let Some(received) = received.take() {
+                if input_complete
+                    && output_complete
+                    && let Some(received) = received.take()
+                {
                     break received;
                 }
             }
@@ -2832,8 +3802,8 @@ mod tests {
         assert_eq!(local_output, remote_payload);
     }
 
-    fn terminal_chunk(bytes: &[u8]) -> TerminalChunk {
-        let mut chunk = TerminalChunk::new();
+    fn local_chunk(bytes: &[u8]) -> LocalInputChunk {
+        let mut chunk = LocalInputChunk::new();
         chunk.writable()[..bytes.len()].copy_from_slice(bytes);
         chunk.set_len(bytes.len()).unwrap();
         chunk
@@ -2841,86 +3811,96 @@ mod tests {
 
     #[test]
     fn interactive_detach_escape_is_chunk_boundary_independent() {
-        let mut escape = LocalInputEscape::new(true);
-        let first = escape.filter(terminal_chunk(b"typed\x1d")).unwrap();
-        assert_eq!(first.chunk.as_slice(), b"typed");
-        assert!(!first.detach);
-        assert_eq!(escape.read_reserve(), 1);
+        let mut machine = LocalControlInput::new(true, false);
+        let first = machine.process(local_chunk(b"typed\x1d"));
+        assert_eq!(first.remote_bytes.as_slice(), b"typed");
+        assert_eq!(first.action, LocalAction::None);
+        assert!(machine.pending_prefix());
 
-        let second = escape.filter(terminal_chunk(b".")).unwrap();
-        assert!(second.chunk.as_slice().is_empty());
-        assert!(second.detach);
+        let second = machine.process(local_chunk(b"."));
+        assert_eq!(second.action, LocalAction::Detach);
+        assert!(second.remote_bytes.is_empty());
+        assert!(machine.ended());
     }
 
     #[test]
     fn interactive_escape_preserves_literal_and_non_command_sequences() {
-        let mut escape = LocalInputEscape::new(true);
-        let terminal_escape = escape.filter(terminal_chunk(b"\x1b")).unwrap();
-        assert_eq!(terminal_escape.chunk.as_slice(), b"\x1b");
-        assert!(!terminal_escape.detach);
+        let mut machine = LocalControlInput::new(true, false);
+        let terminal_escape = machine.process(local_chunk(b"\x1b"));
+        assert_eq!(terminal_escape.remote_bytes.as_slice(), b"\x1b");
+        assert_eq!(terminal_escape.action, LocalAction::None);
 
-        let literal = escape
-            .filter(terminal_chunk(&[LOCAL_ESCAPE, LOCAL_ESCAPE]))
-            .unwrap();
-        assert_eq!(literal.chunk.as_slice(), [LOCAL_ESCAPE]);
-        assert!(!literal.detach);
+        let literal = machine.process(local_chunk(b"\x1d\x1d"));
+        assert_eq!(literal.remote_bytes.as_slice(), b"\x1d");
+        assert_eq!(literal.action, LocalAction::None);
 
-        let ordinary = escape
-            .filter(terminal_chunk(&[LOCAL_ESCAPE, b'x']))
-            .unwrap();
-        assert_eq!(ordinary.chunk.as_slice(), [LOCAL_ESCAPE, b'x']);
-        assert!(!ordinary.detach);
+        let ordinary = machine.process(local_chunk(b"\x1dx"));
+        assert_eq!(ordinary.remote_bytes.as_slice(), b"\x1dx");
+        assert_eq!(ordinary.action, LocalAction::None);
 
-        let before_detach = escape
-            .filter(terminal_chunk(b"abc\x1d.trailing bytes"))
-            .unwrap();
-        assert_eq!(before_detach.chunk.as_slice(), b"abc");
-        assert!(before_detach.detach);
+        let before_detach = machine.process(local_chunk(b"abc\x1d.trailing bytes"));
+        assert_eq!(before_detach.remote_bytes.as_slice(), b"abc");
+        assert_eq!(before_detach.action, LocalAction::Detach);
     }
 
     #[test]
     fn isolated_escape_is_forwarded_when_local_input_reaches_eof() {
-        let mut escape = LocalInputEscape::new(true);
-        let pending = escape.filter(terminal_chunk(&[LOCAL_ESCAPE])).unwrap();
-        assert!(pending.chunk.as_slice().is_empty());
-        assert!(!pending.detach);
-        assert_eq!(escape.finish().unwrap().unwrap().as_slice(), [LOCAL_ESCAPE]);
-        assert!(escape.finish().unwrap().is_none());
+        let mut machine = LocalControlInput::new(true, false);
+        let pending = machine.process(local_chunk(b"\x1d"));
+        assert!(pending.remote_bytes.is_empty());
+        assert!(!pending.remote_bytes.is_empty() || machine.pending_prefix());
+        assert!(machine.pending_prefix());
+        let eof = machine.finish();
+        assert_eq!(eof.remote_bytes.as_slice(), b"\x1d");
+        assert_eq!(eof.action, LocalAction::None);
+        assert!(machine.finish().remote_bytes.is_empty());
     }
 
-    #[test]
-    fn pending_escape_reserve_keeps_filter_output_within_fixed_chunk() {
-        let mut escape = LocalInputEscape::new(true);
-        escape.filter(terminal_chunk(&[LOCAL_ESCAPE])).unwrap();
-        assert_eq!(escape.read_reserve(), 1);
-        let input = vec![b'x'; 16 * 1024 - escape.read_reserve()];
-        let output = escape.filter(terminal_chunk(&input)).unwrap();
-        assert_eq!(output.chunk.as_slice().len(), 16 * 1024);
-        assert_eq!(output.chunk.as_slice()[0], LOCAL_ESCAPE);
-        assert!(
-            output.chunk.as_slice()[1..]
-                .iter()
-                .all(|byte| *byte == b'x')
-        );
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_escape_reserve_keeps_processing_within_fixed_chunks() {
+        let mut machine = LocalControlInput::new(true, false);
+        let _ = machine.process(local_chunk(b"\x1d"));
+        assert!(machine.pending_prefix());
+        // A full-capacity read reserves one byte for the pending selector.
+        let input = vec![b'x'; 16 * 1024];
+        let mut consumed = input.as_slice();
+        let mut controller_write = tokio::io::sink();
+        let mut pending_input = None;
+        let signal = process_local_input_chunk(
+            &mut consumed,
+            &mut controller_write,
+            &mut machine,
+            &mut pending_input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(signal, LocalInputSignal::ChunkPending);
+        let processed = pending_input.take().expect("one chunk");
+        // The pending prefix resolves inside the chunk; the rest forwards,
+        // and the output stays within the fixed remote capacity (§15.1).
+        assert_eq!(processed.remote_bytes.as_slice()[0], b'\x1d');
+        assert_eq!(processed.remote_bytes.as_slice()[1], b'x');
+        assert_eq!(processed.remote_bytes.len(), 4096);
+        assert_eq!(consumed.len(), 16 * 1024 - 4095);
+        assert!(!machine.pending_prefix());
     }
 
     #[test]
     fn non_interactive_input_remains_byte_transparent() {
-        let mut escape = LocalInputEscape::new(false);
-        let bytes = [b'a', LOCAL_ESCAPE, b'.', LOCAL_ESCAPE, LOCAL_ESCAPE];
-        let filtered = escape.filter(terminal_chunk(&bytes)).unwrap();
-        assert_eq!(filtered.chunk.as_slice(), bytes);
-        assert!(!filtered.detach);
-        assert_eq!(escape.read_reserve(), 0);
-        assert!(escape.finish().unwrap().is_none());
+        let mut machine = LocalControlInput::new(false, false);
+        let bytes = *b"a\x1d.\x1d\x1d";
+        let processed = machine.process(local_chunk(&bytes));
+        assert_eq!(processed.remote_bytes.as_slice(), bytes);
+        assert_eq!(processed.action, LocalAction::None);
+        assert!(!machine.pending_prefix());
+        assert!(machine.finish().remote_bytes.is_empty());
     }
 
     fn assert_native_input_adapter_uses_byte_escape_semantics() {
-        let mut escape = LocalInputEscape::new(true);
-        let filtered = escape
-            .filter(terminal_chunk(&[LOCAL_ESCAPE, LOCAL_ESCAPE]))
-            .unwrap();
-        assert_eq!(filtered.chunk.as_slice(), [LOCAL_ESCAPE]);
+        let mut machine = LocalControlInput::new(true, false);
+        let processed = machine.process(local_chunk(b"\x1d\x1d"));
+        assert_eq!(processed.remote_bytes.as_slice(), b"\x1d");
+        assert_eq!(processed.action, LocalAction::None);
     }
 
     #[cfg(windows)]
@@ -2933,6 +3913,533 @@ mod tests {
     #[test]
     fn unix_terminal_input_adapter_uses_byte_escape_semantics() {
         assert_native_input_adapter_uses_byte_escape_semantics();
+    }
+
+    // ---- 0.1.3 native file transfer: capability, prompts, transfers ----
+
+    struct TrackedProbeStream(Rc<Cell<bool>>);
+
+    impl Drop for TrackedProbeStream {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_probe_closes_a_successful_stream_without_a_message() {
+        let dropped = Rc::new(Cell::new(false));
+        let probe_stream = dropped.clone();
+        let result = probe_file_transfer_capability(async move {
+            Ok::<_, ControllerError>(TrackedProbeStream(probe_stream))
+        })
+        .await;
+        assert_eq!(result.unwrap(), CapabilityCache::Supported);
+        assert!(
+            dropped.get(),
+            "the probe substream closes without a message"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_probe_caches_only_explicit_unsupported() {
+        let unsupported = ControllerError::Endpoint(EndpointError::Application(
+            ApplicationStreamError::UnsupportedProtocol,
+        ));
+        let result =
+            probe_file_transfer_capability::<TrackedProbeStream>(async { Err(unsupported) }).await;
+        assert_eq!(result.unwrap(), CapabilityCache::Unsupported);
+
+        // Timeouts, connection errors and transient I/O failures are never
+        // cached: the error propagates and the user may retry (§9.3).
+        let transient = ControllerError::Io(io::Error::other("transient"));
+        let result =
+            probe_file_transfer_capability::<TrackedProbeStream>(async { Err(transient) }).await;
+        assert!(matches!(result, Err(ControllerError::Io(_))));
+    }
+
+    #[test]
+    fn file_transfer_readiness_covers_availability_and_the_three_state_cache() {
+        let base = BaseDirectory::capture().unwrap();
+        let mut ui = TransferUi::new(true, true, true);
+        assert_eq!(
+            file_transfer_ready(&ui, Some(&base)),
+            Err(TransferNotReady::Probe)
+        );
+        ui.capability = CapabilityCache::Supported;
+        assert_eq!(
+            file_transfer_ready(&ui, Some(&base)),
+            Ok(CapabilityCache::Supported)
+        );
+        ui.capability = CapabilityCache::Unsupported;
+        assert_eq!(
+            file_transfer_ready(&ui, Some(&base)),
+            Err(TransferNotReady::Unsupported)
+        );
+
+        let no_terminal = TransferUi::new(true, true, false);
+        assert_eq!(
+            file_transfer_ready(&no_terminal, Some(&base)),
+            Err(TransferNotReady::Unavailable)
+        );
+        let no_base = TransferUi::new(true, true, true);
+        assert_eq!(
+            file_transfer_ready(&no_base, None),
+            Err(TransferNotReady::Unavailable)
+        );
+    }
+
+    #[test]
+    fn prompt_flow_uses_the_selector_remainder_as_initial_input() {
+        let mut flow = PathPromptFlow::new(TransferDirection::Upload);
+        let mut machine = LocalControlInput::new(true, false);
+        let processed = machine.process(local_chunk(b"\x1dusrc/file"));
+        assert_eq!(processed.action, LocalAction::StartUpload);
+        assert_eq!(processed.remainder.as_slice(), b"src/file");
+        match flow.feed(&processed) {
+            PromptProgress::Active { bell: false } => {}
+            other => panic!("expected Active, got {other:?}"),
+        }
+        assert_eq!(flow.current_line(), "src/file");
+        // The rest of the line completes and submits the required field.
+        let processed = machine.process(local_chunk(b".txt\r\n"));
+        match flow.feed(&processed) {
+            PromptProgress::NextField => {}
+            other => panic!("expected NextField, got {other:?}"),
+        }
+        assert_eq!(
+            flow.label(),
+            "remote destination [remote session start directory]:"
+        );
+    }
+
+    #[test]
+    fn prompt_flow_collects_upload_source_and_defaultable_destination() {
+        let mut flow = PathPromptFlow::new(TransferDirection::Upload);
+        assert_eq!(flow.label(), "local source:");
+        let mut machine = LocalControlInput::new(true, false);
+        let started = machine.process(local_chunk(b"\x1du"));
+        assert!(matches!(
+            flow.feed(&started),
+            PromptProgress::Active { bell: false }
+        ));
+        let processed = machine.process(local_chunk(b"src"));
+        assert!(matches!(
+            flow.feed(&processed),
+            PromptProgress::Active { bell: false }
+        ));
+        let processed = machine.process(local_chunk(b"\n"));
+        assert!(matches!(flow.feed(&processed), PromptProgress::NextField));
+        let processed = machine.process(local_chunk(b"\r\n"));
+        assert_eq!(
+            flow.feed(&processed),
+            PromptProgress::Completed {
+                first: "src".to_owned(),
+                second: None,
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_flow_collects_download_source_and_local_destination() {
+        let mut flow = PathPromptFlow::new(TransferDirection::Download);
+        assert_eq!(flow.label(), "remote source:");
+        let mut machine = LocalControlInput::new(true, false);
+        let started = machine.process(local_chunk(b"\x1dd"));
+        assert!(matches!(
+            flow.feed(&started),
+            PromptProgress::Active { bell: false }
+        ));
+        let processed = machine.process(local_chunk(b"/remote/file\n"));
+        assert!(matches!(flow.feed(&processed), PromptProgress::NextField));
+        assert_eq!(
+            flow.label(),
+            "local destination [local connect start directory]:"
+        );
+        let processed = machine.process(local_chunk(b"dest\r\n"));
+        assert_eq!(
+            flow.feed(&processed),
+            PromptProgress::Completed {
+                first: "/remote/file".to_owned(),
+                second: Some("dest".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_flow_rejects_empty_required_fields_and_reprompts() {
+        let mut flow = PathPromptFlow::new(TransferDirection::Upload);
+        let mut machine = LocalControlInput::new(true, false);
+        let started = machine.process(local_chunk(b"\x1du"));
+        flow.feed(&started);
+        let processed = machine.process(local_chunk(b"\n"));
+        assert_eq!(flow.feed(&processed), PromptProgress::Reprompt);
+        assert_eq!(flow.current_line(), "");
+        let processed = machine.process(local_chunk(b"ok\r\n"));
+        assert!(matches!(flow.feed(&processed), PromptProgress::NextField));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prompt_echo_renders_additions_and_backspace_erasure() {
+        let mut machine = LocalControlInput::new(true, false);
+        let started = machine.process(local_chunk(b"\x1du"));
+        let mut flow = PathPromptFlow::new(TransferDirection::Upload);
+        let mut output = CountingWriter::default();
+        flow.feed(&started);
+        let processed = machine.process(local_chunk(b"abc"));
+        assert!(matches!(
+            flow.feed(&processed),
+            PromptProgress::Active { bell: false }
+        ));
+        flow.echo_delta(&mut output).await.unwrap();
+        assert_eq!(output.bytes, b"abc");
+        let processed = machine.process(local_chunk(b"\x08"));
+        flow.feed(&processed);
+        flow.echo_delta(&mut output).await.unwrap();
+        assert_eq!(output.bytes, b"abc\x08 \x08");
+        let processed = machine.process(local_chunk(b"d"));
+        flow.feed(&processed);
+        flow.echo_delta(&mut output).await.unwrap();
+        assert_eq!(output.bytes, b"abc\x08 \x08d");
+        assert_eq!(flow.current_line(), "abd");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prompt_ctrl_c_cancels_without_opening_a_substream() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let started = session_ui.control.process(local_chunk(b"\x1du"));
+        session_ui.flow = Some(PathPromptFlow::new(TransferDirection::Upload));
+        session_ui.direction = Some(TransferDirection::Upload);
+        assert!(matches!(
+            session_ui.flow.as_mut().unwrap().feed(&started),
+            PromptProgress::Active { bell: false }
+        ));
+        assert_eq!(
+            session_ui.delayed.append(b"remote bytes"),
+            AppendOutcome::Ok
+        );
+        let processed = session_ui.control.process(local_chunk(b"abc\x03"));
+        assert_eq!(processed.action, LocalAction::CancelOp);
+        assert_eq!(processed.path_bytes.as_slice(), b"abc");
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        let cancel = AtomicBool::new(false);
+        let handling = handle_processed_input(
+            processed,
+            &mut output,
+            &mut terminal_output,
+            &mut session_ui,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handling, LocalInputHandling::Done);
+        assert!(session_ui.flow.is_none());
+        assert_eq!(session_ui.control.modal_phase(), None);
+        assert!(!cancel.load(Ordering::Relaxed));
+        // §16.1: nothing is sent to the remote; the typed line stays on
+        // the display and the delayed output is flushed in order once the
+        // prompt is gone.
+        assert_eq!(output.bytes, b"abc\r\nremote bytes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_overflow_aborts_the_prompt_and_flushes_in_order() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let _ = session_ui.control.process(local_chunk(b"\x1du"));
+        session_ui.flow = Some(PathPromptFlow::new(TransferDirection::Upload));
+        session_ui.direction = Some(TransferDirection::Upload);
+        assert_eq!(session_ui.delayed.append(b"first"), AppendOutcome::Ok);
+        assert_eq!(session_ui.delayed.append(b"second"), AppendOutcome::Ok);
+        session_ui.delayed_overflow = true;
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        abort_prompt_for_overflow(&mut session_ui, &mut output, &mut terminal_output)
+            .await
+            .unwrap();
+        assert!(session_ui.flow.is_none());
+        assert_eq!(session_ui.control.modal_phase(), None);
+        assert!(session_ui.delayed.is_empty());
+        assert_eq!(output.bytes, b"firstsecond");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transfer_cancellation_writes_one_summary_and_restores_the_terminal() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let _ = session_ui.control.process(local_chunk(b"\x1du"));
+        session_ui.control.enter_transfer().unwrap();
+        session_ui.direction = Some(TransferDirection::Upload);
+        let cancel = AtomicBool::new(false);
+        let mut transfer: Option<Pin<Box<dyn Future<Output = TransferOutcome>>>> =
+            Some(Box::pin(async { TransferOutcome::Cancelled }));
+        let mut output = CountingWriter::default();
+        let completion = handle_transfer_event(
+            TransferOutcome::Cancelled,
+            &mut output,
+            &mut session_ui,
+            &cancel,
+            &mut transfer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion, None);
+        assert!(transfer.is_none());
+        assert_eq!(session_ui.control.modal_phase(), None);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(output.bytes, b"\r\nupload cancelled");
+    }
+
+    #[test]
+    fn transfer_summaries_cover_success_cancellation_and_failure() {
+        assert_eq!(
+            transfer_summary_line(
+                TransferDirection::Upload,
+                TransferOutcome::Committed { bytes: 42 }
+            ),
+            "upload complete: 42 bytes"
+        );
+        assert_eq!(
+            transfer_summary_line(TransferDirection::Download, TransferOutcome::Cancelled),
+            "download cancelled"
+        );
+        assert_eq!(
+            transfer_summary_line(
+                TransferDirection::Upload,
+                TransferOutcome::Failed(FileTransferErrorCode::SourceNotFound)
+            ),
+            "upload failed: SourceNotFound"
+        );
+    }
+
+    #[test]
+    fn fixed_local_ui_texts_cover_the_frozen_interaction() {
+        assert_eq!(FILE_TRANSFER_ALREADY_ACTIVE, "file transfer already active");
+        for shortcut in [
+            "Ctrl+] .",
+            "Ctrl+] Ctrl+]",
+            "Ctrl+] u",
+            "Ctrl+] d",
+            "Ctrl+] ?",
+        ] {
+            assert!(LOCAL_CONTROL_HELP.contains(shortcut), "missing {shortcut}");
+        }
+        assert!(LOCAL_CONTROL_HELP.contains("end the session"));
+        assert!(LOCAL_CONTROL_HELP.contains("upload a file"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn second_operation_while_modal_reports_already_active() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let _ = session_ui.control.process(local_chunk(b"\x1du"));
+        session_ui.flow = Some(PathPromptFlow::new(TransferDirection::Upload));
+        session_ui.direction = Some(TransferDirection::Upload);
+        let processed = session_ui.control.process(local_chunk(b"\x1du"));
+        assert_eq!(processed.action, LocalAction::AlreadyActive);
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        let cancel = AtomicBool::new(false);
+        let handling = handle_processed_input(
+            processed,
+            &mut output,
+            &mut terminal_output,
+            &mut session_ui,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handling, LocalInputHandling::Done);
+        assert_eq!(output.bytes, b"\r\nfile transfer already active");
+        // The active operation keeps its phase (§15.3).
+        assert_eq!(
+            session_ui.control.modal_phase(),
+            Some(ModalPhase::UploadPrompt)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pass_through_help_is_local_ui_only() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let processed = session_ui.control.process(local_chunk(b"\x1d?xy"));
+        assert_eq!(processed.action, LocalAction::ShowHelp);
+        assert_eq!(processed.remote_bytes.as_slice(), b"xy");
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        let cancel = AtomicBool::new(false);
+        let handling = handle_processed_input(
+            processed,
+            &mut output,
+            &mut terminal_output,
+            &mut session_ui,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handling, LocalInputHandling::Done);
+        let text = String::from_utf8_lossy(&output.bytes);
+        assert!(text.contains("Ctrl+] u"));
+        assert_eq!(session_ui.control.modal_phase(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pass_through_u_signals_the_modal_start_without_writing_ui() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let processed = session_ui.control.process(local_chunk(b"\x1du"));
+        assert_eq!(processed.action, LocalAction::StartUpload);
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        let cancel = AtomicBool::new(false);
+        let handling = handle_processed_input(
+            processed,
+            &mut output,
+            &mut terminal_output,
+            &mut session_ui,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            handling,
+            LocalInputHandling::StartModal(TransferDirection::Upload)
+        );
+        assert!(output.bytes.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pass_through_detach_ends_the_session() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let processed = session_ui.control.process(local_chunk(b"abc\x1d."));
+        assert_eq!(processed.action, LocalAction::Detach);
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            handle_processed_input(
+                processed,
+                &mut output,
+                &mut terminal_output,
+                &mut session_ui,
+                &cancel,
+            )
+            .await,
+            Err(ControllerError::Interrupted)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_interactive_chunks_are_forwarded_byte_transparent() {
+        let mut session_ui = TransferUi::new(false, false, false);
+        let bytes = [
+            b'a', b'\x1d', b'u', b'b', b'\x1d', b'.', b'\x1d', b'\x1d', 0x03,
+        ];
+        let mut input = bytes.as_slice();
+        let (mut controller_write, mut peer_read) = tokio::io::duplex(16);
+        let signal = process_local_input_chunk(
+            &mut input,
+            &mut controller_write,
+            &mut session_ui.control,
+            &mut session_ui.pending_input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(signal, LocalInputSignal::ChunkPending);
+        let processed = session_ui.pending_input.take().expect("one chunk");
+        assert_eq!(processed.remote_bytes.as_slice(), bytes);
+        assert_eq!(processed.action, LocalAction::None);
+        let mut received = [0_u8; 9];
+        peer_read.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, bytes);
+        // EOF is reported to the pump loop without side effects.
+        let mut eof_input = tokio::io::empty();
+        assert_eq!(
+            process_local_input_chunk(
+                &mut eof_input,
+                &mut controller_write,
+                &mut session_ui.control,
+                &mut session_ui.pending_input,
+            )
+            .await
+            .unwrap(),
+            LocalInputSignal::Eof
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selector_at_a_chunk_boundary_keeps_the_remainder_in_bounds() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let mut block = b"ab\x1du".to_vec();
+        block.extend(std::iter::repeat_n(b'x', 4096 - 4));
+        assert_eq!(block.len(), 4096);
+        let mut input = block.as_slice();
+        let (mut controller_write, mut peer_read) = tokio::io::duplex(16);
+        let signal = process_local_input_chunk(
+            &mut input,
+            &mut controller_write,
+            &mut session_ui.control,
+            &mut session_ui.pending_input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(signal, LocalInputSignal::ChunkPending);
+        let processed = session_ui.pending_input.take().expect("one chunk");
+        assert_eq!(processed.action, LocalAction::StartUpload);
+        assert_eq!(processed.remote_bytes.as_slice(), b"ab");
+        assert_eq!(processed.remainder.len(), 4092);
+        assert!(processed.drop_remainder);
+        assert_eq!(
+            session_ui.control.modal_phase(),
+            Some(ModalPhase::UploadPrompt)
+        );
+        // Only the forwarded prefix reaches the remote (§17.3).
+        let mut received = [0_u8; 2];
+        peer_read.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, *b"ab");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_local_input_eof_flushes_orphaned_escape_and_shuts_down() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let _ = session_ui.control.process(local_chunk(b"ab\x1d"));
+        assert!(session_ui.control.pending_prefix());
+        let (mut controller_write, mut peer_read) = tokio::io::duplex(16);
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        finish_local_input_eof(
+            &mut controller_write,
+            &mut output,
+            &mut terminal_output,
+            &mut session_ui,
+        )
+        .await
+        .unwrap();
+        assert!(session_ui.local_ended);
+        let mut received = Vec::new();
+        peer_read.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"\x1d");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_input_eof_drops_an_active_prompt_and_flushes_delayed_output() {
+        let mut session_ui = TransferUi::new(true, true, true);
+        let _ = session_ui.control.process(local_chunk(b"\x1du"));
+        session_ui.flow = Some(PathPromptFlow::new(TransferDirection::Upload));
+        session_ui.direction = Some(TransferDirection::Upload);
+        assert_eq!(session_ui.delayed.append(b"tail"), AppendOutcome::Ok);
+        let (mut controller_write, mut peer_read) = tokio::io::duplex(16);
+        let mut output = CountingWriter::default();
+        let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+        finish_local_input_eof(
+            &mut controller_write,
+            &mut output,
+            &mut terminal_output,
+            &mut session_ui,
+        )
+        .await
+        .unwrap();
+        assert!(session_ui.flow.is_none());
+        assert_eq!(session_ui.control.modal_phase(), None);
+        assert_eq!(output.bytes, b"tail");
+        let mut received = Vec::new();
+        peer_read.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

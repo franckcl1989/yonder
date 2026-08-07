@@ -23,6 +23,14 @@
 //!   resolves and opens the wire-provided source and streams it. The
 //!   `random` argument is unused by `handle_download` (the download sender
 //!   creates no files).
+//! - [`handle_upload_from_open`] / [`handle_download_from_open`]: host side,
+//!   entries whose opening frame was already read by the session layer
+//!   during capability probing (design 9.3). They continue from the
+//!   recorded `UploadOpen` / `DownloadOpen` with the same post-open logic
+//!   as [`handle_upload`] / [`handle_download`]; any other opening message
+//!   is a protocol violation. The four original orchestrators keep reading
+//!   the opening frame themselves; the `*_from_open` entries exist so the
+//!   live host session never reads a frame twice.
 //!
 //! # Success, failure and cancellation semantics
 //!
@@ -330,6 +338,117 @@ pub async fn handle_download(
         "file transfer started"
     );
     let outcome = handle_download_impl(stream, config, random, base, cancel).await;
+    tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
+    outcome
+}
+
+/// Runs the host side of an upload whose opening frame was already read by
+/// the session layer during capability probing (design 9.3): continues from
+/// the recorded `UploadOpen` and receives the file into a destination
+/// resolved from the wire, verifying size and digest and committing before
+/// sending `Committed`.
+///
+/// `open` must be an `UploadOpen`; any other message is a protocol
+/// violation that closes the substream with `InvalidRequest`. The cancel
+/// flag is checked before any work and then raced against every control
+/// exchange and polled between data blocks, exactly as in
+/// [`handle_upload`].
+pub async fn handle_upload_from_open(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    random: &mut impl SecureRandom,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    open: &FileTransferMessage<'_>,
+) -> TransferOutcome {
+    let started = Instant::now();
+    tracing::debug!(
+        direction = ?TransferDirection::Upload,
+        side = ?TransferSide::Host,
+        "file transfer started"
+    );
+    let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+    if cancel.load(Ordering::Relaxed) {
+        session.close();
+        return TransferOutcome::Cancelled;
+    }
+    let (destination, file_name, declared_size) = match open {
+        &FileTransferMessage::UploadOpen {
+            destination,
+            file_name,
+            declared_size,
+        } => {
+            let owned = OwnedMessage::UploadOpen {
+                destination: destination.to_owned(),
+                file_name: file_name.to_owned(),
+                declared_size,
+            };
+            if let Err(outcome) = record_received(&mut session, &owned, &[]) {
+                return outcome;
+            }
+            (destination, file_name, declared_size)
+        }
+        _ => return protocol_violation(&mut session),
+    };
+    let outcome = upload_receive_tail(
+        stream,
+        config,
+        random,
+        base,
+        cancel,
+        &mut session,
+        destination,
+        file_name,
+        declared_size,
+    )
+    .await;
+    tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
+    outcome
+}
+
+/// Runs the host side of a download whose opening frame was already read by
+/// the session layer during capability probing (design 9.3): continues from
+/// the recorded `DownloadOpen`, resolves and opens the wire-provided
+/// source, announces it with `DownloadOffer` and streams it; the transfer
+/// succeeds only when `Committed` is received.
+///
+/// `open` must be a `DownloadOpen`; any other message is a protocol
+/// violation that closes the substream with `InvalidRequest`. The host in a
+/// download never sends `Cancel` (direction table, design 10.3); a host-side
+/// cancel is expressed as `Error(SessionClosing)`.
+pub async fn handle_download_from_open(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    random: &mut impl SecureRandom,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    open: &FileTransferMessage<'_>,
+) -> TransferOutcome {
+    let started = Instant::now();
+    tracing::debug!(
+        direction = ?TransferDirection::Download,
+        side = ?TransferSide::Host,
+        "file transfer started"
+    );
+    let _ = random; // The download sender creates no files.
+    let mut session = WireSession::new(TransferDirection::Download, TransferSide::Host);
+    if cancel.load(Ordering::Relaxed) {
+        session.close();
+        return TransferOutcome::Cancelled;
+    }
+    let source = match open {
+        &FileTransferMessage::DownloadOpen { source } => {
+            let owned = OwnedMessage::DownloadOpen {
+                source: source.to_owned(),
+            };
+            if let Err(outcome) = record_received(&mut session, &owned, &[]) {
+                return outcome;
+            }
+            source
+        }
+        _ => return protocol_violation(&mut session),
+    };
+    let outcome = download_send_tail(stream, config, base, cancel, &mut session, source).await;
     tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
     outcome
 }
@@ -744,6 +863,43 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return protocol_violation(&mut session),
     };
 
+    // Continue with the shared post-`UploadOpen` receive path. Keeping the
+    // opening-frame read (with its EOF-before-first-frame semantics) in this
+    // entry lets [`handle_upload_from_open`] reuse the identical
+    // continuation for the live session, where the host already read the
+    // frame during capability probing (design 9.3).
+    upload_receive_tail(
+        stream,
+        config,
+        random,
+        base,
+        cancel,
+        &mut session,
+        destination,
+        file_name,
+        declared_size,
+    )
+    .await
+}
+
+/// The shared post-`UploadOpen` host receive path: resolves the destination,
+/// creates the private temporary file, sends `Ready`, receives the `Data`
+/// blocks and the terminal `Finish`, verifies size and digest and commits
+/// with a no-replace commit before sending `Committed` (design 11.2, 13,
+/// 14). `session` must be an upload host session that already recorded the
+/// received `UploadOpen`.
+#[allow(clippy::too_many_arguments)]
+async fn upload_receive_tail<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    config: &TransferConfig,
+    random: &mut impl SecureRandom,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    session: &mut WireSession,
+    destination: &str,
+    file_name: &str,
+    declared_size: u64,
+) -> TransferOutcome {
     // Resolve the destination (an empty destination selects the default
     // directory) and create the private temporary file (design 8.3, 8.4,
     // 13). Parents are never created automatically.
@@ -757,7 +913,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
         Err(error) => {
             return fail_local(
                 stream,
-                &mut session,
+                session,
                 config,
                 error,
                 FileTransferErrorCode::InvalidRequest,
@@ -770,7 +926,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
         Err(error) => {
             return fail_local(
                 stream,
-                &mut session,
+                session,
                 config,
                 error,
                 FileTransferErrorCode::InvalidRequest,
@@ -778,8 +934,8 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
             .await;
         }
     };
-    if let Err(error) = write_frame(stream, &mut session, &FileTransferMessage::Ready).await {
-        return send_failure(&mut session, error);
+    if let Err(error) = write_frame(stream, session, &FileTransferMessage::Ready).await {
+        return send_failure(session, error);
     }
 
     // Receive Data blocks and the terminal Finish. The temporary file is
@@ -801,7 +957,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
                 // `Error`; the host may never send `Cancel` in any role.
                 best_effort_send(
                     stream,
-                    &mut session,
+                    session,
                     config,
                     FileTransferMessage::Error { code: FileTransferErrorCode::SessionClosing },
                 ).await;
@@ -810,13 +966,13 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
         };
         match &message {
             OwnedMessage::Data { len } => {
-                if let Err(outcome) = record_received(&mut session, &message, &data[..*len]) {
+                if let Err(outcome) = record_received(session, &message, &data[..*len]) {
                     return outcome;
                 }
                 if let Err(error) = temp.write_block(&data[..*len]) {
                     return fail_local(
                         stream,
-                        &mut session,
+                        session,
                         config,
                         error,
                         FileTransferErrorCode::WriteFailed,
@@ -829,7 +985,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
                 actual_size,
                 digest,
             } => {
-                if let Err(outcome) = record_received(&mut session, &message, &[]) {
+                if let Err(outcome) = record_received(session, &message, &[]) {
                     return outcome;
                 }
                 break (*actual_size, *digest);
@@ -842,7 +998,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
                 // because the session is already closed.
                 best_effort_send(
                     stream,
-                    &mut session,
+                    session,
                     config,
                     FileTransferMessage::Error {
                         code: FileTransferErrorCode::Cancelled,
@@ -853,12 +1009,12 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
                 return TransferOutcome::Cancelled;
             }
             OwnedMessage::Error { code } => {
-                if let Err(outcome) = record_received(&mut session, &message, &[]) {
+                if let Err(outcome) = record_received(session, &message, &[]) {
                     return outcome;
                 }
                 return TransferOutcome::Failed(*code);
             }
-            _ => return protocol_violation(&mut session),
+            _ => return protocol_violation(session),
         }
     };
 
@@ -870,7 +1026,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
         Err(error) => {
             return fail_local(
                 stream,
-                &mut session,
+                session,
                 config,
                 error,
                 FileTransferErrorCode::WriteFailed,
@@ -890,7 +1046,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
     if let Err(error) = verify {
         return fail_local(
             stream,
-            &mut session,
+            session,
             config,
             error,
             FileTransferErrorCode::SizeMismatch,
@@ -901,15 +1057,15 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
     if let Err(error) = sealed.commit(plan.final_path()) {
         return fail_local(
             stream,
-            &mut session,
+            session,
             config,
             error,
             FileTransferErrorCode::CommitFailed,
         )
         .await;
     }
-    if let Err(error) = write_frame(stream, &mut session, &FileTransferMessage::Committed).await {
-        return send_failure(&mut session, error);
+    if let Err(error) = write_frame(stream, session, &FileTransferMessage::Committed).await {
+        return send_failure(session, error);
     }
     TransferOutcome::Committed { bytes: written }
 }
@@ -961,14 +1117,37 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return protocol_violation(&mut session),
     };
 
+    // Continue with the shared post-`DownloadOpen` send path. Keeping the
+    // opening-frame read (with its EOF-before-first-frame semantics) in this
+    // entry lets [`handle_download_from_open`] reuse the identical
+    // continuation for the live session, where the host already read the
+    // frame during capability probing (design 9.3).
+    download_send_tail(stream, config, base, cancel, &mut session, &source_path).await
+}
+
+/// The shared post-`DownloadOpen` host send path: resolves and opens the
+/// wire-provided source, announces it with `DownloadOffer`, streams it in
+/// bounded blocks and succeeds only when `Committed` is received (design
+/// 12.2, 14). `session` must be a download host session that already
+/// recorded the received `DownloadOpen`. The host in a download never sends
+/// `Cancel` (direction table, design 10.3); a host-side cancel is expressed
+/// as `Error(SessionClosing)`.
+async fn download_send_tail<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    config: &TransferConfig,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    session: &mut WireSession,
+    source_path: &str,
+) -> TransferOutcome {
     // Resolve and open the source; type and size are judged exclusively
     // from the opened handle (design 8.2).
-    let path = match base.resolve(&source_path) {
+    let path = match base.resolve(source_path) {
         Ok(path) => path,
         Err(error) => {
             return fail_local(
                 stream,
-                &mut session,
+                session,
                 config,
                 error,
                 FileTransferErrorCode::InvalidRequest,
@@ -981,7 +1160,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
         Err(error) => {
             return fail_local(
                 stream,
-                &mut session,
+                session,
                 config,
                 error,
                 FileTransferErrorCode::SourceNotFound,
@@ -1006,8 +1185,8 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
         file_name: &offer_name,
         declared_size: source.size(),
     };
-    if let Err(error) = write_frame(stream, &mut session, &offer).await {
-        return send_failure(&mut session, error);
+    if let Err(error) = write_frame(stream, session, &offer).await {
+        return send_failure(session, error);
     }
 
     // Await Ready (bounded). The controller may cancel here; the host sends
@@ -1030,7 +1209,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
     };
     match &ready_message {
         OwnedMessage::Ready => {
-            if let Err(outcome) = record_received(&mut session, &ready_message, &[]) {
+            if let Err(outcome) = record_received(session, &ready_message, &[]) {
                 return outcome;
             }
         }
@@ -1040,7 +1219,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
             // closes the session.
             best_effort_send(
                 stream,
-                &mut session,
+                session,
                 config,
                 FileTransferMessage::Error {
                     code: FileTransferErrorCode::Cancelled,
@@ -1051,12 +1230,12 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
             return TransferOutcome::Cancelled;
         }
         OwnedMessage::Error { code } => {
-            if let Err(outcome) = record_received(&mut session, &ready_message, &[]) {
+            if let Err(outcome) = record_received(session, &ready_message, &[]) {
                 return outcome;
             }
             return TransferOutcome::Failed(*code);
         }
-        _ => return protocol_violation(&mut session),
+        _ => return protocol_violation(session),
     }
 
     // Stream the source in bounded blocks, hashing in lock-step. The host in
@@ -1068,7 +1247,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
         if cancel.load(Ordering::Relaxed) {
             best_effort_send(
                 stream,
-                &mut session,
+                session,
                 config,
                 FileTransferMessage::Error {
                     code: FileTransferErrorCode::SessionClosing,
@@ -1082,7 +1261,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
             Err(error) => {
                 return fail_local(
                     stream,
-                    &mut session,
+                    session,
                     config,
                     error,
                     FileTransferErrorCode::ReadFailed,
@@ -1096,12 +1275,12 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
         hasher.update(&data[..n]);
         if let Err(error) = write_frame(
             stream,
-            &mut session,
+            session,
             &FileTransferMessage::Data { bytes: &data[..n] },
         )
         .await
         {
-            return send_failure(&mut session, error);
+            return send_failure(session, error);
         }
         tokio::task::yield_now().await;
     }
@@ -1110,7 +1289,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
     if let Err(error) = source.recheck() {
         return fail_local(
             stream,
-            &mut session,
+            session,
             config,
             error,
             FileTransferErrorCode::ReadFailed,
@@ -1121,8 +1300,8 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
         actual_size: source.bytes_read(),
         digest: Sha256Digest::new(hasher.finalize().into()),
     };
-    if let Err(error) = write_frame(stream, &mut session, &finish).await {
-        return send_failure(&mut session, error);
+    if let Err(error) = write_frame(stream, session, &finish).await {
+        return send_failure(session, error);
     }
 
     // Await Committed (bounded). Only the receiver's `Committed` makes the
@@ -1144,7 +1323,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
     };
     match &committed_message {
         OwnedMessage::Committed => {
-            if let Err(outcome) = record_received(&mut session, &committed_message, &[]) {
+            if let Err(outcome) = record_received(session, &committed_message, &[]) {
                 return outcome;
             }
             TransferOutcome::Committed {
@@ -1156,12 +1335,12 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
             TransferOutcome::Cancelled
         }
         OwnedMessage::Error { code } => {
-            if let Err(outcome) = record_received(&mut session, &committed_message, &[]) {
+            if let Err(outcome) = record_received(session, &committed_message, &[]) {
                 return outcome;
             }
             TransferOutcome::Failed(*code)
         }
-        _ => protocol_violation(&mut session),
+        _ => protocol_violation(session),
     }
 }
 
@@ -3909,5 +4088,348 @@ mod tests {
             host_outcome,
             TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The session-layer entries whose opening frame was already read
+    // (design 9.3: the live host reads the first frame during capability
+    // probing and continues with `*_from_open`).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_from_open_success_all_sizes() {
+        let source_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        for size in [0_u64, 1, 65535, 65536, 65537] {
+            let source_path = source_dir.path().join(format!("source-{size}.bin"));
+            write_pattern_file(&source_path, size);
+            let (bytes, chunks) = file_chunks(&source_path);
+            let (controller_half, mut host_half) = duplex(64 * 1024);
+            let mut peer = ScriptedPeer::new(
+                controller_half,
+                TransferDirection::Upload,
+                TransferSide::Controller,
+            );
+            // The session layer consumed the opening frame off the wire
+            // before this entry; the scripted session records the same
+            // transition so the rest of the exchange stays legal.
+            peer.session
+                .send(&FileTransferMessage::UploadOpen {
+                    destination: "",
+                    file_name: "consumed",
+                    declared_size: 0,
+                })
+                .unwrap();
+            let cancel = AtomicBool::new(false);
+            let final_path = host_dir.path().join(format!("final-{size}.bin"));
+            let destination = path_string(&final_path);
+            let open = FileTransferMessage::UploadOpen {
+                destination: &destination,
+                file_name: "uploaded.bin",
+                declared_size: bytes.len() as u64,
+            };
+            let (host_outcome, peer_observed) = tokio::join!(
+                handle_upload_from_open(
+                    &mut host_half,
+                    &config,
+                    &mut random,
+                    &base,
+                    &cancel,
+                    &open,
+                ),
+                async {
+                    assert_eq!(peer.read_control().await, OwnedMessage::Ready);
+                    for chunk in &chunks {
+                        peer.send(FileTransferMessage::Data { bytes: chunk }).await;
+                    }
+                    peer.send(FileTransferMessage::Finish {
+                        actual_size: bytes.len() as u64,
+                        digest: sha256(&bytes),
+                    })
+                    .await;
+                    peer.read_control().await
+                },
+            );
+            assert_eq!(
+                host_outcome,
+                TransferOutcome::Committed { bytes: size },
+                "host outcome for size {size}"
+            );
+            assert_eq!(
+                peer_observed,
+                OwnedMessage::Committed,
+                "wire outcome for size {size}"
+            );
+            assert_eq!(
+                fs::read(&final_path).unwrap(),
+                fs::read(&source_path).unwrap(),
+                "content for size {size}"
+            );
+            assert_dir_entries(host_dir.path(), &[&final_path]);
+            fs::remove_file(&final_path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn download_from_open_success_all_sizes() {
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        for size in [0_u64, 1, 65535, 65536, 65537] {
+            let source_path = source_dir.path().join(format!("source-{size}.bin"));
+            write_pattern_file(&source_path, size);
+            let (bytes, _) = file_chunks(&source_path);
+            let (controller_half, mut host_half) = duplex(64 * 1024);
+            let mut peer = ScriptedPeer::new(
+                controller_half,
+                TransferDirection::Download,
+                TransferSide::Controller,
+            );
+            // The session layer consumed the opening frame off the wire
+            // before this entry; the scripted session records the same
+            // transition so the rest of the exchange stays legal.
+            peer.session
+                .send(&FileTransferMessage::DownloadOpen { source: "consumed" })
+                .unwrap();
+            let cancel = AtomicBool::new(false);
+            let source_string = path_string(&source_path);
+            let open = FileTransferMessage::DownloadOpen {
+                source: &source_string,
+            };
+            let (host_outcome, peer_observed) = tokio::join!(
+                handle_download_from_open(
+                    &mut host_half,
+                    &config,
+                    &mut random,
+                    &base,
+                    &cancel,
+                    &open,
+                ),
+                async {
+                    let offer = peer.read_control().await;
+                    assert!(matches!(
+                        offer,
+                        OwnedMessage::DownloadOffer {
+                            file_name,
+                            declared_size,
+                        } if file_name == format!("source-{size}.bin") && declared_size == size
+                    ));
+                    peer.send(FileTransferMessage::Ready).await;
+                    let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                    let mut received = Vec::new();
+                    loop {
+                        match peer.read_data(&mut *sink).await {
+                            OwnedMessage::Data { len } => {
+                                received.extend_from_slice(&sink[..len]);
+                            }
+                            OwnedMessage::Finish { .. } => break,
+                            message => panic!("unexpected message: {message:?}"),
+                        }
+                    }
+                    peer.send(FileTransferMessage::Committed).await;
+                    received
+                },
+            );
+            assert_eq!(
+                host_outcome,
+                TransferOutcome::Committed { bytes: size },
+                "host outcome for size {size}"
+            );
+            // The scripted controller receives into memory; the real
+            // controller would commit the target itself.
+            assert_eq!(peer_observed, bytes, "received bytes for size {size}");
+            assert_dir_empty(controller_dir.path());
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_from_open_rejects_non_open_first_frames() {
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        // A Ready first frame is a protocol violation for an upload host.
+        let (mut host_half, mut peer_half) = duplex(64 * 1024);
+        let cancel = AtomicBool::new(false);
+        let open = FileTransferMessage::Ready;
+        let outcome =
+            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
+                .await;
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        // The substream was closed without any frame being written.
+        let frame = tokio::time::timeout(Duration::from_millis(50), async {
+            let mut byte = [0_u8; 1];
+            peer_half.read(&mut byte).await.unwrap()
+        })
+        .await;
+        assert!(frame.is_err(), "no frame may reach the peer");
+        assert_dir_empty(host_dir.path());
+
+        // A DownloadOpen first frame on an upload substream is equally a
+        // protocol violation.
+        let (mut host_half, mut peer_half) = duplex(64 * 1024);
+        let open = FileTransferMessage::DownloadOpen { source: "x" };
+        let outcome =
+            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
+                .await;
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        let frame = tokio::time::timeout(Duration::from_millis(50), async {
+            let mut byte = [0_u8; 1];
+            peer_half.read(&mut byte).await.unwrap()
+        })
+        .await;
+        assert!(frame.is_err(), "no frame may reach the peer");
+    }
+
+    #[tokio::test]
+    async fn download_from_open_rejects_non_open_first_frames() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut host_half, mut peer_half) = duplex(64 * 1024);
+        let cancel = AtomicBool::new(false);
+        let open = FileTransferMessage::UploadOpen {
+            destination: "",
+            file_name: "f.bin",
+            declared_size: 1,
+        };
+        let outcome =
+            handle_download_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
+                .await;
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        let frame = tokio::time::timeout(Duration::from_millis(50), async {
+            let mut byte = [0_u8; 1];
+            peer_half.read(&mut byte).await.unwrap()
+        })
+        .await;
+        assert!(frame.is_err(), "no frame may reach the peer");
+    }
+
+    #[tokio::test]
+    async fn upload_from_open_checks_cancel_before_any_work() {
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut host_half, mut peer_half) = duplex(64 * 1024);
+        let cancel = AtomicBool::new(true);
+        let destination = path_string(&host_dir.path().join("f.bin"));
+        let open = FileTransferMessage::UploadOpen {
+            destination: &destination,
+            file_name: "f.bin",
+            declared_size: 1,
+        };
+        let outcome =
+            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
+                .await;
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        let frame = tokio::time::timeout(Duration::from_millis(50), async {
+            let mut byte = [0_u8; 1];
+            peer_half.read(&mut byte).await.unwrap()
+        })
+        .await;
+        assert!(frame.is_err(), "no frame may reach the peer");
+        assert_dir_empty(host_dir.path());
+    }
+
+    #[tokio::test]
+    async fn upload_from_open_destination_exists_fails_and_cleans_up() {
+        let source_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let (bytes, _) = file_chunks(&source_path);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let final_path = host_dir.path().join("exists.bin");
+        fs::write(&final_path, b"pre-existing").unwrap();
+        let (controller_half, mut host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Upload,
+            TransferSide::Controller,
+        );
+        let cancel = AtomicBool::new(false);
+        let destination = path_string(&final_path);
+        let open = FileTransferMessage::UploadOpen {
+            destination: &destination,
+            file_name: "src.bin",
+            declared_size: bytes.len() as u64,
+        };
+        let (host_outcome, error_message) = tokio::join!(
+            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open,),
+            async {
+                peer.send(FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "src.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+                peer.read_unchecked().await
+            },
+        );
+        let expected = TransferOutcome::Failed(FileTransferErrorCode::DestinationExists);
+        assert_eq!(host_outcome, expected);
+        assert_eq!(
+            error_message,
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::DestinationExists
+            }
+        );
+        assert_eq!(fs::read(&final_path).unwrap(), b"pre-existing");
+    }
+
+    #[tokio::test]
+    async fn download_from_open_source_not_found_fails_and_keeps_no_state() {
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let missing = source_dir.path().join("nope.bin");
+        let source_string = path_string(&missing);
+        let (controller_half, mut host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        // The session layer consumed the opening frame off the wire before
+        // this entry; the scripted session records the same transition.
+        peer.session
+            .send(&FileTransferMessage::DownloadOpen { source: "consumed" })
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let open = FileTransferMessage::DownloadOpen {
+            source: &source_string,
+        };
+        let (host_outcome, error_message) = tokio::join!(
+            handle_download_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open,),
+            async { peer.read_control().await },
+        );
+        let expected = TransferOutcome::Failed(FileTransferErrorCode::SourceNotFound);
+        assert_eq!(host_outcome, expected);
+        assert_eq!(
+            error_message,
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::SourceNotFound
+            }
+        );
+        assert_dir_empty(controller_dir.path());
     }
 }

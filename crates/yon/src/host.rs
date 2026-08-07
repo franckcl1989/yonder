@@ -1,3 +1,4 @@
+use crate::file_semantics::BaseDirectory;
 use crate::network::{
     ConnectionBinding, EndpointDriver, EndpointError, EndpointEvent, RelayConnection,
     ReservationLease, build_endpoint, connect_configured_relay, drive_bound, reconverge_relay,
@@ -13,20 +14,31 @@ use crate::terminal::{
     PortablePtyBackend, PtyEventKind, TerminalBackend, TerminalError, TerminalInput,
     TerminalSession,
 };
+use crate::transfer::{TransferConfig, handle_download_from_open, handle_upload_from_open};
 use std::convert::Infallible;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::sync::mpsc;
 use tokio_util::compat::FuturesAsyncReadCompatExt as _;
 use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, CLIENT_HELLO_LEN,
     KE3_LEN, PakeContext,
 };
+use yonder_core::wire::file_transfer::{
+    FRAME_HEADER_LEN, FileTransferErrorCode, FileTransferMessage, MAX_CONTROL_FRAME_LEN,
+    TransferTag, decode_frame_header, validate_payload_len,
+};
 use yonder_core::wire::terminal::{
     MAX_HELLO_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalReady, TerminalResize,
 };
-use yonder_core::wire::{AUTH_PROTOCOL, TERMINAL_CONTROL_PROTOCOL, TERMINAL_DATA_PROTOCOL};
+use yonder_core::wire::{
+    AUTH_PROTOCOL, FILE_TRANSFER_PROTOCOL, TERMINAL_CONTROL_PROTOCOL, TERMINAL_DATA_PROTOCOL,
+};
 use yonder_core::{
     ConnectionCode, DirectRateLimiter, OsSecureRandom, Pake, PeerIdBytes, ProtocolError,
     RandomError, RateLimit, SecureRandom, SessionEvent, TargetSession, TransitionError,
@@ -76,28 +88,42 @@ pub enum HostStage {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        EXCHANGE_TIMEOUT, HostConfig, HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair,
-        binding_event, complete_terminal_exit_io, copy_controller_input, copy_terminal_output,
-        host_error_event, read_auth_hello_io, read_terminal_hello_io, report_connection_code_to,
-        report_replacement_notice_to, retryable_relay_error, run_host, run_host_with,
-        run_host_with_progress, send_auth_retry_io, start_terminal_io, write_authenticated_io,
+        EXCHANGE_TIMEOUT, FILE_SUBSTREAM_QUEUE, FileOpenError, FileOpenFrame, HostConfig,
+        HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair, binding_event,
+        complete_terminal_exit_io, copy_controller_input, copy_terminal_output,
+        file_substream_coordinator, host_error_event, read_auth_hello_io, read_file_open_frame,
+        read_terminal_hello_io, report_connection_code_to, report_replacement_notice_to,
+        retryable_relay_error, run_host, run_host_with, run_host_with_progress, send_auth_retry_io,
+        serve_one_file_substream, start_terminal_io, write_authenticated_io,
         write_terminal_ready_io,
     };
+    use crate::file_semantics::BaseDirectory;
     use crate::network::EndpointError;
     use crate::progress::NoopProgress;
     use crate::protocol::RelayProtocolError;
     use crate::terminal::{
         PtyEvent, TerminalBackend, TerminalChunk, TerminalError, TerminalInput, TerminalSession,
     };
+    use crate::transfer::TransferConfig;
+    use sha2::{Digest, Sha256};
     use std::collections::VecDeque;
+    use std::fs;
     use std::future::Future;
+    use std::io::Write as _;
+    use std::path::Path;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
+    use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+    use tokio::sync::{Notify, mpsc};
     use yonder_core::wire::auth::{AuthClientHello, AuthServerResponse, CLIENT_HELLO_LEN};
+    use yonder_core::wire::file_transfer::{
+        FRAME_HEADER_LEN, FileTransferErrorCode, FileTransferMessage, Sha256Digest, TransferTag,
+        decode_frame_header, encode_frame_header,
+    };
     use yonder_core::wire::terminal::{
         MAX_HELLO_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalResize,
     };
@@ -935,6 +961,861 @@ mod tests {
             .map(|index| ((index + seed) % 251) as u8)
             .collect()
     }
+
+    // ------------------------------------------------------------------
+    // File-transfer integration helpers: the host session layer is
+    // exercised with duplex streams and real file I/O, mirroring how the
+    // existing host tests drive the terminal pumps (no swarm needed).
+    // ------------------------------------------------------------------
+
+    fn file_transfer_config() -> TransferConfig {
+        TransferConfig {
+            control_timeout: Duration::from_secs(2),
+            data_progress_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn pattern_byte(index: u64) -> u8 {
+        ((index * 31) + (index / 251) + (index >> 3)) as u8
+    }
+
+    fn write_pattern_file(path: &Path, size: u64) {
+        let mut file = fs::File::create(path).unwrap();
+        let mut buffer = [0_u8; 4096];
+        let mut remaining = size;
+        let mut offset = 0_u64;
+        while remaining > 0 {
+            let n = remaining.min(4096) as usize;
+            for (i, byte) in buffer[..n].iter_mut().enumerate() {
+                *byte = pattern_byte(offset + i as u64);
+            }
+            file.write_all(&buffer[..n]).unwrap();
+            remaining -= n as u64;
+            offset += n as u64;
+        }
+        file.sync_all().unwrap();
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> Sha256Digest {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        Sha256Digest::new(hasher.finalize().into())
+    }
+
+    /// Writes one control frame from the scripted controller.
+    async fn send_wire_frame<S: AsyncWrite + Unpin>(
+        stream: &mut S,
+        message: &FileTransferMessage<'_>,
+    ) {
+        let encoded = message.encode().unwrap();
+        stream.write_all(encoded.as_slice()).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// Writes one `Data` frame from the scripted controller.
+    async fn send_wire_data<S: AsyncWrite + Unpin>(stream: &mut S, bytes: &[u8]) {
+        let header = encode_frame_header(TransferTag::Data.code(), bytes.len() as u32);
+        stream.write_all(&header).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// Reads one complete frame from the wire and returns the raw bytes.
+    async fn read_wire_frame<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
+        let mut header = [0_u8; FRAME_HEADER_LEN];
+        stream.read_exact(&mut header).await.unwrap();
+        let (_, payload_len) = decode_frame_header(&header).unwrap();
+        let mut payload = vec![0_u8; payload_len as usize];
+        stream.read_exact(&mut payload).await.unwrap();
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Reads the next frame and asserts it is exactly `expected`.
+    async fn expect_wire_control<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        expected: &FileTransferMessage<'_>,
+    ) {
+        let frame = read_wire_frame(stream).await;
+        assert_eq!(
+            FileTransferMessage::decode_frame(&frame).unwrap(),
+            *expected
+        );
+    }
+
+    /// Reads the frames of a download until `Finish` and returns the
+    /// received `Data` payload bytes.
+    async fn receive_download_bytes<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        expected_size: u64,
+    ) -> Vec<u8> {
+        let mut received = Vec::new();
+        loop {
+            let frame = read_wire_frame(stream).await;
+            if frame[0] == TransferTag::Data.code() {
+                received.extend_from_slice(&frame[FRAME_HEADER_LEN..]);
+                continue;
+            }
+            match FileTransferMessage::decode_frame(&frame).unwrap() {
+                FileTransferMessage::Finish {
+                    actual_size,
+                    digest,
+                } => {
+                    assert_eq!(actual_size, expected_size);
+                    assert_eq!(digest, sha256_bytes(&received));
+                    return received;
+                }
+                other => panic!("unexpected host message: {other:?}"),
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Opening-frame read (capability probing, design 9.3).
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_open_frame_read_distinguishes_probe_open_and_protocol() {
+        let budget = file_transfer_config().control_timeout;
+        // EOF before any byte: a zero-side-effect capability probe.
+        let (mut host, peer) = tokio::io::duplex(1);
+        drop(peer);
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap(),
+            FileOpenFrame::Probe
+        );
+
+        // A complete UploadOpen decodes as an upload.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        let open = FileTransferMessage::UploadOpen {
+            destination: "dir/f",
+            file_name: "n.bin",
+            declared_size: 7,
+        };
+        send_wire_frame(&mut peer, &open).await;
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap(),
+            FileOpenFrame::Upload {
+                destination: "dir/f".to_owned(),
+                file_name: "n.bin".to_owned(),
+                declared_size: 7,
+            }
+        );
+
+        // A complete DownloadOpen decodes as a download.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        send_wire_frame(
+            &mut peer,
+            &FileTransferMessage::DownloadOpen { source: "in/f" },
+        )
+        .await;
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap(),
+            FileOpenFrame::Download {
+                source: "in/f".to_owned()
+            }
+        );
+
+        // An unknown tag is a protocol violation.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        peer.write_all(&[0x0A, 0, 0, 0, 0]).await.unwrap();
+        peer.flush().await.unwrap();
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // A frame that cannot open a transfer (Ready) is a protocol
+        // violation.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        send_wire_frame(&mut peer, &FileTransferMessage::Ready).await;
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // A Data first frame is a protocol violation even with a legal
+        // payload length.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        send_wire_data(&mut peer, &[1, 2, 3]).await;
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // A truncated header is a protocol violation: EOF inside a frame.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        peer.write_all(&[0x01, 0, 0]).await.unwrap();
+        peer.flush().await.unwrap();
+        drop(peer);
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // A frame declaring more payload than arrives is a protocol
+        // violation (EOF mid-frame).
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        let header = encode_frame_header(TransferTag::UploadOpen.code(), 100);
+        peer.write_all(&header).await.unwrap();
+        peer.write_all(&[0; 10]).await.unwrap();
+        peer.flush().await.unwrap();
+        drop(peer);
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // Silence until the control deadline is a timeout.
+        let (mut host, _peer) = tokio::io::duplex(1);
+        assert_eq!(
+            read_file_open_frame(&mut host, Duration::from_millis(20))
+                .await
+                .unwrap_err(),
+            FileOpenError::Timeout
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_probe_creates_no_state_or_error() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+
+        // An Active-slot probe: the controller opens a substream and closes
+        // it without a single byte. The host must reply with nothing and
+        // close without creating any state (design 9.3).
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (host_half, mut peer_half) = tokio::io::duplex(1);
+        let served = serve_one_file_substream(
+            host_half,
+            base.as_ref(),
+            Arc::clone(&cancel),
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let peer = async {
+            peer_half.shutdown().await.unwrap();
+            let mut buffer = [0_u8; 8];
+            let read = peer_half.read(&mut buffer).await.unwrap();
+            (read, buffer)
+        };
+        let ((), (read, buffer)) = tokio::join!(served, peer);
+        assert_eq!(read, 0, "a probe must not produce any byte");
+        assert!(buffer.iter().all(|byte| *byte == 0));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        // The same holds while another transfer is active (Busy role): the
+        // probe is answered with silence, not with Error(Busy).
+        let (host_half, mut peer_half) = tokio::io::duplex(1);
+        let served = serve_one_file_substream(
+            host_half,
+            base.as_ref(),
+            Arc::clone(&cancel),
+            &config,
+            super::FileSubstreamRole::Busy,
+        );
+        let peer = async {
+            peer_half.shutdown().await.unwrap();
+            let mut buffer = [0_u8; 8];
+            let read = peer_half.read(&mut buffer).await.unwrap();
+            (read, buffer)
+        };
+        let ((), (read, buffer)) = tokio::join!(served, peer);
+        assert_eq!(read, 0, "a busy probe must still be silent");
+        assert!(buffer.iter().all(|byte| *byte == 0));
+
+        // And when the session base directory is unavailable, a real
+        // opening still leaves no trace and no reply.
+        let (host_half, mut peer_half) = tokio::io::duplex(1);
+        let served = serve_one_file_substream(
+            host_half,
+            None,
+            Arc::clone(&cancel),
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let peer = async {
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::UploadOpen {
+                    destination: "",
+                    file_name: "f.bin",
+                    declared_size: 1,
+                },
+            )
+            .await;
+            let mut buffer = [0_u8; 8];
+            let read = peer_half.read(&mut buffer).await.unwrap();
+            (read, buffer)
+        };
+        let ((), (read, buffer)) = tokio::join!(served, peer);
+        assert_eq!(read, 0, "an unresolvable request must not produce bytes");
+        assert!(buffer.iter().all(|byte| *byte == 0));
+    }
+
+    // ------------------------------------------------------------------
+    // Real transfers over one live substream (probe read + dispatch).
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_over_a_live_substream_succeeds() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        for size in [0_u64, 1, 65535, 65536, 65537] {
+            let source_dir = tempdir().unwrap();
+            let source_path = source_dir.path().join(format!("source-{size}.bin"));
+            write_pattern_file(&source_path, size);
+            let bytes = fs::read(&source_path).unwrap();
+            let final_path = directory.path().join(format!("final-{size}.bin"));
+            let destination = final_path.to_str().unwrap().to_owned();
+            let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let served = serve_one_file_substream(
+                host_half,
+                base.as_ref(),
+                cancel,
+                &config,
+                super::FileSubstreamRole::Active,
+            );
+            let controller = async {
+                send_wire_frame(
+                    &mut peer_half,
+                    &FileTransferMessage::UploadOpen {
+                        destination: &destination,
+                        file_name: "up.bin",
+                        declared_size: bytes.len() as u64,
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_half, &FileTransferMessage::Ready).await;
+                for chunk in bytes.chunks(65536) {
+                    send_wire_data(&mut peer_half, chunk).await;
+                }
+                send_wire_frame(
+                    &mut peer_half,
+                    &FileTransferMessage::Finish {
+                        actual_size: bytes.len() as u64,
+                        digest: sha256_bytes(&bytes),
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_half, &FileTransferMessage::Committed).await;
+                let mut trailing = [0_u8; 1];
+                assert_eq!(
+                    peer_half.read(&mut trailing).await.unwrap(),
+                    0,
+                    "the host must close the substream after Committed"
+                );
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(served, controller)
+            })
+            .await
+            .expect("upload over the live substream deadlocked");
+            assert_eq!(
+                fs::read(&final_path).unwrap(),
+                bytes,
+                "content for size {size}"
+            );
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+            fs::remove_file(&final_path).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_over_a_live_substream_succeeds() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        for size in [0_u64, 1, 65535, 65536, 65537] {
+            let source_path = directory.path().join(format!("source-{size}.bin"));
+            write_pattern_file(&source_path, size);
+            let bytes = fs::read(&source_path).unwrap();
+            let source = source_path.to_str().unwrap().to_owned();
+            let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let served = serve_one_file_substream(
+                host_half,
+                base.as_ref(),
+                cancel,
+                &config,
+                super::FileSubstreamRole::Active,
+            );
+            let controller = async {
+                send_wire_frame(
+                    &mut peer_half,
+                    &FileTransferMessage::DownloadOpen { source: &source },
+                )
+                .await;
+                let offer = read_wire_frame(&mut peer_half).await;
+                let message = FileTransferMessage::decode_frame(&offer).unwrap();
+                let (name, declared) = match &message {
+                    FileTransferMessage::DownloadOffer {
+                        file_name,
+                        declared_size,
+                    } => (*file_name, *declared_size),
+                    other => panic!("expected DownloadOffer, got {other:?}"),
+                };
+                assert_eq!(name, format!("source-{size}.bin"));
+                assert_eq!(declared, size);
+                send_wire_frame(&mut peer_half, &FileTransferMessage::Ready).await;
+                let received = receive_download_bytes(&mut peer_half, size).await;
+                send_wire_frame(&mut peer_half, &FileTransferMessage::Committed).await;
+                let mut trailing = [0_u8; 1];
+                assert_eq!(
+                    peer_half.read(&mut trailing).await.unwrap(),
+                    0,
+                    "the host must close the substream after the transfer"
+                );
+                received
+            };
+            let ((), received) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(served, controller)
+            })
+            .await
+            .expect("download over the live substream deadlocked");
+            assert_eq!(received, bytes, "received bytes for size {size}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Single-transfer mutual exclusion (design 15.3): the coordinator
+    // answers a second substream with Error(Busy) while a transfer runs.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_alone_completes_a_transfer() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
+        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+        let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+        sender.try_send(host_half).unwrap();
+        // The coordinator ends when the sender is dropped, which the real
+        // bridge does at session teardown.
+        drop(sender);
+        let final_path = directory.path().join("out.bin");
+        let destination = final_path.to_str().unwrap().to_owned();
+        let bytes = patterned_bytes(200 * 1024, 5);
+        let controller = async {
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "out.bin",
+                    declared_size: bytes.len() as u64,
+                },
+            )
+            .await;
+            expect_wire_control(&mut peer_half, &FileTransferMessage::Ready).await;
+            for chunk in bytes.chunks(65536) {
+                send_wire_data(&mut peer_half, chunk).await;
+            }
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::Finish {
+                    actual_size: bytes.len() as u64,
+                    digest: sha256_bytes(&bytes),
+                },
+            )
+            .await;
+            expect_wire_control(&mut peer_half, &FileTransferMessage::Committed).await;
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(coordinator, controller)
+        })
+        .await
+        .expect("coordinator-served transfer deadlocked");
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn second_substream_during_a_transfer_is_answered_busy() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
+        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+
+        let (host_first, mut peer_first) = tokio::io::duplex(64 * 1024);
+        let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
+        sender.try_send(host_first).unwrap();
+        let first_started = Arc::new(Notify::new());
+        let busy_done = Arc::new(Notify::new());
+
+        let final_path = directory.path().join("out.bin");
+        let destination = final_path.to_str().unwrap().to_owned();
+        const SIZE: usize = 200 * 1024;
+        let bytes = patterned_bytes(SIZE, 5);
+
+        let first = {
+            let first_started = Arc::clone(&first_started);
+            let busy_done = Arc::clone(&busy_done);
+            let bytes = &bytes;
+            async move {
+                send_wire_frame(
+                    &mut peer_first,
+                    &FileTransferMessage::UploadOpen {
+                        destination: &destination,
+                        file_name: "out.bin",
+                        declared_size: SIZE as u64,
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_first, &FileTransferMessage::Ready).await;
+                send_wire_data(&mut peer_first, &bytes[..65536]).await;
+                // The host is now inside the data phase; let the second
+                // substream be opened while this transfer is active.
+                first_started.notify_one();
+                busy_done.notified().await;
+                for chunk in bytes[65536..].chunks(65536) {
+                    send_wire_data(&mut peer_first, chunk).await;
+                }
+                send_wire_frame(
+                    &mut peer_first,
+                    &FileTransferMessage::Finish {
+                        actual_size: SIZE as u64,
+                        digest: sha256_bytes(bytes),
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_first, &FileTransferMessage::Committed).await;
+            }
+        };
+        let second = async {
+            first_started.notified().await;
+            // The coordinator has consumed the first substream, so the
+            // bounded queue is empty and the second one is accepted — then
+            // answered with Error(Busy) because the transfer is active.
+            sender.try_send(host_second).unwrap();
+            // The coordinator ends when the sender is dropped, which the
+            // real bridge does at session teardown.
+            drop(sender);
+            send_wire_frame(
+                &mut peer_second,
+                &FileTransferMessage::UploadOpen {
+                    destination: "",
+                    file_name: "other.bin",
+                    declared_size: 1,
+                },
+            )
+            .await;
+            expect_wire_control(
+                &mut peer_second,
+                &FileTransferMessage::Error {
+                    code: FileTransferErrorCode::Busy,
+                },
+            )
+            .await;
+            let mut trailing = [0_u8; 1];
+            assert_eq!(
+                peer_second.read(&mut trailing).await.unwrap(),
+                0,
+                "the busy substream must be closed after the reply"
+            );
+            busy_done.notify_one();
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(coordinator, first, second)
+        })
+        .await
+        .expect("busy rejection deadlocked");
+        // The first transfer completed untouched and committed its target.
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Session teardown (design 16.4, 16.5): the shared cancel flag aborts
+    // the active transfer; no uncommitted target appears.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_teardown_cancels_the_active_transfer() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let final_path = directory.path().join("f.bin");
+        let destination = final_path.to_str().unwrap().to_owned();
+        let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+        let served = serve_one_file_substream(
+            host_half,
+            base.as_ref(),
+            Arc::clone(&cancel),
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let controller = async {
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "f.bin",
+                    declared_size: 200 * 1024,
+                },
+            )
+            .await;
+            expect_wire_control(&mut peer_half, &FileTransferMessage::Ready).await;
+            send_wire_data(&mut peer_half, &[7; 65536]).await;
+            // The shell exits or the connection is lost: the bridge sets
+            // the cancel flag and abandons the substream. The host sends
+            // Error(SessionClosing) best-effort and closes.
+            cancel.store(true, Ordering::Relaxed);
+            expect_wire_control(
+                &mut peer_half,
+                &FileTransferMessage::Error {
+                    code: FileTransferErrorCode::SessionClosing,
+                },
+            )
+            .await;
+            let mut trailing = [0_u8; 1];
+            assert_eq!(
+                peer_half.read(&mut trailing).await.unwrap(),
+                0,
+                "the cancelled substream must be closed"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(served, controller)
+        })
+        .await
+        .expect("teardown cancellation deadlocked");
+        // No final target and no leftover temporary file.
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Error mapping (design 10.4) and lifecycle isolation (design 17.2):
+    // a file failure only terminates its substream; the terminal session
+    // stays usable.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_errors_leave_the_session_usable() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // An upload into an existing destination fails with
+        // Error(DestinationExists) and never touches the target.
+        let final_path = directory.path().join("exists.bin");
+        fs::write(&final_path, b"pre-existing").unwrap();
+        let destination = final_path.to_str().unwrap().to_owned();
+        let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+        let served = serve_one_file_substream(
+            host_half,
+            base.as_ref(),
+            Arc::clone(&cancel),
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let controller = async {
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "f.bin",
+                    declared_size: 4,
+                },
+            )
+            .await;
+            expect_wire_control(
+                &mut peer_half,
+                &FileTransferMessage::Error {
+                    code: FileTransferErrorCode::DestinationExists,
+                },
+            )
+            .await;
+            let mut trailing = [0_u8; 1];
+            assert_eq!(peer_half.read(&mut trailing).await.unwrap(), 0);
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(served, controller)
+        })
+        .await
+        .expect("destination-exists rejection deadlocked");
+        assert_eq!(fs::read(&final_path).unwrap(), b"pre-existing");
+
+        // A download of a missing source fails with Error(SourceNotFound).
+        let missing = directory.path().join("nope.bin");
+        let source = missing.to_str().unwrap().to_owned();
+        let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+        let served = serve_one_file_substream(
+            host_half,
+            base.as_ref(),
+            Arc::clone(&cancel),
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let controller = async {
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::DownloadOpen { source: &source },
+            )
+            .await;
+            expect_wire_control(
+                &mut peer_half,
+                &FileTransferMessage::Error {
+                    code: FileTransferErrorCode::SourceNotFound,
+                },
+            )
+            .await;
+            let mut trailing = [0_u8; 1];
+            assert_eq!(peer_half.read(&mut trailing).await.unwrap(), 0);
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(served, controller)
+        })
+        .await
+        .expect("source-not-found rejection deadlocked");
+
+        // The session is still usable: a full upload now succeeds.
+        let final_path = directory.path().join("after.bin");
+        let destination = final_path.to_str().unwrap().to_owned();
+        let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+        let served = serve_one_file_substream(
+            host_half,
+            base.as_ref(),
+            cancel,
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let bytes = patterned_bytes(4096, 11);
+        let controller = async {
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "after.bin",
+                    declared_size: bytes.len() as u64,
+                },
+            )
+            .await;
+            expect_wire_control(&mut peer_half, &FileTransferMessage::Ready).await;
+            send_wire_data(&mut peer_half, &bytes).await;
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::Finish {
+                    actual_size: bytes.len() as u64,
+                    digest: sha256_bytes(&bytes),
+                },
+            )
+            .await;
+            expect_wire_control(&mut peer_half, &FileTransferMessage::Committed).await;
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(served, controller)
+        })
+        .await
+        .expect("post-error upload deadlocked");
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // Terminal fairness (design 15.2, 23.5): the terminal output pump
+    // keeps running while a file transfer is in flight.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_pump_runs_concurrently_with_a_file_transfer() {
+        const EXIT_CODE: u32 = 53;
+        const TRANSFER_SIZE: usize = 200 * 1024;
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let mut events = VecDeque::new();
+        let terminal_bytes = patterned_bytes(16 * 1024, 13);
+        for chunk in terminal_bytes.chunks(4096) {
+            let mut terminal_chunk = TerminalChunk::new();
+            terminal_chunk.writable()[..chunk.len()].copy_from_slice(chunk);
+            terminal_chunk.set_len(chunk.len()).unwrap();
+            events.push_back(PtyEvent::output(terminal_chunk));
+        }
+        events.push_back(PtyEvent::exited(EXIT_CODE));
+        let mut session = PumpSession { events };
+
+        let (host_data, mut controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        let (mut controller_control_read, mut controller_control_write) =
+            tokio::io::split(controller_control);
+        let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+
+        let final_path = directory.path().join("during.bin");
+        let destination = final_path.to_str().unwrap().to_owned();
+        let transfer_bytes = patterned_bytes(TRANSFER_SIZE, 17);
+
+        let pump = copy_terminal_output(
+            &mut session,
+            &mut host_data_write,
+            &mut host_control_read,
+            &mut host_control_write,
+        );
+        let served = serve_one_file_substream(
+            host_half,
+            base.as_ref(),
+            cancel,
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let controller = async {
+            // Drive the file transfer to completion.
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "during.bin",
+                    declared_size: TRANSFER_SIZE as u64,
+                },
+            )
+            .await;
+            expect_wire_control(&mut peer_half, &FileTransferMessage::Ready).await;
+            for chunk in transfer_bytes.chunks(65536) {
+                send_wire_data(&mut peer_half, chunk).await;
+            }
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::Finish {
+                    actual_size: TRANSFER_SIZE as u64,
+                    digest: sha256_bytes(&transfer_bytes),
+                },
+            )
+            .await;
+            expect_wire_control(&mut peer_half, &FileTransferMessage::Committed).await;
+            // Observe the terminal output and complete the session.
+            let mut observed = Vec::new();
+            controller_data.read_to_end(&mut observed).await.unwrap();
+            let mut exit = [0_u8; 5];
+            controller_control_read.read_exact(&mut exit).await.unwrap();
+            controller_control_write
+                .write_all(&TerminalComplete::ENCODED)
+                .await
+                .unwrap();
+            controller_control_write.flush().await.unwrap();
+            (observed, TerminalExit::decode(&exit).unwrap())
+        };
+        let (pump_result, (observed, exit), ()) =
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(pump, controller, served)
+            })
+            .await
+            .expect("terminal pump and file transfer deadlocked");
+        assert_eq!(pump_result.unwrap(), EXIT_CODE);
+        assert_eq!(exit.code(), EXIT_CODE);
+        assert_eq!(observed, terminal_bytes);
+        assert_eq!(fs::read(&final_path).unwrap(), transfer_bytes);
+    }
 }
 
 /// Host-side failures, all of which preserve the one-use state machine semantics.
@@ -1009,6 +1890,7 @@ async fn run_host_session<B: TerminalBackend>(
     let mut auth_incoming = streams.accept(AUTH_PROTOCOL)?;
     let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL)?;
     let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL)?;
+    let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL)?;
     let target = peer_id_bytes(driver.peer_id()).map_err(|_| HostError::PeerIdentity)?;
     let mut pake = OpaquePake;
     let (relay_lease, advertised) = initialize_host_relay(
@@ -1027,6 +1909,7 @@ async fn run_host_session<B: TerminalBackend>(
         auth_incoming: &mut auth_incoming,
         data_incoming: &mut data_incoming,
         control_incoming: &mut control_incoming,
+        file_incoming: &mut file_incoming,
         relays: &relays,
         relay_lease,
         advertised,
@@ -1395,6 +2278,7 @@ struct HostSession<'a, B> {
     auth_incoming: &'a mut IncomingApplicationStreams,
     data_incoming: &'a mut IncomingApplicationStreams,
     control_incoming: &'a mut IncomingApplicationStreams,
+    file_incoming: &'a mut IncomingApplicationStreams,
     relays: &'a EndpointRelaySet,
     relay_lease: ReservationLease,
     advertised: AdvertisedLease,
@@ -1407,6 +2291,7 @@ struct InboundProtocols<'a> {
     auth: &'a mut IncomingApplicationStreams,
     data: &'a mut IncomingApplicationStreams,
     control: &'a mut IncomingApplicationStreams,
+    file: &'a mut IncomingApplicationStreams,
 }
 
 impl<B: TerminalBackend> HostSession<'_, B> {
@@ -1420,6 +2305,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             auth_incoming,
             data_incoming,
             control_incoming,
+            file_incoming,
             relays,
             relay_lease,
             advertised,
@@ -1433,6 +2319,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             auth: auth_incoming,
             data: data_incoming,
             control: control_incoming,
+            file: file_incoming,
         };
         loop {
             progress.update(HostStage::WaitingForController);
@@ -1571,7 +2458,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                 start_terminal(*backend, data, control),
             )
             .await;
-            let (mut pty, data, control) = match result {
+            let (mut pty, base, data, control) = match result {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => {
                     session.apply(host_error_event(&error, SessionEvent::TerminalStartFailed))?;
@@ -1604,8 +2491,16 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                 tracing::warn!(%error, "one-use locator release was not acknowledged after commit");
             }
 
-            let outcome =
-                bridge_terminal(driver, binding, &mut incoming, &mut pty, data, control).await;
+            let outcome = bridge_terminal(
+                driver,
+                binding,
+                &mut incoming,
+                &mut pty,
+                data,
+                control,
+                base.as_ref(),
+            )
+            .await;
             if let Err(error) = &outcome {
                 tracing::debug!(%error, "terminal bridge failed before shell completion");
             }
@@ -1650,6 +2545,12 @@ async fn wait_for_controller_quiescence(
             stream = incoming.control.next() => {
                 drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
             }
+            stream = incoming.file.next() => {
+                // The session is not Active yet; file requests are invalid
+                // and are dropped without creating any transfer state
+                // (design 9.2: only Active sessions accept file substreams).
+                drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
+            }
             () = tokio::time::sleep_until(deadline) => {
                 driver.close_peer_and_wait(controller).await?;
                 return Err(EndpointError::TargetUpgradeDidNotSettle.into());
@@ -1686,6 +2587,7 @@ async fn wait_for_auth(
             }
             stream = incoming.data.next() => drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?),
             stream = incoming.control.next() => drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?),
+            stream = incoming.file.next() => drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?),
             signal = crate::shutdown::endpoint_shutdown_signal() => {
                 signal?;
                 return Err(HostError::Interrupted);
@@ -1717,6 +2619,9 @@ async fn drive_session_inputs<F: Future>(
                 drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
             }
             stream = incoming.control.next() => {
+                drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
+            }
+            stream = incoming.file.next() => {
                 drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
             }
             output = &mut future => {
@@ -1859,6 +2764,11 @@ async fn acknowledge_and_wait_for_terminal_streams(
                     pending.insert_control(stream);
                 }
             }
+            stream = incoming.file.next() => {
+                // The session is not Active yet (TerminalReady has not been
+                // flushed); file requests are dropped without state.
+                drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
+            }
             result = &mut acknowledgement, if terminal_deadline.is_none() => {
                 result?;
                 terminal_deadline = Some(tokio::time::Instant::now() + EXCHANGE_TIMEOUT);
@@ -1940,13 +2850,36 @@ async fn start_terminal<B: TerminalBackend>(
     backend: &B,
     mut data: ApplicationStream,
     mut control: ApplicationStream,
-) -> Result<(B::Session, ApplicationStream, ApplicationStream), HostError> {
+) -> Result<
+    (
+        B::Session,
+        Option<BaseDirectory>,
+        ApplicationStream,
+        ApplicationStream,
+    ),
+    HostError,
+> {
     let pty = {
         let mut data_io = (&mut data).compat();
         let mut control_io = (&mut control).compat();
         start_terminal_io(backend, &mut data_io, &mut control_io).await?
     };
-    Ok((pty, data, control))
+    // The session base directory is captured once, when the session shell
+    // starts; every remote path resolves against it for the whole session
+    // (design 8.5). The shell spawns with the process working directory
+    // (design 21), so the capture equals the shell's initial directory.
+    // The portable-pty session does not expose the directory, so the
+    // process working directory is captured here instead. If the working
+    // directory is unavailable (for example deleted), the terminal session
+    // continues and every file request fails closed without state.
+    let base = match BaseDirectory::capture() {
+        Ok(base) => Some(base),
+        Err(error) => {
+            tracing::debug!(%error, "host session base directory is unavailable; file transfers are refused");
+            None
+        }
+    };
+    Ok((pty, base, data, control))
 }
 
 async fn start_terminal_io<B, D, C>(
@@ -2013,10 +2946,24 @@ async fn bridge_terminal<S: TerminalSession>(
     pty: &mut S,
     data: ApplicationStream,
     control: ApplicationStream,
+    base: Option<&BaseDirectory>,
 ) -> Result<u32, HostError> {
     let (mut data_read, mut data_write) = tokio::io::split(data.into_tokio());
     let (mut control_read, mut control_write) = tokio::io::split(control.into_tokio());
     let mut pty_input = pty.take_input()?;
+    // One cancellation flag shared with the file coordinator: any session
+    // ending (shell exit, connection loss, shutdown signal) sets it so the
+    // active transfer aborts promptly and no uncommitted target appears
+    // (design 16.4, 16.5).
+    let cancel = Arc::new(AtomicBool::new(false));
+    let config = TransferConfig::defaults();
+    let (file_sender, file_receiver) = mpsc::channel::<FileSubstreamIoBox>(FILE_SUBSTREAM_QUEUE);
+    let mut file_coordinator = Box::pin(file_substream_coordinator(
+        file_receiver,
+        base,
+        Arc::clone(&cancel),
+        &config,
+    ));
     let result = {
         let controller_input = copy_controller_input(&mut data_read, &mut pty_input);
         let terminal_output =
@@ -2041,14 +2988,40 @@ async fn bridge_terminal<S: TerminalSession>(
             stream = incoming.control.next() => {
                 drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
             }
+            stream = incoming.file.next() => {
+                let (peer, stream) = stream.ok_or(HostError::ProtocolRegistrationEnded)?;
+                if peer != binding.peer() {
+                    // Only the authenticated controller of this session may
+                    // open file substreams (design 9.2); other peers are
+                    // rejected without any state.
+                    drop(stream);
+                } else {
+                    // The boxed substream is dropped (closing it) when the
+                    // bounded queue is full: the coordinator serves one
+                    // transfer and at most one busy reply at a time
+                    // (design 15.1, 15.3).
+                    let _ = file_sender.try_send(Box::new(stream.into_tokio()));
+                }
+            }
             result = &mut controller_input => match result {
                 Ok(never) => match never {},
-                Err(error) => break Err(error),
+                Err(error) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    break Err(error);
+                }
             },
             result = &mut terminal_output => {
+                cancel.store(true, Ordering::Relaxed);
                 break result;
             }
+            _ = &mut file_coordinator => {
+                // The coordinator ends only when the sender is dropped,
+                // which happens only after this loop breaks; reaching this
+                // arm is an internal invariant failure.
+                break Err(HostError::ProtocolRegistrationEnded);
+            }
             signal = crate::shutdown::endpoint_shutdown_signal() => {
+                cancel.store(true, Ordering::Relaxed);
                 signal?;
                 break Err(HostError::Interrupted);
             }
@@ -2057,6 +3030,317 @@ async fn bridge_terminal<S: TerminalSession>(
     };
     drop(pty_input);
     result
+}
+
+/// The hard cap on file substreams waiting for the single active slot.
+const FILE_SUBSTREAM_QUEUE: usize = 1;
+
+/// The erased file-substream I/O. `ApplicationStream::into_tokio` returns
+/// an opaque type that cannot be named, so the bounded file queue carries
+/// boxed trait objects instead (one bounded allocation per substream). The
+/// trait exists only to give the object a name; every tokio stream
+/// implements it.
+trait FileSubstreamIo: AsyncRead + AsyncWrite + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Unpin> FileSubstreamIo for T {}
+
+/// The boxed carrier type used by the bounded file-substream queue.
+type FileSubstreamIoBox = Box<dyn FileSubstreamIo>;
+
+/// Whether a file substream is served as the single active transfer or as
+/// a busy rejection (design 15.3: at most one file operation per active
+/// session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSubstreamRole {
+    /// The single active slot: the opening frame dispatches a real upload
+    /// or download.
+    Active,
+    /// Another transfer is already running: the opening frame is answered
+    /// with `Error(Busy)` and the substream is closed.
+    Busy,
+}
+
+/// The bounded, zero-side-effect result of the first-frame read of a file
+/// substream (design 9.3: an EOF before any byte is a capability probe).
+#[derive(Debug, PartialEq, Eq)]
+enum FileOpenFrame {
+    /// EOF at a message boundary before any byte: a capability probe. No
+    /// transfer state, error output or log entry may be produced.
+    Probe,
+    /// A complete opening frame of an upload.
+    Upload {
+        destination: String,
+        file_name: String,
+        declared_size: u64,
+    },
+    /// A complete opening frame of a download.
+    Download { source: String },
+}
+
+/// Why the first frame of a file substream could not be read. The serving
+/// path closes the substream without state for every variant; the variants
+/// exist so the failure category is explicit and testable.
+#[derive(Debug, PartialEq, Eq)]
+enum FileOpenError {
+    /// The bounded control deadline expired (design 15.4).
+    Timeout,
+    /// The underlying substream I/O failed.
+    Io,
+    /// Unknown tag, invalid length, truncated frame or a frame that cannot
+    /// open a transfer: a protocol violation (design 10.1).
+    Protocol,
+}
+
+/// Reads exactly one complete opening frame from a file substream, bounded
+/// by the control timeout (design 15.4). An EOF at a message boundary
+/// before any byte is a capability probe ([`FileOpenFrame::Probe`]); an
+/// EOF inside a frame is a protocol violation. Only `UploadOpen` and
+/// `DownloadOpen` can open a transfer; any other tag (including `Data`) is
+/// a protocol violation (design 10.1). The payload is decoded into a
+/// bounded stack buffer (at most 8 KiB, design 15.1) and never allocated
+/// from a peer-declared size.
+async fn read_file_open_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    budget: Duration,
+) -> Result<FileOpenFrame, FileOpenError> {
+    tokio::time::timeout(budget, async {
+        let mut header = [0_u8; FRAME_HEADER_LEN];
+        if !read_file_frame_bytes(stream, &mut header)
+            .await
+            .map_err(classify_file_open_io)?
+        {
+            return Ok(FileOpenFrame::Probe);
+        }
+        let (tag, payload_len) =
+            decode_frame_header(&header).map_err(|_| FileOpenError::Protocol)?;
+        if tag == TransferTag::Data.code() {
+            return Err(FileOpenError::Protocol);
+        }
+        let payload_len = usize::try_from(payload_len).map_err(|_| FileOpenError::Protocol)?;
+        validate_payload_len(tag, payload_len).map_err(|_| FileOpenError::Protocol)?;
+        let mut frame = [0_u8; MAX_CONTROL_FRAME_LEN];
+        frame[..FRAME_HEADER_LEN].copy_from_slice(&header);
+        if !read_file_frame_bytes(
+            stream,
+            &mut frame[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len],
+        )
+        .await
+        .map_err(classify_file_open_io)?
+        {
+            return Err(FileOpenError::Protocol);
+        }
+        let message = FileTransferMessage::decode_frame(&frame[..FRAME_HEADER_LEN + payload_len])
+            .map_err(|_| FileOpenError::Protocol)?;
+        match message {
+            FileTransferMessage::UploadOpen {
+                destination,
+                file_name,
+                declared_size,
+            } => Ok(FileOpenFrame::Upload {
+                destination: destination.to_owned(),
+                file_name: file_name.to_owned(),
+                declared_size,
+            }),
+            FileTransferMessage::DownloadOpen { source } => Ok(FileOpenFrame::Download {
+                source: source.to_owned(),
+            }),
+            _ => Err(FileOpenError::Protocol),
+        }
+    })
+    .await
+    .map_err(|_| FileOpenError::Timeout)?
+}
+
+/// Reads exactly `buffer.len()` bytes from the substream. Returns
+/// `Ok(false)` when EOF arrives before any byte of the buffer (a message
+/// boundary); an EOF inside the buffer is a truncated frame and fails.
+async fn read_file_frame_bytes<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buffer: &mut [u8],
+) -> Result<bool, std::io::Error> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = stream.read(&mut buffer[filled..]).await?;
+        if read == 0 {
+            if filled == 0 {
+                return Ok(false);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated file transfer frame",
+            ));
+        }
+        filled += read;
+    }
+    Ok(true)
+}
+
+/// Maps an I/O failure of the opening-frame read: a truncated frame is a
+/// protocol violation (EOF must only occur at a message boundary, design
+/// 10.1), everything else stays an I/O failure. The original error is
+/// deliberately not carried: the serving path closes the substream without
+/// any state, error output or log entry (design 9.3).
+fn classify_file_open_io(error: std::io::Error) -> FileOpenError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        FileOpenError::Protocol
+    } else {
+        FileOpenError::Io
+    }
+}
+
+/// Serves one file substream for the active session: reads the opening
+/// frame with the bounded capability-probe semantics (design 9.3), then
+/// dispatches a real upload or download, answers with `Error(Busy)` while
+/// another transfer is active (design 15.3), or closes the substream
+/// without any state. The terminal session is never touched: a file
+/// failure only terminates the current substream and the remote terminal
+/// stays Active (design 17.2).
+async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    base: Option<&BaseDirectory>,
+    cancel: Arc<AtomicBool>,
+    config: &TransferConfig,
+    role: FileSubstreamRole,
+) {
+    match read_file_open_frame(&mut stream, config.control_timeout).await {
+        Ok(FileOpenFrame::Probe) | Err(_) => {
+            // A capability probe (EOF before any byte) or a failed opening
+            // frame: close the substream without any transfer state, error
+            // output or log entry (design 9.3).
+        }
+        Ok(FileOpenFrame::Upload {
+            destination,
+            file_name,
+            declared_size,
+        }) if role == FileSubstreamRole::Active => {
+            let Some(base) = base else {
+                // The session base directory is unavailable; the request
+                // cannot be resolved and the substream closes without
+                // state.
+                return;
+            };
+            let open = FileTransferMessage::UploadOpen {
+                destination: &destination,
+                file_name: &file_name,
+                declared_size,
+            };
+            let mut random = OsSecureRandom;
+            handle_upload_from_open(&mut stream, config, &mut random, base, &cancel, &open).await;
+        }
+        Ok(FileOpenFrame::Download { source }) if role == FileSubstreamRole::Active => {
+            let Some(base) = base else {
+                // The session base directory is unavailable; the request
+                // cannot be resolved and the substream closes without
+                // state.
+                return;
+            };
+            let open = FileTransferMessage::DownloadOpen { source: &source };
+            let mut random = OsSecureRandom;
+            handle_download_from_open(&mut stream, config, &mut random, base, &cancel, &open).await;
+        }
+        Ok(_) => {
+            // Another file operation is active: answer the opening frame
+            // with `Error(Busy)` and close (design 10.4, 15.3).
+            send_busy_reply(&mut stream, config).await;
+        }
+    }
+}
+
+/// Answers an opening frame with `Error(Busy)` and closes the substream
+/// (design 15.3: a second file operation during an active transfer is
+/// rejected, never queued). The whole exchange is bounded by the control
+/// timeout.
+async fn send_busy_reply<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    config: &TransferConfig,
+) {
+    let Ok(encoded) = FileTransferMessage::Error {
+        code: FileTransferErrorCode::Busy,
+    }
+    .encode() else {
+        return;
+    };
+    let _ = tokio::time::timeout(config.control_timeout, async {
+        stream.write_all(encoded.as_slice()).await?;
+        stream.flush().await?;
+        stream.shutdown().await
+    })
+    .await;
+}
+
+/// The session's file-substream coordinator: processes the substreams
+/// handed over by the bridge loop with a hard cap of one active transfer
+/// and one busy reply at a time (design 15.3). Each substream is probed
+/// with the bounded first-frame read; capability probes (EOF before any
+/// byte) are closed without side effects, real openings dispatch a
+/// transfer, and openings while a transfer is active are answered with
+/// `Error(Busy)`. Substreams beyond the caps are dropped (bounded
+/// resources, design 15.1). The coordinator ends when the sender is
+/// dropped, which happens when the session bridge tears down; the shared
+/// cancel flag then aborts the active transfer and no uncommitted target
+/// appears (design 16.4, 16.5).
+async fn file_substream_coordinator<S>(
+    mut pending: mpsc::Receiver<S>,
+    base: Option<&BaseDirectory>,
+    cancel: Arc<AtomicBool>,
+    config: &TransferConfig,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut active: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
+    let mut busy_reply: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
+    loop {
+        tokio::select! {
+            stream = pending.recv() => {
+                match stream {
+                    None => {
+                        // The queue is closed (the bridge dropped the
+                        // sender at session teardown): finish any in-flight
+                        // work, then end.
+                        if active.is_none() && busy_reply.is_none() {
+                            return;
+                        }
+                    }
+                    Some(stream) => {
+                        if active.is_none() && busy_reply.is_none() {
+                            active = Some(Box::pin(serve_one_file_substream(
+                                stream,
+                                base,
+                                cancel.clone(),
+                                config,
+                                FileSubstreamRole::Active,
+                            )));
+                        } else if busy_reply.is_none() {
+                            // A transfer is active: answer this opening
+                            // with `Error(Busy)` (design 15.3).
+                            busy_reply = Some(Box::pin(serve_one_file_substream(
+                                stream,
+                                base,
+                                cancel.clone(),
+                                config,
+                                FileSubstreamRole::Busy,
+                            )));
+                        }
+                        // Else both slots are occupied; the substream is
+                        // dropped.
+                    }
+                }
+            }
+            _ = async {
+                if let Some(future) = active.as_mut() {
+                    future.await;
+                }
+            }, if active.is_some() => {
+                active = None;
+            }
+            _ = async {
+                if let Some(future) = busy_reply.as_mut() {
+                    future.await;
+                }
+            }, if busy_reply.is_some() => {
+                busy_reply = None;
+            }
+        }
+    }
 }
 
 async fn copy_controller_input(
