@@ -1658,9 +1658,12 @@ mod tests {
     fn peer_file_names_are_validated_on_the_receiving_platform() {
         let directory = tempdir().unwrap();
         let base = test_base(&directory);
-        for name in [
-            "", ".", "..", "a/b", "a\\b", "a\x00b", "a\x1fb", "a\u{7f}b", "a\u{9f}b",
-        ] {
+        let mut rejected = vec![
+            "", ".", "..", "a/b", "a\x00b", "a\x1fb", "a\u{7f}b", "a\u{9f}b",
+        ];
+        #[cfg(windows)]
+        rejected.push("a\\b");
+        for name in rejected {
             assert!(
                 matches!(
                     resolve_destination(&base, None, Some(name)),
@@ -1674,7 +1677,10 @@ mod tests {
             resolve_destination(&base, None, Some(&long)),
             Err(FileSemanticsError::InvalidFileName)
         ));
-        for name in ["a.txt", "name", "with space", "üñï", "a.b.c", "com10.txt"] {
+        let mut accepted = vec!["a.txt", "name", "with space", "üñï", "a.b.c", "com10.txt"];
+        #[cfg(not(windows))]
+        accepted.push("a\\b");
+        for name in accepted {
             let plan = resolve_destination(&base, None, Some(name)).unwrap();
             assert_eq!(plan.final_path(), directory.path().join(name), "{name:?}");
         }
@@ -1725,7 +1731,10 @@ mod tests {
             resolve_destination(&base, Some("out"), None),
             Err(FileSemanticsError::InvalidFileName)
         ));
-        for name in [".", "..", "a/b", "a\\b"] {
+        let mut invalid_names = vec![".", "..", "a/b"];
+        #[cfg(windows)]
+        invalid_names.push("a\\b");
+        for name in invalid_names {
             assert!(
                 matches!(
                     resolve_destination(&base, Some("out"), Some(name)),
@@ -1733,6 +1742,13 @@ mod tests {
                 ),
                 "{name:?}"
             );
+        }
+        #[cfg(not(windows))]
+        {
+            // Backslash is an ordinary name character on Unix; the
+            // directory target then receives it as the default name.
+            let plan = resolve_destination(&base, Some("out"), Some("a\\b")).unwrap();
+            assert_eq!(plan.final_path(), directory.path().join("out").join("a\\b"));
         }
         #[cfg(windows)]
         {
