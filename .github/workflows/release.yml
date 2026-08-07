@@ -60,6 +60,10 @@ jobs:
           # Enterprise e2e tests keep provider secret files in a protected
           # directory (design section 7: secrets never in plaintext places).
           YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}
+          # The in-process session tests hold several libp2p swarms at once;
+          # the frozen production memory-connection-limits cap (96 MiB,
+          # process-wide) would deny their connections in the test process.
+          RUSTFLAGS: --cfg yonder_testing
         run: cargo test --locked --workspace --all-targets --all-features
       - name: Run 10,000-iteration lifecycle stress gates
         run: cargo test --locked --release --workspace stress_10000 -- --ignored --nocapture
@@ -73,13 +77,15 @@ jobs:
         run: >-
           cargo test --locked -p yon --test end_to_end
           strict_relay_only_fallback_rebuilds_the_controller_swarm -- --exact
-      - name: Reject the test-only rebuild cfg in release builds
+      - name: Reject the test-only cfgs in release builds
         shell: bash
         run: |
-          if RUSTFLAGS='--cfg yonder_e2e_rebuild' cargo check --locked --release -p yon; then
-            echo 'test-only rebuild cfg entered a release build' >&2
-            exit 1
-          fi
+          for cfg in yonder_e2e_rebuild yonder_testing; do
+            if RUSTFLAGS="--cfg $cfg" cargo check --locked --release -p yon; then
+              echo "test-only cfg $cfg entered a release build" >&2
+              exit 1
+            fi
+          done
       - run: cargo test --locked --workspace --doc
       - name: Reject unsafe first-party Rust
         shell: bash
@@ -118,10 +124,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The musl coverage jobs need yonder_testing (the in-process
+          # session tests hold several swarms over the frozen 96 MiB
+          # process memory cap) while preserving the frozen static-link
+          # flags from .cargo/config.toml, which RUSTFLAGS would replace.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            rustflags: -C target-feature=+crt-static -C link-self-contained=yes --cfg yonder_testing
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            rustflags: -C target-feature=+crt-static -C link-self-contained=yes --cfg yonder_testing
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           - os: macos-15-intel
@@ -154,6 +166,12 @@ jobs:
           YONDER_E2E_RELAY_ROOT: ${{ runner.temp }}
         shell: bash
         run: |
+          # The musl entries set yonder_testing (plus the static-link flags
+          # RUSTFLAGS would otherwise replace) so the in-process session
+          # tests are not denied by the frozen 96 MiB process memory cap.
+          if [ -n "${{ matrix.rustflags }}" ]; then
+            export RUSTFLAGS="${{ matrix.rustflags }}"
+          fi
           cargo +nightly-2026-07-22 llvm-cov \
             --locked --workspace --all-targets --all-features \
             --target "${{ matrix.target }}" \

@@ -58,7 +58,7 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", "cfg(yonder_e2e_rebuild)", "cfg(yonder_sanitizer)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", "cfg(yonder_e2e_rebuild)", "cfg(yonder_sanitizer)", "cfg(yonder_testing)"] }
 
 [profile.dev]
 codegen-units = 256

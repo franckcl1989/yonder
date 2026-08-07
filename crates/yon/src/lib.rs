@@ -5,6 +5,10 @@
 
 #[cfg(all(yonder_e2e_rebuild, not(debug_assertions)))]
 compile_error!("yonder_e2e_rebuild is a test-only fault injection and cannot enter release builds");
+#[cfg(all(yonder_testing, not(debug_assertions)))]
+compile_error!(
+    "yonder_testing is a test-only memory-limit relaxation and cannot enter release builds"
+);
 
 #[cfg(test)]
 pub(crate) static IN_PROCESS_NETWORK_GUARD: std::sync::LazyLock<tokio::sync::Semaphore> =

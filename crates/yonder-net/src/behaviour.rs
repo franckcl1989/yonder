@@ -14,15 +14,20 @@ const PING_TIMEOUT: Duration = Duration::from_millis(750);
 // libp2p-relay 0.21.1 rejects only when the current per-peer count is greater
 // than this field, so zero enforces Yonder's effective maximum of one.
 const LIBP2P_SINGLE_PER_PEER_LIMIT: usize = 0;
-#[cfg(not(yonder_sanitizer))]
+#[cfg(not(any(yonder_sanitizer, yonder_testing)))]
 const ENDPOINT_MEMORY_LIMIT_BYTES: usize = 96 * 1024 * 1024;
-#[cfg(not(yonder_sanitizer))]
+#[cfg(not(any(yonder_sanitizer, yonder_testing)))]
 const RELAY_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
-// Sanitizer instrumentation raises the idle process RSS above the production limits.
-#[cfg(yonder_sanitizer)]
+// Sanitizer instrumentation and the test builds raise the process RSS above
+// the production limits: the memory-connection-limits cap is process-wide,
+// so a test process running several swarms at once would be denied
+// connections under the frozen production values. `yonder_testing` is only
+// ever set by the CI test steps (never in release builds; the workflows
+// reject it there).
+#[cfg(any(yonder_sanitizer, yonder_testing))]
 const ENDPOINT_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
-#[cfg(yonder_sanitizer)]
+#[cfg(any(yonder_sanitizer, yonder_testing))]
 const RELAY_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
 /// The endpoint role's composition of official libp2p behaviours.
@@ -247,12 +252,12 @@ mod tests {
 
     #[test]
     fn memory_limits_match_the_build_purpose() {
-        #[cfg(not(yonder_sanitizer))]
+        #[cfg(not(any(yonder_sanitizer, yonder_testing)))]
         {
             assert_eq!(ENDPOINT_MEMORY_LIMIT_BYTES, 96 * 1024 * 1024);
             assert_eq!(RELAY_MEMORY_LIMIT_BYTES, 64 * 1024 * 1024);
         }
-        #[cfg(yonder_sanitizer)]
+        #[cfg(any(yonder_sanitizer, yonder_testing))]
         {
             assert_eq!(ENDPOINT_MEMORY_LIMIT_BYTES, 512 * 1024 * 1024);
             assert_eq!(RELAY_MEMORY_LIMIT_BYTES, 512 * 1024 * 1024);
