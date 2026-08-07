@@ -5620,10 +5620,11 @@ mod tests {
 
     #[test]
     fn local_terminal_hello_defaults_an_empty_term_and_reads_colorterm() {
-        // The workspace forbids unsafe code (edition 2024 marks
-        // `std::env::set_var` unsafe), so the process environment is only
-        // reachable through a child process with controlled variables. The
-        // inner test is `#[ignore]`d and re-run here with `--ignored`.
+        // The workspace forbids the `unsafe_code` lint category (edition
+        // 2024 marks `std::env::set_var` as an `unsafe_fn`), so the process
+        // environment is only reachable through a child process with
+        // controlled variables. The inner test is `#[ignore]`d and re-run
+        // here with `--ignored`.
         let exe = std::env::current_exe().unwrap();
         for (name, term, colorterm) in [
             (
