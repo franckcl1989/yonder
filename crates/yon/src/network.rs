@@ -2381,6 +2381,7 @@ mod tests {
         // Eight distinct relayed peers fill the direct-upgrade tracker;
         // a ninth relayed connection must be closed without entering the
         // roster, mirroring the roster-overflow guard for direct paths.
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         for index in 300..308_u16 {
             let peer = Keypair::generate_ed25519().public().to_peer_id();
@@ -2436,6 +2437,7 @@ mod tests {
         // A dial window far in the future with an attempt deadline in
         // the near future: the timeout that lands at the attempt
         // deadline must classify as RelayUnavailable.
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relays = relay_set(relay_peer);
@@ -2457,6 +2459,7 @@ mod tests {
         // The frozen connection limits deny the seventeenth concurrent
         // outbound dial: the batch must log the rejection and keep the
         // relay dial tracker empty instead of failing.
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relays = relay_set(relay_peer);
@@ -2470,6 +2473,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn build_endpoint_starts_the_frozen_direct_listener_stack() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let identity = Keypair::generate_ed25519();
         let (driver, _streams) =
             build_endpoint(identity.clone(), WssTransportConfig::client(None)).unwrap();

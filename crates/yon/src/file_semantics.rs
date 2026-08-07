@@ -2230,11 +2230,11 @@ mod tests {
             Err(FileSemanticsError::InvalidFileName)
         ));
         // Nothing was created at the final path and the temporary file was
-        // cleaned up by Drop on the failure path.
-        assert!(matches!(
-            fs::symlink_metadata(&final_path),
-            Err(e) if e.kind() == io::ErrorKind::NotFound
-        ));
+        // cleaned up by Drop on the failure path. The directory listing is
+        // used instead of probing the final path directly: on Unix an
+        // over-long component makes the probe itself fail with
+        // ENAMETOOLONG, which is not the NotFound this asserts.
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         assert!(matches!(
             fs::symlink_metadata(&temp_path),
             Err(e) if e.kind() == io::ErrorKind::NotFound

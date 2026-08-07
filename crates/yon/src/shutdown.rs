@@ -71,25 +71,31 @@ mod tests {
     /// A real SIGTERM delivered by a child process resolves the future with
     /// `Ok(())`: the tokio signal handler intercepts the signal before the
     /// default termination disposition can run. `bash -c "kill -TERM <pid>"`
-    /// is used because bash's `kill` builtin is present on every CI image;
-    /// the signal is sent only after the signal futures have been created
-    /// (the spawned task has been polled once) plus a quiescence delay, so
-    /// the handler is installed before the signal can arrive.
+    /// is used because bash's `kill` builtin is present on every CI image.
+    ///
+    /// The killer child sleeps first so the OS handler is guaranteed to be
+    /// installed before the signal arrives: the handler registers on the
+    /// signal future's first poll, which happens when this task starts
+    /// awaiting it. Without the delay a loaded CI runner could deliver the
+    /// signal before installation, which would terminate the whole test
+    /// process instead of resolving the future.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn unix_shutdown_signal_resolves_on_sigterm() {
-        let signal = tokio::spawn(endpoint_shutdown_signal());
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let status = std::process::Command::new("bash")
-            .args(["-c", &format!("kill -TERM {}", std::process::id())])
-            .status()
+        let pid = std::process::id();
+        let mut killer = std::process::Command::new("bash")
+            .args(["-c", &format!("sleep 1; kill -TERM {pid}")])
+            .spawn()
             .expect("bash must run on the unix CI images");
-        assert!(status.success(), "bash kill must succeed");
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), signal)
-            .await
-            .expect("the shutdown future must resolve after SIGTERM")
-            .expect("the shutdown task must not panic");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::spawn(endpoint_shutdown_signal()),
+        )
+        .await
+        .expect("the shutdown future must resolve after SIGTERM")
+        .expect("the shutdown task must not panic");
         result.expect("the shutdown future must complete with Ok(())");
+        let status = killer.wait().expect("the killer child must exit");
+        assert!(status.success(), "the killer child must succeed");
     }
 }
