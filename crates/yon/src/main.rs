@@ -756,10 +756,10 @@ mod tests {
     use super::{
         AppError, Cli, Command, ConfigCommand, ConnectionCodeArgument, ENDPOINT_SCHEMA,
         LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
-        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, map_controller_error,
-        open_diagnostic_log, portable_process_exit, process_result, read_ca, read_ca_document,
-        read_connection_code_from, run, terminal_supports_progress, validate_diagnostic_output,
-        write_remote_exit_warning,
+        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, execute_command,
+        map_controller_error, open_diagnostic_log, portable_process_exit, process_result, read_ca,
+        read_ca_document, read_connection_code_from, run, terminal_supports_progress,
+        validate_diagnostic_output, write_remote_exit_warning,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -1050,6 +1050,38 @@ mod tests {
         unavailable_columns.update(ControllerStage::ConnectingRelay);
         assert!(!unavailable_columns.enabled);
         assert_eq!(unavailable_columns.writer.calls, 0);
+    }
+
+    #[test]
+    fn successful_runs_map_to_the_reporting_exit_code() {
+        assert_eq!(process_result(Ok(0)), ExitCode::SUCCESS);
+        assert_eq!(process_result(Ok(42)), ExitCode::from(42));
+    }
+
+    #[test]
+    fn terminal_progress_new_is_disabled_until_configured() {
+        let mut progress = TerminalProgress::new(Vec::new(), false);
+        assert!(!progress.enabled);
+        assert!(!progress.visible);
+        progress.update(ControllerStage::ConnectingRelay);
+        progress.clear_line();
+        assert!(progress.writer.is_empty());
+    }
+
+    #[test]
+    fn config_check_validates_and_reports_the_effective_configuration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = execute_command(
+            &runtime,
+            Command::Config {
+                command: ConfigCommand::Check,
+            },
+        );
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]

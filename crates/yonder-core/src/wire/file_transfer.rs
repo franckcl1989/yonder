@@ -1533,4 +1533,985 @@ mod tests {
             Err(WireStateError::AlreadyClosed)
         );
     }
+
+    #[test]
+    fn error_code_from_u16_maps_every_defined_code() {
+        let codes = [
+            (1, FileTransferErrorCode::Busy),
+            (2, FileTransferErrorCode::InvalidRequest),
+            (3, FileTransferErrorCode::InvalidPathEncoding),
+            (4, FileTransferErrorCode::InvalidFileName),
+            (5, FileTransferErrorCode::PathTooLong),
+            (6, FileTransferErrorCode::SourceNotFound),
+            (7, FileTransferErrorCode::SourceNotRegularFile),
+            (8, FileTransferErrorCode::DestinationExists),
+            (9, FileTransferErrorCode::DestinationParentNotFound),
+            (10, FileTransferErrorCode::DestinationNotDirectory),
+            (11, FileTransferErrorCode::PermissionDenied),
+            (12, FileTransferErrorCode::NoSpace),
+            (13, FileTransferErrorCode::FileTooLargeForPlatform),
+            (14, FileTransferErrorCode::ReadFailed),
+            (15, FileTransferErrorCode::WriteFailed),
+            (16, FileTransferErrorCode::SizeMismatch),
+            (17, FileTransferErrorCode::DigestMismatch),
+            (18, FileTransferErrorCode::SourceChanged),
+            (19, FileTransferErrorCode::CommitFailed),
+            (20, FileTransferErrorCode::Cancelled),
+            (21, FileTransferErrorCode::SessionClosing),
+            (22, FileTransferErrorCode::Unsupported),
+        ];
+        for (code, expected) in codes {
+            assert_eq!(
+                FileTransferErrorCode::from_u16(code),
+                Some(expected),
+                "from_u16({code})"
+            );
+            assert_eq!(expected.code(), code, "{expected:?}.code()");
+        }
+        assert_eq!(FileTransferErrorCode::from_u16(0), None);
+        assert_eq!(FileTransferErrorCode::from_u16(23), None);
+        assert_eq!(FileTransferErrorCode::from_u16(u16::MAX), None);
+        // Every defined code also round-trips through a wire Error frame.
+        for (code, expected) in codes {
+            let message = FileTransferMessage::Error { code: expected };
+            assert_eq!(
+                FileTransferMessage::decode_frame(&frame(&message)).unwrap(),
+                message,
+                "error code {code} round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_shorter_than_header_is_rejected() {
+        for len in 0..FRAME_HEADER_LEN {
+            let short = vec![0_u8; len];
+            assert_eq!(
+                FileTransferMessage::decode_frame(&short),
+                Err(ProtocolError::InvalidLength {
+                    expected: FRAME_HEADER_LEN,
+                    actual: len,
+                }),
+                "frame of {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_trailing_bytes_are_rejected_for_each_open_message() {
+        // UploadOpen: destination "d", file name "f", size 1, plus one stray
+        // byte after the exact field layout.
+        let mut payload = vec![];
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.push(b'd');
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.push(b'f');
+        payload.extend_from_slice(&1_u64.to_be_bytes());
+        payload.push(0xAA);
+        let mut encoded =
+            encode_frame_header(TransferTag::UploadOpen.code(), payload.len() as u32).to_vec();
+        encoded.extend_from_slice(&payload);
+        assert_eq!(
+            FileTransferMessage::decode_frame(&encoded),
+            Err(ProtocolError::TrailingBytes)
+        );
+
+        // DownloadOpen: source "s" plus one stray byte.
+        let mut payload = vec![];
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.push(b's');
+        payload.push(0xAA);
+        let mut encoded =
+            encode_frame_header(TransferTag::DownloadOpen.code(), payload.len() as u32).to_vec();
+        encoded.extend_from_slice(&payload);
+        assert_eq!(
+            FileTransferMessage::decode_frame(&encoded),
+            Err(ProtocolError::TrailingBytes)
+        );
+
+        // DownloadOffer: file name "f", size 1, plus one stray byte.
+        let mut payload = vec![];
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.push(b'f');
+        payload.extend_from_slice(&1_u64.to_be_bytes());
+        payload.push(0xAA);
+        let mut encoded =
+            encode_frame_header(TransferTag::DownloadOffer.code(), payload.len() as u32).to_vec();
+        encoded.extend_from_slice(&payload);
+        assert_eq!(
+            FileTransferMessage::decode_frame(&encoded),
+            Err(ProtocolError::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn decode_payload_rejects_wrong_finish_and_error_lengths() {
+        // Finish payloads shorter than the u64 size field.
+        for len in 0..8 {
+            assert_eq!(
+                FileTransferMessage::decode_payload(TransferTag::Finish.code(), &vec![0_u8; len]),
+                Err(ProtocolError::InvalidField(ProtocolField::FileTransferSize)),
+                "finish payload len {len}"
+            );
+        }
+        // Finish payloads with fewer than DIGEST_LEN bytes after the size.
+        for len in 8..FINISH_LEN {
+            assert_eq!(
+                FileTransferMessage::decode_payload(TransferTag::Finish.code(), &vec![0_u8; len]),
+                Err(ProtocolError::InvalidLength {
+                    expected: FINISH_LEN,
+                    actual: len,
+                }),
+                "finish payload len {len}"
+            );
+        }
+        // Error payloads must be exactly two bytes.
+        for len in [0, 1, 3] {
+            assert_eq!(
+                FileTransferMessage::decode_payload(TransferTag::Error.code(), &vec![0_u8; len]),
+                Err(ProtocolError::InvalidLength {
+                    expected: 2,
+                    actual: len,
+                }),
+                "error payload len {len}"
+            );
+        }
+        // An exact-length Finish still decodes.
+        let mut payload = [0_u8; FINISH_LEN];
+        payload[8..].copy_from_slice(&DIGEST_BYTES);
+        assert_eq!(
+            FileTransferMessage::decode_payload(TransferTag::Finish.code(), &payload),
+            Ok(FileTransferMessage::Finish {
+                actual_size: 0,
+                digest: Sha256Digest::new(DIGEST_BYTES),
+            })
+        );
+    }
+
+    #[test]
+    fn undefined_error_codes_are_rejected_as_invalid_fields() {
+        for code in [0_u16, 23, u16::MAX] {
+            assert_eq!(
+                FileTransferMessage::decode_payload(TransferTag::Error.code(), &code.to_be_bytes()),
+                Err(ProtocolError::InvalidField(
+                    ProtocolField::FileTransferErrorCode
+                )),
+                "undefined error code {code}"
+            );
+        }
+        // The public frame path reports the same for code 0.
+        let mut encoded = encode_frame_header(TransferTag::Error.code(), 2).to_vec();
+        encoded.extend_from_slice(&0_u16.to_be_bytes());
+        assert_eq!(
+            FileTransferMessage::decode_frame(&encoded),
+            Err(ProtocolError::InvalidField(
+                ProtocolField::FileTransferErrorCode
+            ))
+        );
+    }
+
+    #[test]
+    fn short_and_oversized_declared_fields_are_rejected() {
+        // Input shorter than the two length bytes.
+        let inputs: [&[u8]; 2] = [&[], &[0_u8]];
+        for payload in inputs {
+            assert_eq!(
+                FileTransferMessage::decode_payload(TransferTag::UploadOpen.code(), payload),
+                Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath)),
+                "payload {payload:?}"
+            );
+        }
+        // A declared destination length beyond the remaining input.
+        let payload = [0xff, 0xff, 0x00];
+        assert_eq!(
+            FileTransferMessage::decode_payload(TransferTag::UploadOpen.code(), &payload),
+            Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath))
+        );
+        // The same for the file-name field after a valid destination.
+        let mut payload = vec![];
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.push(b'd');
+        payload.extend_from_slice(&0xffff_u16.to_be_bytes());
+        assert_eq!(
+            FileTransferMessage::decode_payload(TransferTag::UploadOpen.code(), &payload),
+            Err(ProtocolError::InvalidField(
+                ProtocolField::FileTransferFileName
+            ))
+        );
+        // The public frame path: DownloadOpen declaring 65535 bytes.
+        let mut encoded = encode_frame_header(TransferTag::DownloadOpen.code(), 3).to_vec();
+        encoded.extend_from_slice(&[0xff, 0xff, 0x00]);
+        assert_eq!(
+            FileTransferMessage::decode_frame(&encoded),
+            Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath))
+        );
+    }
+
+    #[test]
+    fn overlong_file_name_is_rejected_when_decoding() {
+        let name = vec![b'a'; MAX_FILE_NAME_LEN + 1];
+        let mut payload = vec![];
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // empty destination
+        payload.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&name);
+        payload.extend_from_slice(&0_u64.to_be_bytes());
+        let mut encoded =
+            encode_frame_header(TransferTag::UploadOpen.code(), payload.len() as u32).to_vec();
+        encoded.extend_from_slice(&payload);
+        assert_eq!(
+            FileTransferMessage::decode_frame(&encoded),
+            Err(ProtocolError::InvalidField(
+                ProtocolField::FileTransferFileName
+            ))
+        );
+    }
+
+    #[test]
+    fn encode_rejects_overlong_and_empty_fields() {
+        let overlong_name = "a".repeat(MAX_FILE_NAME_LEN + 1);
+        assert_eq!(
+            FileTransferMessage::DownloadOffer {
+                file_name: &overlong_name,
+                declared_size: 0,
+            }
+            .encode(),
+            Err(ProtocolError::InvalidField(
+                ProtocolField::FileTransferFileName
+            ))
+        );
+        let overlong_path = "p".repeat(MAX_PATH_LEN + 1);
+        assert_eq!(
+            FileTransferMessage::DownloadOpen {
+                source: &overlong_path
+            }
+            .encode(),
+            Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath))
+        );
+        assert_eq!(
+            FileTransferMessage::DownloadOpen { source: "" }.encode(),
+            Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath))
+        );
+        assert_eq!(
+            FileTransferMessage::DownloadOffer {
+                file_name: "",
+                declared_size: 0,
+            }
+            .encode(),
+            Err(ProtocolError::InvalidField(
+                ProtocolField::FileTransferFileName
+            ))
+        );
+        // A control character in a path is rejected by the encoder too.
+        assert_eq!(
+            FileTransferMessage::UploadOpen {
+                destination: "bad\x00dir",
+                file_name: "f",
+                declared_size: 0,
+            }
+            .encode(),
+            Err(ProtocolError::InvalidField(ProtocolField::FileTransferPath))
+        );
+    }
+
+    #[test]
+    fn tag_of_data_is_the_wire_data_tag() {
+        assert_eq!(
+            tag_of(&FileTransferMessage::Data { bytes: &[1, 2] }),
+            TransferTag::Data.code()
+        );
+    }
+
+    #[test]
+    fn overlong_default_file_name_is_rejected() {
+        assert_eq!(
+            validate_default_file_name(&"a".repeat(MAX_FILE_NAME_LEN + 1)),
+            Err(ProtocolError::InvalidField(
+                ProtocolField::FileTransferFileName
+            ))
+        );
+        assert!(validate_default_file_name(&"a".repeat(MAX_FILE_NAME_LEN)).is_ok());
+        for bad in [
+            "a\u{80}b", "a\u{85}b", "a\u{9f}b", "a\u{1c}b", "a\u{7f}b", "a\u{0}b",
+        ] {
+            assert_eq!(
+                validate_default_file_name(bad),
+                Err(ProtocolError::InvalidField(
+                    ProtocolField::FileTransferFileName
+                )),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_controller_send_side_transitions() {
+        // OpenSent: Data before Ready is rejected.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::OpenSent);
+        // OpenSent: Cancel and Error close the session.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        assert_eq!(controller.send(&FileTransferMessage::Cancel), Ok(()));
+        assert_eq!(controller.state(), WireState::Closed);
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::Busy
+            }),
+            Ok(())
+        );
+        assert_eq!(controller.state(), WireState::Closed);
+        // OpenSent: Ready advances the implemented state machine, although
+        // §10.3 assigns Ready to the host only.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        assert_eq!(controller.send(&FileTransferMessage::Ready), Ok(()));
+        assert_eq!(controller.state(), WireState::Transferring);
+        // Transferring: illegal messages are rejected without a transition.
+        assert_eq!(
+            controller.send(&FileTransferMessage::Committed),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::Transferring);
+        // Transferring: Cancel closes the session.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        controller.receive(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(controller.send(&FileTransferMessage::Cancel), Ok(()));
+        assert_eq!(controller.state(), WireState::Closed);
+        // Transferring: Error closes the session.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        controller.receive(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::ReadFailed
+            }),
+            Ok(())
+        );
+        assert_eq!(controller.state(), WireState::Closed);
+    }
+
+    #[test]
+    fn upload_host_send_side_transitions() {
+        // The host may not send anything before receiving UploadOpen.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        assert_eq!(
+            host.send(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingOpen);
+        // In Transferring the host may only send Error.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            host.send(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::Transferring);
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            host.send(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::ReadFailed
+            }),
+            Ok(())
+        );
+        assert_eq!(host.state(), WireState::Closed);
+        // In AwaitingCommitted the host may only send Committed.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.send(&FileTransferMessage::Ready).unwrap();
+        host.receive(&finish()).unwrap();
+        assert_eq!(
+            host.send(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingCommitted);
+    }
+
+    #[test]
+    fn upload_receive_side_illegal_transitions() {
+        // Controller: nothing may be received while AwaitingOpen.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingOpen);
+        // Controller in OpenSent accepts only Ready and Error.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::OpenSent);
+        // Controller in Transferring may receive nothing.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        controller.receive(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::Transferring);
+        // Controller in AwaitingCommitted accepts Committed and Error only.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        controller.receive(&FileTransferMessage::Ready).unwrap();
+        controller.send(&finish()).unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingCommitted);
+        // Error while awaiting Committed closes the session.
+        let mut controller = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        controller.send(&upload_open()).unwrap();
+        controller.receive(&FileTransferMessage::Ready).unwrap();
+        controller.send(&finish()).unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::WriteFailed
+            }),
+            Ok(())
+        );
+        assert_eq!(controller.state(), WireState::Closed);
+    }
+
+    #[test]
+    fn upload_host_receive_side_illegal_transitions() {
+        // Host in AwaitingOpen accepts only UploadOpen.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        assert_eq!(
+            host.receive(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::Busy
+            }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingOpen);
+        // Host in Transferring accepts Data, Finish, Cancel and Error only.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::Transferring);
+        // Error in Transferring closes the session.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::ReadFailed
+            }),
+            Ok(())
+        );
+        assert_eq!(host.state(), WireState::Closed);
+        // Cancel in Transferring closes the session.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(host.receive(&FileTransferMessage::Cancel), Ok(()));
+        assert_eq!(host.state(), WireState::Closed);
+        // Host in AwaitingCommitted may receive nothing.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.send(&FileTransferMessage::Ready).unwrap();
+        host.receive(&finish()).unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingCommitted);
+    }
+
+    #[test]
+    fn download_controller_send_side_transitions() {
+        // AwaitingOpen: only DownloadOpen may be sent.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        assert_eq!(
+            controller.send(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::Busy
+            }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingOpen);
+        // AwaitingOffer: Cancel closes the session.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        assert_eq!(controller.send(&FileTransferMessage::Cancel), Ok(()));
+        assert_eq!(controller.state(), WireState::Closed);
+        // AwaitingOffer: Error closes the session.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::Busy
+            }),
+            Ok(())
+        );
+        assert_eq!(controller.state(), WireState::Closed);
+        // AwaitingOffer: other messages are rejected.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingOffer);
+        // AwaitingReady: Data before Ready is rejected.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingReady);
+        // AwaitingReady: Cancel closes the session.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        assert_eq!(controller.send(&FileTransferMessage::Cancel), Ok(()));
+        assert_eq!(controller.state(), WireState::Closed);
+        // Transferring: the implemented state machine also accepts Data and
+        // Finish from the download controller (§10.3 does not list them),
+        // rejects other messages, and lets Cancel/Error close the session.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Data { bytes: &[1] }),
+            Ok(())
+        );
+        assert_eq!(controller.state(), WireState::Transferring);
+        assert_eq!(
+            controller.send(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::Transferring);
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(controller.send(&finish()), Ok(()));
+        assert_eq!(controller.state(), WireState::AwaitingCommitted);
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(controller.send(&FileTransferMessage::Cancel), Ok(()));
+        assert_eq!(controller.state(), WireState::Closed);
+        // AwaitingCommitted: no further sends are legal.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        controller.receive(&finish()).unwrap();
+        assert_eq!(
+            controller.send(&FileTransferMessage::Cancel),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingCommitted);
+    }
+
+    #[test]
+    fn download_controller_receive_side_transitions() {
+        // AwaitingOpen: nothing may be received.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        assert_eq!(
+            controller.receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingOpen);
+        // AwaitingOffer: Error closes the session.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::SourceNotFound
+            }),
+            Ok(())
+        );
+        assert_eq!(controller.state(), WireState::Closed);
+        // AwaitingOffer: other messages are rejected.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingOffer);
+        // AwaitingReady: Data before Ready is rejected.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingReady);
+        // Transferring: Error closes the session.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::ReadFailed
+            }),
+            Ok(())
+        );
+        assert_eq!(controller.state(), WireState::Closed);
+        // Transferring: other messages are rejected.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::Transferring);
+        // AwaitingCommitted: nothing may be received.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        controller.receive(&finish()).unwrap();
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(controller.state(), WireState::AwaitingCommitted);
+    }
+
+    #[test]
+    fn download_host_send_side_transitions() {
+        // The host may not send before receiving DownloadOpen.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        assert_eq!(
+            host.send(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingOpen);
+        // In OpenSent only DownloadOffer may be sent.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        assert_eq!(
+            host.send(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::OpenSent);
+        // In AwaitingReady nothing may be sent.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            host.send(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingReady);
+        // Error mid-transfer closes the session.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        host.receive(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            host.send(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::ReadFailed
+            }),
+            Ok(())
+        );
+        assert_eq!(host.state(), WireState::Closed);
+        // In AwaitingCommitted nothing may be sent.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        host.receive(&FileTransferMessage::Ready).unwrap();
+        host.send(&finish()).unwrap();
+        assert_eq!(
+            host.send(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingCommitted);
+    }
+
+    #[test]
+    fn download_host_receive_side_transitions() {
+        // In OpenSent nothing may be received.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Ready),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::OpenSent);
+        // In AwaitingReady, Cancel closes the session.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        assert_eq!(host.receive(&FileTransferMessage::Cancel), Ok(()));
+        assert_eq!(host.state(), WireState::Closed);
+        // In AwaitingReady, Error closes the session.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::Busy
+            }),
+            Ok(())
+        );
+        assert_eq!(host.state(), WireState::Closed);
+        // In AwaitingReady, Data is rejected.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingReady);
+        // In Transferring nothing may be received.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        host.receive(&FileTransferMessage::Ready).unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::Transferring);
+        // In AwaitingCommitted, Cancel closes the session and other messages
+        // are rejected.
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        host.receive(&FileTransferMessage::Ready).unwrap();
+        host.send(&finish()).unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Data { bytes: &[1] }),
+            Err(WireStateError::UnexpectedMessage)
+        );
+        assert_eq!(host.state(), WireState::AwaitingCommitted);
+        let mut host = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        host.receive(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        host.send(&FileTransferMessage::DownloadOffer {
+            file_name: "f",
+            declared_size: 1,
+        })
+        .unwrap();
+        host.receive(&FileTransferMessage::Ready).unwrap();
+        host.send(&finish()).unwrap();
+        assert_eq!(
+            host.receive(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::Busy
+            }),
+            Ok(())
+        );
+        assert_eq!(host.state(), WireState::Closed);
+    }
+
+    #[test]
+    fn messages_after_close_and_commit_are_rejected() {
+        // Send and receive after a Cancel-closed session.
+        let mut host = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        host.receive(&upload_open()).unwrap();
+        host.receive(&FileTransferMessage::Cancel).unwrap();
+        assert_eq!(host.state(), WireState::Closed);
+        assert_eq!(
+            host.send(&FileTransferMessage::Error {
+                code: FileTransferErrorCode::Busy
+            }),
+            Err(WireStateError::AlreadyClosed)
+        );
+        assert_eq!(
+            host.receive(&FileTransferMessage::Ready),
+            Err(WireStateError::AlreadyClosed)
+        );
+        // Receive after the successful Committed state.
+        let mut controller =
+            WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        controller
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        controller
+            .receive(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 1,
+            })
+            .unwrap();
+        controller.send(&FileTransferMessage::Ready).unwrap();
+        controller.receive(&finish()).unwrap();
+        controller.send(&FileTransferMessage::Committed).unwrap();
+        assert_eq!(controller.state(), WireState::Committed);
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Committed),
+            Err(WireStateError::AlreadyClosed)
+        );
+        assert_eq!(
+            controller.receive(&FileTransferMessage::Cancel),
+            Err(WireStateError::AlreadyClosed)
+        );
+    }
 }

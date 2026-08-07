@@ -1322,6 +1322,21 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_source_reads_zero_immediately() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("empty.bin");
+        fs::write(&path, b"").unwrap();
+        let mut source = SourceFile::open(&path).unwrap();
+        assert_eq!(source.size(), 0);
+        let mut buffer = [0_u8; CHUNK_SIZE];
+        // Nothing was ever handed out, and the handle is never touched.
+        assert_eq!(source.read_chunked(&mut buffer).unwrap(), 0);
+        assert_eq!(source.bytes_read(), 0);
+        assert_eq!(source.read_chunked(&mut buffer).unwrap(), 0);
+        source.recheck().unwrap();
+    }
+
+    #[test]
     fn reads_never_exceed_the_initial_size_and_never_overshoot_the_chunk() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("growing.bin");
@@ -1374,6 +1389,35 @@ mod tests {
         assert!(matches!(
             SourceFile::open(&directory.path().join("missing.bin")),
             Err(FileSemanticsError::SourceNotFound)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_probe_and_open_failures_classify_structured_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        // A directory without search permission fails the path-level probe.
+        let blocked = directory.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        let inside = blocked.join("f.bin");
+        fs::write(&inside, b"x").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        match SourceFile::open(&inside) {
+            Err(FileSemanticsError::PermissionDenied) => {}
+            Ok(_) => {
+                eprintln!("skipping: this environment ignores permission bits");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        // A self-referential symbolic link fails the probe with a loop
+        // error, which is not one of the fixed categories.
+        let loop_path = directory.path().join("loop");
+        std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+        assert!(matches!(
+            SourceFile::open(&loop_path),
+            Err(FileSemanticsError::Io(_))
         ));
     }
 
@@ -1547,6 +1591,17 @@ mod tests {
             size: 10,
             modified: Some(t0),
         };
+        // The getters report the recorded fields.
+        assert_eq!(initial.size(), 10);
+        assert_eq!(initial.modified(), Some(t0));
+        assert_eq!(
+            SourceIdentity {
+                size: 7,
+                modified: None
+            }
+            .modified(),
+            None
+        );
         assert!(!initial.changed_since(&initial));
         assert!(
             SourceIdentity {
@@ -1583,6 +1638,27 @@ mod tests {
             }
             .changed_since(&initial)
         );
+    }
+
+    #[test]
+    fn source_file_identity_getters_report_the_open_time_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("f.bin");
+        write_pattern_file(&path, 1234);
+        let source = SourceFile::open(&path).unwrap();
+        assert_eq!(source.size(), 1234);
+        assert_eq!(
+            source.modified_identity(),
+            source.initial_identity().modified()
+        );
+        assert_eq!(source.initial_identity().size(), 1234);
+        // The identity re-read from the same handle matches the open-time
+        // state while the file is untouched.
+        assert_eq!(
+            source.current_identity().unwrap(),
+            source.initial_identity()
+        );
+        source.recheck().unwrap();
     }
 
     #[test]
@@ -1652,6 +1728,11 @@ mod tests {
             assert_eq!(plan.final_path(), directory.path().join("peer-name.txt"));
             assert_eq!(plan.temp_dir(), directory.path());
         }
+        // Without a peer-provided name there is no default destination.
+        assert!(matches!(
+            resolve_destination(&base, None, None),
+            Err(FileSemanticsError::InvalidFileName)
+        ));
     }
 
     #[test]
@@ -1712,6 +1793,25 @@ mod tests {
                 let plan = resolve_destination(&base, None, Some(name)).unwrap();
                 assert_eq!(plan.final_path(), directory.path().join(name), "{name:?}");
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn colons_inside_default_names_are_rejected_on_windows() {
+        let directory = tempdir().unwrap();
+        let base = test_base(&directory);
+        // A colon after more than one character is not a drive prefix, so
+        // the single-component check passes and the receiving-platform
+        // colon rule must reject the name before any system call.
+        for name in ["ab:c", "1:2", "ü:ü"] {
+            assert!(
+                matches!(
+                    resolve_destination(&base, None, Some(name)),
+                    Err(FileSemanticsError::InvalidFileName)
+                ),
+                "{name:?}"
+            );
         }
     }
 
@@ -1851,6 +1951,31 @@ mod tests {
             resolve_destination(&base, Some("blocker/child.bin"), None),
             Err(FileSemanticsError::DestinationNotDirectory)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_target_without_search_permission_fails_at_the_final_path_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        let locked = directory.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        // The directory itself is stat-able, so it resolves as a directory
+        // target; probing the joined final path needs search permission
+        // inside it and fails there.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        let base = test_base(&directory);
+        match resolve_destination(&base, Some("locked"), Some("peer.bin")) {
+            Err(FileSemanticsError::PermissionDenied) => {}
+            Ok(plan) => {
+                // Elevated privileges ignore permission bits; the
+                // environment, not the module, decides.
+                eprintln!("skipping: this environment ignores permission bits");
+                assert_eq!(plan.final_path(), locked.join("peer.bin"));
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -2066,6 +2191,86 @@ mod tests {
     }
 
     #[test]
+    fn the_sealed_temp_file_keeps_the_private_temp_file_path() {
+        let directory = tempdir().unwrap();
+        let mut random = OsSecureRandom;
+        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let temp_path = temp.path().to_path_buf();
+        let mut buffer = [0_u8; CHUNK_SIZE];
+        write_blocks_to_temp(&mut temp, &mut buffer, 4096).unwrap();
+        let sealed = temp.finish().unwrap();
+        assert_eq!(sealed.path(), temp_path);
+        assert_eq!(sealed.written(), 4096);
+        sealed.verify_finish(4096, pattern_digest(4096)).unwrap();
+        drop(sealed);
+        // Dropping the sealed file removes the temporary name.
+        assert!(matches!(
+            fs::symlink_metadata(&temp_path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn commit_rejects_final_names_the_platform_cannot_create() {
+        let directory = tempdir().unwrap();
+        let mut random = OsSecureRandom;
+        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let temp_path = temp.path().to_path_buf();
+        let mut buffer = [0_u8; CHUNK_SIZE];
+        write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
+        let sealed = temp.finish().unwrap();
+        // A colon is an alternate-data-stream separator on Windows; a name
+        // past the platform component limit fails on Unix.
+        #[cfg(windows)]
+        let final_path = directory.path().join("bad:name.bin");
+        #[cfg(not(windows))]
+        let final_path = directory.path().join("n".repeat(300));
+        assert!(matches!(
+            sealed.commit(&final_path),
+            Err(FileSemanticsError::InvalidFileName)
+        ));
+        // Nothing was created at the final path and the temporary file was
+        // cleaned up by Drop on the failure path.
+        assert!(matches!(
+            fs::symlink_metadata(&final_path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            fs::symlink_metadata(&temp_path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn commit_fails_when_the_directory_denies_new_file_creation() {
+        let directory = tempdir().unwrap();
+        let mut random = OsSecureRandom;
+        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let temp_path = temp.path().to_path_buf();
+        let mut buffer = [0_u8; CHUNK_SIZE];
+        write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
+        let sealed = temp.finish().unwrap();
+        let final_path = directory.path().join("out.bin");
+        // Denying new-file creation on the directory makes the no-replace
+        // hard link fail; the destination is never created.
+        let guard = WriteDenyGuard::new(directory.path());
+        assert!(matches!(
+            sealed.commit(&final_path),
+            Err(FileSemanticsError::CommitFailed(_))
+        ));
+        drop(guard);
+        assert!(matches!(
+            fs::symlink_metadata(&final_path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            fs::symlink_metadata(&temp_path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
     fn dropping_the_temporary_file_removes_it() {
         let directory = tempdir().unwrap();
         let mut random = OsSecureRandom;
@@ -2209,8 +2414,8 @@ mod tests {
     #[test]
     fn io_kinds_classify_into_the_fixed_categories() {
         use io::ErrorKind::{
-            AlreadyExists, FileTooLarge, InvalidFilename, NotADirectory, NotFound,
-            PermissionDenied, ReadOnlyFilesystem, StorageFull,
+            AlreadyExists, FileTooLarge, InvalidFilename, InvalidInput, NotADirectory, NotFound,
+            Other, PermissionDenied, ReadOnlyFilesystem, StorageFull,
         };
         let kind = |kind| io::Error::new(kind, "probe");
 
@@ -2259,6 +2464,10 @@ mod tests {
             map_write_error(kind(NotFound)),
             FileSemanticsError::WriteFailed(_)
         ));
+        assert!(matches!(
+            map_write_error(kind(InvalidFilename)),
+            FileSemanticsError::InvalidFileName
+        ));
 
         assert!(matches!(
             map_read_error(kind(PermissionDenied)),
@@ -2279,6 +2488,14 @@ mod tests {
                 map_source_probe_error(kind(NotADirectory)),
                 FileSemanticsError::SourceNotFound
             ));
+            assert!(matches!(
+                map_source_probe_error(kind(PermissionDenied)),
+                FileSemanticsError::PermissionDenied
+            ));
+            assert!(matches!(
+                map_source_probe_error(kind(Other)),
+                FileSemanticsError::Io(_)
+            ));
         }
 
         assert!(matches!(
@@ -2292,6 +2509,23 @@ mod tests {
         assert!(matches!(
             map_source_open_error(kind(InvalidFilename)),
             FileSemanticsError::PathTooLong
+        ));
+        assert!(matches!(
+            map_source_open_error(kind(InvalidInput)),
+            FileSemanticsError::InvalidPathEncoding
+        ));
+        assert!(matches!(
+            map_source_open_error(kind(Other)),
+            FileSemanticsError::Io(_)
+        ));
+
+        assert!(matches!(
+            map_handle_metadata_error(kind(PermissionDenied)),
+            FileSemanticsError::PermissionDenied
+        ));
+        assert!(matches!(
+            map_handle_metadata_error(kind(Other)),
+            FileSemanticsError::Io(_)
         ));
 
         assert!(matches!(
@@ -2386,6 +2620,27 @@ mod tests {
         assert!(!temp_debug.contains(root));
         assert!(!temp_debug.contains(&temp_path.to_string_lossy().to_string()));
         drop(temp);
+    }
+
+    #[test]
+    fn debug_output_is_redacted_to_fixed_strings() {
+        let directory = tempdir().unwrap();
+        let plan = resolve_destination(&test_base(&directory), None, Some("x.bin")).unwrap();
+        assert_eq!(format!("{plan:?}"), "DestinationPlan { .. }");
+        let mut random = OsSecureRandom;
+        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut buffer = [0_u8; CHUNK_SIZE];
+        write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
+        assert_eq!(format!("{temp:?}"), "PrivateTempFile { written: 16, .. }");
+        let sealed = temp.finish().unwrap();
+        assert_eq!(format!("{sealed:?}"), "SealedTempFile { written: 16, .. }");
+        // The guard is private and never appears in derived output; its
+        // Debug implementation is fixed to the redacted marker.
+        let guard = TempFileGuard {
+            path: PathBuf::from("secret-placeholder"),
+        };
+        assert_eq!(format!("{guard:?}"), "TempFileGuard([REDACTED])");
+        drop(sealed);
     }
 
     #[test]

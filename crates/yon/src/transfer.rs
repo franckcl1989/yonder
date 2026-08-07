@@ -1692,12 +1692,12 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime};
 
     use tempfile::tempdir;
     use tokio::io::{ReadBuf, duplex};
     use tokio::sync::Notify;
-    use yonder_core::OsSecureRandom;
+    use yonder_core::{OsSecureRandom, RandomError, SecureRandom};
 
     use crate::file_semantics::CHUNK_SIZE;
 
@@ -4431,5 +4431,2323 @@ mod tests {
             }
         );
         assert_dir_empty(controller_dir.path());
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage-closure tests: orchestrator failure paths, cancellation
+    // windows, protocol violations, wire-frame fault injection and helper
+    // unit tests (design 10.3, 10.4, 10.5, 14, 15.2, 15.4).
+    // ------------------------------------------------------------------
+
+    /// Wraps a stream and fails the `fail_on_call`-th `poll_write` with a
+    /// broken-pipe error, placing a deterministic write failure on a chosen
+    /// frame while all earlier frames pass through.
+    struct WriteFailAfter<S> {
+        inner: S,
+        fail_on_call: usize,
+        calls: usize,
+    }
+
+    impl<S> WriteFailAfter<S> {
+        fn new(inner: S, fail_on_call: usize) -> Self {
+            Self {
+                inner,
+                fail_on_call,
+                calls: 0,
+            }
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for WriteFailAfter<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.calls += 1;
+            if self.calls == self.fail_on_call {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for WriteFailAfter<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    /// A stream whose reads always fail with an I/O error.
+    struct ReadErrorStream;
+
+    impl AsyncRead for ReadErrorStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("injected read failure")))
+        }
+    }
+
+    /// A secure-random source that always fails, so private temporary file
+    /// creation fails with a purely local error (no wire code).
+    struct FailingRandom;
+
+    impl SecureRandom for FailingRandom {
+        fn try_fill(&mut self, _destination: &mut [u8]) -> Result<(), RandomError> {
+            Err(RandomError)
+        }
+    }
+
+    /// Asserts that no frame reaches `stream` within a short window.
+    async fn assert_no_wire_frame(stream: &mut (impl AsyncRead + Unpin)) {
+        let frame = tokio::time::timeout(Duration::from_millis(50), async {
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await.unwrap()
+        })
+        .await;
+        assert!(frame.is_err(), "no frame may reach the peer");
+    }
+
+    /// Drains the sender's `Data` frames until the terminal `Finish` arrives.
+    async fn drain_data_until_finish<S: AsyncRead + AsyncWrite + Unpin>(
+        peer: &mut ScriptedPeer<S>,
+        sink: &mut [u8],
+    ) {
+        loop {
+            match peer.read_data(sink).await {
+                OwnedMessage::Data { .. } => continue,
+                OwnedMessage::Finish { .. } => break,
+                message => panic!("unexpected message while draining: {message:?}"),
+            }
+        }
+    }
+
+    /// The one data block used by the small-file transfer tests, patterned
+    /// exactly like `write_pattern_file` so the receiver's digest check
+    /// matches the wire bytes.
+    fn one_block_bytes(size: usize) -> Vec<u8> {
+        (0..size).map(|index| pattern_byte(index as u64)).collect()
+    }
+
+    // -- Helper unit tests ------------------------------------------------
+
+    #[test]
+    fn transfer_config_defaults_are_the_fixed_durations() {
+        let defaults = TransferConfig::defaults();
+        assert_eq!(defaults.control_timeout, Duration::from_secs(30));
+        assert_eq!(defaults.data_progress_timeout, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn write_frame_rejects_illegal_local_sends_and_send_failure_maps_them() {
+        // In AwaitingOpen an upload controller may only send UploadOpen, so
+        // a Ready send is rejected by the wire session before any byte is
+        // written; send_failure maps the rejection to InvalidRequest.
+        let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        let (mut stream, _peer) = duplex(64 * 1024);
+        let error = write_frame(&mut stream, &mut session, &FileTransferMessage::Ready)
+            .await
+            .expect_err("the wire session must reject an illegal local send");
+        assert!(matches!(error, WriteFrameError::Protocol));
+        assert_eq!(
+            send_failure(&mut session, error),
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert!(session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn write_frame_raw_control_write_failure_is_an_io_error() {
+        // A control frame that encodes fine but cannot be written maps to
+        // an I/O error (the encode succeeded; the stream failed).
+        let (mut stream, _peer) = duplex(64 * 1024);
+        let mut failing = WriteFailAfter::new(&mut stream, 1);
+        let error = write_frame_raw(&mut failing, &FileTransferMessage::Ready)
+            .await
+            .expect_err("the injected write failure must surface");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn owned_message_maps_every_control_variant_and_rejects_data() {
+        let digest = Sha256Digest::new([0x5A; 32]);
+        assert_eq!(
+            owned_message(FileTransferMessage::UploadOpen {
+                destination: "d",
+                file_name: "f",
+                declared_size: 3,
+            })
+            .unwrap(),
+            OwnedMessage::UploadOpen {
+                destination: "d".to_owned(),
+                file_name: "f".to_owned(),
+                declared_size: 3,
+            }
+        );
+        assert_eq!(
+            owned_message(FileTransferMessage::DownloadOpen { source: "s" }).unwrap(),
+            OwnedMessage::DownloadOpen {
+                source: "s".to_owned()
+            }
+        );
+        assert_eq!(
+            owned_message(FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 4,
+            })
+            .unwrap(),
+            OwnedMessage::DownloadOffer {
+                file_name: "f".to_owned(),
+                declared_size: 4,
+            }
+        );
+        assert_eq!(
+            owned_message(FileTransferMessage::Ready).unwrap(),
+            OwnedMessage::Ready
+        );
+        assert_eq!(
+            owned_message(FileTransferMessage::Finish {
+                actual_size: 5,
+                digest,
+            })
+            .unwrap(),
+            OwnedMessage::Finish {
+                actual_size: 5,
+                digest,
+            }
+        );
+        assert_eq!(
+            owned_message(FileTransferMessage::Committed).unwrap(),
+            OwnedMessage::Committed
+        );
+        assert_eq!(
+            owned_message(FileTransferMessage::Cancel).unwrap(),
+            OwnedMessage::Cancel
+        );
+        assert_eq!(
+            owned_message(FileTransferMessage::Error {
+                code: FileTransferErrorCode::NoSpace,
+            })
+            .unwrap(),
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::NoSpace,
+            }
+        );
+        // Data never reaches the decoder through read_frame (the tag
+        // dispatch streams it into the sink); the defensive arm rejects it.
+        assert!(matches!(
+            owned_message(FileTransferMessage::Data { bytes: &[] }),
+            Err(FrameReadError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn record_received_accepts_every_variant_in_a_legal_state() {
+        let digest = Sha256Digest::new([0x5A; 32]);
+
+        // Upload host: UploadOpen, then Data and Cancel in the transfer
+        // phase (Finish moves the session out of the transfer phase), and
+        // Error in any open stage.
+        let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        record_received(
+            &mut session,
+            &OwnedMessage::UploadOpen {
+                destination: "d".to_owned(),
+                file_name: "f".to_owned(),
+                declared_size: 3,
+            },
+            &[],
+        )
+        .expect("UploadOpen is the legal opening frame");
+        session.send(&FileTransferMessage::Ready).unwrap();
+        record_received(&mut session, &OwnedMessage::Data { len: 3 }, &[1, 2, 3])
+            .expect("Data is legal in the upload transfer phase");
+        record_received(&mut session, &OwnedMessage::Cancel, &[])
+            .expect("a peer Cancel is legal in the transfer phase");
+        let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        session
+            .receive(&FileTransferMessage::UploadOpen {
+                destination: "",
+                file_name: "f",
+                declared_size: 3,
+            })
+            .unwrap();
+        session.send(&FileTransferMessage::Ready).unwrap();
+        record_received(
+            &mut session,
+            &OwnedMessage::Finish {
+                actual_size: 3,
+                digest,
+            },
+            &[],
+        )
+        .expect("Finish is legal in the upload transfer phase");
+        let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        session
+            .receive(&FileTransferMessage::UploadOpen {
+                destination: "",
+                file_name: "f",
+                declared_size: 0,
+            })
+            .unwrap();
+        record_received(
+            &mut session,
+            &OwnedMessage::Error {
+                code: FileTransferErrorCode::SessionClosing,
+            },
+            &[],
+        )
+        .expect("a peer Error is legal in any open stage");
+
+        // Download host: DownloadOpen then Ready.
+        let mut session = WireSession::new(TransferDirection::Download, TransferSide::Host);
+        record_received(
+            &mut session,
+            &OwnedMessage::DownloadOpen {
+                source: "s".to_owned(),
+            },
+            &[],
+        )
+        .expect("DownloadOpen is the legal opening frame");
+        session
+            .send(&FileTransferMessage::DownloadOffer {
+                file_name: "f",
+                declared_size: 0,
+            })
+            .unwrap();
+        record_received(&mut session, &OwnedMessage::Ready, &[])
+            .expect("Ready is legal after the offer");
+
+        // Download controller: DownloadOffer after DownloadOpen.
+        let mut session = WireSession::new(TransferDirection::Download, TransferSide::Controller);
+        session
+            .send(&FileTransferMessage::DownloadOpen { source: "s" })
+            .unwrap();
+        record_received(
+            &mut session,
+            &OwnedMessage::DownloadOffer {
+                file_name: "f".to_owned(),
+                declared_size: 0,
+            },
+            &[],
+        )
+        .expect("DownloadOffer is the legal offer frame");
+
+        // Upload controller: Committed after Finish.
+        let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
+        session
+            .send(&FileTransferMessage::UploadOpen {
+                destination: "",
+                file_name: "f",
+                declared_size: 0,
+            })
+            .unwrap();
+        session.receive(&FileTransferMessage::Ready).unwrap();
+        session
+            .send(&FileTransferMessage::Finish {
+                actual_size: 0,
+                digest,
+            })
+            .unwrap();
+        record_received(&mut session, &OwnedMessage::Committed, &[])
+            .expect("Committed is the legal terminal frame");
+    }
+
+    #[test]
+    fn record_received_rejects_illegal_sequences_as_protocol_violations() {
+        // Committed before the opening frame on an upload host.
+        let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        let outcome = record_received(&mut session, &OwnedMessage::Committed, &[])
+            .expect_err("Committed before the opening frame is illegal");
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert!(session.is_closed());
+
+        // Data before Ready on an upload host (OpenSent accepts only Cancel
+        // and Error).
+        let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Host);
+        session
+            .receive(&FileTransferMessage::UploadOpen {
+                destination: "",
+                file_name: "f",
+                declared_size: 0,
+            })
+            .unwrap();
+        let outcome = record_received(&mut session, &OwnedMessage::Data { len: 0 }, &[])
+            .expect_err("Data before Ready is illegal");
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert!(session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn cancel_signal_resolves_immediately_when_already_set() {
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        cancel_signal(&cancel).await;
+        assert!(
+            started.elapsed() < CANCEL_POLL_INTERVAL,
+            "a set flag must not wait for the poll interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_signal_polls_until_the_flag_is_set() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let setter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        cancel_signal(&cancel).await;
+        setter.await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn read_exact_maps_eof_truncation_and_io_errors() {
+        // EOF at the start of the read is a boundary EOF.
+        let (peer, mut stream) = duplex(64);
+        drop(peer);
+        let mut buf = [0_u8; 5];
+        assert!(matches!(
+            read_exact(&mut stream, &mut buf, None).await,
+            Err(FrameReadError::Eof)
+        ));
+
+        // EOF in the middle of the frame is a truncated frame.
+        let (mut peer, mut stream) = duplex(64);
+        peer.write_all(&[1, 2]).await.unwrap();
+        drop(peer);
+        let mut buf = [0_u8; 5];
+        assert!(matches!(
+            read_exact(&mut stream, &mut buf, None).await,
+            Err(FrameReadError::Truncated)
+        ));
+
+        // A stream I/O failure is reported as-is.
+        let mut stream = ReadErrorStream;
+        let mut buf = [0_u8; 5];
+        assert!(matches!(
+            read_exact(&mut stream, &mut buf, None).await,
+            Err(FrameReadError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_frame_surfaces_stream_io_errors() {
+        let mut stream = ReadErrorStream;
+        let result = read_frame(
+            &mut stream,
+            ReadMode::Control {
+                budget: Duration::from_secs(5),
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(FrameReadError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_data_declared_larger_than_the_sink() {
+        let (mut peer_half, mut stream) = duplex(64 * 1024);
+        write_frame_raw(
+            &mut peer_half,
+            &FileTransferMessage::Data {
+                bytes: &[0xAB; 100],
+            },
+        )
+        .await
+        .unwrap();
+        // The declared length is within the wire bounds but exceeds the
+        // caller's sink: a protocol violation, never a buffer overflow.
+        let mut sink = [0_u8; 10];
+        let result = read_frame(
+            &mut stream,
+            ReadMode::Control {
+                budget: Duration::from_secs(5),
+            },
+            Some(&mut sink),
+        )
+        .await;
+        assert!(matches!(result, Err(FrameReadError::Protocol)));
+    }
+
+    // -- Peer Error frames instead of the expected message -----------------
+
+    #[tokio::test]
+    async fn run_upload_receives_error_instead_of_ready() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                // The host may not send Error in this state; inject it raw.
+                peer.send_fault(FileTransferMessage::Error {
+                    code: FileTransferErrorCode::SourceNotFound,
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SourceNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_upload_receives_error_instead_of_committed() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                peer.send_fault(FileTransferMessage::Error {
+                    code: FileTransferErrorCode::DigestMismatch,
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::DigestMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_download_receives_error_in_the_data_phase() {
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let (bytes, chunks) = file_chunks(&source_path);
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let target_string = path_string(&controller_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &source_string,
+                Some(&target_string),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: source_string.clone()
+                    }
+                );
+                peer.send(FileTransferMessage::DownloadOffer {
+                    file_name: "f.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+                assert_eq!(peer.read_control().await, OwnedMessage::Ready);
+                peer.send(FileTransferMessage::Data { bytes: &chunks[0] })
+                    .await;
+                // The host may report a peer-visible failure mid-data.
+                peer.send(FileTransferMessage::Error {
+                    code: FileTransferErrorCode::NoSpace,
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::NoSpace)
+        );
+        assert_dir_empty(controller_dir.path());
+    }
+
+    #[tokio::test]
+    async fn handle_upload_error_as_opening_frame_is_a_protocol_failure() {
+        // The wire session accepts Error only after the opening frame; an
+        // Error first frame is a protocol violation, not a reported code.
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Upload,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send_fault(FileTransferMessage::Error {
+                    code: FileTransferErrorCode::SourceNotFound,
+                })
+                .await;
+            },
+        )
+        .0;
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert_dir_empty(host_dir.path());
+    }
+
+    #[tokio::test]
+    async fn handle_download_error_as_opening_frame_is_a_protocol_failure() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send_fault(FileTransferMessage::Error {
+                    code: FileTransferErrorCode::SourceNotFound,
+                })
+                .await;
+            },
+        )
+        .0;
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_download_ready_as_opening_frame_is_a_protocol_failure() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send_fault(FileTransferMessage::Ready).await;
+            },
+        )
+        .0;
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+    }
+
+    // -- Protocol violations in the Ready and Committed phases --------------
+
+    #[tokio::test]
+    async fn run_upload_peer_cancel_while_awaiting_ready_is_a_protocol_failure() {
+        // The host may never send Cancel in an upload (direction table); the
+        // controller treats it as a protocol violation.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send_fault(FileTransferMessage::Cancel).await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_upload_peer_cancel_while_awaiting_committed_is_a_protocol_failure() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                peer.send_fault(FileTransferMessage::Cancel).await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_download_ready_instead_of_offer_is_a_protocol_failure() {
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let target_string = path_string(&controller_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &source_string,
+                Some(&target_string),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: source_string.clone()
+                    }
+                );
+                // The host may not send Ready before the offer.
+                peer.send_fault(FileTransferMessage::Ready).await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert_dir_empty(controller_dir.path());
+    }
+
+    #[tokio::test]
+    async fn download_host_committed_while_awaiting_ready_is_a_protocol_failure() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                // The controller may not commit before Ready.
+                peer.send_fault(FileTransferMessage::Committed).await;
+            },
+        )
+        .0;
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_host_receives_error_while_awaiting_committed() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                peer.send_fault(FileTransferMessage::Error {
+                    code: FileTransferErrorCode::CommitFailed,
+                })
+                .await;
+            },
+        )
+        .0;
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::CommitFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_host_ready_while_awaiting_committed_is_a_protocol_failure() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                peer.send_fault(FileTransferMessage::Ready).await;
+            },
+        )
+        .0;
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+    }
+
+    // -- Cancellation in every await window ----------------------------------
+
+    #[tokio::test]
+    async fn run_upload_cancel_during_await_ready_sends_cancel() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, peer_message) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                // The host goes silent and the operator cancels the wait.
+                cancel.store(true, Ordering::Relaxed);
+                peer.read_control().await
+            },
+        );
+        assert_eq!(controller_outcome, TransferOutcome::Cancelled);
+        assert_eq!(peer_message, OwnedMessage::Cancel);
+    }
+
+    #[tokio::test]
+    async fn run_download_cancel_during_await_offer_sends_cancel() {
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let target_string = path_string(&controller_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, peer_message) = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &source_string,
+                Some(&target_string),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: source_string.clone()
+                    }
+                );
+                cancel.store(true, Ordering::Relaxed);
+                // The host may not record a Cancel in this state; assert it
+                // unchecked.
+                peer.read_unchecked().await
+            },
+        );
+        assert_eq!(controller_outcome, TransferOutcome::Cancelled);
+        assert_eq!(peer_message, OwnedMessage::Cancel);
+        assert_dir_empty(controller_dir.path());
+    }
+
+    #[tokio::test]
+    async fn run_download_cancel_before_start_closes_without_wire_exchange() {
+        let (mut controller_stream, mut peer_half) = duplex(64 * 1024);
+        let cancel = AtomicBool::new(true);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let outcome = run_download(
+            &mut controller_stream,
+            &config,
+            &mut random,
+            &base,
+            "src.bin",
+            Some("out.bin"),
+            &cancel,
+        )
+        .await;
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        assert_no_wire_frame(&mut peer_half).await;
+    }
+
+    #[tokio::test]
+    async fn run_upload_cancel_after_finish_abandons_without_a_cancel_frame() {
+        // After Finish the direction table forbids Cancel; the controller
+        // abandons the Committed wait locally and writes nothing.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                cancel.store(true, Ordering::Relaxed);
+                assert_no_wire_frame(&mut peer.stream).await;
+            },
+        );
+        assert_eq!(controller_outcome, TransferOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn handle_upload_cancel_during_await_open_leaves_no_frame() {
+        // The host cannot send anything before the opening frame; a cancel
+        // closes the substream silently.
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut host_stream, mut peer_half) = duplex(64 * 1024);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        let outcome = handle_upload(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        cancel_task.await.unwrap();
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        assert_no_wire_frame(&mut peer_half).await;
+    }
+
+    #[tokio::test]
+    async fn handle_download_cancel_before_start_closes_without_wire_exchange() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut host_stream, mut peer_half) = duplex(64 * 1024);
+        let cancel = AtomicBool::new(true);
+        let outcome = handle_download(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        assert_no_wire_frame(&mut peer_half).await;
+    }
+
+    #[tokio::test]
+    async fn handle_download_cancel_during_await_open_leaves_no_frame() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut host_stream, mut peer_half) = duplex(64 * 1024);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        let outcome = handle_download(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        cancel_task.await.unwrap();
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        assert_no_wire_frame(&mut peer_half).await;
+    }
+
+    #[tokio::test]
+    async fn handle_download_from_open_cancel_before_start_closes_without_wire_exchange() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut host_half, mut peer_half) = duplex(64 * 1024);
+        let cancel = AtomicBool::new(true);
+        let open = FileTransferMessage::DownloadOpen { source: "s" };
+        let outcome =
+            handle_download_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
+                .await;
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        assert_no_wire_frame(&mut peer_half).await;
+    }
+
+    #[tokio::test]
+    async fn download_host_cancel_during_await_ready_leaves_no_frame() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                cancel.store(true, Ordering::Relaxed);
+                assert_no_wire_frame(&mut peer.stream).await;
+            },
+        );
+        assert_eq!(host_outcome, TransferOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn download_host_cancel_during_await_committed_leaves_no_frame() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                cancel.store(true, Ordering::Relaxed);
+                assert_no_wire_frame(&mut peer.stream).await;
+            },
+        );
+        assert_eq!(host_outcome, TransferOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn download_host_receiving_cancel_awaiting_ready_cancels_without_reply() {
+        // The direction table allows no reply in this state; the best-effort
+        // Error is silently rejected by the session and nothing reaches the
+        // wire.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Cancel).await;
+                assert_no_wire_frame(&mut peer.stream).await;
+            },
+        );
+        assert_eq!(host_outcome, TransferOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn download_host_receiving_cancel_awaiting_committed_cancels() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                // The controller may not send Cancel from AwaitingCommitted;
+                // inject it raw.
+                peer.send_fault(FileTransferMessage::Cancel).await;
+            },
+        )
+        .0;
+        assert_eq!(host_outcome, TransferOutcome::Cancelled);
+    }
+
+    // -- EOF while awaiting a control exchange ------------------------------
+
+    #[tokio::test]
+    async fn eof_before_first_frame_fails_download_host() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut host_stream, peer) = duplex(64 * 1024);
+        drop(peer);
+        let cancel = AtomicBool::new(false);
+        let outcome = handle_download(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_download_eof_awaiting_offer_fails_controller() {
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let controller_outcome = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                "src.bin",
+                Some("out.bin"),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: "src.bin".to_owned()
+                    }
+                );
+                // The host terminates without an offer.
+                drop(peer);
+            },
+        )
+        .0;
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_host_eof_awaiting_committed_fails() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 200 * 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let host_outcome = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                drain_data_until_finish(&mut peer, &mut *sink).await;
+                // The controller terminates without Committed.
+                drop(peer);
+            },
+        )
+        .0;
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    // -- Source failures: mid-stream read and the pre-Finish recheck ---------
+
+    #[tokio::test]
+    async fn run_upload_source_shrunk_before_start_fails_with_source_changed() {
+        // The source shrank between open and the first read: the first
+        // chunked read hits EOF and the recheck reports the change, so the
+        // data loop fails with SourceChanged.
+        let source_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 2 * 1024 * 1024);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let destination = path_string(&host_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, error_message) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &mut source,
+                &destination,
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                peer.read_control().await
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SourceChanged)
+        );
+        assert_eq!(
+            error_message,
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::SourceChanged
+            }
+        );
+        assert_dir_empty(host_dir.path());
+    }
+
+    #[tokio::test]
+    async fn download_host_source_shrunk_after_offer_fails_with_source_changed() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 2 * 1024 * 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, error_message) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                // The offer proves the host's source handle is open; shrink
+                // the file before any byte is read.
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&source_path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                peer.send(FileTransferMessage::Ready).await;
+                peer.read_control().await
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SourceChanged)
+        );
+        assert_eq!(
+            error_message,
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::SourceChanged
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn run_upload_source_mtime_changed_before_transfer_fails_at_recheck() {
+        // The size is unchanged so every read succeeds; the modification
+        // identity change is only detected by the recheck before Finish.
+        let source_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024 * 1024);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let destination = path_string(&host_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, error_message) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &mut source,
+                &destination,
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                loop {
+                    match peer.read_data(&mut *sink).await {
+                        OwnedMessage::Data { .. } => continue,
+                        OwnedMessage::Error { code } => break code,
+                        message => panic!("unexpected message: {message:?}"),
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SourceChanged)
+        );
+        assert_eq!(error_message, FileTransferErrorCode::SourceChanged);
+        assert_dir_empty(host_dir.path());
+    }
+
+    #[tokio::test]
+    async fn download_host_source_mtime_changed_after_offer_fails_at_recheck() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024 * 1024);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, error_message) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                fs::File::options()
+                    .write(true)
+                    .open(&source_path)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(3600))
+                    .unwrap();
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                loop {
+                    match peer.read_data(&mut *sink).await {
+                        OwnedMessage::Data { .. } => continue,
+                        OwnedMessage::Error { code } => break code,
+                        message => panic!("unexpected message: {message:?}"),
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SourceChanged)
+        );
+        assert_eq!(error_message, FileTransferErrorCode::SourceChanged);
+    }
+
+    // -- Wire write failures on the opening, data, Ready, Finish and
+    //    Committed frames ----------------------------------------------------
+
+    #[tokio::test]
+    async fn run_upload_opening_frame_write_failure_fails_controller() {
+        // The peer is gone before the transfer starts: the UploadOpen write
+        // fails and the transfer aborts with SessionClosing.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut controller_stream, peer) = duplex(64 * 1024);
+        drop(peer);
+        let cancel = AtomicBool::new(false);
+        let outcome = run_upload(
+            &mut controller_stream,
+            &config,
+            &mut random,
+            &base,
+            &mut source,
+            "",
+            "src.bin",
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_download_opening_frame_write_failure_fails_controller() {
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (mut controller_stream, peer) = duplex(64 * 1024);
+        drop(peer);
+        let cancel = AtomicBool::new(false);
+        let outcome = run_download(
+            &mut controller_stream,
+            &config,
+            &mut random,
+            &base,
+            "src.bin",
+            Some("out.bin"),
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_upload_data_frame_write_failure_fails_controller() {
+        // The third write is the single data block's payload (opening frame,
+        // data header, data payload): the data loop write fails.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = WriteFailAfter::new(controller_half, 3);
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_upload_finish_frame_write_failure_fails_controller() {
+        // The fourth write is the Finish frame: the terminal write fails.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
+        let mut controller_stream = WriteFailAfter::new(controller_half, 4);
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_upload(
+                &mut controller_stream,
+                &config,
+                &mut random,
+                &base,
+                &mut source,
+                "",
+                "src.bin",
+                &cancel,
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::UploadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                assert!(matches!(
+                    peer.read_data(&mut *sink).await,
+                    OwnedMessage::Data { .. }
+                ));
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_download_ready_write_failure_fails_controller() {
+        // The second write is the Ready frame after the offer.
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let (bytes, _) = file_chunks(&source_path);
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let target_string = path_string(&controller_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = WriteFailAfter::new(controller_half, 2);
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &source_string,
+                Some(&target_string),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: source_string.clone()
+                    }
+                );
+                peer.send(FileTransferMessage::DownloadOffer {
+                    file_name: "f.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+        assert_dir_empty(controller_dir.path());
+    }
+
+    #[tokio::test]
+    async fn run_download_committed_write_failure_fails_controller() {
+        // The third write is the Committed frame: the commit has already
+        // happened, so the final file exists even though the transfer fails.
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        let bytes = one_block_bytes(4096);
+        fs::write(&source_path, &bytes).unwrap();
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let target_string = path_string(&controller_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = WriteFailAfter::new(controller_half, 3);
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &source_string,
+                Some(&target_string),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: source_string.clone()
+                    }
+                );
+                peer.send(FileTransferMessage::DownloadOffer {
+                    file_name: "f.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+                assert_eq!(peer.read_control().await, OwnedMessage::Ready);
+                peer.send(FileTransferMessage::Data { bytes: &bytes }).await;
+                peer.send(FileTransferMessage::Finish {
+                    actual_size: bytes.len() as u64,
+                    digest: sha256(&bytes),
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+        let final_path = controller_dir.path().join("f.bin");
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+        assert_dir_entries(controller_dir.path(), &[&final_path]);
+    }
+
+    #[tokio::test]
+    async fn upload_host_ready_write_failure_fails_host() {
+        // The host's only write before the data phase is Ready.
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let destination = path_string(&host_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Upload,
+            TransferSide::Controller,
+        );
+        let mut host_stream = WriteFailAfter::new(host_half, 1);
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "src.bin",
+                    declared_size: 4096,
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+        assert_dir_empty(host_dir.path());
+    }
+
+    #[tokio::test]
+    async fn upload_host_committed_write_failure_fails_host() {
+        // The host's second write is Committed: the commit has already
+        // happened, so the final file exists even though the transfer fails.
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let destination = path_string(&host_dir.path().join("f.bin"));
+        let bytes = one_block_bytes(4096);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Upload,
+            TransferSide::Controller,
+        );
+        let mut host_stream = WriteFailAfter::new(host_half, 2);
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "src.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+                assert_eq!(peer.read_control().await, OwnedMessage::Ready);
+                peer.send(FileTransferMessage::Data { bytes: &bytes }).await;
+                peer.send(FileTransferMessage::Finish {
+                    actual_size: bytes.len() as u64,
+                    digest: sha256(&bytes),
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+        let final_path = host_dir.path().join("f.bin");
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+        assert_dir_entries(host_dir.path(), &[&final_path]);
+    }
+
+    #[tokio::test]
+    async fn download_host_offer_write_failure_fails_host() {
+        // The host's first write is the DownloadOffer.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = WriteFailAfter::new(host_half, 1);
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_host_data_write_failure_fails_host() {
+        // The third write is the data block's payload (offer, data header,
+        // data payload): the data loop write fails.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = WriteFailAfter::new(host_half, 3);
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_host_finish_write_failure_fails_host() {
+        // The fourth write is the Finish frame.
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 4096);
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = WriteFailAfter::new(host_half, 4);
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen {
+                    source: &source_string,
+                })
+                .await;
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOffer { .. }
+                ));
+                peer.send(FileTransferMessage::Ready).await;
+                let mut sink = Box::new([0_u8; MAX_DATA_LEN]);
+                assert!(matches!(
+                    peer.read_data(&mut *sink).await,
+                    OwnedMessage::Data { .. }
+                ));
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
+        );
+    }
+
+    // -- Local file failures: temporary-file creation, writes, finish and
+    //    the no-replace commit -----------------------------------------------
+
+    #[tokio::test]
+    async fn upload_host_temp_creation_failure_closes_without_wire_message() {
+        // A failing random source fails the temporary-file creation; the
+        // failure has no wire code, so the substream closes silently and the
+        // nearest fixed code is reported locally.
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = FailingRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let destination = path_string(&host_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Upload,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, _) = tokio::join!(
+            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "src.bin",
+                    declared_size: 4096,
+                })
+                .await;
+                assert_no_wire_frame(&mut peer.stream).await;
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert_dir_empty(host_dir.path());
+    }
+
+    #[tokio::test]
+    async fn download_controller_temp_creation_failure_closes_without_wire_message() {
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        write_pattern_file(&source_path, 1024);
+        let (bytes, _) = file_chunks(&source_path);
+        let config = test_config();
+        let mut controller_random = FailingRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let target_string = path_string(&controller_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, _) = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &source_string,
+                Some(&target_string),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: source_string.clone()
+                    }
+                );
+                peer.send(FileTransferMessage::DownloadOffer {
+                    file_name: "f.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+                assert_no_wire_frame(&mut peer.stream).await;
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert_dir_empty(controller_dir.path());
+    }
+
+    #[tokio::test]
+    async fn upload_host_commit_fails_when_final_appears_concurrently() {
+        // The destination is resolved and the temporary file exists before
+        // Ready; a concurrent writer claiming the final path afterwards must
+        // be refused by the no-replace commit.
+        let host_dir = tempdir().unwrap();
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let destination = path_string(&host_dir.path().join("f.bin"));
+        let bytes = one_block_bytes(4096);
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Upload,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, error_message) = tokio::join!(
+            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: "src.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+                assert_eq!(peer.read_control().await, OwnedMessage::Ready);
+                let final_path = host_dir.path().join("f.bin");
+                fs::write(&final_path, b"concurrent").unwrap();
+                peer.send(FileTransferMessage::Data { bytes: &bytes }).await;
+                peer.send(FileTransferMessage::Finish {
+                    actual_size: bytes.len() as u64,
+                    digest: sha256(&bytes),
+                })
+                .await;
+                peer.read_unchecked().await
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::DestinationExists)
+        );
+        assert_eq!(
+            error_message,
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::DestinationExists
+            }
+        );
+        let final_path = host_dir.path().join("f.bin");
+        assert_eq!(fs::read(&final_path).unwrap(), b"concurrent");
+        assert_dir_entries(host_dir.path(), &[&final_path]);
+    }
+
+    #[tokio::test]
+    async fn download_controller_commit_fails_when_final_appears_concurrently() {
+        let source_dir = tempdir().unwrap();
+        let controller_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("src.bin");
+        let bytes = one_block_bytes(4096);
+        fs::write(&source_path, &bytes).unwrap();
+        let config = test_config();
+        let mut controller_random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let source_string = path_string(&source_path);
+        let target_string = path_string(&controller_dir.path().join("f.bin"));
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer =
+            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
+        let mut controller_stream = controller_half;
+        let cancel = AtomicBool::new(false);
+        let (controller_outcome, error_message) = tokio::join!(
+            run_download(
+                &mut controller_stream,
+                &config,
+                &mut controller_random,
+                &base,
+                &source_string,
+                Some(&target_string),
+                &cancel,
+            ),
+            async {
+                assert_eq!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen {
+                        source: source_string.clone()
+                    }
+                );
+                peer.send(FileTransferMessage::DownloadOffer {
+                    file_name: "f.bin",
+                    declared_size: bytes.len() as u64,
+                })
+                .await;
+                assert_eq!(peer.read_control().await, OwnedMessage::Ready);
+                let final_path = controller_dir.path().join("f.bin");
+                fs::write(&final_path, b"concurrent").unwrap();
+                peer.send(FileTransferMessage::Data { bytes: &bytes }).await;
+                peer.send(FileTransferMessage::Finish {
+                    actual_size: bytes.len() as u64,
+                    digest: sha256(&bytes),
+                })
+                .await;
+                peer.read_unchecked().await
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::DestinationExists)
+        );
+        assert_eq!(
+            error_message,
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::DestinationExists
+            }
+        );
+        let final_path = controller_dir.path().join("f.bin");
+        assert_eq!(fs::read(&final_path).unwrap(), b"concurrent");
+        assert_dir_entries(controller_dir.path(), &[&final_path]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn download_host_drive_relative_source_fails_with_invalid_request() {
+        // A drive-relative source ("C:foo") is valid on the wire but cannot
+        // resolve against the base directory on Windows; resolution fails
+        // and both sides learn InvalidRequest. (On Unix every encodable
+        // source resolves, so this path is Windows-only.)
+        let config = test_config();
+        let mut random = OsSecureRandom;
+        let base = BaseDirectory::capture().unwrap();
+        let (controller_half, host_half) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            controller_half,
+            TransferDirection::Download,
+            TransferSide::Controller,
+        );
+        let mut host_stream = host_half;
+        let cancel = AtomicBool::new(false);
+        let (host_outcome, error_message) = tokio::join!(
+            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            async {
+                peer.send(FileTransferMessage::DownloadOpen { source: "C:foo" })
+                    .await;
+                peer.read_unchecked().await
+            },
+        );
+        assert_eq!(
+            host_outcome,
+            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
+        );
+        assert_eq!(
+            error_message,
+            OwnedMessage::Error {
+                code: FileTransferErrorCode::InvalidRequest
+            }
+        );
     }
 }

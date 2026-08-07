@@ -1433,6 +1433,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_rejects_a_start_response_that_is_neither_offer_nor_retry() {
+        // The relay answers the start with a message that is neither a
+        // providers offer nor a rate-limit retry: the machine phase must
+        // reject it without ever consulting the UI.
+        for start_response in [
+            EnterpriseResolveResponse::Failed,
+            EnterpriseResolveResponse::Unavailable,
+            EnterpriseResolveResponse::Expired,
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let relay_side = async move {
+                let mut expected_start = [0_u8; 4];
+                server.read_exact(&mut expected_start).await.unwrap();
+                assert!(EnterpriseStart::decode(&expected_start).is_ok());
+                server
+                    .write_all(start_response.encode().as_slice())
+                    .await
+                    .unwrap();
+            };
+            let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+            let attempt = async {
+                enterprise_exchange_io(
+                    &mut client,
+                    Locator::new(7).unwrap(),
+                    &mut ui,
+                    Duration::from_secs(2),
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .await
+            };
+            let (attempt, ()) = tokio::join!(attempt, relay_side);
+            assert!(matches!(
+                attempt,
+                Err(RelayProtocolError::UnexpectedResponse)
+            ));
+            assert!(ui.offered.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_exchange_rejects_a_non_authorization_response_after_selection() {
+        // The relay offers providers, receives the selection, and then
+        // answers with a terminal status instead of the authorization
+        // URL: the selection step must reject it and never open a browser.
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let relay_side = async move {
+            let mut expected_start = [0_u8; 4];
+            server.read_exact(&mut expected_start).await.unwrap();
+            assert!(EnterpriseStart::decode(&expected_start).is_ok());
+            server
+                .write_all(
+                    EnterpriseResolveResponse::Providers(
+                        EnterpriseProviders::new(true, false).unwrap(),
+                    )
+                    .encode()
+                    .as_slice(),
+                )
+                .await
+                .unwrap();
+            let mut select = [0_u8; 2];
+            server.read_exact(&mut select).await.unwrap();
+            assert!(EnterpriseSelect::decode(&select).is_ok());
+            server
+                .write_all(EnterpriseResolveResponse::Failed.encode().as_slice())
+                .await
+                .unwrap();
+        };
+        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
+        let attempt = async {
+            enterprise_exchange_io(
+                &mut client,
+                Locator::new(7).unwrap(),
+                &mut ui,
+                Duration::from_secs(2),
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .await
+        };
+        let (attempt, ()) = tokio::join!(attempt, relay_side);
+        assert!(matches!(
+            attempt,
+            Err(RelayProtocolError::UnexpectedResponse)
+        ));
+        assert!(ui.opened.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn enterprise_exchange_machine_phase_respects_the_machine_deadline() {
         // The relay never answers the start: the absolute machine
         // deadline must terminate the machine phase before the coarser

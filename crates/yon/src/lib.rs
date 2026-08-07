@@ -6,6 +6,10 @@
 #[cfg(all(yonder_e2e_rebuild, not(debug_assertions)))]
 compile_error!("yonder_e2e_rebuild is a test-only fault injection and cannot enter release builds");
 
+#[cfg(test)]
+pub(crate) static IN_PROCESS_NETWORK_GUARD: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
 pub mod controller;
 pub mod file_semantics;
 pub mod host;

@@ -1476,10 +1476,11 @@ mod tests {
         RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall, ShutdownReason,
         completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
         handle_registry_call, handle_resolve_call, handle_resolve_call_observed,
-        handle_swarm_event as handle_swarm_event_inner, read_exact_eof, registry_exchange,
-        registry_immediate_retry, report_ready_to, resolve_exchange, resolve_immediate_retry,
-        run_relay, run_relay_until, run_relay_until_shutdown, try_acquire_enterprise_permit,
-        with_timeout, write_close,
+        handle_swarm_event as handle_swarm_event_inner, read_deadline, read_exact_eof,
+        registry_exchange, registry_immediate_retry, report_ready, report_ready_to,
+        resolve_exchange, resolve_immediate_retry, run_relay, run_relay_until,
+        run_relay_until_shutdown, try_acquire_enterprise_permit, with_timeout, write_close,
+        write_message, write_timeout,
     };
     #[cfg(windows)]
     use super::{process_shutdown_signal, select_windows_shutdown};
@@ -1497,11 +1498,14 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::{Semaphore, mpsc, oneshot};
     use url::Url;
+    use yonder_core::wire::enterprise::{
+        EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart,
+    };
     use yonder_core::{
-        EnterpriseProviders, Locator, MonotonicClock, OsSecureRandom, ProtocolError,
-        RegistrationCapacity, RegistrationLimits, RelayResourceConfig, ReservationDuration,
-        ResolveConcurrency, ResolveLimits, RetryAfter, SecretDocument, SourceRegistrationCapacity,
-        SystemClock,
+        EnterpriseProvider, EnterpriseProviders, Locator, MonotonicClock, OsSecureRandom,
+        ProtocolError, RegistrationCapacity, RegistrationLimits, RelayResourceConfig,
+        ReservationDuration, ResolveConcurrency, ResolveLimits, RetryAfter, SecretDocument,
+        SourceRegistrationCapacity, SystemClock,
         wire::registry::{RegistryRequest, RegistryResponse},
         wire::resolve::{ResolveRequest, ResolveResponse},
     };
@@ -1562,6 +1566,47 @@ mod tests {
         }
     }
 
+    /// An in-memory tracing writer: every formatted event lands in a
+    /// shared buffer the test can assert on after the relay run.
+    #[derive(Clone, Default)]
+    struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for SharedLog {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&self) -> Self::Writer {
+            SharedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct SharedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn shared_log_subscriber(logs: SharedLog) -> impl tracing::Subscriber {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(logs)
+            .finish()
+    }
+
+    impl SharedLog {
+        /// The captured formatted events as text.
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     #[test]
     fn ready_output_contains_only_public_addresses_and_propagates_failures() {
         let peer = Keypair::generate_ed25519().public().to_peer_id();
@@ -1579,8 +1624,25 @@ mod tests {
         );
         assert_eq!(lines[1], format!("Relay PeerId: {peer}"));
 
-        let error = report_ready_to(&mut FailingOutput, peer, &[external]).unwrap_err();
+        let error =
+            report_ready_to(&mut FailingOutput, peer, std::slice::from_ref(&external)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+        // The readiness wrapper reports every ready listener address and
+        // the public endpoints, then logs the relay_ready event with the
+        // exact counts.
+        let mut listeners = RequiredListeners::new([]);
+        listeners
+            .ready_addresses
+            .push(external.as_multiaddr().clone());
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
+        report_ready(peer, &listeners, std::slice::from_ref(&external)).unwrap();
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_ready\""));
+        assert!(text.contains("listener_count=1"));
+        assert!(text.contains("external_count=1"));
+        assert!(text.contains("relay listener is active"));
     }
 
     #[test]
@@ -1733,10 +1795,30 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_starts_and_obeys_injected_shutdown_results() {
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         let relay_config = config();
+        let resources = relay_config.resources;
         run_relay_until(relay_config, async { Ok(()) })
             .await
             .unwrap();
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_starting\""));
+        assert!(text.contains("relay_mode=\"normal\""));
+        assert!(text.contains("listen_count=1"));
+        assert!(text.contains("external_count=1"));
+        assert!(text.contains(&format!(
+            "registration_capacity={}",
+            resources.registration().capacity().get()
+        )));
+        assert!(text.contains(&format!(
+            "resolve_concurrency={}",
+            resources.resolve().concurrency().get()
+        )));
+        assert!(text.contains(&format!(
+            "circuit_capacity={}",
+            resources.circuit().capacity().get()
+        )));
 
         let error = run_relay_until(config(), async { Err(io::Error::other("signal")) })
             .await
@@ -1746,14 +1828,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_process_shutdown_maps_the_typed_reason_before_stopping() {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         run_relay_until_shutdown(config(), async { Ok(ShutdownReason::Interrupt) })
             .await
             .unwrap();
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_shutdown_requested\""));
+        assert!(text.contains("reason=\"interrupt\""));
 
         let error = run_relay_until_shutdown(config(), async {
             Err(io::Error::other("shutdown source failed"))
@@ -2156,6 +2238,103 @@ mod tests {
         .expect("the bounded enterprise relay scenario must finish");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_enterprise_relay_serves_the_admitted_start_to_authenticate_flow() {
+        // One substream walks the whole pre-callback enterprise flow over
+        // the wire: a valid start is admitted, the provider set is offered,
+        // the selection is accepted and the authorization URL carries the
+        // single-use state. The client then closes the substream while the
+        // browser callback is pending, which cancels the transaction
+        // (design section 8: 断开立即失效) and keeps the relay serving.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::with_enterprise(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config("127.0.0.1:0".parse().unwrap()),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+            let stream = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+            )
+            .await;
+            let mut stream = stream.into_tokio();
+
+            let locator = Locator::new(7).unwrap();
+            stream
+                .write_all(&EnterpriseStart::new(locator).encode())
+                .await
+                .unwrap();
+            assert_eq!(
+                read_enterprise_frame(&mut stream).await,
+                EnterpriseResolveResponse::Providers(
+                    EnterpriseProviders::new(true, false).unwrap()
+                )
+            );
+
+            stream
+                .write_all(&EnterpriseSelect::new(EnterpriseProvider::WeCom).encode())
+                .await
+                .unwrap();
+            let EnterpriseResolveResponse::Authenticate(url) =
+                read_enterprise_frame(&mut stream).await
+            else {
+                panic!("expected an authorization URL after the provider selection");
+            };
+            let authorization = Url::parse(url.as_str()).expect("the authorization URL parses");
+            let state = authorization
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            assert!(
+                !state.is_empty() && state.len() <= 64,
+                "the state is the fixed-length lowercase hex state"
+            );
+
+            // The client closes the substream while the browser callback
+            // is pending: the relay cancels the transaction immediately.
+            drop(stream);
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the admitted enterprise flow must finish");
+    }
+
     #[test]
     fn enterprise_exchange_permits_count_overload_when_exhausted() {
         // The permit acquisition is a pure function at the call site of
@@ -2291,6 +2470,134 @@ mod tests {
         })
         .await
         .expect("capacity rejection must respond and disconnect every same-peer connection");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_capacity_rejection_tracks_the_peer_until_cleanup_and_drain_cancellation() {
+        // The capacity decision inserts the peer into the rejected set and
+        // closes its connections; a further registry substream from the
+        // rejected peer is answered with an immediate retry instead of a
+        // fresh exchange. Once the exchange drain ends and the peer has no
+        // connections left, the registry_done handler drops the rejected
+        // marker. A shutdown arriving during a later rejection drain hits
+        // the cancellation branch of the drain wait.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_address: EndpointRelayAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                    .parse()
+                    .unwrap();
+            let relay_config = RelayServeConfig::with_resources(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                resources_with_registration_capacity(1, 1),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut accepted = connected_reserved_endpoint(&relay_address, relay_peer).await;
+            let mut accepted_streams = accepted.streams().clone();
+            let stream = open_stream(
+                &mut accepted,
+                &mut accepted_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut accepted, stream, &RegistryRequest::Allocate.encode()).await;
+            assert!(matches!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Acquired(_)
+            ));
+            drop(accepted);
+
+            // The second peer exhausts the registration capacity. Its
+            // rejected marker is already set, so any further registry
+            // substream from the same peer is answered with an immediate
+            // retry instead of a fresh exchange.
+            let rejected_identity = Keypair::generate_ed25519();
+            let mut rejected = connected_reserved_endpoint_with_identity(
+                &relay_address,
+                relay_peer,
+                rejected_identity.clone(),
+            )
+            .await;
+            let mut rejected_streams = rejected.streams().clone();
+            let stream = open_stream(
+                &mut rejected,
+                &mut rejected_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut rejected, stream, &RegistryRequest::Allocate.encode()).await;
+            assert_eq!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Capacity
+            );
+            let stream = open_stream(
+                &mut rejected,
+                &mut rejected_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut rejected, stream, &RegistryRequest::Allocate.encode()).await;
+            assert!(matches!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Retry(_)
+            ));
+
+            // Closing the rejected peer's connection before the exchange
+            // drain ends means the registry_done cleanup observes zero
+            // connections and drops the rejected marker there.
+            drop(rejected);
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+
+            // The same peer reconnects and is admitted fresh again; the
+            // capacity decision still rejects it. Shutting down while the
+            // rejected-connection drain is in flight reaches the
+            // cancellation branch of the drain wait.
+            let mut readmitted = connected_reserved_endpoint_with_identity(
+                &relay_address,
+                relay_peer,
+                rejected_identity,
+            )
+            .await;
+            let mut readmitted_streams = readmitted.streams().clone();
+            let stream = open_stream(
+                &mut readmitted,
+                &mut readmitted_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut readmitted, stream, &RegistryRequest::Allocate.encode()).await;
+            assert_eq!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Capacity
+            );
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("capacity tracking must finish");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2493,6 +2800,31 @@ mod tests {
         assert!(matches!(
             write_close(&mut shutdown_failure, &[1]).await,
             Err(ProtocolTaskError::Io(_))
+        ));
+
+        // A silent stream never completes a bounded read: the explicit
+        // deadline fires and the read fails closed with a timeout.
+        let (writer, mut reader) = tokio::io::duplex(16);
+        assert!(matches!(
+            read_deadline::<3>(&mut reader, Duration::from_millis(50)).await,
+            Err(ProtocolTaskError::Timeout)
+        ));
+        drop(writer);
+
+        // write_message propagates a flush failure fail-closed after the
+        // write itself succeeded.
+        let mut flush_failure = FailingWrite::new(WriteFailure::Flush);
+        assert!(matches!(
+            write_message(&mut flush_failure, &[1]).await,
+            Err(ProtocolTaskError::Io(_))
+        ));
+
+        // A duplex whose buffer is full and whose reader never drains
+        // blocks the write until the message timeout fires.
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        assert!(matches!(
+            write_timeout(&mut writer, &[1, 2, 3]).await,
+            Err(ProtocolTaskError::Timeout)
         ));
     }
 
@@ -2789,6 +3121,24 @@ mod tests {
         assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
         assert!(response.is_empty());
 
+        // A reserved-field violation is rejected by decode just like an
+        // unknown tag, in both the full exchange and the immediate retry.
+        let reserved_field_registry = [0x01, 0, 0, 1];
+        let (client, server) = tokio::io::duplex(32);
+        let (result, response) = tokio::join!(
+            registry_exchange_without_rejection(peer, server, mpsc::channel(1).0),
+            request_response(client, &reserved_field_registry),
+        );
+        assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
+        assert!(response.is_empty());
+        let (client, server) = tokio::io::duplex(32);
+        let (result, response) = tokio::join!(
+            registry_immediate_retry(server, retry_after()),
+            request_response(client, &reserved_field_registry),
+        );
+        assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
+        assert!(response.is_empty());
+
         let (client, server) = tokio::io::duplex(32);
         let (result, response) = tokio::join!(
             resolve_exchange(peer, server, mpsc::channel(1).0),
@@ -3000,6 +3350,55 @@ mod tests {
             RegistryResponse::Retry(_)
         ));
 
+        // Reclaiming into a full registry reports the capacity decision
+        // and marks the unique connection for rejection, exactly like
+        // allocation does.
+        let limits = RegistrationLimits::new(
+            RegistrationCapacity::new(1).unwrap(),
+            SourceRegistrationCapacity::new(1).unwrap(),
+            ReservationDuration::from_seconds(60).unwrap(),
+        )
+        .unwrap();
+        let mut full_registry = Registry::with_limits(SystemClock::new(), limits, retry_after());
+        full_registry.set_connection(peer, true);
+        full_registry.set_reservation(peer, true);
+        let reclaimed = handle_registry_call(
+            &registry_call(
+                peer,
+                ConnectionId::new_unchecked(1),
+                RegistryRequest::Reclaim(Locator::new(21).unwrap()),
+            ),
+            &connections,
+            &mut full_registry,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(
+            reclaimed.response,
+            RegistryResponse::Acquired(Locator::new(21).unwrap())
+        );
+        assert_eq!(reclaimed.rejected_connection, None);
+        let competing = Keypair::generate_ed25519().public().to_peer_id();
+        let competing_connection = ConnectionId::new_unchecked(4);
+        connections
+            .established(competing, competing_connection, endpoint())
+            .unwrap();
+        full_registry.set_connection(competing, true);
+        full_registry.set_reservation(competing, true);
+        let rejected = handle_registry_call(
+            &registry_call(
+                competing,
+                competing_connection,
+                RegistryRequest::Reclaim(Locator::new(22).unwrap()),
+            ),
+            &connections,
+            &mut full_registry,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(rejected.response, RegistryResponse::Capacity);
+        assert_eq!(rejected.rejected_connection, Some(competing_connection));
+
         let valid = resolve_call(peer, locator);
         let observations = RelayObservability::default();
         let mut exhausted_global = ResolveLimiters::new();
@@ -3083,6 +3482,97 @@ mod tests {
             .unwrap(),
             ResolveResponse::Resolved(_)
         ));
+    }
+
+    #[test]
+    fn resolve_limit_observations_count_every_admission_branch() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let locator = Locator::new(7).unwrap();
+        let mut connections = ConnectionBook::new();
+        connections
+            .established(peer, ConnectionId::new_unchecked(1), endpoint())
+            .unwrap();
+        let clock = SystemClock::new();
+        let mut registry = Registry::new(clock.clone());
+        let source = connections.unique(&peer).unwrap().source_prefix().unwrap();
+        let call = resolve_call(peer, locator);
+
+        // The global limiter is exhausted: the request never reaches the
+        // connection or per-source checks.
+        let observations = RelayObservability::default();
+        let mut exhausted_global = ResolveLimiters::new();
+        for _ in 0..128 {
+            assert!(exhausted_global.check_global());
+        }
+        assert!(matches!(
+            handle_resolve_call_observed(
+                &call,
+                &connections,
+                &clock,
+                &mut registry,
+                &mut exhausted_global,
+                &observations,
+            )
+            .unwrap(),
+            ResolveResponse::Retry(_)
+        ));
+        assert_eq!(
+            observations.resolve_global_limited.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(observations.resolve_retry.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observations.resolve_source_limited.load(Ordering::Relaxed),
+            0
+        );
+
+        // A peer without a unique connection is deferred and counted as a
+        // retry before any per-source accounting.
+        let observations = RelayObservability::default();
+        let stranger = Keypair::generate_ed25519().public().to_peer_id();
+        let mut fresh = ResolveLimiters::new();
+        assert!(matches!(
+            handle_resolve_call_observed(
+                &resolve_call(stranger, locator),
+                &connections,
+                &clock,
+                &mut registry,
+                &mut fresh,
+                &observations,
+            )
+            .unwrap(),
+            ResolveResponse::Retry(_)
+        ));
+        assert_eq!(observations.resolve_retry.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            observations.resolve_global_limited.load(Ordering::Relaxed),
+            0
+        );
+
+        // The per-source limiter is exhausted: the request passes the
+        // global and connection checks and is deferred at the source check.
+        let observations = RelayObservability::default();
+        let mut exhausted_source = ResolveLimiters::new();
+        for _ in 0..32 {
+            assert!(exhausted_source.check_source(source, clock.now()));
+        }
+        assert!(matches!(
+            handle_resolve_call_observed(
+                &call,
+                &connections,
+                &clock,
+                &mut registry,
+                &mut exhausted_source,
+                &observations,
+            )
+            .unwrap(),
+            ResolveResponse::Retry(_)
+        ));
+        assert_eq!(
+            observations.resolve_source_limited.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(observations.resolve_retry.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3261,6 +3751,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn required_listener_readiness_and_failures_are_authoritative() {
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         let identity = Keypair::generate_ed25519();
         let mut node = RelayNode::new(identity, WssTransportConfig::client(None)).unwrap();
         let first = node
@@ -3324,6 +3816,15 @@ mod tests {
         .unwrap();
         assert!(listeners.ready_reported);
         assert_eq!(listeners.ready_addresses.len(), 2);
+        // The BecameReady transition reported every ready listener and
+        // logged the readiness event with the exact counts.
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_ready\""));
+        assert!(text.contains("listener_count=2"));
+        assert!(text.contains("external_count=0"));
+        assert!(text.contains("relay listener is active"));
+        assert!(text.contains("/ip4/127.0.0.1/tcp/4001"));
+        assert!(text.contains("/ip4/127.0.0.1/udp/4002/quic-v1"));
         handle_swarm_event_inner(
             SwarmEvent::NewListenAddr {
                 listener_id: second,
@@ -3613,6 +4114,46 @@ mod tests {
                 _ = endpoint.next_event() => {}
             }
         }
+    }
+
+    /// Reads one encoded enterprise response from the client side of a
+    /// live enterprise substream.
+    async fn read_enterprise_frame(
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> EnterpriseResolveResponse {
+        let mut tag = [0_u8; 1];
+        stream.read_exact(&mut tag).await.unwrap();
+        let message = match tag[0] {
+            0x10 => {
+                let mut payload = [0_u8; 1];
+                stream.read_exact(&mut payload).await.unwrap();
+                vec![0x10, payload[0]]
+            }
+            0x11 => {
+                let mut payload = [0_u8; 4];
+                stream.read_exact(&mut payload).await.unwrap();
+                std::iter::once(0x11).chain(payload).collect()
+            }
+            0x12 => {
+                let mut length = [0_u8; 2];
+                stream.read_exact(&mut length).await.unwrap();
+                let mut url = vec![0_u8; usize::from(u16::from_be_bytes(length))];
+                stream.read_exact(&mut url).await.unwrap();
+                std::iter::once(0x12).chain(length).chain(url).collect()
+            }
+            0x13 => {
+                let mut peer_length = [0_u8; 1];
+                stream.read_exact(&mut peer_length).await.unwrap();
+                let mut peer = vec![0_u8; usize::from(peer_length[0])];
+                stream.read_exact(&mut peer).await.unwrap();
+                std::iter::once(0x13)
+                    .chain(peer_length)
+                    .chain(peer)
+                    .collect()
+            }
+            tag => vec![tag],
+        };
+        EnterpriseResolveResponse::decode(&message).unwrap()
     }
 
     struct ExactThenError<const LENGTH: usize> {

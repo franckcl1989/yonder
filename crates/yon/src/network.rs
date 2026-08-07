@@ -1371,7 +1371,7 @@ mod tests {
         LATE_DIRECT_SAMPLE_WINDOW, PendingRelayDials, RELAY_DIAL_WINDOW, RELAY_DRAIN_WINDOW,
         RelayConnection, ReservationDecision, ReservationLease, ReservationListenerId,
         ReservationSlot, SELECTION_WINDOW, TARGET_SELECTION_WINDOW, TARGET_SETTLE_TIMEOUT,
-        arm_late_sample_window, connect_configured_relay, connect_relay_attempt,
+        arm_late_sample_window, build_endpoint, connect_configured_relay, connect_relay_attempt,
         connect_target_until, converge_to_binding, dial_relay_set, drain_relay_state, drive,
         drive_bound, enforce_binding_after_event, finish_bound_output, finish_relay_selection,
         finish_target_selection, next_relay_dial, open_stream, process_relay_selection_event,
@@ -2374,6 +2374,106 @@ mod tests {
             finish_bound_output(&mut driver, binding, 7),
             Err(EndpointError::BoundConnectionLost)
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relayed_connections_beyond_tracker_capacity_are_closed_and_dropped() {
+        // Eight distinct relayed peers fill the direct-upgrade tracker;
+        // a ninth relayed connection must be closed without entering the
+        // roster, mirroring the roster-overflow guard for direct paths.
+        let mut driver = endpoint_driver();
+        for index in 300..308_u16 {
+            let peer = Keypair::generate_ed25519().public().to_peer_id();
+            assert!(
+                driver
+                    .record_established(
+                        peer,
+                        ConnectionId::new_unchecked(usize::from(index)),
+                        relayed_listener_endpoint(index),
+                    )
+                    .is_some()
+            );
+        }
+        let overflow_peer = Keypair::generate_ed25519().public().to_peer_id();
+        assert!(
+            driver
+                .record_established(
+                    overflow_peer,
+                    ConnectionId::new_unchecked(308),
+                    relayed_listener_endpoint(308),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enabled_direct_policy_requires_direct_evidence_to_finish() {
+        // A relay-only selection can never satisfy the enabled direct
+        // policy: with no recorded outcome the selection must not settle
+        // at all, while the disabled policy still finishes on the relay.
+        let relay = ConnectionId::new_unchecked(699);
+        let mut relay_only = ConnectionSelection::new();
+        relay_only
+            .established(relay, &relayed_listener_endpoint(699))
+            .unwrap();
+        assert!(matches!(
+            finish_target_selection(&relay_only, None, DirectUpgradePolicy::Enabled),
+            Err(EndpointError::TargetUpgradeDidNotSettle)
+        ));
+        let empty = ConnectionSelection::new();
+        assert!(matches!(
+            finish_target_selection(&empty, None, DirectUpgradePolicy::Enabled),
+            Err(EndpointError::TargetUpgradeDidNotSettle)
+        ));
+        assert!(matches!(
+            finish_target_selection(&empty, None, DirectUpgradePolicy::Disabled),
+            Err(EndpointError::RelayUnavailable)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_attempt_hits_the_absolute_attempt_deadline() {
+        // A dial window far in the future with an attempt deadline in
+        // the near future: the timeout that lands at the attempt
+        // deadline must classify as RelayUnavailable.
+        let mut driver = endpoint_driver();
+        let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
+        let relays = relay_set(relay_peer);
+        let now = tokio::time::Instant::now();
+        assert!(matches!(
+            connect_relay_attempt(
+                &mut driver,
+                &relays,
+                now + Duration::from_secs(1),
+                now + Duration::from_millis(150),
+            )
+            .await,
+            Err(EndpointError::RelayUnavailable)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dial_relay_set_continues_when_the_swarm_rejects_a_relay_dial() {
+        // The frozen connection limits deny the seventeenth concurrent
+        // outbound dial: the batch must log the rejection and keep the
+        // relay dial tracker empty instead of failing.
+        let mut driver = endpoint_driver();
+        let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
+        let relays = relay_set(relay_peer);
+        let address = relays.iter().next().unwrap().as_multiaddr().clone();
+        for _ in 0..16 {
+            driver.dial(address.clone()).unwrap();
+        }
+        assert!(dial_relay_set(&mut driver, &relays).is_ok());
+        assert!(driver.pending_relay_dials.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_endpoint_starts_the_frozen_direct_listener_stack() {
+        let identity = Keypair::generate_ed25519();
+        let (driver, _streams) =
+            build_endpoint(identity.clone(), WssTransportConfig::client(None)).unwrap();
+        assert_eq!(driver.peer_id(), identity.public().to_peer_id());
     }
 
     fn endpoint_driver() -> EndpointDriver {

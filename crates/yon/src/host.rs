@@ -89,16 +89,17 @@ pub enum HostStage {
 mod tests {
     use super::{
         EXCHANGE_TIMEOUT, FILE_SUBSTREAM_QUEUE, FileOpenError, FileOpenFrame, HostConfig,
-        HostError, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair, binding_event,
-        complete_terminal_exit_io, copy_controller_input, copy_terminal_output,
-        file_substream_coordinator, host_error_event, read_auth_hello_io, read_file_open_frame,
-        read_terminal_hello_io, report_connection_code_to, report_replacement_notice_to,
-        retryable_relay_error, run_host, run_host_with, run_host_with_progress, send_auth_retry_io,
-        serve_one_file_substream, start_terminal_io, write_authenticated_io,
+        HostError, HostStage, OpaquePake, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair, binding_event,
+        classify_file_open_io, complete_terminal_exit_io, copy_controller_input,
+        copy_terminal_output, create_advertisement, file_substream_coordinator, host_error_event,
+        read_auth_hello_io, read_file_open_frame, read_terminal_hello_io,
+        report_connection_code_to, report_replacement_notice_to, retryable_relay_error, run_host,
+        run_host_with, run_host_with_progress, send_auth_retry_io, send_busy_reply,
+        serve_one_file_substream, start_terminal_io, wait_for_host_retry, write_authenticated_io,
         write_terminal_ready_io,
     };
     use crate::file_semantics::BaseDirectory;
-    use crate::network::EndpointError;
+    use crate::network::{EndpointError, relay_backoff};
     use crate::progress::NoopProgress;
     use crate::protocol::RelayProtocolError;
     use crate::terminal::{
@@ -119,7 +120,9 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
     use tokio::sync::{Notify, mpsc};
-    use yonder_core::wire::auth::{AuthClientHello, AuthServerResponse, CLIENT_HELLO_LEN};
+    use yonder_core::wire::auth::{
+        AuthClientHello, AuthServerResponse, CLIENT_HELLO_LEN, PakeContext,
+    };
     use yonder_core::wire::file_transfer::{
         FRAME_HEADER_LEN, FileTransferErrorCode, FileTransferMessage, Sha256Digest, TransferTag,
         decode_frame_header, encode_frame_header,
@@ -128,10 +131,12 @@ mod tests {
         MAX_HELLO_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalResize,
     };
     use yonder_core::{
-        ConnectionCode, Locator, PakeSecret, SessionEvent, TerminalSize, TerminalValue,
+        ConnectionCode, Locator, Pake, PakeSecret, RetryAfter, SessionEvent, TerminalSize,
+        TerminalValue,
     };
     use yonder_net::{
         EndpointRelayAddress, EndpointRelaySet, Keypair, NetworkBuildError, WssTransportConfig,
+        peer_id_bytes,
     };
 
     struct FailingOutput;
@@ -156,6 +161,74 @@ mod tests {
                 std::io::ErrorKind::BrokenPipe,
                 "closed output",
             ))
+        }
+    }
+
+    /// An async writer that accepts every write but fails every flush, so a
+    /// code path whose write succeeded can still observe the flush failure.
+    struct FlushFailingWriter;
+
+    impl AsyncWrite for FlushFailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed output",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An async pty input that records how often it was flushed and closed.
+    struct RecordingInput {
+        flushes: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl AsyncWrite for RecordingInput {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TerminalInput for RecordingInput {
+        fn close(&mut self) {
+            self.closes.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -190,6 +263,38 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[test]
+    fn advertisement_creation_registers_the_printed_code_for_authentication() {
+        let locator = Locator::new(12_345).unwrap();
+        let target = peer_id_bytes(Keypair::generate_ed25519().public().to_peer_id()).unwrap();
+        let mut host = OpaquePake;
+        let (advertised, code) = create_advertisement(locator, &target, &mut host).unwrap();
+        assert_eq!(advertised.locator, locator);
+        assert_eq!(code.locator(), locator);
+
+        // The user-facing code round-trips through its printed representation,
+        // so the controller can look the advertisement up with exactly what
+        // the host printed.
+        let parsed: ConnectionCode = code.expose().to_string().parse().unwrap();
+        assert_eq!(parsed.locator(), locator);
+        assert_eq!(parsed.secret().expose_bytes(), code.secret().expose_bytes());
+
+        // A client that knows the code completes the full PAKE exchange
+        // against the registration the host created.
+        let controller = peer_id_bytes(Keypair::generate_ed25519().public().to_peer_id()).unwrap();
+        let context = PakeContext::new(locator, &controller, &target, &[9; 32], &[11; 32]);
+        let mut client = OpaquePake;
+        let (client_state, ke1) = client.client_start(&target, code.secret()).unwrap();
+        let (server_state, ke2) = host
+            .server_start(&advertised.registration, &ke1, context.as_bytes())
+            .unwrap();
+        let (ke3, client_key) = client
+            .client_finish(client_state, &ke2, context.as_bytes())
+            .unwrap();
+        let server_key = host.server_finish(server_state, &ke3).unwrap();
+        assert_eq!(client_key.as_ref(), server_key.as_ref());
     }
 
     #[test]
@@ -383,6 +488,24 @@ mod tests {
         ] {
             assert!(!retryable_relay_error(&error));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_retry_delay_waits_before_the_next_attempt() {
+        let mut backoff = relay_backoff();
+        let started = tokio::time::Instant::now();
+        wait_for_host_retry(&mut backoff, HostStage::ConnectingRelay, &mut NoopProgress)
+            .await
+            .unwrap();
+        // The frozen first backoff is 250 ms; jitter only extends it.
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "first retry delay was {:?}",
+            started.elapsed()
+        );
+        // The retry schedule is unbounded, so every reconnect keeps a next
+        // delay available (the invariant the production `expect` relies on).
+        assert!(backoff.next().is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -738,6 +861,31 @@ mod tests {
             complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_millis(10))
                 .await,
             Err(HostError::Timeout)
+        ));
+    }
+
+    struct ErroringReader;
+
+    impl tokio::io::AsyncRead for ErroringReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed input",
+            )))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_input_read_error_ends_the_pump_with_an_io_error() {
+        let mut failing = ErroringReader;
+        let mut input = TestInput;
+        assert!(matches!(
+            copy_controller_input(&mut failing, &mut input).await,
+            Err(HostError::Io(_))
         ));
     }
 
@@ -1177,6 +1325,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_open_io_failures_are_classified_by_eof_kind() {
+        // EOF inside a frame is a protocol violation; every other I/O
+        // failure of the substream stays an I/O failure.
+        assert_eq!(
+            classify_file_open_io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated frame",
+            )),
+            FileOpenError::Protocol
+        );
+        assert_eq!(
+            classify_file_open_io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "substream failure",
+            )),
+            FileOpenError::Io
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn capability_probe_creates_no_state_or_error() {
         let config = file_transfer_config();
@@ -1531,6 +1699,128 @@ mod tests {
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn third_substream_while_both_slots_are_occupied_is_dropped() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
+        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+
+        let (host_first, mut peer_first) = tokio::io::duplex(64 * 1024);
+        let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
+        let (mut host_third, mut peer_third) = tokio::io::duplex(64 * 1024);
+        sender.try_send(host_first).unwrap();
+        let first_started = Arc::new(Notify::new());
+        let second_answered = Arc::new(Notify::new());
+
+        let final_path = directory.path().join("first.bin");
+        let destination = final_path.to_str().unwrap().to_owned();
+        const SIZE: usize = 200 * 1024;
+        let bytes = patterned_bytes(SIZE, 29);
+
+        let first = {
+            let first_started = Arc::clone(&first_started);
+            let second_answered = Arc::clone(&second_answered);
+            let bytes = &bytes;
+            async move {
+                send_wire_frame(
+                    &mut peer_first,
+                    &FileTransferMessage::UploadOpen {
+                        destination: &destination,
+                        file_name: "first.bin",
+                        declared_size: SIZE as u64,
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_first, &FileTransferMessage::Ready).await;
+                send_wire_data(&mut peer_first, &bytes[..65536]).await;
+                first_started.notify_one();
+                second_answered.notified().await;
+                for chunk in bytes[65536..].chunks(65536) {
+                    send_wire_data(&mut peer_first, chunk).await;
+                }
+                send_wire_frame(
+                    &mut peer_first,
+                    &FileTransferMessage::Finish {
+                        actual_size: SIZE as u64,
+                        digest: sha256_bytes(bytes),
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_first, &FileTransferMessage::Committed).await;
+            }
+        };
+        let second = async {
+            first_started.notified().await;
+            // The second substream occupies the busy slot: its serving is
+            // blocked reading the opening frame, so both slots stay taken
+            // until that frame arrives.
+            sender.try_send(host_second).unwrap();
+            let mut queued = false;
+            for _ in 0..100 {
+                match sender.try_send(host_third) {
+                    Ok(()) => {
+                        queued = true;
+                        break;
+                    }
+                    Err(error) => {
+                        host_third = match error {
+                            tokio::sync::mpsc::error::TrySendError::Full(stream) => stream,
+                            tokio::sync::mpsc::error::TrySendError::Closed(stream) => stream,
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(queued, "the coordinator must drain the queue");
+            // The coordinator ends when the sender is dropped, which the
+            // real bridge does at session teardown.
+            drop(sender);
+            // Both slots are occupied: the third substream is dropped
+            // without any reply, so its peer observes a closed substream.
+            let mut trailing = [0_u8; 8];
+            assert_eq!(
+                peer_third.read(&mut trailing).await.unwrap(),
+                0,
+                "a substream beyond the active and busy slots must be closed silently"
+            );
+            // Now let the busy reply proceed.
+            send_wire_frame(
+                &mut peer_second,
+                &FileTransferMessage::UploadOpen {
+                    destination: "",
+                    file_name: "second.bin",
+                    declared_size: 1,
+                },
+            )
+            .await;
+            expect_wire_control(
+                &mut peer_second,
+                &FileTransferMessage::Error {
+                    code: FileTransferErrorCode::Busy,
+                },
+            )
+            .await;
+            let mut trailing = [0_u8; 1];
+            assert_eq!(
+                peer_second.read(&mut trailing).await.unwrap(),
+                0,
+                "the busy substream must be closed after the reply"
+            );
+            second_answered.notify_one();
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(coordinator, first, second)
+        })
+        .await
+        .expect("three-substream coordination deadlocked");
+        // The first transfer completed untouched and committed its target.
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
     // ------------------------------------------------------------------
     // Session teardown (design 16.4, 16.5): the shared cancel flag aborts
     // the active transfer; no uncommitted target appears.
@@ -1815,6 +2105,1789 @@ mod tests {
         assert_eq!(exit.code(), EXIT_CODE);
         assert_eq!(observed, terminal_bytes);
         assert_eq!(fs::read(&final_path).unwrap(), transfer_bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage closure: error propagation, fragmented reads and write
+    // side effects for the io helpers exercised above.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_write_propagates_write_and_flush_failures() {
+        let (mut closed, peer) = tokio::io::duplex(1);
+        drop(peer);
+        assert!(matches!(
+            write_authenticated_io(&mut closed).await,
+            Err(HostError::Io(_))
+        ));
+        let mut flush_failing = FlushFailingWriter;
+        assert!(matches!(
+            write_authenticated_io(&mut flush_failing).await,
+            Err(HostError::Io(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_terminal_io_times_out_when_the_hello_never_arrives() {
+        // The frozen hello deadline is EXCHANGE_TIMEOUT (ten seconds), so
+        // this test genuinely waits it out on a silent control stream.
+        let (mut data, _data_peer) = tokio::io::duplex(1);
+        let (mut control, _control_peer) = tokio::io::duplex(1);
+        let backend = TestBackend::open_failure();
+        assert!(matches!(
+            start_terminal_io(&backend, &mut data, &mut control).await,
+            Err(HostError::Timeout)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_hello_reader_accepts_a_fragmented_hello() {
+        let hello = TerminalHello::new(
+            TerminalSize::new(80, 24).unwrap(),
+            TerminalValue::new("xterm").unwrap(),
+            TerminalValue::new("truecolor").unwrap(),
+        );
+        let encoded = hello.encode().as_slice().to_vec();
+        let (mut host, mut peer) = tokio::io::duplex(1);
+        let read = read_terminal_hello_io(&mut host);
+        let write = async {
+            for byte in encoded {
+                peer.write_all(&[byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        };
+        let (result, ()) = tokio::join!(read, write);
+        assert_eq!(result.unwrap(), hello);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_ready_write_propagates_a_flush_failure() {
+        let mut host = FlushFailingWriter;
+        assert!(matches!(
+            write_terminal_ready_io(&mut host).await,
+            Err(HostError::Io(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_retry_writes_the_frozen_bytes_and_shuts_the_stream_down() {
+        let (mut host, mut controller) = tokio::io::duplex(8);
+        let expected = AuthServerResponse::retry(RetryAfter::from_millis(1_000).unwrap()).encode();
+        let expected_len = expected.as_slice().len();
+        let write = send_auth_retry_io(&mut host);
+        let read = async move {
+            let mut response = vec![0_u8; expected_len];
+            controller.read_exact(&mut response).await.unwrap();
+            // The shutdown side effect: once the frozen bytes are drained,
+            // the peer observes EOF (a written-but-open stream would not).
+            let mut trailing = [0_u8; 1];
+            let trailing_len = controller.read(&mut trailing).await.unwrap();
+            (response, trailing_len)
+        };
+        let (result, (response, trailing_len)) = tokio::join!(write, read);
+        result.unwrap();
+        assert_eq!(response, expected.as_slice());
+        assert_eq!(
+            trailing_len, 0,
+            "the retry stream must be shut down after the reply"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_open_frame_read_rejects_invalid_lengths_and_bad_bodies() {
+        let budget = file_transfer_config().control_timeout;
+        // A payload length below the tag's structural minimum is rejected
+        // before any payload byte is read.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        peer.write_all(&encode_frame_header(TransferTag::UploadOpen.code(), 5))
+            .await
+            .unwrap();
+        peer.flush().await.unwrap();
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // A payload length above the tag's bound is equally rejected.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        peer.write_all(&encode_frame_header(
+            TransferTag::UploadOpen.code(),
+            u32::MAX,
+        ))
+        .await
+        .unwrap();
+        peer.flush().await.unwrap();
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // A legal length whose payload never begins is a truncated frame:
+        // EOF exactly at the payload boundary.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        peer.write_all(&encode_frame_header(TransferTag::UploadOpen.code(), 13))
+            .await
+            .unwrap();
+        peer.flush().await.unwrap();
+        drop(peer);
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+
+        // A complete frame whose body cannot be decoded as UploadOpen: the
+        // two-byte length prefix claims a 13-byte destination with only 11
+        // payload bytes remaining.
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        peer.write_all(&encode_frame_header(TransferTag::UploadOpen.code(), 13))
+            .await
+            .unwrap();
+        peer.write_all(&[0, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        peer.flush().await.unwrap();
+        assert_eq!(
+            read_file_open_frame(&mut host, budget).await.unwrap_err(),
+            FileOpenError::Protocol
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_open_frame_read_tolerates_byte_fragmented_writes() {
+        let budget = file_transfer_config().control_timeout;
+        let (mut host, mut peer) = tokio::io::duplex(1);
+        let open = FileTransferMessage::UploadOpen {
+            destination: "dir/f",
+            file_name: "n.bin",
+            declared_size: 7,
+        };
+        let encoded = open.encode().unwrap().as_slice().to_vec();
+        let read = read_file_open_frame(&mut host, budget);
+        let write = async {
+            for byte in encoded {
+                peer.write_all(&[byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        };
+        let (result, ()) = tokio::join!(read, write);
+        assert_eq!(
+            result.unwrap(),
+            FileOpenFrame::Upload {
+                destination: "dir/f".to_owned(),
+                file_name: "n.bin".to_owned(),
+                declared_size: 7,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unresolvable_download_requests_close_without_state_or_reply() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (host_half, mut peer_half) = tokio::io::duplex(1);
+        let served = serve_one_file_substream(
+            host_half,
+            None,
+            cancel,
+            &config,
+            super::FileSubstreamRole::Active,
+        );
+        let peer = async {
+            send_wire_frame(
+                &mut peer_half,
+                &FileTransferMessage::DownloadOpen { source: "in/f" },
+            )
+            .await;
+            let mut buffer = [0_u8; 8];
+            let read = peer_half.read(&mut buffer).await.unwrap();
+            (read, buffer)
+        };
+        let ((), (read, buffer)) = tokio::join!(served, peer);
+        assert_eq!(read, 0, "an unresolvable download must not produce bytes");
+        assert!(buffer.iter().all(|byte| *byte == 0));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_reply_writes_the_canonical_frame_then_shuts_the_substream_down() {
+        let config = file_transfer_config();
+        let (mut host, mut peer) = tokio::io::duplex(64 * 1024);
+        let reply = send_busy_reply(&mut host, &config);
+        let read = async {
+            let frame = read_wire_frame(&mut peer).await;
+            let mut trailing = [0_u8; 1];
+            let trailing_len = peer.read(&mut trailing).await.unwrap();
+            (frame, trailing_len)
+        };
+        let ((), (frame, trailing_len)) = tokio::join!(reply, read);
+        let expected = FileTransferMessage::Error {
+            code: FileTransferErrorCode::Busy,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            frame,
+            expected.as_slice(),
+            "the busy reply must be exactly the canonical error frame"
+        );
+        assert_eq!(
+            trailing_len, 0,
+            "the busy substream must be shut down after the reply"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_reuses_the_active_slot_after_a_transfer_completes() {
+        let config = file_transfer_config();
+        let directory = tempdir().unwrap();
+        let base = Some(BaseDirectory::capture().unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
+        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+
+        let first_bytes = patterned_bytes(64 * 1024, 5);
+        let second_bytes = patterned_bytes(64 * 1024, 7);
+        let first_path = directory.path().join("first.bin");
+        let second_path = directory.path().join("second.bin");
+        let first_destination = first_path.to_str().unwrap().to_owned();
+        let second_destination = second_path.to_str().unwrap().to_owned();
+
+        let (host_first, mut peer_first) = tokio::io::duplex(64 * 1024);
+        sender.try_send(host_first).unwrap();
+        let first_done = Arc::new(Notify::new());
+
+        let first = {
+            let first_done = Arc::clone(&first_done);
+            let first_bytes = &first_bytes;
+            let first_destination = &first_destination;
+            async move {
+                send_wire_frame(
+                    &mut peer_first,
+                    &FileTransferMessage::UploadOpen {
+                        destination: first_destination,
+                        file_name: "first.bin",
+                        declared_size: first_bytes.len() as u64,
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_first, &FileTransferMessage::Ready).await;
+                send_wire_data(&mut peer_first, first_bytes).await;
+                send_wire_frame(
+                    &mut peer_first,
+                    &FileTransferMessage::Finish {
+                        actual_size: first_bytes.len() as u64,
+                        digest: sha256_bytes(first_bytes),
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_first, &FileTransferMessage::Committed).await;
+                let mut trailing = [0_u8; 1];
+                assert_eq!(
+                    peer_first.read(&mut trailing).await.unwrap(),
+                    0,
+                    "the first substream must be closed by the host"
+                );
+                first_done.notify_one();
+            }
+        };
+        let second = {
+            let first_done = Arc::clone(&first_done);
+            let second_bytes = &second_bytes;
+            let second_destination = &second_destination;
+            async move {
+                first_done.notified().await;
+                // Let the coordinator observe the completed serve future and
+                // free the active slot before the next substream arrives.
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
+                sender.try_send(host_second).unwrap();
+                send_wire_frame(
+                    &mut peer_second,
+                    &FileTransferMessage::UploadOpen {
+                        destination: second_destination,
+                        file_name: "second.bin",
+                        declared_size: second_bytes.len() as u64,
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_second, &FileTransferMessage::Ready).await;
+                send_wire_data(&mut peer_second, second_bytes).await;
+                send_wire_frame(
+                    &mut peer_second,
+                    &FileTransferMessage::Finish {
+                        actual_size: second_bytes.len() as u64,
+                        digest: sha256_bytes(second_bytes),
+                    },
+                )
+                .await;
+                expect_wire_control(&mut peer_second, &FileTransferMessage::Committed).await;
+                drop(sender);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(coordinator, first, second)
+        })
+        .await
+        .expect("coordinator slot reuse deadlocked");
+        assert_eq!(fs::read(&first_path).unwrap(), first_bytes);
+        assert_eq!(fs::read(&second_path).unwrap(), second_bytes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_input_flush_and_close_are_invoked_at_stream_end() {
+        let (mut host_data, peer) = tokio::io::duplex(8);
+        drop(peer);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut input = RecordingInput {
+            flushes: Arc::clone(&flushes),
+            closes: Arc::clone(&closes),
+        };
+        let copy = copy_controller_input(&mut host_data, &mut input);
+        tokio::pin!(copy);
+        // The peer half is dropped, so the read side reports EOF on the
+        // first poll; the copy then flushes, closes the pty input and
+        // parks in `pending()`. Poll the future directly (it never
+        // resolves) until the close is observed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        loop {
+            if closes.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pty input was not closed at EOF"
+            );
+            let _ = copy.as_mut().poll(&mut context);
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            1,
+            "the pty input must be closed at EOF"
+        );
+        assert_eq!(
+            flushes.load(Ordering::Relaxed),
+            2,
+            "one flush from tokio::io::copy at EOF plus the explicit flush"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_applies_a_resize_split_across_writes_then_exits() {
+        const EXIT_CODE: u32 = 41;
+        let resized = TerminalSize::new(117, 41).unwrap();
+        let encoded = TerminalResize::new(resized).encode();
+        let mut session = ResizeThenExitSession {
+            resized: None,
+            exit_code: EXIT_CODE,
+        };
+        let (host_data, mut controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        let (mut controller_control_read, mut controller_control_write) =
+            tokio::io::split(controller_control);
+
+        let host = copy_terminal_output(
+            &mut session,
+            &mut host_data_write,
+            &mut host_control_read,
+            &mut host_control_write,
+        );
+        let controller = async {
+            // Deliver the five-byte resize in two fragments so the control
+            // read has to complete across several rounds.
+            controller_control_write
+                .write_all(&encoded[..2])
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            controller_control_write
+                .write_all(&encoded[2..])
+                .await
+                .unwrap();
+            let mut terminal_bytes = Vec::new();
+            controller_data
+                .read_to_end(&mut terminal_bytes)
+                .await
+                .unwrap();
+            let mut exit = [0_u8; 5];
+            controller_control_read.read_exact(&mut exit).await.unwrap();
+            controller_control_write
+                .write_all(&TerminalComplete::ENCODED)
+                .await
+                .unwrap();
+            controller_control_write.flush().await.unwrap();
+            let mut trailing = [0_u8; 1];
+            assert_eq!(
+                controller_control_read.read(&mut trailing).await.unwrap(),
+                0
+            );
+            (terminal_bytes, TerminalExit::decode(&exit).unwrap())
+        };
+        let (exit, (terminal_bytes, remote_exit)) = tokio::join!(host, controller);
+
+        assert_eq!(exit.unwrap(), EXIT_CODE);
+        assert!(terminal_bytes.is_empty());
+        assert_eq!(remote_exit.code(), EXIT_CODE);
+        assert_eq!(session.resized, Some(resized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_rejects_an_invalid_resize_tag() {
+        let mut session = ResizeThenExitSession {
+            resized: None,
+            exit_code: 0,
+        };
+        let (host_data, _controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, mut controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        controller_control
+            .write_all(&[0xff, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        assert!(matches!(
+            copy_terminal_output(
+                &mut session,
+                &mut host_data_write,
+                &mut host_control_read,
+                &mut host_control_write,
+            )
+            .await,
+            Err(HostError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_propagates_a_failed_data_flush() {
+        let mut chunk = TerminalChunk::new();
+        chunk.writable()[..4].copy_from_slice(b"data");
+        chunk.set_len(4).unwrap();
+        let mut session = PumpSession {
+            events: VecDeque::from([PtyEvent::output(chunk), PtyEvent::exited(9)]),
+        };
+        let (host_control, _controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        let mut host_data_write = FlushFailingWriter;
+        assert!(matches!(
+            copy_terminal_output(
+                &mut session,
+                &mut host_data_write,
+                &mut host_control_read,
+                &mut host_control_write,
+            )
+            .await,
+            Err(HostError::Io(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_propagates_a_failed_control_flush_when_reporting_exit() {
+        const EXIT_CODE: u32 = 13;
+        let mut session = PumpSession {
+            events: VecDeque::from([PtyEvent::exited(EXIT_CODE)]),
+        };
+        let (host_data, _controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, _controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, _host_control_peer) = tokio::io::split(host_control);
+        let mut host_control_write = FlushFailingWriter;
+        assert!(matches!(
+            copy_terminal_output(
+                &mut session,
+                &mut host_data_write,
+                &mut host_control_read,
+                &mut host_control_write,
+            )
+            .await,
+            Err(HostError::Io(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_propagates_a_control_read_error() {
+        let mut session = ResizeThenExitSession {
+            resized: None,
+            exit_code: 0,
+        };
+        let (host_data, _controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let mut failing = ErroringReader;
+        let mut host_control_write = FlushFailingWriter;
+        assert!(matches!(
+            copy_terminal_output(
+                &mut session,
+                &mut host_data_write,
+                &mut failing,
+                &mut host_control_write,
+            )
+            .await,
+            Err(HostError::Io(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_propagates_a_session_error() {
+        let mut session = PumpSession {
+            events: VecDeque::new(),
+        };
+        let (host_data, _controller_data) = tokio::io::duplex(8);
+        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+        let (host_control, _controller_control) = tokio::io::duplex(8);
+        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
+        assert!(matches!(
+            copy_terminal_output(
+                &mut session,
+                &mut host_data_write,
+                &mut host_control_read,
+                &mut host_control_write,
+            )
+            .await,
+            Err(HostError::Terminal(TerminalError::TaskStopped))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_drains_several_resizes_before_shutting_down_the_control_half() {
+        let first = TerminalSize::new(100, 30).unwrap();
+        let second = TerminalSize::new(132, 43).unwrap();
+        let (host_control, controller_control) = tokio::io::duplex(8);
+        let (mut host_read, mut host_write) = tokio::io::split(host_control);
+        let (mut controller_read, mut controller_write) = tokio::io::split(controller_control);
+        let host =
+            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1));
+        let controller = async {
+            controller_write
+                .write_all(&TerminalResize::new(first).encode())
+                .await
+                .unwrap();
+            controller_write
+                .write_all(&TerminalResize::new(second).encode())
+                .await
+                .unwrap();
+            controller_write
+                .write_all(&TerminalComplete::ENCODED)
+                .await
+                .unwrap();
+            controller_write.flush().await.unwrap();
+            let mut trailing = [0_u8; 1];
+            assert_eq!(
+                controller_read.read(&mut trailing).await.unwrap(),
+                0,
+                "the control half must be shut down after the completion"
+            );
+        };
+        let (result, ()) = tokio::join!(host, controller);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_propagates_a_control_read_error() {
+        let mut failing = ErroringReader;
+        let mut host_write = FlushFailingWriter;
+        assert!(matches!(
+            complete_terminal_exit_io(&mut failing, &mut host_write, Duration::from_secs(1)).await,
+            Err(HostError::Io(_))
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // In-process session harness: a real relay service, a real host
+    // session and a scripted controller all live in the test runtime, so
+    // the 0.1.1 session state machine (hello -> auth -> terminal streams
+    // -> bridge -> shell exit) runs over the real libp2p loopback stack
+    // without spawning any binaries. The connection code is the only
+    // secret-bearing host output, so the tests synchronize on the host
+    // milestones instead of reading the printed code; the authenticated
+    // happy path drives the same private session functions directly with
+    // a code the test itself created.
+    // ------------------------------------------------------------------
+
+    use super::{
+        FileSubstreamIo, InboundProtocols, acknowledge_and_wait_for_terminal_streams, authenticate,
+        bridge_terminal, drive_session_inputs, read_auth_hello, run_host_session, start_terminal,
+        wait_for_auth, wait_for_controller_quiescence,
+    };
+    use crate::network::{
+        EndpointDriver, RelayConnection, build_endpoint, connect_configured_relay,
+        wait_for_reservation,
+    };
+    use crate::pake::OpaqueClientState;
+    use crate::progress::OperationProgress;
+    use crate::protocol::allocate_locator;
+    use std::sync::Mutex;
+    use tokio::io::DuplexStream;
+    use tokio::sync::oneshot;
+    use yon_relay::{RelayServeConfig, RelayServiceError, run_relay_until};
+    use yonder_core::wire::auth::{Authenticated, KE3_LEN, PROCEED_LEN, RETRY_LEN};
+    use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
+    use yonder_core::wire::terminal::TerminalReady;
+    use yonder_core::wire::{
+        AUTH_PROTOCOL, FILE_TRANSFER_PROTOCOL, RESOLVE_PROTOCOL, TERMINAL_CONTROL_PROTOCOL,
+        TERMINAL_DATA_PROTOCOL,
+    };
+    use yonder_net::{
+        ApplicationStream, ApplicationStreams, DirectUpgradePolicy, EndpointNode,
+        Libp2pApplicationStreams, PeerId, RelayExternalAddress, RelayListenAddress,
+        swarm::SwarmEvent,
+    };
+
+    fn available_tcp_port() -> u16 {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Waits until the relay's TCP listener accepts connections.
+    /// Connects to the in-process relay with bounded retries: the relay's
+    /// listener is up before its swarm is fully ready, so under parallel
+    /// test load the first dial may transiently fail.
+    async fn connect_relay_with_retry(
+        driver: &mut EndpointDriver,
+        relays: &EndpointRelaySet,
+    ) -> RelayConnection {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match connect_configured_relay(driver, relays).await {
+                Ok(connection) => return connection,
+                Err(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the relay connection did not stabilize"
+                    );
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_tcp_listener(port: u16) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(_) => return,
+                Err(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the relay listener did not open on port {port}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// A real relay service running inside the test runtime on a pinned
+    /// port, restartable with the same identity for the recovery scenario.
+    struct InProcessRelay {
+        task: tokio::task::JoinHandle<Result<(), RelayServiceError>>,
+        shutdown: Option<oneshot::Sender<()>>,
+    }
+
+    impl InProcessRelay {
+        fn start(identity: Keypair, port: u16) -> Self {
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let config = RelayServeConfig::new(
+                identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(run_relay_until(config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+            Self {
+                task,
+                shutdown: Some(shutdown_tx),
+            }
+        }
+
+        async fn stop(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            let _ = self.task.await;
+        }
+    }
+
+    /// Records every host milestone so the tests can synchronize on
+    /// registration and relay recovery without reading the connection
+    /// code from the printed output.
+    #[derive(Clone, Default)]
+    struct SharedSessionProgress {
+        stages: Arc<Mutex<Vec<HostStage>>>,
+    }
+
+    impl OperationProgress<HostStage> for SharedSessionProgress {
+        fn update(&mut self, stage: HostStage) {
+            self.stages.lock().unwrap().push(stage);
+        }
+
+        fn clear(&mut self) {}
+    }
+
+    impl SharedSessionProgress {
+        async fn wait_for(&self, stage: HostStage) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if self.stages.lock().unwrap().contains(&stage) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the host session never reached {stage:?}; stages: {:?}",
+                    *self.stages.lock().unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        async fn wait_for_count(&self, stage: HostStage, count: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let seen = self
+                    .stages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|seen| **seen == stage)
+                    .count();
+                if seen >= count {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the host session never reached {stage:?} {count} times; stages: {:?}",
+                    *self.stages.lock().unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    /// The scripted controller: a real yonder endpoint with DCUtR
+    /// disabled, so the host's direct-upgrade attempt fails fast and the
+    /// pre-auth quiescence settles on the unique relayed connection
+    /// (design 0.1.1). It reaches the host through the relay circuit,
+    /// resolves the locator over the wire, and drives the OPAQUE client
+    /// side with `OpaquePake`.
+    struct ScriptedController {
+        node: EndpointNode,
+        streams: Libp2pApplicationStreams,
+        relay: EndpointRelayAddress,
+        relay_peer: PeerId,
+        pake: OpaquePake,
+    }
+
+    impl ScriptedController {
+        async fn connect(relay_address: &EndpointRelayAddress) -> Self {
+            let relay_peer = relay_address.relay().get();
+            let mut node = EndpointNode::with_direct_upgrade(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+                DirectUpgradePolicy::Disabled,
+            )
+            .unwrap();
+            node.listen_on_defaults().unwrap();
+            let streams = node.streams().clone();
+            let _ = node.dial_relay(relay_address);
+            // The resolve substream and the circuit dial both need the
+            // relay connection to exist first.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match tokio::time::timeout_at(deadline, node.next_event()).await {
+                    Ok(SwarmEvent::ConnectionEstablished { peer_id, .. })
+                        if peer_id == relay_peer =>
+                    {
+                        break;
+                    }
+                    Ok(SwarmEvent::OutgoingConnectionError { .. }) => {
+                        // The relay may still be starting under parallel
+                        // test load; re-dial and keep waiting for the
+                        // deadline instead of failing the harness.
+                        let _ = node.dial_relay(relay_address);
+                    }
+                    Ok(_) => {}
+                    Err(_) => panic!("the controller never reached the relay"),
+                }
+            }
+            Self {
+                node,
+                streams,
+                relay: relay_address.clone(),
+                relay_peer,
+                pake: OpaquePake,
+            }
+        }
+
+        /// Resolves the locator through the in-process relay: the
+        /// controller-side lookup of the 0.1.1 session flow, driven over
+        /// the real resolve substream protocol.
+        async fn resolve_locator(&mut self, locator: Locator) -> PeerId {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let open = self.streams.open(self.relay_peer, RESOLVE_PROTOCOL);
+                tokio::pin!(open);
+                let stream = match tokio::time::timeout_at(deadline, &mut open).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(_)) => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    Err(_) => panic!("locator resolve substream never opened"),
+                };
+                let mut stream = stream.into_tokio();
+                stream
+                    .write_all(&ResolveRequest::new(locator).encode())
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.unwrap();
+                match ResolveResponse::decode(&response).unwrap() {
+                    ResolveResponse::Resolved(peer) => {
+                        return PeerId::from_bytes(peer.as_bytes()).unwrap();
+                    }
+                    ResolveResponse::Unavailable => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    ResolveResponse::Retry(after) => {
+                        tokio::time::sleep(Duration::from_millis(u64::from(after.millis()))).await;
+                    }
+                }
+            }
+        }
+
+        /// Establishes the relayed connection to the host's reservation.
+        /// The dial fails while the host has no live reservation (relay
+        /// restart recovery), so the attempt is retried with backoff.
+        async fn reach_host(&mut self, host: PeerId) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let _ = self.node.dial(self.relay.circuit_to(host));
+                if let Some(()) =
+                    tokio::time::timeout_at(deadline, self.wait_for_relayed_connection(host))
+                        .await
+                        .ok()
+                        .flatten()
+                {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the controller could not reach the host through the relay"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        async fn wait_for_relayed_connection(&mut self, host: PeerId) -> Option<()> {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match tokio::time::timeout_at(deadline, self.node.next_event()).await {
+                    Ok(SwarmEvent::ConnectionEstablished {
+                        peer_id, endpoint, ..
+                    }) if peer_id == host && endpoint.is_relayed() => {
+                        return Some(());
+                    }
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        async fn open(&mut self, peer: PeerId, protocol: &'static str) -> ApplicationStream {
+            let open = self.streams.open(peer, protocol);
+            tokio::pin!(open);
+            loop {
+                tokio::select! {
+                    result = &mut open => {
+                        return result.expect("the host must accept the substream");
+                    }
+                    _ = self.node.next_event() => {}
+                }
+            }
+        }
+
+        /// Sends the OPAQUE client hello and reads the host's response.
+        /// Streams that die before any answer (the host was still settling
+        /// the pre-auth quiescence and drops early auth starts) are
+        /// retried on a fresh substream.
+        async fn auth_start(
+            &mut self,
+            host: PeerId,
+            code: &ConnectionCode,
+        ) -> Result<AuthStart, ()> {
+            let target = peer_id_bytes(host).map_err(|_| ())?;
+            let nonce = [0_u8; 32];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+            loop {
+                let stream = self.open(host, AUTH_PROTOCOL).await;
+                let mut stream = stream.into_tokio();
+                let (state, ke1) = self
+                    .pake
+                    .client_start(&target, code.secret())
+                    .map_err(|_| ())?;
+                let hello = AuthClientHello::new(nonce, ke1).encode();
+                match stream.write_all(&hello).await {
+                    Ok(()) => {}
+                    Err(_) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                }
+                stream.flush().await.map_err(|_| ())?;
+                let mut tag = [0_u8; 1];
+                match tokio::time::timeout_at(deadline, stream.read_exact(&mut tag)).await {
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                }
+                let response = match tag[0] {
+                    0x01 => {
+                        let mut rest = [0_u8; PROCEED_LEN - 1];
+                        tokio::time::timeout_at(deadline, stream.read_exact(&mut rest))
+                            .await
+                            .map_err(|_| ())?
+                            .map_err(|_| ())?;
+                        let mut frame = [0_u8; PROCEED_LEN];
+                        frame[0] = tag[0];
+                        frame[1..].copy_from_slice(&rest);
+                        AuthServerResponse::decode(&frame).map_err(|_| ())?
+                    }
+                    0x02 => {
+                        let mut rest = [0_u8; RETRY_LEN - 1];
+                        tokio::time::timeout_at(deadline, stream.read_exact(&mut rest))
+                            .await
+                            .map_err(|_| ())?
+                            .map_err(|_| ())?;
+                        let mut frame = [0_u8; RETRY_LEN];
+                        frame[0] = tag[0];
+                        frame[1..].copy_from_slice(&rest);
+                        AuthServerResponse::decode(&frame).map_err(|_| ())?
+                    }
+                    _other => return Err(()),
+                };
+                return Ok(AuthStart {
+                    state,
+                    stream: Box::new(stream),
+                    nonce,
+                    response,
+                    host,
+                });
+            }
+        }
+
+        /// Completes the started exchange: a matching secret confirms the
+        /// session key and reads the `Authenticated` acknowledgement; a
+        /// mismatched secret cannot confirm, so a bogus KE3 makes the host
+        /// reject the attempt cleanly (design 0.1.1).
+        async fn finish_auth(
+            &mut self,
+            started: AuthStart,
+            code: &ConnectionCode,
+        ) -> Result<AuthServerResponse, ()> {
+            let AuthStart {
+                state,
+                mut stream,
+                nonce,
+                response,
+                host,
+            } = started;
+            if response.proceed_parts().is_none() {
+                return Ok(response);
+            }
+            let (target_nonce, ke2) = response
+                .proceed_parts()
+                .expect("the proceed parts were checked above");
+            let controller = peer_id_bytes(self.node.peer_id()).map_err(|_| ())?;
+            let target = peer_id_bytes(host).map_err(|_| ())?;
+            let context =
+                PakeContext::new(code.locator(), &controller, &target, &nonce, target_nonce);
+            match self.pake.client_finish(state, ke2, context.as_bytes()) {
+                Ok((ke3, session_key)) => {
+                    stream.write_all(&ke3).await.map_err(|_| ())?;
+                    stream.flush().await.map_err(|_| ())?;
+                    let mut acknowledgement = [0_u8; 1];
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        stream.read_exact(&mut acknowledgement),
+                    )
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?;
+                    if acknowledgement != Authenticated::ENCODED {
+                        return Err(());
+                    }
+                    drop(session_key);
+                }
+                Err(_) => {
+                    stream.write_all(&[0xAB; KE3_LEN]).await.map_err(|_| ())?;
+                    stream.flush().await.map_err(|_| ())?;
+                }
+            }
+            Ok(response)
+        }
+
+        /// One complete OPAQUE client exchange: start, response, and the
+        /// KE3 that either confirms the session key or provokes a clean
+        /// rejection. The response tells the caller which path ran.
+        async fn auth_exchange(
+            &mut self,
+            host: PeerId,
+            code: &ConnectionCode,
+        ) -> Result<AuthServerResponse, ()> {
+            let started = self.auth_start(host, code).await?;
+            self.finish_auth(started, code).await
+        }
+    }
+
+    /// The in-flight part of one OPAQUE client exchange.
+    struct AuthStart {
+        state: OpaqueClientState,
+        stream: Box<dyn FileSubstreamIo>,
+        nonce: [u8; 32],
+        response: AuthServerResponse,
+        host: PeerId,
+    }
+
+    /// A backend whose session records controller input on a duplex and
+    /// emits one scripted output block before waiting for the shared exit
+    /// flag, so a real bridge can drive a full terminal lifecycle.
+    struct ScriptedBackend {
+        output: Vec<u8>,
+        exit_flag: Arc<AtomicBool>,
+        exit_code: u32,
+        input_write: Mutex<Option<DuplexStream>>,
+    }
+
+    impl TerminalBackend for ScriptedBackend {
+        type Session = ScriptedSession;
+
+        async fn open(&self, _hello: TerminalHello) -> Result<Self::Session, TerminalError> {
+            Ok(ScriptedSession {
+                output: self.output.clone(),
+                exit_flag: Arc::clone(&self.exit_flag),
+                exit_code: self.exit_code,
+                input_write: self.input_write.lock().unwrap().take(),
+                resized: None,
+                exited: false,
+            })
+        }
+    }
+
+    struct ScriptedSession {
+        output: Vec<u8>,
+        exit_flag: Arc<AtomicBool>,
+        exit_code: u32,
+        input_write: Option<DuplexStream>,
+        resized: Option<TerminalSize>,
+        exited: bool,
+    }
+
+    impl TerminalSession for ScriptedSession {
+        type Input = DuplexInput;
+
+        fn take_input(&mut self) -> Result<Self::Input, TerminalError> {
+            Ok(DuplexInput(
+                self.input_write
+                    .take()
+                    .expect("the scripted session input is taken once"),
+            ))
+        }
+
+        async fn resize(&mut self, size: TerminalSize) -> Result<(), TerminalError> {
+            self.resized = Some(size);
+            Ok(())
+        }
+
+        async fn next(&mut self) -> Result<PtyEvent, TerminalError> {
+            if !self.output.is_empty() {
+                let output = std::mem::take(&mut self.output);
+                let mut chunk = TerminalChunk::new();
+                chunk.writable()[..output.len()].copy_from_slice(&output);
+                chunk.set_len(output.len()).unwrap();
+                return Ok(PtyEvent::output(chunk));
+            }
+            // The shell may only exit after the scripted resize has been
+            // applied, so the bridge processes the resize before the
+            // completion handshake regardless of select ordering.
+            if self.resized.is_some() && self.exit_flag.load(Ordering::Relaxed) && !self.exited {
+                self.exited = true;
+                return Ok(PtyEvent::exited(self.exit_code));
+            }
+            std::future::pending().await
+        }
+
+        async fn shutdown(self) -> Result<(), TerminalError> {
+            Ok(())
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The session-level scenarios. The host runs the real
+    // `run_host_session` state machine; the scripted controller proves
+    // the session's behaviour over the wire and then the host task is
+    // aborted, which is the in-process equivalent of a forced exit.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_host_session_rejects_an_unknown_secret_and_keeps_serving() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        // The host session future is not Send: the production bridge owns
+        // `Box<dyn FileSubstreamIo>` and `Pin<Box<dyn Future>>` trait
+        // objects, so the session runs on a LocalSet instead of a spawned
+        // Send task (the relay service stays a regular Send spawn).
+        let local = tokio::task::LocalSet::new();
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            local.run_until(async {
+                let port = available_tcp_port();
+                let relay_identity = Keypair::generate_ed25519();
+                let relay_address: EndpointRelayAddress = format!(
+                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                    relay_identity.public().to_peer_id()
+                )
+                .parse()
+                .unwrap();
+                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                let relay = InProcessRelay::start(relay_identity, port);
+                wait_for_tcp_listener(port).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                let host_identity = Keypair::generate_ed25519();
+                let host_peer = host_identity.public().to_peer_id();
+                let progress = SharedSessionProgress::default();
+                let mut observed = progress.clone();
+                let host = tokio::task::spawn_local(async move {
+                    run_host_session(
+                        HostConfig::new(host_identity, relays, WssTransportConfig::client(None)),
+                        TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
+                        &mut observed,
+                    )
+                    .await
+                });
+                progress.wait_for(HostStage::WaitingForController).await;
+
+                let wrong_code = ConnectionCode::new(
+                    Locator::new(1).unwrap(),
+                    PakeSecret::from_u64(0x1234).unwrap(),
+                );
+                let controller = tokio::task::spawn_local(async move {
+                    let mut controller = ScriptedController::connect(&relay_address).await;
+                    controller.reach_host(host_peer).await;
+                    for attempt in 1..=2 {
+                        let response = loop {
+                            let response = controller
+                                .auth_exchange(host_peer, &wrong_code)
+                                .await
+                                .expect("the host must answer the authentication start");
+                            if response.proceed_parts().is_some() {
+                                break response;
+                            }
+                            // The host answers with a transient Retry while it
+                            // drains the previous failed exchange; honor a
+                            // bounded wait and retry, mirroring the production
+                            // controller's retry semantics.
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        };
+                        assert!(
+                            response.proceed_parts().is_some(),
+                            "attempt {attempt} must proceed before the bogus KE3 is rejected"
+                        );
+                    }
+                });
+
+                controller.await.unwrap();
+                assert!(
+                    !host.is_finished(),
+                    "the host session must keep waiting after rejected authentication"
+                );
+                host.abort();
+                relay.stop().await;
+            }),
+        )
+        .await
+        .expect("the in-process rejection scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_host_session_answers_retry_after_the_auth_burst() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let local = tokio::task::LocalSet::new();
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            local.run_until(async {
+                let port = available_tcp_port();
+                let relay_identity = Keypair::generate_ed25519();
+                let relay_address: EndpointRelayAddress = format!(
+                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                    relay_identity.public().to_peer_id()
+                )
+                .parse()
+                .unwrap();
+                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                let relay = InProcessRelay::start(relay_identity, port);
+                wait_for_tcp_listener(port).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                let host_identity = Keypair::generate_ed25519();
+                let host_peer = host_identity.public().to_peer_id();
+                let progress = SharedSessionProgress::default();
+                let mut observed = progress.clone();
+                let host = tokio::task::spawn_local(async move {
+                    run_host_session(
+                        HostConfig::new(host_identity, relays, WssTransportConfig::client(None)),
+                        TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
+                        &mut observed,
+                    )
+                    .await
+                });
+                progress.wait_for(HostStage::WaitingForController).await;
+
+                // The authentication-start limit is 1/s with a burst of 4
+                // (design 0.1.1). One real OPAQUE exchange first proves the
+                // quiescence settled; then fast starts with an invalid KE1
+                // (rejected without the OPAQUE KSF on either side) drain the
+                // burst, and the first start beyond it is answered with Retry.
+                let wrong_code = ConnectionCode::new(
+                    Locator::new(1).unwrap(),
+                    PakeSecret::from_u64(0x5678).unwrap(),
+                );
+                let controller = tokio::task::spawn_local(async move {
+                    let mut controller = ScriptedController::connect(&relay_address).await;
+                    controller.reach_host(host_peer).await;
+                    let response = controller
+                        .auth_exchange(host_peer, &wrong_code)
+                        .await
+                        .expect("the host must answer the authentication start");
+                    assert!(
+                        response.proceed_parts().is_some(),
+                        "the first attempt must proceed before the bogus KE3 is rejected"
+                    );
+
+                    let hello = AuthClientHello::new([0x11; 32], [0xAB; 96]).encode();
+                    let mut retry = None;
+                    for _ in 0..8 {
+                        let mut stream =
+                            controller.open(host_peer, AUTH_PROTOCOL).await.into_tokio();
+                        stream.write_all(&hello).await.unwrap();
+                        stream.flush().await.unwrap();
+                        let mut tag = [0_u8; 1];
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            stream.read_exact(&mut tag),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) if tag[0] == 0x02 => {
+                                let mut rest = [0_u8; RETRY_LEN - 1];
+                                stream.read_exact(&mut rest).await.unwrap();
+                                let mut frame = [0_u8; RETRY_LEN];
+                                frame[0] = tag[0];
+                                frame[1..].copy_from_slice(&rest);
+                                retry = Some(AuthServerResponse::decode(&frame).unwrap());
+                                break;
+                            }
+                            Ok(Ok(_)) if tag[0] == 0x01 => {
+                                let mut rest = [0_u8; PROCEED_LEN - 1];
+                                stream.read_exact(&mut rest).await.unwrap();
+                                stream.write_all(&[0xAB; KE3_LEN]).await.unwrap();
+                                stream.flush().await.unwrap();
+                            }
+                            _ => {
+                                // The invalid KE1 was rejected (or the start
+                                // was dropped mid-quiescence): try again.
+                            }
+                        }
+                    }
+                    let response =
+                        retry.expect("the burst must be exhausted within the fast-start loop");
+                    assert!(
+                        response.retry_after().is_some(),
+                        "a start beyond the burst must be answered with Retry"
+                    );
+                });
+
+                controller.await.unwrap();
+                host.abort();
+                relay.stop().await;
+            }),
+        )
+        .await
+        .expect("the in-process rate-limit scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_host_session_answers_an_extra_auth_stream_with_retry() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let local = tokio::task::LocalSet::new();
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            local.run_until(async {
+                let port = available_tcp_port();
+                let relay_identity = Keypair::generate_ed25519();
+                let relay_address: EndpointRelayAddress = format!(
+                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                    relay_identity.public().to_peer_id()
+                )
+                .parse()
+                .unwrap();
+                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                let relay = InProcessRelay::start(relay_identity, port);
+                wait_for_tcp_listener(port).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                let host_identity = Keypair::generate_ed25519();
+                let host_peer = host_identity.public().to_peer_id();
+                let progress = SharedSessionProgress::default();
+                let mut observed = progress.clone();
+                let host = tokio::task::spawn_local(async move {
+                    run_host_session(
+                        HostConfig::new(host_identity, relays, WssTransportConfig::client(None)),
+                        TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
+                        &mut observed,
+                    )
+                    .await
+                });
+                progress.wait_for(HostStage::WaitingForController).await;
+
+                // While one auth exchange is in flight, a second auth stream
+                // from the same controller must be answered with Retry and
+                // closed without disturbing the active exchange (design 0.1.1
+                // extra-auth rejection).
+                let wrong_code = ConnectionCode::new(
+                    Locator::new(1).unwrap(),
+                    PakeSecret::from_u64(0x9ABC).unwrap(),
+                );
+                let controller = tokio::task::spawn_local(async move {
+                    let mut controller = ScriptedController::connect(&relay_address).await;
+                    controller.reach_host(host_peer).await;
+                    let first = controller
+                        .auth_start(host_peer, &wrong_code)
+                        .await
+                        .expect("the first auth stream must be answered");
+                    assert!(
+                        first.response.proceed_parts().is_some(),
+                        "the first stream must proceed"
+                    );
+                    let extra = controller
+                        .auth_start(host_peer, &wrong_code)
+                        .await
+                        .expect("the extra auth stream must be answered");
+                    assert!(
+                        extra.response.retry_after().is_some(),
+                        "the extra auth stream must be answered with Retry"
+                    );
+                    controller
+                        .finish_auth(first, &wrong_code)
+                        .await
+                        .expect("the active exchange must finish after the extra rejection");
+                });
+
+                controller.await.unwrap();
+                host.abort();
+                relay.stop().await;
+            }),
+        )
+        .await
+        .expect("the in-process extra-auth scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_host_session_recovers_when_the_relay_restarts() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let local = tokio::task::LocalSet::new();
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            local.run_until(async {
+                let port = available_tcp_port();
+                let relay_identity = Keypair::generate_ed25519();
+                let relay_address: EndpointRelayAddress = format!(
+                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                    relay_identity.public().to_peer_id()
+                )
+                .parse()
+                .unwrap();
+                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                let relay = InProcessRelay::start(relay_identity.clone(), port);
+                wait_for_tcp_listener(port).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                let host_identity = Keypair::generate_ed25519();
+                let host_peer = host_identity.public().to_peer_id();
+                let progress = SharedSessionProgress::default();
+                let mut observed = progress.clone();
+                let host = tokio::task::spawn_local(async move {
+                    run_host_session(
+                        HostConfig::new(host_identity, relays, WssTransportConfig::client(None)),
+                        TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
+                        &mut observed,
+                    )
+                    .await
+                });
+                progress.wait_for(HostStage::WaitingForController).await;
+
+                // The relay dies mid-session: the host must notice the lost
+                // lease, reconnect to a restarted relay on the same identity
+                // and port, reclaim the locator, and keep waiting for a
+                // controller (design 0.1.1 relay recovery).
+                relay.stop().await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let relay = InProcessRelay::start(relay_identity, port);
+                wait_for_tcp_listener(port).await;
+                progress.wait_for(HostStage::ReconnectingRelay).await;
+                progress
+                    .wait_for_count(HostStage::WaitingForController, 3)
+                    .await;
+
+                let wrong_code = ConnectionCode::new(
+                    Locator::new(1).unwrap(),
+                    PakeSecret::from_u64(0xDEF0).unwrap(),
+                );
+                let controller = tokio::task::spawn_local(async move {
+                    let mut controller = ScriptedController::connect(&relay_address).await;
+                    controller.reach_host(host_peer).await;
+                    let response = controller
+                        .auth_exchange(host_peer, &wrong_code)
+                        .await
+                        .expect("the recovered session must answer authentication");
+                    assert!(
+                        response.proceed_parts().is_some(),
+                        "the recovered session must still serve the exchange"
+                    );
+                });
+
+                controller.await.unwrap();
+                host.abort();
+                relay.stop().await;
+            }),
+        )
+        .await
+        .expect("the in-process relay recovery scenario must finish");
+    }
+
+    // ------------------------------------------------------------------
+    // The authenticated happy path. The code is generated inside the
+    // session and only ever printed, so this test drives the same
+    // private session functions in the same order with a code the test
+    // itself created: resolve -> direct connection -> OPAQUE success ->
+    // terminal handshake -> data flow -> file transfer (0.1.3) ->
+    // TerminalComplete -> the host-side exit code.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_controller_completes_an_authenticated_terminal_session() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let local = tokio::task::LocalSet::new();
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            local.run_until(async {
+                const EXIT_CODE: u32 = 7;
+                const OUTPUT: &[u8] = b"scripted-host-output";
+                const INPUT: &[u8] = b"scripted-controller-input";
+                let port = available_tcp_port();
+                let relay_identity = Keypair::generate_ed25519();
+                let relay_address: EndpointRelayAddress = format!(
+                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                    relay_identity.public().to_peer_id()
+                )
+                .parse()
+                .unwrap();
+                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                let relay = InProcessRelay::start(relay_identity, port);
+                wait_for_tcp_listener(port).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                let upload_directory = tempdir().unwrap();
+                let upload_source = upload_directory.path().join("upload-source.bin");
+                write_pattern_file(&upload_source, 128 * 1024);
+                let upload_bytes = fs::read(&upload_source).unwrap();
+                let destination = upload_directory.path().join("upload-final.bin");
+                let destination = destination.to_str().unwrap().to_owned();
+                let download_source = upload_directory.path().join("download-source.bin");
+                write_pattern_file(&download_source, 64 * 1024);
+                let download_bytes = fs::read(&download_source).unwrap();
+                let download_source = download_source.to_str().unwrap().to_owned();
+
+                let host_identity = Keypair::generate_ed25519();
+                let host_peer = host_identity.public().to_peer_id();
+                let (input_write, input_read) = tokio::io::duplex(64 * 1024);
+                let exit_flag = Arc::new(AtomicBool::new(false));
+                let input_read = Arc::new(Mutex::new(Some(input_read)));
+                let backend = ScriptedBackend {
+                    output: OUTPUT.to_vec(),
+                    exit_flag: Arc::clone(&exit_flag),
+                    exit_code: EXIT_CODE,
+                    input_write: Mutex::new(Some(input_write)),
+                };
+
+                let (mut driver, mut streams) =
+                    build_endpoint(host_identity, WssTransportConfig::client(None)).unwrap();
+                let relay_connection = connect_relay_with_retry(&mut driver, &relays).await;
+                let listener = driver.reserve(relay_connection.address()).unwrap();
+                let lease = wait_for_reservation(&mut driver, relay_connection, listener)
+                    .await
+                    .unwrap();
+                let locator = allocate_locator(&mut driver, &mut streams, lease.relay())
+                    .await
+                    .unwrap();
+                let target = peer_id_bytes(driver.peer_id()).unwrap();
+                let mut pake = OpaquePake;
+                let (advertised, code) = create_advertisement(locator, &target, &mut pake).unwrap();
+
+                let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+                let mut incoming = InboundProtocols {
+                    auth: &mut auth_incoming,
+                    data: &mut data_incoming,
+                    control: &mut control_incoming,
+                    file: &mut file_incoming,
+                };
+
+                let controller = tokio::task::spawn_local(async move {
+                    let mut controller = ScriptedController::connect(&relay_address).await;
+                    let resolved = controller.resolve_locator(locator).await;
+                    assert_eq!(resolved, host_peer, "the locator must resolve to the host");
+                    controller.reach_host(host_peer).await;
+                    let response = controller
+                        .auth_exchange(host_peer, &code)
+                        .await
+                        .expect("the real code must authenticate");
+                    assert!(
+                        response.proceed_parts().is_some(),
+                        "the authentication must proceed and confirm"
+                    );
+
+                    let mut data = controller
+                        .open(host_peer, TERMINAL_DATA_PROTOCOL)
+                        .await
+                        .into_tokio();
+                    let mut control = controller
+                        .open(host_peer, TERMINAL_CONTROL_PROTOCOL)
+                        .await
+                        .into_tokio();
+                    let hello = TerminalHello::new(
+                        TerminalSize::new(80, 24).unwrap(),
+                        TerminalValue::new("xterm").unwrap(),
+                        TerminalValue::new("truecolor").unwrap(),
+                    );
+                    control.write_all(hello.encode().as_slice()).await.unwrap();
+                    control.flush().await.unwrap();
+                    data.write_all(INPUT).await.unwrap();
+                    data.flush().await.unwrap();
+                    let mut ready = [0_u8; 1];
+                    data.read_exact(&mut ready).await.unwrap();
+                    assert_eq!(
+                        ready,
+                        TerminalReady::ENCODED,
+                        "the host must flush TerminalReady"
+                    );
+
+                    // File transfer over the real session connection (0.1.3
+                    // file-transfer semantics on the bridge substream queue).
+                    let mut file = controller
+                        .open(host_peer, FILE_TRANSFER_PROTOCOL)
+                        .await
+                        .into_tokio();
+                    send_wire_frame(
+                        &mut file,
+                        &FileTransferMessage::UploadOpen {
+                            destination: &destination,
+                            file_name: "upload-source.bin",
+                            declared_size: upload_bytes.len() as u64,
+                        },
+                    )
+                    .await;
+                    expect_wire_control(&mut file, &FileTransferMessage::Ready).await;
+                    for chunk in upload_bytes.chunks(65536) {
+                        send_wire_data(&mut file, chunk).await;
+                    }
+                    send_wire_frame(
+                        &mut file,
+                        &FileTransferMessage::Finish {
+                            actual_size: upload_bytes.len() as u64,
+                            digest: sha256_bytes(&upload_bytes),
+                        },
+                    )
+                    .await;
+                    expect_wire_control(&mut file, &FileTransferMessage::Committed).await;
+                    drop(file);
+
+                    let mut file = controller
+                        .open(host_peer, FILE_TRANSFER_PROTOCOL)
+                        .await
+                        .into_tokio();
+                    send_wire_frame(
+                        &mut file,
+                        &FileTransferMessage::DownloadOpen {
+                            source: &download_source,
+                        },
+                    )
+                    .await;
+                    let offer = read_wire_frame(&mut file).await;
+                    match FileTransferMessage::decode_frame(&offer).unwrap() {
+                        FileTransferMessage::DownloadOffer { declared_size, .. } => {
+                            assert_eq!(declared_size, download_bytes.len() as u64)
+                        }
+                        other => panic!("expected DownloadOffer, got {other:?}"),
+                    }
+                    send_wire_frame(&mut file, &FileTransferMessage::Ready).await;
+                    let received =
+                        receive_download_bytes(&mut file, download_bytes.len() as u64).await;
+                    send_wire_frame(&mut file, &FileTransferMessage::Committed).await;
+                    drop(file);
+                    assert_eq!(received, download_bytes, "the downloaded bytes must match");
+
+                    // The pty output, one resize, and the controller-completion
+                    // handshake that lets the host return the exit code.
+                    let mut output = [0_u8; OUTPUT.len()];
+                    data.read_exact(&mut output).await.unwrap();
+                    assert_eq!(&output, OUTPUT);
+                    let resize = TerminalSize::new(100, 30).unwrap();
+                    control
+                        .write_all(&TerminalResize::new(resize).encode())
+                        .await
+                        .unwrap();
+                    control.flush().await.unwrap();
+                    exit_flag.store(true, Ordering::Relaxed);
+                    let mut exit = [0_u8; 5];
+                    control.read_exact(&mut exit).await.unwrap();
+                    assert_eq!(TerminalExit::decode(&exit).unwrap().code(), EXIT_CODE);
+                    control.write_all(&TerminalComplete::ENCODED).await.unwrap();
+                    control.flush().await.unwrap();
+                    let mut trailing = [0_u8; 1];
+                    assert_eq!(
+                        control.read(&mut trailing).await.unwrap(),
+                        0,
+                        "the host must shut down the control half after the completion"
+                    );
+                    assert_eq!(
+                        data.read(&mut trailing).await.unwrap(),
+                        0,
+                        "the host must shut down the data half after the shell exit"
+                    );
+                });
+
+                let (controller_peer, mut auth_stream) =
+                    wait_for_auth(&mut driver, &mut incoming, &lease)
+                        .await
+                        .expect("the auth wait must not fail")
+                        .expect("an authenticated controller must arrive");
+                let binding =
+                    wait_for_controller_quiescence(&mut driver, &mut incoming, controller_peer)
+                        .await
+                        .expect("the controller direct upgrade must settle");
+                let hello = drive_session_inputs(
+                    &mut driver,
+                    binding,
+                    &mut incoming,
+                    read_auth_hello(&mut auth_stream),
+                )
+                .await
+                .expect("the auth hello read must not fail")
+                .expect("the controller must send a valid hello");
+                drive_session_inputs(
+                    &mut driver,
+                    binding,
+                    &mut incoming,
+                    authenticate(
+                        &mut auth_stream,
+                        hello,
+                        advertised.locator,
+                        &target,
+                        controller_peer,
+                        &advertised.registration,
+                        &mut pake,
+                    ),
+                )
+                .await
+                .expect("the authentication exchange must not fail")
+                .expect("the real code must authenticate");
+                let (data, control) = acknowledge_and_wait_for_terminal_streams(
+                    &mut driver,
+                    binding,
+                    &mut incoming,
+                    controller_peer,
+                    auth_stream,
+                )
+                .await
+                .expect("the controller must open both terminal streams");
+                let (mut pty, base, data, control) = drive_session_inputs(
+                    &mut driver,
+                    binding,
+                    &mut incoming,
+                    start_terminal(&backend, data, control),
+                )
+                .await
+                .expect("the terminal start must not fail")
+                .expect("the controller must send a valid terminal hello");
+                let exit_code = bridge_terminal(
+                    &mut driver,
+                    binding,
+                    &mut incoming,
+                    &mut pty,
+                    data,
+                    control,
+                    base.as_ref(),
+                )
+                .await
+                .expect("the terminal bridge must complete");
+                assert_eq!(
+                    exit_code, EXIT_CODE,
+                    "the shell exit code must reach the host"
+                );
+
+                controller
+                    .await
+                    .expect("the scripted controller must finish");
+                assert_eq!(
+                    pty.resized,
+                    Some(TerminalSize::new(100, 30).unwrap()),
+                    "the resize must reach the session before the completion"
+                );
+
+                let mut recorded = Vec::new();
+                let mut captured_input = input_read
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("the input capture exists");
+                captured_input.read_to_end(&mut recorded).await.unwrap();
+                assert_eq!(
+                    recorded, INPUT,
+                    "the controller input must reach the session"
+                );
+
+                relay.stop().await;
+            }),
+        )
+        .await
+        .expect("the in-process happy path must finish");
     }
 }
 
