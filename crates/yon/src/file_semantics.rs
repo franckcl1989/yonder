@@ -1658,12 +1658,9 @@ mod tests {
     fn peer_file_names_are_validated_on_the_receiving_platform() {
         let directory = tempdir().unwrap();
         let base = test_base(&directory);
-        let mut rejected = vec![
+        for name in [
             "", ".", "..", "a/b", "a\x00b", "a\x1fb", "a\u{7f}b", "a\u{9f}b",
-        ];
-        #[cfg(windows)]
-        rejected.push("a\\b");
-        for name in rejected {
+        ] {
             assert!(
                 matches!(
                     resolve_destination(&base, None, Some(name)),
@@ -1672,17 +1669,25 @@ mod tests {
                 "{name:?}"
             );
         }
+        #[cfg(windows)]
+        assert!(matches!(
+            resolve_destination(&base, None, Some("a\\b")),
+            Err(FileSemanticsError::InvalidFileName)
+        ));
         let long = "n".repeat(1025);
         assert!(matches!(
             resolve_destination(&base, None, Some(&long)),
             Err(FileSemanticsError::InvalidFileName)
         ));
-        let mut accepted = vec!["a.txt", "name", "with space", "üñï", "a.b.c", "com10.txt"];
-        #[cfg(not(windows))]
-        accepted.push("a\\b");
-        for name in accepted {
+        for name in ["a.txt", "name", "with space", "üñï", "a.b.c", "com10.txt"] {
             let plan = resolve_destination(&base, None, Some(name)).unwrap();
             assert_eq!(plan.final_path(), directory.path().join(name), "{name:?}");
+        }
+        #[cfg(not(windows))]
+        {
+            // Backslash is an ordinary name character on Unix.
+            let plan = resolve_destination(&base, None, Some("a\\b")).unwrap();
+            assert_eq!(plan.final_path(), directory.path().join("a\\b"), "a\\b");
         }
         #[cfg(windows)]
         {
@@ -1731,10 +1736,7 @@ mod tests {
             resolve_destination(&base, Some("out"), None),
             Err(FileSemanticsError::InvalidFileName)
         ));
-        let mut invalid_names = vec![".", "..", "a/b"];
-        #[cfg(windows)]
-        invalid_names.push("a\\b");
-        for name in invalid_names {
+        for name in [".", "..", "a/b"] {
             assert!(
                 matches!(
                     resolve_destination(&base, Some("out"), Some(name)),
@@ -1743,6 +1745,11 @@ mod tests {
                 "{name:?}"
             );
         }
+        #[cfg(windows)]
+        assert!(matches!(
+            resolve_destination(&base, Some("out"), Some("a\\b")),
+            Err(FileSemanticsError::InvalidFileName)
+        ));
         #[cfg(not(windows))]
         {
             // Backslash is an ordinary name character on Unix; the
