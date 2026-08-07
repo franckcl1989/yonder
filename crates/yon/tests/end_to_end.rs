@@ -2309,14 +2309,30 @@ fn wait_for_bytes(
     expected: &[u8],
     timeout: Duration,
 ) -> Result<(), std::io::Error> {
+    wait_for_bytes_from(chunks, output, &mut 0, expected, timeout)
+}
+
+/// Waits for `expected` to appear in the bytes of `output` that were not
+/// yet consumed (from `search_from` on). On success the cursor advances to
+/// the end of the accumulated output, so a marker that already appeared
+/// earlier in the session cannot be matched again by a later wait. The
+/// cursor is untouched on timeout, so a retry re-searches the same region.
+fn wait_for_bytes_from(
+    chunks: &mpsc::Receiver<Vec<u8>>,
+    output: &mut Vec<u8>,
+    search_from: &mut usize,
+    expected: &[u8],
+    timeout: Duration,
+) -> Result<(), std::io::Error> {
     let deadline = Instant::now() + timeout;
-    while !contains_bytes(output, expected) {
+    while !contains_bytes(&output[*search_from..], expected) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match chunks.recv_timeout(remaining) {
             Ok(chunk) => output.extend_from_slice(&chunk),
             Err(error) => {
                 output.extend(chunks.try_iter().flatten());
-                if contains_bytes(output, expected) {
+                if contains_bytes(&output[*search_from..], expected) {
+                    *search_from = output.len();
                     return Ok(());
                 }
                 const DIAGNOSTIC_TAIL_LIMIT: usize = 4 * 1024;
@@ -2329,6 +2345,7 @@ fn wait_for_bytes(
             }
         }
     }
+    *search_from = output.len();
     Ok(())
 }
 
@@ -3254,6 +3271,11 @@ struct PtyTransferSession {
     output_rx: mpsc::Receiver<Vec<u8>>,
     output_reader: Option<JoinHandle<Result<(), std::io::Error>>>,
     output: Vec<u8>,
+    /// The consumed prefix of `output`: marker waits only search bytes
+    /// from this position on, so a marker that already appeared earlier in
+    /// the session (for example the prompt label of a previous transfer)
+    /// cannot be matched again by a later wait.
+    search_from: usize,
 }
 
 #[cfg(unix)]
@@ -3265,7 +3287,13 @@ impl PtyTransferSession {
     }
 
     fn wait_for(&mut self, marker: &[u8], timeout: Duration) -> Result<(), std::io::Error> {
-        wait_for_bytes(&self.output_rx, &mut self.output, marker, timeout)
+        wait_for_bytes_from(
+            &self.output_rx,
+            &mut self.output,
+            &mut self.search_from,
+            marker,
+            timeout,
+        )
     }
 
     /// Writes one scripted input segment and blocks until the expected
@@ -3396,6 +3424,7 @@ fn start_controller_pty(
         output_rx,
         output_reader: Some(output_reader),
         output: Vec::new(),
+        search_from: 0,
     })
 }
 
