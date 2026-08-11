@@ -292,7 +292,19 @@ impl ReplayMachine {
         }
     }
 
-    fn run(&mut self, path: &Path, mut output: Option<&mut dyn Write>) -> Result<(), RunError> {
+    fn run(&mut self, path: &Path, output: Option<&mut dyn Write>) -> Result<(), RunError> {
+        self.run_with_interrupt(path, output, poll_interrupt)
+    }
+
+    fn run_with_interrupt<F>(
+        &mut self,
+        path: &Path,
+        mut output: Option<&mut dyn Write>,
+        mut interrupt: F,
+    ) -> Result<(), RunError>
+    where
+        F: FnMut() -> io::Result<bool>,
+    {
         let mut display_error = None;
         let stream_result = stream_frames(path, &mut |record_type, payload| {
             match record_type {
@@ -312,7 +324,7 @@ impl ReplayMachine {
                             display_error = Some(error);
                             return Err(StreamError::Tampered("the replay display failed"));
                         }
-                        let interrupted = match poll_interrupt() {
+                        let interrupted = match interrupt() {
                             Ok(interrupted) => interrupted,
                             Err(error) => {
                                 display_error = Some(error);
@@ -856,7 +868,9 @@ mod tests {
         );
         let mut output = Vec::new();
         let mut machine = ReplayMachine::new(24, 80);
-        machine.run(&valid, Some(&mut output)).unwrap();
+        machine
+            .run_with_interrupt(&valid, Some(&mut output), || Ok(false))
+            .unwrap();
         let report = machine.report(VerificationState::IntactUnpaired, true);
         assert_eq!(report.final_screen, (1, MAX_COLS));
         assert_eq!(report.display_records, 1);
@@ -865,7 +879,26 @@ mod tests {
         assert!(!output.is_empty());
 
         assert!(matches!(
-            ReplayMachine::new(24, 80).run(&valid, Some(&mut FailingWriter)),
+            ReplayMachine::new(24, 80).run_with_interrupt(
+                &valid,
+                Some(&mut FailingWriter),
+                || Ok(false),
+            ),
+            Err(RunError::Display(error)) if error.kind() == io::ErrorKind::Other
+        ));
+
+        let mut interrupted = ReplayMachine::new(24, 80);
+        interrupted
+            .run_with_interrupt(&valid, Some(&mut Vec::new()), || Ok(true))
+            .unwrap();
+        assert!(interrupted.interrupted);
+
+        assert!(matches!(
+            ReplayMachine::new(24, 80).run_with_interrupt(
+                &valid,
+                Some(&mut Vec::new()),
+                || Err(io::Error::other("expected input failure")),
+            ),
             Err(RunError::Display(error)) if error.kind() == io::ErrorKind::Other
         ));
     }
