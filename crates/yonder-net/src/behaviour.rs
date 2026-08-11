@@ -14,16 +14,23 @@ const PING_TIMEOUT: Duration = Duration::from_millis(750);
 // libp2p-relay 0.21.1 rejects only when the current per-peer count is greater
 // than this field, so zero enforces Yonder's effective maximum of one.
 const LIBP2P_SINGLE_PER_PEER_LIMIT: usize = 0;
-#[cfg(not(yonder_sanitizer))]
-const ENDPOINT_MEMORY_LIMIT_BYTES: usize = 96 * 1024 * 1024;
-#[cfg(not(yonder_sanitizer))]
-const RELAY_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const PRODUCTION_ENDPOINT_MEMORY_LIMIT_BYTES: usize = 96 * 1024 * 1024;
+const PRODUCTION_RELAY_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const INSTRUMENTED_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
-// Sanitizer instrumentation raises the idle process RSS above the production limits.
-#[cfg(yonder_sanitizer)]
-const ENDPOINT_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
-#[cfg(yonder_sanitizer)]
-const RELAY_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+// Debug and sanitizer instrumentation can raise idle RSS above production limits.
+// These builds remain bounded, while optimized release artifacts use the exact
+// production limits above.
+const ENDPOINT_MEMORY_LIMIT_BYTES: usize = if cfg!(any(debug_assertions, yonder_sanitizer)) {
+    INSTRUMENTED_MEMORY_LIMIT_BYTES
+} else {
+    PRODUCTION_ENDPOINT_MEMORY_LIMIT_BYTES
+};
+const RELAY_MEMORY_LIMIT_BYTES: usize = if cfg!(any(debug_assertions, yonder_sanitizer)) {
+    INSTRUMENTED_MEMORY_LIMIT_BYTES
+} else {
+    PRODUCTION_RELAY_MEMORY_LIMIT_BYTES
+};
 
 /// The endpoint role's composition of official libp2p behaviours.
 #[derive(NetworkBehaviour)]
@@ -195,6 +202,7 @@ fn relay_config(registration: RegistrationLimits, circuit: CircuitRelayLimits) -
 mod tests {
     use super::{
         DirectUpgradePolicy, ENDPOINT_MEMORY_LIMIT_BYTES, EndpointBehaviour,
+        PRODUCTION_ENDPOINT_MEMORY_LIMIT_BYTES, PRODUCTION_RELAY_MEMORY_LIMIT_BYTES,
         RELAY_MEMORY_LIMIT_BYTES, RelayBehaviour, relay_config,
     };
     use libp2p::{PeerId, identity::Keypair, relay};
@@ -247,15 +255,23 @@ mod tests {
 
     #[test]
     fn memory_limits_match_the_build_purpose() {
-        #[cfg(not(yonder_sanitizer))]
-        {
-            assert_eq!(ENDPOINT_MEMORY_LIMIT_BYTES, 96 * 1024 * 1024);
-            assert_eq!(RELAY_MEMORY_LIMIT_BYTES, 64 * 1024 * 1024);
-        }
-        #[cfg(yonder_sanitizer)]
+        assert_eq!(PRODUCTION_ENDPOINT_MEMORY_LIMIT_BYTES, 96 * 1024 * 1024);
+        assert_eq!(PRODUCTION_RELAY_MEMORY_LIMIT_BYTES, 64 * 1024 * 1024);
+        #[cfg(any(debug_assertions, yonder_sanitizer))]
         {
             assert_eq!(ENDPOINT_MEMORY_LIMIT_BYTES, 512 * 1024 * 1024);
             assert_eq!(RELAY_MEMORY_LIMIT_BYTES, 512 * 1024 * 1024);
+        }
+        #[cfg(not(any(debug_assertions, yonder_sanitizer)))]
+        {
+            assert_eq!(
+                ENDPOINT_MEMORY_LIMIT_BYTES,
+                PRODUCTION_ENDPOINT_MEMORY_LIMIT_BYTES
+            );
+            assert_eq!(
+                RELAY_MEMORY_LIMIT_BYTES,
+                PRODUCTION_RELAY_MEMORY_LIMIT_BYTES
+            );
         }
     }
 }

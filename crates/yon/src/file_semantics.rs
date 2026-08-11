@@ -73,7 +73,6 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use yonder_core::SecureRandom;
 use yonder_core::wire::file_transfer::{
     FileTransferErrorCode, MAX_PATH_LEN, Sha256Digest, validate_default_file_name,
     validate_protocol_path,
@@ -219,7 +218,7 @@ impl SourceFile {
     /// with [`FileSemanticsError::SourceNotRegularFile`]. On Unix a
     /// path-level probe runs before the open for one reason only: opening a
     /// FIFO without `O_NONBLOCK` blocks forever and safe `std` offers no
-    /// non-blocking open flag. The probe never judges the transfer object —
+    /// non-blocking open flag. The probe never judges the transfer object;
     /// type and size are still taken exclusively from the opened handle
     /// (design 8.2). On Windows, paths in the device, verbatim or UNC
     /// namespace (`\\`-leading paths) and paths whose last component is a
@@ -242,9 +241,8 @@ impl SourceFile {
                 #[cfg(windows)]
                 {
                     // Windows refuses to open a directory; classify the
-                    // refusal from the path (only as a classification aid —
-                    // the handle remains the sole authority when an open
-                    // succeeds).
+                    // refusal from the path only as an error-classification
+                    // aid. The handle remains authoritative after an open.
                     if error.kind() == io::ErrorKind::PermissionDenied
                         && fs::metadata(path).is_ok_and(|meta| meta.is_dir())
                     {
@@ -514,10 +512,7 @@ impl PrivateTempFile {
     /// or a read-only file system is [`FileSemanticsError::PermissionDenied`],
     /// a full file system is [`FileSemanticsError::NoSpace`], and everything
     /// else is [`FileSemanticsError::TempFileCreateFailed`].
-    pub fn create(
-        directory: &Path,
-        _random: &mut impl SecureRandom,
-    ) -> Result<Self, FileSemanticsError> {
+    pub fn create(directory: &Path) -> Result<Self, FileSemanticsError> {
         let file = NamedTempFile::new_in(directory).map_err(map_temp_create_error)?;
         Ok(Self {
             file,
@@ -832,7 +827,7 @@ fn validate_protocol_path_string(path: &str) -> Result<(), FileSemanticsError> {
 
 /// Validates a peer-provided base file name with the receiving platform's
 /// rules (design 8.4): the frozen wire validator plus the platform rule that
-/// the name must resolve to exactly one ordinary name component — no drive
+/// the name must resolve to exactly one ordinary name component: no drive
 /// prefixes, no roots, no separators. On Windows, reserved device names,
 /// trailing dots or spaces and colons are rejected as well.
 fn validate_default_file_name_on_receiving_platform(name: &str) -> Result<(), FileSemanticsError> {
@@ -991,7 +986,6 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
-    use yonder_core::{OsSecureRandom, RandomError};
 
     // ------------------------------------------------------------------
     // Deterministic pattern helpers (bounded memory by construction).
@@ -1056,40 +1050,6 @@ mod tests {
             offset += n as u64;
         }
         Ok(())
-    }
-
-    // ------------------------------------------------------------------
-    // Deterministic random sources for the tests.
-    // ------------------------------------------------------------------
-
-    /// Fills with one deterministic byte.
-    #[derive(Clone)]
-    struct FixedRandom(Vec<u8>);
-
-    impl FixedRandom {
-        fn repeat(value: u8) -> Self {
-            Self(vec![value])
-        }
-    }
-
-    impl SecureRandom for FixedRandom {
-        fn try_fill(&mut self, destination: &mut [u8]) -> Result<(), RandomError> {
-            let value = if self.0.len() > 1 {
-                self.0.remove(0)
-            } else {
-                self.0[0]
-            };
-            destination.fill(value);
-            Ok(())
-        }
-    }
-
-    struct FailingRandom;
-
-    impl SecureRandom for FailingRandom {
-        fn try_fill(&mut self, _destination: &mut [u8]) -> Result<(), RandomError> {
-            Err(RandomError)
-        }
     }
 
     // ------------------------------------------------------------------
@@ -1222,9 +1182,7 @@ mod tests {
             assert_eq!(source.read_chunked(&mut buffer).unwrap(), 0);
             assert_eq!(source.bytes_read(), size);
             source.recheck().unwrap();
-
-            let mut random = OsSecureRandom;
-            let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+            let mut temp = PrivateTempFile::create(directory.path()).unwrap();
             assert_eq!(temp.path().parent(), Some(directory.path()));
             write_blocks_to_temp(&mut temp, &mut buffer, size).unwrap();
             assert_eq!(temp.written(), size);
@@ -1955,9 +1913,8 @@ mod tests {
     #[test]
     fn temporary_files_are_exclusive_and_unpredictable() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let first = PrivateTempFile::create(directory.path(), &mut random).unwrap();
-        let second = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let first = PrivateTempFile::create(directory.path()).unwrap();
+        let second = PrivateTempFile::create(directory.path()).unwrap();
         assert_ne!(first.path(), second.path());
         for temp in [&first, &second] {
             assert!(temp.path().parent() == Some(directory.path()));
@@ -1969,31 +1926,19 @@ mod tests {
     #[test]
     fn temporary_file_creation_fails_cleanly() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
         // Missing directory: the destination parent is gone.
         assert!(matches!(
-            PrivateTempFile::create(&directory.path().join("missing"), &mut random),
+            PrivateTempFile::create(&directory.path().join("missing")),
             Err(FileSemanticsError::DestinationParentNotFound)
         ));
-        // Tempfile owns name generation; Yonder's injected protocol RNG is
-        // deliberately not consulted for filesystem temporary names.
-        assert!(PrivateTempFile::create(directory.path(), &mut FailingRandom).is_ok());
-    }
-
-    #[test]
-    fn temporary_file_creation_is_independent_of_protocol_randomness() {
-        let directory = tempdir().unwrap();
-        let mut random = FixedRandom::repeat(7);
-        let first = PrivateTempFile::create(directory.path(), &mut random).unwrap();
-        let second = PrivateTempFile::create(directory.path(), &mut random).unwrap();
-        assert_ne!(first.path(), second.path());
+        // Tempfile owns secure name generation and exclusive creation.
+        assert!(PrivateTempFile::create(directory.path()).is_ok());
     }
 
     #[test]
     fn write_finish_verify_and_commit() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 300_000).unwrap();
@@ -2041,8 +1986,7 @@ mod tests {
     #[test]
     fn commit_never_overwrites_a_concurrently_created_target() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 4096).unwrap();
@@ -2068,8 +2012,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let other = directory.path().join("other");
         fs::create_dir(&other).unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
@@ -2088,8 +2031,7 @@ mod tests {
     #[test]
     fn the_sealed_temp_file_keeps_the_private_temp_file_path() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 4096).unwrap();
@@ -2108,8 +2050,7 @@ mod tests {
     #[test]
     fn commit_rejects_final_names_the_platform_cannot_create() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
@@ -2140,8 +2081,7 @@ mod tests {
     #[test]
     fn commit_fails_when_the_directory_denies_new_file_creation() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
@@ -2154,8 +2094,8 @@ mod tests {
         // rather than failing the release gate: privileged CI agents
         // (for example with SeRestorePrivilege enabled) bypass directory
         // ACL denials entirely, and Windows CreateHardLinkW checks only
-        // the target file's FILE_ADD_LINK right — not the directory's
-        // add-file ACL — so the deny may not block the link at all.
+        // the target file's FILE_ADD_LINK right, not the directory's
+        // add-file ACL, so the deny may not block the link at all.
         if fs::File::create(directory.path().join("probe.bin")).is_ok()
             || fs::hard_link(&temp_path, directory.path().join("probe-link.bin")).is_ok()
         {
@@ -2179,8 +2119,7 @@ mod tests {
     #[test]
     fn dropping_the_temporary_file_removes_it() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         drop(temp);
         assert!(matches!(
@@ -2193,8 +2132,7 @@ mod tests {
     fn large_receive_streams_with_bounded_memory_and_commits_verified_content() {
         const SIZE: u64 = 16 * 1024 * 1024 + 1234;
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, SIZE).unwrap();
@@ -2224,8 +2162,7 @@ mod tests {
         let blocked = directory.path().join("blocked");
         fs::create_dir(&blocked).unwrap();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).unwrap();
-        let mut random = OsSecureRandom;
-        let result = PrivateTempFile::create(&blocked, &mut random);
+        let result = PrivateTempFile::create(&blocked);
         if let Err(error) = result {
             assert!(
                 matches!(error, FileSemanticsError::PermissionDenied),
@@ -2292,9 +2229,8 @@ mod tests {
         if fs::File::create(blocked.join("probe.bin")).is_ok() {
             return;
         }
-        let mut random = OsSecureRandom;
         assert!(matches!(
-            PrivateTempFile::create(&blocked, &mut random),
+            PrivateTempFile::create(&blocked),
             Err(FileSemanticsError::PermissionDenied)
         ));
         // Destination resolution requires the parent to exist and be a
@@ -2307,16 +2243,14 @@ mod tests {
             "{plan:?}"
         );
         if let Ok(plan) = plan {
-            let mut random = OsSecureRandom;
             assert!(matches!(
-                PrivateTempFile::create(plan.temp_dir(), &mut random),
+                PrivateTempFile::create(plan.temp_dir()),
                 Err(FileSemanticsError::PermissionDenied)
             ));
         }
         drop(guard);
         // After the ACL is removed the directory works again.
-        let mut random = OsSecureRandom;
-        assert!(PrivateTempFile::create(&blocked, &mut random).is_ok());
+        assert!(PrivateTempFile::create(&blocked).is_ok());
     }
 
     // ------------------------------------------------------------------
@@ -2473,15 +2407,14 @@ mod tests {
         let parent_missing =
             resolve_destination(&test_base(&directory), Some("no-dir/child.bin"), None)
                 .unwrap_err();
-        let mut random = OsSecureRandom;
-        let temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let sub = directory.path().join("sub");
         fs::create_dir(&sub).unwrap();
         let foreign =
             resolve_destination(&test_base(&directory), Some("sub/foreign.bin"), None).unwrap();
         assert_eq!(foreign.temp_dir(), sub);
-        let mut temp2 = PrivateTempFile::create(foreign.temp_dir(), &mut random).unwrap();
+        let mut temp2 = PrivateTempFile::create(foreign.temp_dir()).unwrap();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp2, &mut buffer, 8).unwrap();
         let sealed = temp2.finish().unwrap();
@@ -2539,8 +2472,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let plan = resolve_destination(&test_base(&directory), None, Some("x.bin")).unwrap();
         assert_eq!(format!("{plan:?}"), "DestinationPlan { .. }");
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
         assert_eq!(format!("{temp:?}"), "PrivateTempFile { written: 16, .. }");

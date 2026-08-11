@@ -14,6 +14,7 @@ pub mod rate;
 pub mod resource;
 pub mod roster;
 pub mod secret;
+pub mod secret_file;
 pub mod session;
 pub mod time;
 pub mod wire;
@@ -34,5 +35,9 @@ pub use resource::{
 };
 pub use roster::{ConnectionRoster, RosterError};
 pub use secret::SecretDocument;
+pub use secret_file::{
+    PrivateDirectoryPolicy, SecretFileError, SecretFilePolicy, SystemPrivateDirectoryPolicy,
+    SystemSecretFilePolicy,
+};
 pub use session::{SessionEvent, TargetSession, TargetSessionState, TransitionError};
 pub use time::{MonotonicClock, MonotonicTime, SystemClock};

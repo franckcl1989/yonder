@@ -1,4 +1,4 @@
-//! The versioned `.yonaudit` container format, Yonder 0.1.4 design
+//! The versioned `.yonaudit` container format, Yonder 0.2.0 design
 //! section 23. The container is a binary file: a fixed-size header, a stream
 //! of record frames, and an optional footer written only by normal
 //! finalization. Files without a footer are valid interrupted prefixes
@@ -58,7 +58,7 @@ use super::audit::{
     AUDIT_FORMAT_VERSION, AUDIT_HELLO_LEN, AUDIT_READY_LEN, AuditHello, AuditReady, AuditRole,
     AuthMode, DIGEST_LEN, Digest32, ED25519_PUBLIC_KEY_LEN, ED25519_SIGNATURE_LEN,
     Ed25519PublicKey, Ed25519Signature, JointManifest, LEDGER_COMMIT_LEN, LOCAL_RECORD_SEAL_LEN,
-    LedgerCommit, LedgerRoot, LocalRecordSeal, MANIFEST_SIGNATURE_LEN, MAX_MANIFEST_LEN,
+    LedgerCommit, LedgerRoot, LocalRecordSeal, MANIFEST_LEN, MANIFEST_SIGNATURE_LEN,
     ManifestSignature, SessionId,
 };
 use crate::error::{ProtocolError, ProtocolField};
@@ -117,7 +117,7 @@ pub const CONTAINER_HEADER_SIGNING_LEN: usize = CONTAINER_HEADER_DOMAIN.len()
 /// Largest footer prefix: the footer magic and the five `u16`-prefixed
 /// components.
 pub const MAX_FOOTER_PREFIX_LEN: usize = FOOTER_MAGIC.len()
-    + (2 + MAX_MANIFEST_LEN)
+    + (2 + MANIFEST_LEN)
     + (2 + MANIFEST_SIGNATURE_LEN) * 2
     + (2 + LOCAL_RECORD_SEAL_LEN)
     + (2 + LEDGER_COMMIT_LEN);
@@ -567,8 +567,8 @@ fn append_header_fields(destination: &mut [u8], cursor: &mut usize, header: &Aud
 /// the joint manifest, the controller and host session signatures, the local
 /// record seal and the ledger commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditContainerFooter<'a> {
-    pub manifest: JointManifest<'a>,
+pub struct AuditContainerFooter {
+    pub manifest: JointManifest,
     pub controller_session_signature: ManifestSignature,
     pub host_session_signature: ManifestSignature,
     pub seal: LocalRecordSeal,
@@ -578,8 +578,8 @@ pub struct AuditContainerFooter<'a> {
 /// The decoded footer together with the final container digest and the three
 /// digest boundaries as absolute container offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedFooter<'a> {
-    pub footer: AuditContainerFooter<'a>,
+pub struct DecodedFooter {
+    pub footer: AuditContainerFooter,
     /// The final container digest occupying `[ledger_end, ledger_end + 32)`.
     /// It covers every preceding container byte but excludes itself (design
     /// section 23.4).
@@ -601,7 +601,7 @@ pub struct DecodedFooter<'a> {
 /// hashing the whole prefix (design section 12.3, step 7), so no circular
 /// dependency exists.
 pub fn encode_footer_prefix(
-    footer: &AuditContainerFooter<'_>,
+    footer: &AuditContainerFooter,
 ) -> Result<WireBytes<MAX_FOOTER_PREFIX_LEN>, ProtocolError> {
     let mut bytes = [0_u8; MAX_FOOTER_PREFIX_LEN];
     let mut cursor = 0;
@@ -646,7 +646,7 @@ fn write_prefixed(destination: &mut [u8], cursor: &mut usize, source: &[u8]) {
 /// components and exactly the 32-byte final container digest, rejecting
 /// trailing bytes. The returned offsets are measured from the start of the
 /// footer magic.
-pub fn decode_footer(bytes: &[u8]) -> Result<DecodedFooter<'_>, ProtocolError> {
+pub fn decode_footer(bytes: &[u8]) -> Result<DecodedFooter, ProtocolError> {
     if bytes.len() < FOOTER_MAGIC.len() || !bytes.starts_with(&FOOTER_MAGIC) {
         return Err(ProtocolError::InvalidField(ProtocolField::Reserved));
     }
@@ -830,7 +830,7 @@ impl<'a> ContainerReader<'a> {
     /// exactly with the 32-byte final container digest. The digest
     /// boundaries in the returned [`DecodedFooter`] are absolute container
     /// offsets.
-    pub fn footer(&mut self) -> Result<DecodedFooter<'a>, ProtocolError> {
+    pub fn footer(&mut self) -> Result<DecodedFooter, ProtocolError> {
         let footer_start = self.pos;
         let decoded = decode_footer(&self.bytes[footer_start..])?;
         self.pos = self.bytes.len();
@@ -899,7 +899,7 @@ mod tests {
             7,
             ZERO_ROOT,
             1_700_000_000,
-            AuthMode::Standard,
+            AuthMode::Enterprise,
             Digest32::new([5; DIGEST_LEN]),
             test_hello(),
             test_ready(),
@@ -907,7 +907,7 @@ mod tests {
         .with_header_signature(Ed25519Signature::new([9; ED25519_SIGNATURE_LEN]))
     }
 
-    fn test_manifest() -> JointManifest<'static> {
+    fn test_manifest() -> JointManifest {
         JointManifest::new(
             AUDIT_FORMAT_VERSION,
             SessionId::new([1; DIGEST_LEN]),
@@ -916,7 +916,6 @@ mod tests {
             Ed25519PublicKey::new([4; ED25519_PUBLIC_KEY_LEN]),
             Ed25519PublicKey::new([5; ED25519_PUBLIC_KEY_LEN]),
             BindingDigest::new([6; DIGEST_LEN]),
-            "alice@wecom",
             Digest32::new([7; DIGEST_LEN]),
             snapshot(),
             ManifestEnding::ShellExit(0),
@@ -951,7 +950,7 @@ mod tests {
         )
     }
 
-    fn test_footer() -> AuditContainerFooter<'static> {
+    fn test_footer() -> AuditContainerFooter {
         AuditContainerFooter {
             manifest: test_manifest(),
             controller_session_signature: ManifestSignature::new(Ed25519Signature::new(
@@ -1000,7 +999,7 @@ mod tests {
         assert_eq!(decoded.session_id(), &SessionId::new([1; DIGEST_LEN]));
         assert_eq!(decoded.ledger_sequence(), 7);
         assert_eq!(decoded.utc_start_seconds(), 1_700_000_000);
-        assert_eq!(decoded.auth_mode(), AuthMode::Standard);
+        assert_eq!(decoded.auth_mode(), AuthMode::Enterprise);
         assert_eq!(
             decoded.audit_hello().persistent_audit_key(),
             &Ed25519PublicKey::new([1; ED25519_PUBLIC_KEY_LEN])
@@ -1057,7 +1056,14 @@ mod tests {
             AuditContainerHeader::decode(&bytes),
             Err(ProtocolError::InvalidField(ProtocolField::Reserved))
         );
-        bytes[219] = AuthMode::Standard.code();
+        // Audit containers are enterprise-only in format v2. A former
+        // standard-mode value is an invalid state, not a compatibility mode.
+        bytes[219] = 0x01;
+        assert_eq!(
+            AuditContainerHeader::decode(&bytes),
+            Err(ProtocolError::InvalidField(ProtocolField::Reserved))
+        );
+        bytes[219] = AuthMode::Enterprise.code();
         bytes.truncate(bytes.len() - 1);
         assert_eq!(
             AuditContainerHeader::decode(&bytes),
@@ -1310,7 +1316,7 @@ mod tests {
         let mut complete = prefix.as_slice().to_vec();
         complete.extend_from_slice(&[0xAB; CONTAINER_DIGEST_LEN]);
         let decoded = decode_footer(&complete).unwrap();
-        assert_eq!(decoded.footer.manifest.enterprise_identity(), "alice@wecom");
+        assert_eq!(decoded.footer.manifest, test_manifest());
         // Trailing bytes after the digest are rejected.
         let mut trailing = complete.clone();
         trailing.push(0);
@@ -1346,8 +1352,7 @@ mod tests {
         use super::*;
         use crate::wire::audit::{
             AuditNonce, BindingDigest, ChainHead, CommitmentDigest, IdentityFingerprint,
-            MAX_ENTERPRISE_IDENTITY_LEN, ManifestEnding, SessionResult, SharedSnapshot,
-            StreamSnapshot,
+            ManifestEnding, SessionResult, SharedSnapshot, StreamSnapshot,
         };
         use proptest::prelude::*;
 
@@ -1439,7 +1444,7 @@ mod tests {
                     any::<u64>(),
                     any::<[u8; 32]>(),
                     any::<u64>(),
-                    prop_oneof![Just(AuthMode::Standard), Just(AuthMode::Enterprise)],
+                    Just(AuthMode::Enterprise),
                     any::<[u8; 32]>(),
                     arbitrary_hello(),
                     arbitrary_ready(),
@@ -1485,7 +1490,7 @@ mod tests {
                 )
         }
 
-        fn arbitrary_manifest() -> impl Strategy<Value = JointManifest<'static>> {
+        fn arbitrary_manifest() -> impl Strategy<Value = JointManifest> {
             (
                 any::<[u8; 32]>(),
                 any::<[u8; 32]>(),
@@ -1498,7 +1503,6 @@ mod tests {
                 any::<u8>(),
                 any::<bool>(),
                 any::<u64>(),
-                prop::collection::vec(prop::char::range('a', 'z'), 0..=MAX_ENTERPRISE_IDENTITY_LEN),
             )
                 .prop_map(
                     |(
@@ -1513,9 +1517,7 @@ mod tests {
                         exit_code,
                         ended_normally,
                         checkpoint_sequence,
-                        enterprise_chars,
                     )| {
-                        let enterprise = enterprise_chars.into_iter().collect::<String>();
                         JointManifest::new(
                             AUDIT_FORMAT_VERSION,
                             SessionId::new(session),
@@ -1524,7 +1526,6 @@ mod tests {
                             Ed25519PublicKey::new(ctrl_key),
                             Ed25519PublicKey::new(host_key),
                             BindingDigest::new(binding),
-                            Box::leak(enterprise.into_boxed_str()),
                             Digest32::new(hello_digest),
                             snapshot,
                             ManifestEnding::ShellExit(exit_code),
@@ -1535,7 +1536,7 @@ mod tests {
                 )
         }
 
-        fn arbitrary_footer() -> impl Strategy<Value = AuditContainerFooter<'static>> {
+        fn arbitrary_footer() -> impl Strategy<Value = AuditContainerFooter> {
             (
                 arbitrary_manifest(),
                 arbitrary_signature(),

@@ -309,7 +309,8 @@ fn parse_certificate_documents(
     Ok(certificates)
 }
 
-fn contains_pem_marker(document: &[u8]) -> bool {
+/// Detects a PEM `BEGIN` marker so callers can branch between DER and PEM.
+pub fn contains_pem_marker(document: &[u8]) -> bool {
     document
         .windows(b"-----BEGIN".len())
         .any(|window| window == b"-----BEGIN")

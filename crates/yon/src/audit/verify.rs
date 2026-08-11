@@ -1,0 +1,3304 @@
+//! Offline verification of `.yonaudit` container pairs, Yonder 0.2.0 design
+//! sections 25 (CLI), 27.1 (streaming, bounded) and 31 (threat model).
+//!
+//! [`verify_files`] verifies both containers, both local event chains, the
+//! four shared fact chains (input commitments by HMAC comparison, output
+//! blocks, terminal control events and file transfer events), the bilateral
+//! checkpoints, the ephemeral session signatures, the final joint manifest,
+//! the embedded persistent identity signatures and, when the current machine
+//! holds a matching protected audit identity, the optional local ledger
+//! continuity anchor (design sections 25.1 and 9.4).
+//!
+//! Verification is fully streaming and bounded: only one record frame, the
+//! footer (at most [`MAX_FOOTER_PREFIX_LEN`] plus the final digest) and the
+//! fixed chain state live in memory at once. Files are never loaded whole
+//! (design section 27.1). The anchor walk over the local ledger chain is
+//! capped so a pathological history cannot stall verification.
+//!
+//! # Offline boundary
+//!
+//! This module performs no network I/O, reads no OPAQUE state and never
+//! prints input commitments, private keys, connection codes or raw audit
+//! content (design section 30: error text is fixed and redacted). Input
+//! commitment verification compares only the HMAC values that are already
+//! protected by the hash chains and signatures of both files; the input
+//! commitment key is never needed offline (design section 5.4).
+//!
+//! # Result classification (design section 25.2)
+//!
+//! - [`VerificationState::VerifiedComplete`]: both files complete, identical
+//!   joint manifest, valid embedded identity and session signatures on both
+//!   sides, all shared chains consistent, both local chains and
+//!   `LocalRecordSeal`s valid, and at least one end matches the current
+//!   machine's protected persistent audit identity with ledger continuity.
+//! - [`VerificationState::ConsistentCompleteUnanchored`]: the same checks
+//!   pass but no trusted identity or ledger anchor exists on this machine.
+//! - [`VerificationState::MatchedInterruptedPrefix`]: the session ended
+//!   without a complete joint manifest; both files certify the same last
+//!   bilaterally confirmed checkpoint.
+//! - [`VerificationState::IntactUnpaired`]: a single file is self-consistent
+//!   but no peer file was provided.
+//! - [`VerificationState::Mismatch`]: the two files are internally valid but
+//!   inconsistent with each other.
+//! - [`VerificationState::Tampered`]: a container, hash chain,
+//!   `LocalRecordSeal`, signature or the ledger proof is invalid.
+//!
+//! Exit codes (design section 25.3) are exposed by
+//! [`VerificationState::exit_code`].
+
+use std::fs::{self, File};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use yonder_core::OsSecureRandom;
+use yonder_core::wire::audit::{
+    AUDIT_FORMAT_VERSION, AuditHello, AuditRole, ChainHead, Checkpoint, CheckpointAck, DIGEST_LEN,
+    Digest32, Ed25519PublicKey, Ed25519Signature, IdentityFingerprint, JointManifest,
+    LEDGER_COMMIT_LEN, LOCAL_RECORD_SEAL_LEN, LedgerRoot, MANIFEST_LEN, MANIFEST_SIGNATURE_LEN,
+    ManifestEnding, ManifestSignature, SessionId, SharedSnapshot, SharedStream, StreamSnapshot,
+};
+use yonder_core::wire::audit_container::{
+    AuditContainerHeader, CONTAINER_DIGEST_LEN, CONTAINER_HEADER_LEN, FOOTER_MAGIC,
+    MAX_FOOTER_PREFIX_LEN, RECORD_FRAME_HEADER_LEN, RecordType, decode_footer, validate_frame_len,
+};
+
+use crate::audit::identity::{self, AuditIdentity};
+use crate::audit::ledger;
+use crate::audit::session::{
+    CHAIN_CONTROL_DOMAIN, CHAIN_FILE_DOMAIN, CHAIN_INPUT_DOMAIN, CHAIN_LOCAL_DOMAIN,
+    CHAIN_OUTPUT_DOMAIN, CONTROL_KIND_CLOSE_REASON, CONTROL_KIND_RESIZE,
+    CONTROL_KIND_TERMINAL_COMPLETE, CONTROL_KIND_TERMINAL_EXIT, CONTROL_KIND_TERMINAL_HELLO,
+    CONTROL_KIND_TERMINAL_READY, DIRECTION_CTRL_TO_HOST, DIRECTION_HOST_TO_CTRL,
+    EVIDENCE_RECEIVED_CHECKPOINT, EVIDENCE_RECEIVED_CHECKPOINT_ACK, EVIDENCE_RECEIVED_MANIFEST,
+    EVIDENCE_RECEIVED_MANIFEST_SIGNATURE, EVIDENCE_SENT_CHECKPOINT, EVIDENCE_SENT_CHECKPOINT_ACK,
+    EVIDENCE_SENT_MANIFEST, EVIDENCE_SENT_MANIFEST_SIGNATURE, FILE_KIND_CANCELLED,
+    FILE_KIND_FAILED, FILE_KIND_START, FILE_KIND_SUCCESS, INPUT_EVENT_KIND, OUTPUT_EVENT_KIND,
+    SPLIT_PREFIX_LEN, decode_shared_control, decode_shared_file, decode_shared_input,
+    decode_shared_output, zero_head,
+};
+
+/// The number of shared fact streams.
+const SHARED_STREAMS: usize = 4;
+
+/// The smallest complete footer: footer magic, the smallest manifest, both
+/// manifest signatures, the seal, the ledger commit and the final digest. A
+/// file ending inside a footer shorter than this can never be complete, so it
+/// is a truncated interrupted prefix (design section 22.5).
+const MIN_LEGAL_FOOTER_LEN: usize = FOOTER_MAGIC.len()
+    + 2
+    + MANIFEST_LEN
+    + (2 + MANIFEST_SIGNATURE_LEN) * 2
+    + 2
+    + LOCAL_RECORD_SEAL_LEN
+    + 2
+    + LEDGER_COMMIT_LEN
+    + CONTAINER_DIGEST_LEN;
+
+/// The bounded tail parsed when walking the local ledger chain backwards.
+const ANCHOR_TAIL_LEN: usize = MAX_FOOTER_PREFIX_LEN + CONTAINER_DIGEST_LEN;
+/// The maximum number of ledger links walked backward when anchoring.
+const MAX_ANCHOR_STEPS: u64 = 1024;
+/// The maximum number of records scanned per ledger link when anchoring.
+const MAX_ANCHOR_SCAN: usize = 8192;
+
+/// The fixed ledger state file layout mirrored read-only from `audit::ledger`
+/// (magic, version, sequence, root, checksum). Verify only ever reads this
+/// file; it never creates or advances anything.
+const LEDGER_STATE_LEN: usize = 8 + 2 + 8 + 32 + 32;
+const LEDGER_STATE_CHECKSUM_OFFSET: usize = LEDGER_STATE_LEN - 32;
+
+/// The six verification states of design section 25.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationState {
+    /// Both files complete and consistent, anchored to at least one known
+    /// endpoint identity and ledger.
+    VerifiedComplete,
+    /// Both files complete and cryptographically self-consistent, but no
+    /// trusted identity or ledger anchor exists on this machine.
+    ConsistentCompleteUnanchored,
+    /// The session was interrupted; both files certify the same last
+    /// bilaterally confirmed checkpoint and there is no complete joint
+    /// manifest.
+    MatchedInterruptedPrefix,
+    /// A single file is self-consistent; no peer file was provided, so
+    /// bilateral consistency cannot be certified.
+    IntactUnpaired,
+    /// The two files' shared chains, counts, identities, checkpoints or
+    /// joint manifests are inconsistent with each other.
+    Mismatch,
+    /// A container, hash chain, `LocalRecordSeal`, signature or ledger proof
+    /// is invalid.
+    Tampered,
+}
+
+impl VerificationState {
+    /// The CLI exit code of this state (design section 25.3): `0` verified
+    /// complete, `1` format or I/O errors (see [`VerifyError`]), `2`
+    /// consistent-but-unanchored or interrupted or unpaired, `3` mismatch,
+    /// `4` tampered.
+    #[must_use]
+    pub const fn exit_code(self) -> u32 {
+        match self {
+            Self::VerifiedComplete => 0,
+            Self::ConsistentCompleteUnanchored
+            | Self::MatchedInterruptedPrefix
+            | Self::IntactUnpaired => 2,
+            Self::Mismatch => 3,
+            Self::Tampered => 4,
+        }
+    }
+
+    /// The fixed display name of the state.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::VerifiedComplete => "VERIFIED_COMPLETE",
+            Self::ConsistentCompleteUnanchored => "CONSISTENT_COMPLETE_UNANCHORED",
+            Self::MatchedInterruptedPrefix => "MATCHED_INTERRUPTED_PREFIX",
+            Self::IntactUnpaired => "INTACT_UNPAIRED",
+            Self::Mismatch => "MISMATCH",
+            Self::Tampered => "TAMPERED",
+        }
+    }
+}
+
+/// Fixed facts about one verified file, for reporting.
+#[derive(Debug, Clone)]
+pub struct FileReport {
+    /// The verified file path.
+    pub path: PathBuf,
+    /// The role recorded in the container header.
+    pub role: AuditRole,
+    /// The SHA-256 fingerprint of the embedded persistent audit identity.
+    pub fingerprint: IdentityFingerprint,
+    /// The UTC wall-clock session start recorded in the header. Wall-clock
+    /// time is display metadata, not a trusted timestamp (design
+    /// section 15.4).
+    pub utc_start_seconds: u64,
+    /// The final event counts of the four shared chains.
+    pub shared_counts: [u64; SHARED_STREAMS],
+    /// The final local observation chain event count.
+    pub local_event_count: u64,
+    /// Whether the file has a complete footer (joint manifest, signatures,
+    /// seal and ledger commit).
+    pub finalized: bool,
+    /// Whether the file ends in a truncated tail (a partial frame or an
+    /// incomplete footer). The verified prefix stays valid.
+    pub truncated_tail: bool,
+    /// The last bilaterally confirmed checkpoint: sequence and checkpoint
+    /// payload digest, when one exists.
+    pub last_confirmed_checkpoint: Option<(u64, [u8; DIGEST_LEN])>,
+    /// The manifest ending, when the file is finalized.
+    pub ending: Option<ManifestEnding>,
+    /// The manifest's normal-completion flag, when the file is finalized.
+    pub ended_normally: bool,
+}
+
+/// The optional local anchor outcome (design sections 9.4 and 25.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnchorReport {
+    /// The current machine's protected persistent audit identity matches the
+    /// embedded identity of at least one provided file.
+    pub identity_matched: bool,
+    /// The matching file's ledger commit is part of the current local ledger
+    /// chain (the continuity walk reached the commit without a gap).
+    pub ledger_continuous: bool,
+}
+
+/// The result of one offline verification.
+#[derive(Debug, Clone)]
+pub struct VerificationReport {
+    /// The classification state.
+    pub state: VerificationState,
+    /// The session ID, when a container header parsed.
+    pub session_id: Option<SessionId>,
+    /// Facts about the controller file, when provided and parseable.
+    pub controller: Option<FileReport>,
+    /// Facts about the host file, when provided and parseable.
+    pub host: Option<FileReport>,
+    /// The local anchor outcome (only meaningful for complete pairs).
+    pub anchor: AnchorReport,
+    /// A fixed, redacted reason for `Mismatch` and `Tampered` states.
+    pub reason: Option<&'static str>,
+}
+
+/// Errors that prevent verification entirely: I/O failures and files that are
+/// not audit containers. Both map to exit code `1` (design section 25.3);
+/// verification outcomes with cryptographic or structural defects are
+/// reported as [`VerificationState`] results instead.
+#[derive(Debug, Error)]
+pub enum VerifyError {
+    /// An I/O error while reading a file.
+    #[error("the audit file could not be read")]
+    Io(#[from] io::Error),
+    /// The file is not a `.yonaudit` container (too short, bad magic, bad
+    /// format version or bad embedded handshake structure).
+    #[error("the file is not a valid audit container")]
+    NotAnAuditContainer,
+}
+
+/// Errors surfaced by the streaming frame walk shared with the replay layer.
+#[derive(Debug, Error)]
+pub enum StreamError {
+    /// An I/O error while reading.
+    #[error("the audit file could not be read")]
+    Io(#[from] io::Error),
+    /// The file is not a `.yonaudit` container.
+    #[error("the file is not a valid audit container")]
+    NotAnAuditContainer,
+    /// The container structure or cryptography is invalid. The fixed reason
+    /// text is redacted and never contains file content.
+    #[error("the audit container is invalid: {0}")]
+    Tampered(&'static str),
+}
+
+/// The local anchor lookup: the current machine's protected persistent audit
+/// identity and its audit root. The production implementation is
+/// [`PlatformAnchorLookup`]; tests inject a temporary root.
+pub trait AnchorLookup {
+    /// The local audit root and its protected persistent identity, or `None`
+    /// when this machine has no audit identity (design section 9.2: an
+    /// existing identity is loaded read-only; nothing is ever created).
+    fn local_anchor(&self) -> Option<(PathBuf, AuditIdentity)>;
+}
+
+/// Resolves the platform audit root and loads the local protected identity
+/// read-only.
+pub struct PlatformAnchorLookup;
+
+impl AnchorLookup for PlatformAnchorLookup {
+    fn local_anchor(&self) -> Option<(PathBuf, AuditIdentity)> {
+        use crate::audit::identity::AuditRoot as _;
+        let root = identity::PlatformAuditRoot.audit_root().ok()?;
+        let identity = load_anchor_identity(&root)?;
+        Some((root, identity))
+    }
+}
+
+/// Loads the persistent audit identity of the given root without creating
+/// anything: the identity file must already exist.
+fn load_anchor_identity(root: &Path) -> Option<AuditIdentity> {
+    if !root.join(identity::IDENTITY_FILE_NAME).is_file() {
+        return None;
+    }
+    // The identity file exists, so this only loads and validates the file
+    // and its permissions; it never generates a new identity.
+    identity::open_or_create_identity(root, &mut OsSecureRandom).ok()
+}
+
+/// A streaming action request from the frame visitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAction {
+    /// Continue with the next frame.
+    Continue,
+    /// Stop the walk; the current frame was the last one delivered.
+    Stop,
+}
+
+/// The summary of one streaming frame walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamSummary {
+    /// The total file length in bytes.
+    pub file_len: u64,
+    /// Whether the file ends in a truncated tail (a partial frame or an
+    /// incomplete footer). Frames before the tail were delivered.
+    pub truncated_tail: bool,
+}
+
+/// The visitor signature of [`stream_frames`]: the record type and payload of
+/// each frame in file order.
+pub type FrameVisitor<'a> = dyn FnMut(RecordType, &[u8]) -> Result<StreamAction, StreamError> + 'a;
+
+/// Streams the record frames of one container in file order, stopping at the
+/// footer (if any) or at a truncated tail. The visitor receives the record
+/// type and payload; the payload buffer is reused between frames, so the
+/// visitor must not retain the slice. Memory stays bounded: at most one frame
+/// (up to the container's 1 MiB frame bound) is in memory at once. The
+/// container header is validated structurally but not cryptographically here
+/// (callers that need full verification use [`verify_files`]).
+pub fn stream_frames(
+    path: &Path,
+    visit: &mut FrameVisitor<'_>,
+) -> Result<StreamSummary, StreamError> {
+    let mut walker = FrameWalker::open(path)?;
+    walker.skip_header()?;
+    loop {
+        let Some((record_type, payload)) = walker.next_frame()? else {
+            return Ok(walker.summary());
+        };
+        match visit(record_type, payload)? {
+            StreamAction::Continue => {}
+            StreamAction::Stop => return Ok(walker.summary()),
+        }
+    }
+}
+
+/// A bounded streaming frame reader over one container file.
+struct FrameWalker {
+    reader: BufReader<File>,
+    pos: u64,
+    len: u64,
+    buffer: Vec<u8>,
+    truncated_tail: bool,
+}
+
+impl FrameWalker {
+    fn open(path: &Path) -> Result<Self, StreamError> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        if len < CONTAINER_HEADER_LEN as u64 {
+            return Err(StreamError::NotAnAuditContainer);
+        }
+        Ok(Self {
+            reader: BufReader::with_capacity(64 * 1024, file),
+            pos: 0,
+            len,
+            buffer: Vec::with_capacity(64 * 1024),
+            truncated_tail: false,
+        })
+    }
+
+    /// Consumes and structurally validates the fixed header, returning its
+    /// bytes.
+    fn skip_header(&mut self) -> Result<[u8; CONTAINER_HEADER_LEN], StreamError> {
+        let mut header = [0_u8; CONTAINER_HEADER_LEN];
+        self.reader.read_exact(&mut header)?;
+        self.pos = CONTAINER_HEADER_LEN as u64;
+        AuditContainerHeader::decode(&header).map_err(|_| StreamError::NotAnAuditContainer)?;
+        Ok(header)
+    }
+
+    fn summary(&self) -> StreamSummary {
+        StreamSummary {
+            file_len: self.len,
+            truncated_tail: self.truncated_tail,
+        }
+    }
+
+    /// The absolute offset of the footer magic, when the walk stopped at a
+    /// footer.
+    fn footer_start(&self) -> Option<u64> {
+        (self.pos >= RECORD_FRAME_HEADER_LEN as u64)
+            .then_some(self.pos - RECORD_FRAME_HEADER_LEN as u64)
+    }
+
+    /// Reads the next frame, or `Ok(None)` when the footer begins or the
+    /// walk ended (cleanly or at a truncated tail). The footer magic bytes
+    /// are consumed; [`FrameWalker::footer_start`] points at them.
+    fn next_frame(&mut self) -> Result<Option<(RecordType, &[u8])>, StreamError> {
+        let remaining = self.len - self.pos;
+        if remaining < RECORD_FRAME_HEADER_LEN as u64 + 1 {
+            self.truncated_tail = remaining > 0;
+            return Ok(None);
+        }
+        let mut length_bytes = [0_u8; 4];
+        self.reader.read_exact(&mut length_bytes)?;
+        self.pos += 4;
+        if length_bytes == FOOTER_MAGIC {
+            // The remaining bytes are the footer; frames end here.
+            return Ok(None);
+        }
+        let mut type_byte = [0_u8; 1];
+        self.reader.read_exact(&mut type_byte)?;
+        self.pos += 1;
+        let frame_len = u32::from_be_bytes(length_bytes);
+        let record_type = RecordType::from_byte(type_byte[0]).ok_or(StreamError::Tampered(
+            "the audit container has an unknown record type",
+        ))?;
+        validate_frame_len(record_type, frame_len).map_err(|_| {
+            StreamError::Tampered("the audit container has an invalid record frame")
+        })?;
+        let payload_len = usize::try_from(frame_len).map_err(|_| {
+            StreamError::Tampered("the audit container has an invalid record frame")
+        })? - 1;
+        if remaining < RECORD_FRAME_HEADER_LEN as u64 + 1 + payload_len as u64 {
+            // The frame is cut off: everything before it is a valid
+            // prefix (design sections 22.5 and 23.3).
+            self.truncated_tail = true;
+            return Ok(None);
+        }
+        self.buffer.resize(payload_len, 0);
+        self.reader.read_exact(&mut self.buffer)?;
+        self.pos += payload_len as u64;
+        Ok(Some((record_type, &self.buffer)))
+    }
+}
+
+/// The per-stream shared chain state maintained during the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedChainState {
+    count: u64,
+    head: ChainHead,
+}
+
+/// The pending relation of one canonical input or output batch: the local
+/// observation record is followed by the shared blocks it completed.
+#[derive(Debug, Clone, Copy)]
+struct BatchState {
+    related: ChainHead,
+    saw_block: bool,
+}
+
+/// One checkpoint or acknowledgment reference.
+#[derive(Debug, Clone, Copy)]
+struct CheckpointRef {
+    sequence: u64,
+    digest: [u8; DIGEST_LEN],
+    snapshot: SharedSnapshot,
+}
+
+/// One bilaterally confirmed checkpoint.
+#[derive(Debug, Clone, Copy)]
+struct Confirmed {
+    sequence: u64,
+    digest: [u8; DIGEST_LEN],
+}
+
+/// The verified facts of one file after the streaming walk.
+struct VerifiedFile {
+    path: PathBuf,
+    header: AuditContainerHeader,
+    hello: AuditHello,
+    shared: [SharedChainState; SHARED_STREAMS],
+    local_head: ChainHead,
+    local_count: u64,
+    last_confirmed: Option<Confirmed>,
+    prev_confirmed: Option<Confirmed>,
+    footer: Option<FooterFacts>,
+    truncated_tail: bool,
+    manifest_evidence: Option<Vec<u8>>,
+    received_manifest_evidence: Option<Vec<u8>>,
+    sent_manifest_signature: Option<ManifestSignature>,
+    received_manifest_signature: Option<ManifestSignature>,
+}
+
+/// The decoded footer facts with the absolute digest boundaries.
+#[derive(Debug, Clone)]
+struct FooterFacts {
+    manifest_bytes: Vec<u8>,
+    controller_signature: ManifestSignature,
+    host_signature: ManifestSignature,
+    seal: yonder_core::wire::audit::LocalRecordSeal,
+    commit: yonder_core::wire::audit::LedgerCommit,
+    sealed_prefix_end: u64,
+    seal_end: u64,
+    ledger_end: u64,
+    final_digest: Digest32,
+}
+
+/// Verifies one file pair (or a single file when `peer` is `None`).
+///
+/// `anchor` supplies the optional local identity and ledger root for
+/// anchoring; the production caller passes [`PlatformAnchorLookup`].
+pub fn verify_files(
+    local: &Path,
+    peer: Option<&Path>,
+    anchor: &dyn AnchorLookup,
+) -> Result<VerificationReport, VerifyError> {
+    let local_walk = match walk_file(local) {
+        Ok(walk) => walk,
+        Err(error) => return map_walk_error(error),
+    };
+    let Some(peer_path) = peer else {
+        return Ok(single_report(local_walk));
+    };
+    let peer_walk = match walk_file(peer_path) {
+        Ok(walk) => walk,
+        Err(StreamError::Tampered(reason)) => {
+            return Ok(report_pair(
+                Some(&local_walk),
+                None,
+                VerificationState::Tampered,
+                Some(reason),
+                AnchorReport::default(),
+                Some(*local_walk.header.session_id()),
+            ));
+        }
+        Err(error) => {
+            return Err(map_walk_error(error).expect_err("only tampered maps to a report"));
+        }
+    };
+    let (controller, host) = match (local_walk.header.role(), peer_walk.header.role()) {
+        (AuditRole::Controller, AuditRole::Host) => (local_walk, peer_walk),
+        (AuditRole::Host, AuditRole::Controller) => (peer_walk, local_walk),
+        _ => {
+            return Ok(report_pair(
+                Some(&local_walk),
+                Some(&peer_walk),
+                VerificationState::Mismatch,
+                Some("the two files have the same role"),
+                AnchorReport::default(),
+                Some(*local_walk.header.session_id()),
+            ));
+        }
+    };
+    // -----------------------------------------------------------------
+    // Pair identity bindings (design section 25.1).
+    // -----------------------------------------------------------------
+    if controller.header.session_id() != host.header.session_id() {
+        return Ok(mismatch_report(
+            &controller,
+            &host,
+            "the session IDs do not match",
+        ));
+    }
+    if controller.header.peer_identity_pubkey() != host.header.identity_pubkey()
+        || host.header.peer_identity_pubkey() != controller.header.identity_pubkey()
+    {
+        return Ok(mismatch_report(
+            &controller,
+            &host,
+            "the embedded identities do not match",
+        ));
+    }
+    if controller.header.peer_session_pubkey() != host.header.session_pubkey()
+        || host.header.peer_session_pubkey() != controller.header.session_pubkey()
+    {
+        return Ok(mismatch_report(
+            &controller,
+            &host,
+            "the embedded session keys do not match",
+        ));
+    }
+    if controller.hello.connection_binding() != host.hello.connection_binding() {
+        return Ok(mismatch_report(
+            &controller,
+            &host,
+            "the connection binding does not match",
+        ));
+    }
+    // Each `AuditReady` carries a digest of the peer's encoded `AuditHello`,
+    // so the two files cross-bind each other's identities and session facts.
+    let expected = sha256_32(host.hello.encode_payload().as_slice());
+    if controller
+        .header
+        .audit_ready()
+        .peer_audit_hello_digest()
+        .as_bytes()
+        != &expected
+    {
+        return Ok(mismatch_report(
+            &controller,
+            &host,
+            "the audit handshake confirmations do not match",
+        ));
+    }
+    let expected = sha256_32(controller.hello.encode_payload().as_slice());
+    if host
+        .header
+        .audit_ready()
+        .peer_audit_hello_digest()
+        .as_bytes()
+        != &expected
+    {
+        return Ok(mismatch_report(
+            &controller,
+            &host,
+            "the audit handshake confirmations do not match",
+        ));
+    }
+
+    match (&controller.footer, &host.footer) {
+        (Some(_), Some(_)) => {
+            // Complete pair (design sections 21 and 25.2). Both files' chains
+            // already match the shared manifest snapshot (checked per file),
+            // so manifest equality implies shared chain equality.
+            if controller
+                .footer
+                .as_ref()
+                .expect("matched above")
+                .manifest_bytes
+                != host.footer.as_ref().expect("matched above").manifest_bytes
+            {
+                return Ok(mismatch_report(
+                    &controller,
+                    &host,
+                    "the joint manifests differ",
+                ));
+            }
+            let manifest_bytes = &controller
+                .footer
+                .as_ref()
+                .expect("matched above")
+                .manifest_bytes;
+            let manifest = match JointManifest::decode_payload(manifest_bytes) {
+                Ok(manifest) => manifest,
+                Err(_) => {
+                    return Ok(tampered_report(
+                        &controller,
+                        &host,
+                        "the joint manifest is invalid",
+                    ));
+                }
+            };
+            // The manifest fingerprints must match the embedded identities of
+            // both files.
+            let controller_fingerprint = sha256_32(controller.header.identity_pubkey().as_bytes());
+            let host_fingerprint = sha256_32(host.header.identity_pubkey().as_bytes());
+            if manifest.controller_fingerprint().as_bytes() != &controller_fingerprint
+                || manifest.host_fingerprint().as_bytes() != &host_fingerprint
+            {
+                return Ok(mismatch_report(
+                    &controller,
+                    &host,
+                    "the embedded identities do not match the joint manifest",
+                ));
+            }
+            // Both footers carry both manifest signatures in the same
+            // positional slots (design section 21.2): the controller slot
+            // holds the controller session signature and the host slot the
+            // host session signature in both files. The two files must
+            // agree on both signatures.
+            let controller_footer = controller.footer.as_ref().expect("matched above");
+            let host_footer = host.footer.as_ref().expect("matched above");
+            if controller_footer.controller_signature != host_footer.controller_signature
+                || controller_footer.host_signature != host_footer.host_signature
+            {
+                return Ok(mismatch_report(
+                    &controller,
+                    &host,
+                    "the manifest signatures differ",
+                ));
+            }
+            // The ledger commits reference the peer's identity fingerprint.
+            let controller_commit = &controller.footer.as_ref().expect("matched above").commit;
+            let host_commit = &host.footer.as_ref().expect("matched above").commit;
+            if controller_commit.peer_identity_fingerprint().as_bytes() != &host_fingerprint
+                || host_commit.peer_identity_fingerprint().as_bytes() != &controller_fingerprint
+            {
+                return Ok(mismatch_report(
+                    &controller,
+                    &host,
+                    "the ledger commits do not match the peer identities",
+                ));
+            }
+            let anchor = anchor_pair(&controller, &host, anchor);
+            let state = if anchor.identity_matched && anchor.ledger_continuous {
+                VerificationState::VerifiedComplete
+            } else {
+                VerificationState::ConsistentCompleteUnanchored
+            };
+            Ok(report_pair(
+                Some(&controller),
+                Some(&host),
+                state,
+                None,
+                anchor,
+                Some(*controller.header.session_id()),
+            ))
+        }
+        (_, _) => {
+            // Interrupted pair (design sections 20.4 and 22.4): certify only
+            // the last bilaterally confirmed checkpoint.
+            if let Err(reason) = last_common_confirmed(&controller, &host) {
+                return Ok(mismatch_report(&controller, &host, reason));
+            }
+            // A complete file's footer manifest must agree with the
+            // interrupted side's manifest evidence, when the evidence exists.
+            // The signature slots are positional: the interrupted side's own
+            // signature lives in the slot of its own role in the complete
+            // file, and the peer signature it received in the peer-role
+            // slot (design section 21.2).
+            for (complete, interrupted, interrupted_is_host) in
+                [(&controller, &host, true), (&host, &controller, false)]
+            {
+                if let (Some(footer), Some(evidence)) =
+                    (&complete.footer, &interrupted.manifest_evidence)
+                    && footer.manifest_bytes != *evidence
+                {
+                    return Ok(mismatch_report(
+                        &controller,
+                        &host,
+                        "the joint manifests differ",
+                    ));
+                }
+                if let (Some(footer), Some(signature)) =
+                    (&complete.footer, &interrupted.sent_manifest_signature)
+                {
+                    let own_slot = if interrupted_is_host {
+                        &footer.host_signature
+                    } else {
+                        &footer.controller_signature
+                    };
+                    if signature != own_slot {
+                        return Ok(mismatch_report(
+                            &controller,
+                            &host,
+                            "the manifest signatures differ",
+                        ));
+                    }
+                }
+                if let (Some(footer), Some(signature)) =
+                    (&complete.footer, &interrupted.received_manifest_signature)
+                {
+                    let peer_slot = if interrupted_is_host {
+                        &footer.controller_signature
+                    } else {
+                        &footer.host_signature
+                    };
+                    if signature != peer_slot {
+                        return Ok(mismatch_report(
+                            &controller,
+                            &host,
+                            "the manifest signatures differ",
+                        ));
+                    }
+                }
+            }
+            Ok(report_pair(
+                Some(&controller),
+                Some(&host),
+                VerificationState::MatchedInterruptedPrefix,
+                None,
+                AnchorReport::default(),
+                Some(*controller.header.session_id()),
+            ))
+        }
+    }
+}
+
+/// The last checkpoint confirmed by both files, or the fixed reason why the
+/// prefixes cannot match.
+fn last_common_confirmed(
+    controller: &VerifiedFile,
+    host: &VerifiedFile,
+) -> Result<(u64, [u8; DIGEST_LEN]), &'static str> {
+    let reason = "the checkpoint prefixes do not match";
+    match (controller.last_confirmed, host.last_confirmed) {
+        (None, None) => Ok((0, [0; DIGEST_LEN])),
+        (Some(_), None) | (None, Some(_)) => Err(reason),
+        (Some(a), Some(b)) if a.sequence == b.sequence => {
+            if a.digest == b.digest {
+                Ok((a.sequence, a.digest))
+            } else {
+                Err(reason)
+            }
+        }
+        (Some(a), Some(b)) if a.sequence > b.sequence => match controller.prev_confirmed {
+            Some(prev) if prev.sequence == b.sequence && prev.digest == b.digest => {
+                Ok((b.sequence, b.digest))
+            }
+            _ => Err(reason),
+        },
+        (Some(a), Some(_)) => match host.prev_confirmed {
+            Some(prev) if prev.sequence == a.sequence && prev.digest == a.digest => {
+                Ok((a.sequence, a.digest))
+            }
+            _ => Err(reason),
+        },
+    }
+}
+
+fn mismatch_report(
+    controller: &VerifiedFile,
+    host: &VerifiedFile,
+    reason: &'static str,
+) -> VerificationReport {
+    report_pair(
+        Some(controller),
+        Some(host),
+        VerificationState::Mismatch,
+        Some(reason),
+        AnchorReport::default(),
+        Some(*controller.header.session_id()),
+    )
+}
+
+fn tampered_report(
+    controller: &VerifiedFile,
+    host: &VerifiedFile,
+    reason: &'static str,
+) -> VerificationReport {
+    report_pair(
+        Some(controller),
+        Some(host),
+        VerificationState::Tampered,
+        Some(reason),
+        AnchorReport::default(),
+        Some(*controller.header.session_id()),
+    )
+}
+
+fn report_pair(
+    controller: Option<&VerifiedFile>,
+    host: Option<&VerifiedFile>,
+    state: VerificationState,
+    reason: Option<&'static str>,
+    anchor: AnchorReport,
+    session_id: Option<SessionId>,
+) -> VerificationReport {
+    VerificationReport {
+        state,
+        session_id,
+        controller: controller.map(file_report),
+        host: host.map(file_report),
+        anchor,
+        reason,
+    }
+}
+
+fn file_report(file: &VerifiedFile) -> FileReport {
+    let footer = file.footer.as_ref();
+    let manifest =
+        footer.and_then(|footer| JointManifest::decode_payload(&footer.manifest_bytes).ok());
+    FileReport {
+        path: file.path.clone(),
+        role: file.header.role(),
+        fingerprint: IdentityFingerprint::new(sha256_32(file.header.identity_pubkey().as_bytes())),
+        utc_start_seconds: file.header.utc_start_seconds(),
+        shared_counts: file.shared.map(|chain| chain.count),
+        local_event_count: file.local_count,
+        finalized: footer.is_some(),
+        truncated_tail: file.truncated_tail,
+        last_confirmed_checkpoint: file
+            .last_confirmed
+            .map(|confirmed| (confirmed.sequence, confirmed.digest)),
+        ending: manifest.as_ref().map(|manifest| manifest.ending()),
+        ended_normally: manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.ended_normally()),
+    }
+}
+
+fn single_report(file: VerifiedFile) -> VerificationReport {
+    let session_id = Some(*file.header.session_id());
+    match file.header.role() {
+        AuditRole::Controller => report_pair(
+            Some(&file),
+            None,
+            VerificationState::IntactUnpaired,
+            None,
+            AnchorReport::default(),
+            session_id,
+        ),
+        AuditRole::Host => report_pair(
+            None,
+            Some(&file),
+            VerificationState::IntactUnpaired,
+            None,
+            AnchorReport::default(),
+            session_id,
+        ),
+    }
+}
+
+fn map_walk_error(error: StreamError) -> Result<VerificationReport, VerifyError> {
+    match error {
+        StreamError::Tampered(reason) => Ok(VerificationReport {
+            state: VerificationState::Tampered,
+            session_id: None,
+            controller: None,
+            host: None,
+            anchor: AnchorReport::default(),
+            reason: Some(reason),
+        }),
+        StreamError::Io(error) => Err(VerifyError::Io(error)),
+        StreamError::NotAnAuditContainer => Err(VerifyError::NotAnAuditContainer),
+    }
+}
+
+/// Walks one container file: header bindings, record frames, chains,
+/// checkpoints, footer and prefix digests.
+fn walk_file(path: &Path) -> Result<VerifiedFile, StreamError> {
+    let mut walker = FrameWalker::open(path)?;
+    let header_bytes = walker.skip_header()?;
+    let header = AuditContainerHeader::decode(&header_bytes)
+        .map_err(|_| StreamError::NotAnAuditContainer)?;
+    let hello = *header.audit_hello();
+    check_header_bindings(&header, &hello)?;
+
+    let mut verifier = ChainVerifier::new(header, hello);
+    while let Some((record_type, payload)) = walker.next_frame()? {
+        verifier.process_frame(record_type, payload)?;
+    }
+    let mut verified = verifier.finish(walker.summary().truncated_tail, path.to_path_buf())?;
+
+    // The footer: bounded tail read, digest verification and seal checks.
+    if let Some(footer_start) = walker.footer_start() {
+        let footer_len = walker.len - footer_start - RECORD_FRAME_HEADER_LEN as u64;
+        let max_footer_len =
+            MAX_FOOTER_PREFIX_LEN as u64 - FOOTER_MAGIC.len() as u64 + CONTAINER_DIGEST_LEN as u64;
+        if footer_len > max_footer_len {
+            return Err(StreamError::Tampered(
+                "the audit container has trailing bytes",
+            ));
+        }
+        // The footer buffer starts with the footer magic, which the frame
+        // walker already consumed.
+        let mut footer_buf = vec![0_u8; footer_len as usize + FOOTER_MAGIC.len()];
+        footer_buf[..FOOTER_MAGIC.len()].copy_from_slice(&FOOTER_MAGIC);
+        walker
+            .reader
+            .read_exact(&mut footer_buf[FOOTER_MAGIC.len()..])?;
+        match decode_footer(&footer_buf) {
+            Ok(decoded) => {
+                let manifest_bytes = decoded
+                    .footer
+                    .manifest
+                    .encode_payload()
+                    .map_err(|_| StreamError::Tampered("the joint manifest is invalid"))?
+                    .as_slice()
+                    .to_vec();
+                let footer = FooterFacts {
+                    manifest_bytes,
+                    controller_signature: decoded.footer.controller_session_signature,
+                    host_signature: decoded.footer.host_session_signature,
+                    seal: decoded.footer.seal,
+                    commit: decoded.footer.ledger_commit,
+                    sealed_prefix_end: footer_start + decoded.sealed_prefix_end as u64,
+                    seal_end: footer_start + decoded.seal_end as u64,
+                    ledger_end: footer_start + decoded.ledger_end as u64,
+                    final_digest: decoded.final_container_digest,
+                };
+                let footer = verify_footer(path, &verified, footer)?;
+                verified.footer = Some(footer);
+            }
+            Err(_) if footer_len as usize + FOOTER_MAGIC.len() >= MIN_LEGAL_FOOTER_LEN => {
+                // The footer is long enough to be complete but does not
+                // decode: the container footer is invalid.
+                return Err(StreamError::Tampered("the container footer is invalid"));
+            }
+            Err(_) => {
+                // The footer is incomplete: the file is an interrupted
+                // prefix with a truncated tail (design section 22.5).
+                verified.truncated_tail = true;
+            }
+        }
+    }
+    verify_manifest_evidence(&verified)?;
+    Ok(verified)
+}
+
+/// The header-level bindings of design sections 13.3, 13.5 and 23.2: the
+/// embedded handshake messages must match the header fields, and all three
+/// signatures must verify.
+fn check_header_bindings(
+    header: &AuditContainerHeader,
+    hello: &AuditHello,
+) -> Result<(), StreamError> {
+    if hello.role() != header.role()
+        || hello.persistent_audit_key() != header.identity_pubkey()
+        || hello.session_key() != header.session_pubkey()
+        || hello.ledger_sequence() != header.ledger_sequence()
+        || hello.ledger_root() != header.previous_ledger_root()
+        || hello.format_version() != AUDIT_FORMAT_VERSION
+    {
+        return Err(StreamError::Tampered(
+            "the embedded audit handshake does not match the container header",
+        ));
+    }
+    let ready = header.audit_ready();
+    if ready.session_id() != header.session_id() || ready.format_version() != AUDIT_FORMAT_VERSION {
+        return Err(StreamError::Tampered(
+            "the audit handshake confirmation does not match the container header",
+        ));
+    }
+    if !verify_ed25519(
+        hello.persistent_audit_key(),
+        hello.signing_input().as_slice(),
+        hello.signature(),
+    ) {
+        return Err(StreamError::Tampered(
+            "the embedded audit handshake signature is invalid",
+        ));
+    }
+    if !verify_ed25519(
+        header.session_pubkey(),
+        ready.signing_input().as_slice(),
+        ready.signature(),
+    ) {
+        return Err(StreamError::Tampered(
+            "the audit handshake confirmation signature is invalid",
+        ));
+    }
+    if !verify_ed25519(
+        header.identity_pubkey(),
+        header.signing_input().as_slice(),
+        header.header_signature(),
+    ) {
+        return Err(StreamError::Tampered(
+            "the container header signature is invalid",
+        ));
+    }
+    Ok(())
+}
+
+/// Verifies the footer against the walked chains, the signatures and the
+/// three prefix digests (design sections 21 and 23.4). Returns the verified
+/// footer facts for the report.
+fn verify_footer(
+    path: &Path,
+    verified: &VerifiedFile,
+    footer: FooterFacts,
+) -> Result<FooterFacts, StreamError> {
+    let tampered = |reason| StreamError::Tampered(reason);
+    let manifest = JointManifest::decode_payload(&footer.manifest_bytes)
+        .map_err(|_| tampered("the joint manifest is invalid"))?;
+    if manifest.format_version() != AUDIT_FORMAT_VERSION
+        || manifest.session_id() != verified.header.session_id()
+    {
+        return Err(tampered("the joint manifest is invalid"));
+    }
+    let is_controller = verified.header.role() == AuditRole::Controller;
+    if is_controller {
+        if manifest.controller_session_key() != verified.header.session_pubkey()
+            || manifest.host_session_key() != verified.header.peer_session_pubkey()
+        {
+            return Err(tampered(
+                "the joint manifest does not match the container keys",
+            ));
+        }
+        if manifest.controller_fingerprint().as_bytes()
+            != &sha256_32(verified.header.identity_pubkey().as_bytes())
+            || manifest.host_fingerprint().as_bytes()
+                != &sha256_32(verified.header.peer_identity_pubkey().as_bytes())
+        {
+            return Err(tampered(
+                "the joint manifest does not match the container identities",
+            ));
+        }
+    } else {
+        if manifest.controller_session_key() != verified.header.peer_session_pubkey()
+            || manifest.host_session_key() != verified.header.session_pubkey()
+        {
+            return Err(tampered(
+                "the joint manifest does not match the container keys",
+            ));
+        }
+        if manifest.controller_fingerprint().as_bytes()
+            != &sha256_32(verified.header.peer_identity_pubkey().as_bytes())
+            || manifest.host_fingerprint().as_bytes()
+                != &sha256_32(verified.header.identity_pubkey().as_bytes())
+        {
+            return Err(tampered(
+                "the joint manifest does not match the container identities",
+            ));
+        }
+    }
+    if manifest.connection_binding() != verified.hello.connection_binding() {
+        return Err(tampered(
+            "the joint manifest does not match the container binding",
+        ));
+    }
+    if manifest.terminal_hello_digest() != verified.header.terminal_hello_digest() {
+        return Err(tampered(
+            "the joint manifest does not match the container header",
+        ));
+    }
+    let snapshot = SharedSnapshot::new(
+        verified
+            .shared
+            .map(|chain| StreamSnapshot::new(chain.count, chain.head)),
+    );
+    if manifest.final_snapshot() != snapshot {
+        return Err(tampered(
+            "the joint manifest does not match the recorded chains",
+        ));
+    }
+    let confirmed_sequence = verified
+        .last_confirmed
+        .map_or(0, |confirmed| confirmed.sequence);
+    if manifest.final_checkpoint_sequence() != confirmed_sequence {
+        return Err(tampered(
+            "the joint manifest does not match the recorded checkpoints",
+        ));
+    }
+    let manifest_input = manifest
+        .signing_input()
+        .map_err(|_| tampered("the joint manifest is invalid"))?;
+    // The footer signature slots are positional (design section 21.2): the
+    // controller slot always holds the controller session signature and the
+    // host slot the host session signature, in both files, matching the
+    // positional key fields of the joint manifest (design section 21.1).
+    if !verify_ed25519(
+        manifest.controller_session_key(),
+        manifest_input.as_slice(),
+        footer.controller_signature.signature(),
+    ) {
+        return Err(tampered("the controller session signature is invalid"));
+    }
+    if !verify_ed25519(
+        manifest.host_session_key(),
+        manifest_input.as_slice(),
+        footer.host_signature.signature(),
+    ) {
+        return Err(tampered("the host session signature is invalid"));
+    }
+
+    // LocalRecordSeal (design section 21.3).
+    let seal = footer.seal;
+    if seal.session_id() != manifest.session_id() || seal.role() != verified.header.role() {
+        return Err(tampered("the local record seal is invalid"));
+    }
+    if seal.final_local_event_root() != &verified.local_head
+        || seal.local_event_count() != verified.local_count
+    {
+        return Err(tampered(
+            "the local record seal does not match the local chain",
+        ));
+    }
+    if seal.final_shared_roots() != &verified.shared.map(|chain| chain.head) {
+        return Err(tampered(
+            "the local record seal does not match the shared chains",
+        ));
+    }
+    let manifest_digest = sha256_32(&footer.manifest_bytes);
+    if seal.joint_manifest_digest().as_bytes() != &manifest_digest {
+        return Err(tampered(
+            "the local record seal does not match the joint manifest",
+        ));
+    }
+    if !verify_ed25519(
+        verified.header.session_pubkey(),
+        seal.signing_input().as_slice(),
+        seal.signature(),
+    ) {
+        return Err(tampered("the local record seal signature is invalid"));
+    }
+
+    // Ledger commit (design section 12.1).
+    let commit = footer.commit;
+    if commit.session_id() != manifest.session_id() {
+        return Err(tampered("the ledger commit is invalid"));
+    }
+    if commit.manifest_digest().as_bytes() != &manifest_digest {
+        return Err(tampered(
+            "the ledger commit does not match the joint manifest",
+        ));
+    }
+    if !verify_ed25519(
+        verified.header.identity_pubkey(),
+        commit.signing_input().as_slice(),
+        commit.signature(),
+    ) {
+        return Err(tampered("the ledger commit signature is invalid"));
+    }
+
+    // The manifest evidence records must agree with the footer manifest.
+    if let Some(evidence) = &verified.manifest_evidence
+        && evidence != &footer.manifest_bytes
+    {
+        return Err(tampered("the joint manifest is invalid"));
+    }
+
+    // The three prefix digests in one streaming pass (design section 23.4).
+    let digests = compute_prefix_digests(path, &footer)?;
+    if seal.sealed_prefix_digest().as_bytes() != &digests.sealed_prefix {
+        return Err(tampered("the local record seal digest is invalid"));
+    }
+    if commit.sealed_record_digest().as_bytes() != &digests.sealed_record {
+        return Err(tampered("the ledger commit digest is invalid"));
+    }
+    if footer.final_digest.as_bytes() != &digests.final_digest {
+        return Err(tampered("the container digest does not match its contents"));
+    }
+    Ok(footer)
+}
+
+/// The three prefix digests of a completed container: `[0, sealed_prefix_end)`,
+/// `[0, seal_end)` and `[0, ledger_end)`.
+struct PrefixDigests {
+    sealed_prefix: [u8; DIGEST_LEN],
+    sealed_record: [u8; DIGEST_LEN],
+    final_digest: [u8; DIGEST_LEN],
+}
+
+fn compute_prefix_digests(path: &Path, footer: &FooterFacts) -> Result<PrefixDigests, StreamError> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut sealed_prefix: Option<[u8; DIGEST_LEN]> = None;
+    let mut sealed_record: Option<[u8; DIGEST_LEN]> = None;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut position = 0_u64;
+    loop {
+        if position == footer.sealed_prefix_end && sealed_prefix.is_none() {
+            sealed_prefix = Some(hasher.clone().finalize().into());
+        }
+        if position == footer.seal_end && sealed_record.is_none() {
+            sealed_record = Some(hasher.clone().finalize().into());
+        }
+        let remaining = footer.ledger_end.saturating_sub(position);
+        if remaining == 0 {
+            break;
+        }
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..want])?;
+        if read == 0 {
+            break;
+        }
+        let mut offset = 0;
+        if sealed_prefix.is_none() && position < footer.sealed_prefix_end {
+            let take = (footer.sealed_prefix_end - position).min(read as u64) as usize;
+            hasher.update(&buffer[..take]);
+            offset = take;
+            if take < read {
+                sealed_prefix = Some(hasher.clone().finalize().into());
+            }
+        }
+        if sealed_record.is_none() && (position + offset as u64) < footer.seal_end {
+            let take =
+                (footer.seal_end - (position + offset as u64)).min((read - offset) as u64) as usize;
+            hasher.update(&buffer[offset..offset + take]);
+            offset += take;
+            if offset < read {
+                sealed_record = Some(hasher.clone().finalize().into());
+            }
+        }
+        hasher.update(&buffer[offset..read]);
+        position += read as u64;
+    }
+    if position != footer.ledger_end || sealed_prefix.is_none() || sealed_record.is_none() {
+        return Err(StreamError::Tampered("the audit container is truncated"));
+    }
+    Ok(PrefixDigests {
+        sealed_prefix: sealed_prefix.expect("the prefix snapshot was taken"),
+        sealed_record: sealed_record.expect("the seal snapshot was taken"),
+        final_digest: hasher.finalize().into(),
+    })
+}
+
+/// Cross-checks the manifest evidence records at the end of the walk: the
+/// sent and received manifests must agree and their signatures must verify.
+fn verify_manifest_evidence(verified: &VerifiedFile) -> Result<(), StreamError> {
+    let Some(sent) = &verified.manifest_evidence else {
+        return Ok(());
+    };
+    if let Some(received) = &verified.received_manifest_evidence
+        && sent != received
+    {
+        return Err(StreamError::Tampered("the audit manifests do not match"));
+    }
+    if let Some(signature) = &verified.sent_manifest_signature {
+        let manifest = JointManifest::decode_payload(sent)
+            .map_err(|_| StreamError::Tampered("the audit manifest is invalid"))?;
+        let input = manifest
+            .signing_input()
+            .map_err(|_| StreamError::Tampered("the audit manifest is invalid"))?;
+        if !verify_ed25519(
+            verified.header.session_pubkey(),
+            input.as_slice(),
+            signature.signature(),
+        ) {
+            return Err(StreamError::Tampered(
+                "the audit manifest signature is invalid",
+            ));
+        }
+    }
+    if let Some(signature) = &verified.received_manifest_signature {
+        let received =
+            verified
+                .received_manifest_evidence
+                .as_ref()
+                .ok_or(StreamError::Tampered(
+                    "the audit manifest signature is invalid",
+                ))?;
+        let manifest = JointManifest::decode_payload(received)
+            .map_err(|_| StreamError::Tampered("the audit manifest is invalid"))?;
+        let input = manifest
+            .signing_input()
+            .map_err(|_| StreamError::Tampered("the audit manifest is invalid"))?;
+        if !verify_ed25519(
+            verified.header.peer_session_pubkey(),
+            input.as_slice(),
+            signature.signature(),
+        ) {
+            return Err(StreamError::Tampered(
+                "the audit manifest signature is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The per-file chain and checkpoint verifier.
+struct ChainVerifier {
+    header: AuditContainerHeader,
+    hello: AuditHello,
+    shared: [SharedChainState; SHARED_STREAMS],
+    local_head: ChainHead,
+    local_count: u64,
+    last_block: [ChainHead; SHARED_STREAMS],
+    input_batch: Option<BatchState>,
+    output_batch: Option<BatchState>,
+    last_checkpoint_seq: u64,
+    last_received_checkpoint: Option<CheckpointRef>,
+    last_sent_checkpoint: Option<CheckpointRef>,
+    last_received_ack_seq: u64,
+    last_sent_ack_seq: u64,
+    last_confirmed: Option<Confirmed>,
+    prev_confirmed: Option<Confirmed>,
+    manifest_evidence: Option<Vec<u8>>,
+    received_manifest_evidence: Option<Vec<u8>>,
+    sent_manifest_signature: Option<ManifestSignature>,
+    received_manifest_signature: Option<ManifestSignature>,
+}
+
+impl ChainVerifier {
+    fn new(header: AuditContainerHeader, hello: AuditHello) -> Self {
+        Self {
+            header,
+            hello,
+            shared: [SharedChainState {
+                count: 0,
+                head: zero_head(),
+            }; SHARED_STREAMS],
+            local_head: zero_head(),
+            local_count: 0,
+            last_block: [zero_head(); SHARED_STREAMS],
+            input_batch: None,
+            output_batch: None,
+            last_checkpoint_seq: 0,
+            last_received_checkpoint: None,
+            last_sent_checkpoint: None,
+            last_received_ack_seq: 0,
+            last_sent_ack_seq: 0,
+            last_confirmed: None,
+            prev_confirmed: None,
+            manifest_evidence: None,
+            received_manifest_evidence: None,
+            sent_manifest_signature: None,
+            received_manifest_signature: None,
+        }
+    }
+
+    fn finish(mut self, truncated_tail: bool, path: PathBuf) -> Result<VerifiedFile, StreamError> {
+        self.flush_batches()?;
+        Ok(VerifiedFile {
+            path,
+            header: self.header,
+            hello: self.hello,
+            shared: self.shared,
+            local_head: self.local_head,
+            local_count: self.local_count,
+            last_confirmed: self.last_confirmed,
+            prev_confirmed: self.prev_confirmed,
+            footer: None,
+            truncated_tail,
+            manifest_evidence: self.manifest_evidence,
+            received_manifest_evidence: self.received_manifest_evidence,
+            sent_manifest_signature: self.sent_manifest_signature,
+            received_manifest_signature: self.received_manifest_signature,
+        })
+    }
+
+    fn process_frame(
+        &mut self,
+        record_type: RecordType,
+        payload: &[u8],
+    ) -> Result<(), StreamError> {
+        match record_type {
+            RecordType::SharedInputCommitment => {
+                if let Some(batch) = self.input_batch.as_mut() {
+                    batch.saw_block = true;
+                }
+                self.process_shared_input(payload)
+            }
+            RecordType::SharedOutputBlock => {
+                if let Some(batch) = self.output_batch.as_mut() {
+                    batch.saw_block = true;
+                }
+                self.process_shared_output(payload)
+            }
+            RecordType::SharedControlEvent => {
+                self.flush_batches()?;
+                self.process_shared_control(payload)
+            }
+            RecordType::SharedFileTransferEvent => {
+                self.flush_batches()?;
+                self.process_shared_file(payload)
+            }
+            RecordType::LocalDisplayBytes => self.process_display(payload),
+            _ => {
+                self.flush_batches()?;
+                self.process_local(record_type, payload)
+            }
+        }
+    }
+
+    fn shared_snapshot(&self) -> SharedSnapshot {
+        SharedSnapshot::new(
+            self.shared
+                .map(|chain| StreamSnapshot::new(chain.count, chain.head)),
+        )
+    }
+
+    fn flush_batches(&mut self) -> Result<(), StreamError> {
+        self.flush_input_batch()?;
+        self.flush_output_batch()
+    }
+
+    fn flush_input_batch(&mut self) -> Result<(), StreamError> {
+        let Some(batch) = self.input_batch.take() else {
+            return Ok(());
+        };
+        let stream = SharedStream::Input.index();
+        if batch.saw_block {
+            if self.last_block[stream] != batch.related {
+                return Err(StreamError::Tampered(
+                    "the local audit chain is inconsistent",
+                ));
+            }
+        } else if batch.related != zero_head() {
+            return Err(StreamError::Tampered(
+                "the local audit chain is inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush_output_batch(&mut self) -> Result<(), StreamError> {
+        let Some(batch) = self.output_batch.take() else {
+            return Ok(());
+        };
+        let stream = SharedStream::Output.index();
+        if batch.saw_block {
+            if self.last_block[stream] != batch.related {
+                return Err(StreamError::Tampered(
+                    "the local audit chain is inconsistent",
+                ));
+            }
+        } else if batch.related != zero_head() {
+            return Err(StreamError::Tampered(
+                "the local audit chain is inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The display-bytes record relates to the last completed output block of
+    /// its batch (design section 18.4): the batch's last block, or zero when
+    /// the batch completed no block.
+    fn process_display(&mut self, payload: &[u8]) -> Result<(), StreamError> {
+        if payload.len() < SPLIT_PREFIX_LEN {
+            return Err(StreamError::Tampered(
+                "the local audit chain is inconsistent",
+            ));
+        }
+        let related = ChainHead::new(payload[8..40].try_into().expect("fixed slice"));
+        let stream = SharedStream::Output.index();
+        let ok = match &self.output_batch {
+            Some(batch) => {
+                related == batch.related
+                    || related == self.last_block[stream]
+                    || related == zero_head()
+            }
+            None => related == self.last_block[stream] || related == zero_head(),
+        };
+        if !ok {
+            return Err(StreamError::Tampered(
+                "the local audit chain is inconsistent",
+            ));
+        }
+        self.flush_output_batch()?;
+        self.commit_local(RecordType::LocalDisplayBytes, payload)
+    }
+
+    fn process_shared_input(&mut self, payload: &[u8]) -> Result<(), StreamError> {
+        let decoded = decode_shared_input(payload)
+            .map_err(|_| StreamError::Tampered("the shared audit chain is inconsistent"))?;
+        if decoded.direction != DIRECTION_CTRL_TO_HOST {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        let stream = SharedStream::Input;
+        let chain = &mut self.shared[stream.index()];
+        if decoded.sequence != chain.count + 1 || decoded.previous_head != chain.head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        let mut canonical = [0_u8; 8 + DIGEST_LEN];
+        canonical[..8].copy_from_slice(&decoded.length.to_be_bytes());
+        canonical[8..].copy_from_slice(&decoded.hmac);
+        let expected = shared_event_hash(
+            CHAIN_INPUT_DOMAIN,
+            chain.head,
+            stream.index() as u8,
+            decoded.direction,
+            decoded.sequence,
+            INPUT_EVENT_KIND,
+            &canonical,
+        );
+        if ChainHead::new(expected) != decoded.new_head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        chain.count += 1;
+        chain.head = decoded.new_head;
+        self.last_block[stream.index()] = decoded.new_head;
+        Ok(())
+    }
+
+    fn process_shared_output(&mut self, payload: &[u8]) -> Result<(), StreamError> {
+        let decoded = decode_shared_output(payload)
+            .map_err(|_| StreamError::Tampered("the shared audit chain is inconsistent"))?;
+        if decoded.direction != DIRECTION_HOST_TO_CTRL {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        let stream = SharedStream::Output;
+        let chain = &mut self.shared[stream.index()];
+        if decoded.sequence != chain.count + 1 || decoded.previous_head != chain.head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        let mut canonical = [0_u8; 8 + DIGEST_LEN];
+        canonical[..8].copy_from_slice(&decoded.length.to_be_bytes());
+        canonical[8..].copy_from_slice(&decoded.digest);
+        let expected = shared_event_hash(
+            CHAIN_OUTPUT_DOMAIN,
+            chain.head,
+            stream.index() as u8,
+            decoded.direction,
+            decoded.sequence,
+            OUTPUT_EVENT_KIND,
+            &canonical,
+        );
+        if ChainHead::new(expected) != decoded.new_head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        chain.count += 1;
+        chain.head = decoded.new_head;
+        self.last_block[stream.index()] = decoded.new_head;
+        Ok(())
+    }
+
+    fn process_shared_control(&mut self, payload: &[u8]) -> Result<(), StreamError> {
+        let decoded = decode_shared_control(payload)
+            .map_err(|_| StreamError::Tampered("the shared audit chain is inconsistent"))?;
+        if decoded.direction != DIRECTION_CTRL_TO_HOST
+            && decoded.direction != DIRECTION_HOST_TO_CTRL
+        {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        if !control_kind_payload_len(decoded.kind, decoded.control_payload.len()) {
+            return Err(StreamError::Tampered("the shared control event is invalid"));
+        }
+        let stream = SharedStream::Control;
+        let chain = &mut self.shared[stream.index()];
+        if decoded.sequence != chain.count + 1 || decoded.previous_head != chain.head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        // The session's committed canonical slice covers the whole fixed
+        // 106-byte stack array from the kind byte on (97 bytes): the hash
+        // input is kind || control_payload || deterministic zero padding.
+        let mut canonical = Vec::with_capacity(97);
+        canonical.push(decoded.kind);
+        canonical.extend_from_slice(&decoded.control_payload);
+        canonical.resize(97, 0);
+        let expected = shared_event_hash(
+            CHAIN_CONTROL_DOMAIN,
+            chain.head,
+            stream.index() as u8,
+            decoded.direction,
+            decoded.sequence,
+            decoded.kind,
+            &canonical,
+        );
+        if ChainHead::new(expected) != decoded.new_head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        chain.count += 1;
+        chain.head = decoded.new_head;
+        self.last_block[stream.index()] = decoded.new_head;
+        Ok(())
+    }
+
+    fn process_shared_file(&mut self, payload: &[u8]) -> Result<(), StreamError> {
+        let decoded = decode_shared_file(payload)
+            .map_err(|_| StreamError::Tampered("the shared audit chain is inconsistent"))?;
+        if (decoded.direction != DIRECTION_CTRL_TO_HOST
+            && decoded.direction != DIRECTION_HOST_TO_CTRL)
+            || !matches!(
+                decoded.kind,
+                FILE_KIND_START | FILE_KIND_SUCCESS | FILE_KIND_CANCELLED | FILE_KIND_FAILED
+            )
+        {
+            return Err(StreamError::Tampered(
+                "the shared file transfer event is invalid",
+            ));
+        }
+        let stream = SharedStream::FileTransfer;
+        let chain = &mut self.shared[stream.index()];
+        if decoded.sequence != chain.count + 1 || decoded.previous_head != chain.head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        let mut canonical = Vec::with_capacity(
+            1 + 8 * 3
+                + DIGEST_LEN
+                + 2
+                + decoded.remote_path.len()
+                + 2
+                + decoded.file_name.len()
+                + 2,
+        );
+        canonical.push(decoded.kind);
+        canonical.extend_from_slice(&decoded.transfer_id.to_be_bytes());
+        canonical.extend_from_slice(&decoded.declared_size.to_be_bytes());
+        canonical.extend_from_slice(&decoded.final_size.to_be_bytes());
+        canonical.extend_from_slice(&decoded.digest);
+        canonical.extend_from_slice(&(decoded.remote_path.len() as u16).to_be_bytes());
+        canonical.extend_from_slice(decoded.remote_path.as_bytes());
+        canonical.extend_from_slice(&(decoded.file_name.len() as u16).to_be_bytes());
+        canonical.extend_from_slice(decoded.file_name.as_bytes());
+        canonical.extend_from_slice(&decoded.error_code.to_be_bytes());
+        // The session's committed canonical slice runs to the end of the
+        // exact-sized record vec, covering the not-yet-written previous and
+        // new head fields: 64 deterministic zero bytes of padding.
+        canonical.extend_from_slice(&[0_u8; 2 * DIGEST_LEN]);
+        let expected = shared_event_hash(
+            CHAIN_FILE_DOMAIN,
+            chain.head,
+            stream.index() as u8,
+            decoded.direction,
+            decoded.sequence,
+            decoded.kind,
+            &canonical,
+        );
+        if ChainHead::new(expected) != decoded.new_head {
+            return Err(StreamError::Tampered(
+                "the shared audit chain is inconsistent",
+            ));
+        }
+        chain.count += 1;
+        chain.head = decoded.new_head;
+        self.last_block[stream.index()] = decoded.new_head;
+        Ok(())
+    }
+
+    /// One local observation record: validates the envelope, the kind
+    /// structure and the related shared event, then advances the local chain.
+    fn process_local(
+        &mut self,
+        record_type: RecordType,
+        payload: &[u8],
+    ) -> Result<(), StreamError> {
+        if payload.len() < SPLIT_PREFIX_LEN {
+            return Err(StreamError::Tampered(
+                "the local audit chain is inconsistent",
+            ));
+        }
+        let related = ChainHead::new(payload[8..40].try_into().expect("fixed slice"));
+        let kind = &payload[SPLIT_PREFIX_LEN..];
+        let inconsistent = || StreamError::Tampered("the local audit chain is inconsistent");
+        match record_type {
+            RecordType::LocalInputCommitment => {
+                if kind.len() < 9 || kind[0] != DIRECTION_CTRL_TO_HOST {
+                    return Err(inconsistent());
+                }
+                self.input_batch = Some(BatchState {
+                    related,
+                    saw_block: false,
+                });
+            }
+            RecordType::LocalRawOutput => {
+                self.output_batch = Some(BatchState {
+                    related,
+                    saw_block: false,
+                });
+            }
+            RecordType::LocalSendOutcome => {
+                if kind.len() < 10
+                    || (kind[0] != DIRECTION_CTRL_TO_HOST && kind[0] != DIRECTION_HOST_TO_CTRL)
+                {
+                    return Err(inconsistent());
+                }
+                let stream = if kind[0] == DIRECTION_CTRL_TO_HOST {
+                    SharedStream::Input
+                } else {
+                    SharedStream::Output
+                };
+                if related != self.last_block[stream.index()] {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalPtyWriteOutcome => {
+                if kind.len() < 9 {
+                    return Err(inconsistent());
+                }
+                if related != self.last_block[SharedStream::Input.index()] {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalDisplayWriteOutcome => {
+                if kind.len() < 9 {
+                    return Err(inconsistent());
+                }
+                if related != self.last_block[SharedStream::Output.index()] {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalResizeEvent => {
+                if kind.len() < 5
+                    || (kind[0] != DIRECTION_CTRL_TO_HOST && kind[0] != DIRECTION_HOST_TO_CTRL)
+                {
+                    return Err(inconsistent());
+                }
+                if related != self.last_block[SharedStream::Control.index()] {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalLifecycleEvent => {
+                if kind.is_empty()
+                    || (related != self.last_block[SharedStream::Control.index()]
+                        && related != zero_head())
+                {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalKeyAction | RecordType::LocalConnectionState => {
+                if kind.is_empty() || related != zero_head() {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalAuditError => {
+                if kind.len() < 2 || related != zero_head() {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalFileTransferEvent => {
+                if kind.len() < 11 || related != self.last_block[SharedStream::FileTransfer.index()]
+                {
+                    return Err(inconsistent());
+                }
+                let path_len =
+                    u16::from_be_bytes(kind[9..11].try_into().expect("fixed slice")) as usize;
+                if kind.len() != 11 + path_len || std::str::from_utf8(&kind[11..]).is_err() {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::LocalCloseEvent => {
+                if kind.len() < 2
+                    || (related != self.last_block[SharedStream::Control.index()]
+                        && related != zero_head())
+                {
+                    return Err(inconsistent());
+                }
+            }
+            RecordType::CheckpointEvidence => {
+                if related != zero_head() {
+                    return Err(inconsistent());
+                }
+                self.process_evidence(kind)?;
+            }
+            RecordType::SharedInputCommitment
+            | RecordType::SharedOutputBlock
+            | RecordType::SharedControlEvent
+            | RecordType::SharedFileTransferEvent
+            | RecordType::LocalDisplayBytes => {
+                return Err(inconsistent());
+            }
+        }
+        self.commit_local(record_type, payload)
+    }
+
+    /// Advances the local observation chain over one record (design
+    /// section 17.2).
+    fn commit_local(&mut self, record_type: RecordType, payload: &[u8]) -> Result<(), StreamError> {
+        let time = u64::from_be_bytes(payload[..8].try_into().expect("fixed slice"));
+        let related = ChainHead::new(payload[8..40].try_into().expect("fixed slice"));
+        let kind = &payload[SPLIT_PREFIX_LEN..];
+        let head = local_event_hash(
+            self.local_head,
+            self.local_count + 1,
+            time,
+            record_type.code(),
+            kind,
+            related,
+        );
+        self.local_count += 1;
+        self.local_head = ChainHead::new(head);
+        Ok(())
+    }
+
+    /// One checkpoint evidence record (design sections 15.2, 20.2 and 20.3).
+    fn process_evidence(&mut self, kind_payload: &[u8]) -> Result<(), StreamError> {
+        if kind_payload.len() < 5 {
+            return Err(StreamError::Tampered("the checkpoint evidence is invalid"));
+        }
+        let kind = kind_payload[0];
+        let len = u32::from_be_bytes(kind_payload[1..5].try_into().expect("fixed slice")) as usize;
+        if kind_payload.len() != 5 + len {
+            return Err(StreamError::Tampered("the checkpoint evidence is invalid"));
+        }
+        let evidence = &kind_payload[5..];
+        match kind {
+            EVIDENCE_SENT_CHECKPOINT | EVIDENCE_RECEIVED_CHECKPOINT => {
+                let checkpoint = Checkpoint::decode_payload(evidence)
+                    .map_err(|_| StreamError::Tampered("the checkpoint is invalid"))?;
+                let key = if kind == EVIDENCE_SENT_CHECKPOINT {
+                    self.header.session_pubkey()
+                } else {
+                    self.header.peer_session_pubkey()
+                };
+                if !verify_ed25519(
+                    key,
+                    checkpoint.signing_input().as_slice(),
+                    checkpoint.signature(),
+                ) {
+                    return Err(StreamError::Tampered("the checkpoint signature is invalid"));
+                }
+                if checkpoint.session_id() != self.header.session_id()
+                    || checkpoint.sequence() != self.last_checkpoint_seq + 1
+                {
+                    return Err(StreamError::Tampered("the checkpoint is invalid"));
+                }
+                if checkpoint.snapshot() != self.shared_snapshot() {
+                    return Err(StreamError::Tampered(
+                        "the checkpoint does not match the shared chains",
+                    ));
+                }
+                let mut snapshot_bytes = [0_u8; 8 + DIGEST_LEN];
+                snapshot_bytes[..8].copy_from_slice(&self.header.ledger_sequence().to_be_bytes());
+                snapshot_bytes[8..].copy_from_slice(self.header.previous_ledger_root().as_bytes());
+                let expected_snapshot = sha256_32(&snapshot_bytes);
+                // The ledger snapshot digest refers to the sender's ledger,
+                // which only the sender's own file can verify: the received
+                // copy is bound to the sent copy by the pair-level checkpoint
+                // digest comparison.
+                if checkpoint.ledger_snapshot_digest().as_bytes() != &expected_snapshot
+                    && kind == EVIDENCE_SENT_CHECKPOINT
+                {
+                    return Err(StreamError::Tampered("the checkpoint is invalid"));
+                }
+                self.last_checkpoint_seq = checkpoint.sequence();
+                let digest = sha256_32(evidence);
+                let reference = CheckpointRef {
+                    sequence: checkpoint.sequence(),
+                    digest,
+                    snapshot: checkpoint.snapshot(),
+                };
+                if kind == EVIDENCE_SENT_CHECKPOINT {
+                    if checkpoint.local_chain_head() != &self.local_head {
+                        return Err(StreamError::Tampered(
+                            "the checkpoint does not match the local chain",
+                        ));
+                    }
+                    self.last_sent_checkpoint = Some(reference);
+                } else {
+                    self.last_received_checkpoint = Some(reference);
+                    self.confirm(reference.sequence, reference.digest)?;
+                }
+            }
+            EVIDENCE_SENT_CHECKPOINT_ACK | EVIDENCE_RECEIVED_CHECKPOINT_ACK => {
+                let ack = CheckpointAck::decode_payload(evidence).map_err(|_| {
+                    StreamError::Tampered("the checkpoint acknowledgment is invalid")
+                })?;
+                let key = if kind == EVIDENCE_SENT_CHECKPOINT_ACK {
+                    self.header.session_pubkey()
+                } else {
+                    self.header.peer_session_pubkey()
+                };
+                if !verify_ed25519(key, ack.signing_input().as_slice(), ack.signature()) {
+                    return Err(StreamError::Tampered(
+                        "the checkpoint acknowledgment signature is invalid",
+                    ));
+                }
+                if ack.session_id() != self.header.session_id()
+                    || ack.sequence() == 0
+                    || ack.sequence() > self.last_checkpoint_seq
+                {
+                    return Err(StreamError::Tampered(
+                        "the checkpoint acknowledgment is invalid",
+                    ));
+                }
+                if kind == EVIDENCE_SENT_CHECKPOINT_ACK {
+                    if ack.sequence() <= self.last_sent_ack_seq {
+                        return Err(StreamError::Tampered(
+                            "the checkpoint acknowledgment is invalid",
+                        ));
+                    }
+                    self.last_sent_ack_seq = ack.sequence();
+                    let Some(last) = &self.last_received_checkpoint else {
+                        return Err(StreamError::Tampered(
+                            "the checkpoint acknowledgment is invalid",
+                        ));
+                    };
+                    if ack.sequence() != last.sequence
+                        || ack.checkpoint_digest().as_bytes() != &last.digest
+                        || ack.snapshot() != last.snapshot
+                    {
+                        return Err(StreamError::Tampered(
+                            "the checkpoint acknowledgment is invalid",
+                        ));
+                    }
+                } else {
+                    if ack.sequence() <= self.last_received_ack_seq {
+                        return Err(StreamError::Tampered(
+                            "the checkpoint acknowledgment is invalid",
+                        ));
+                    }
+                    self.last_received_ack_seq = ack.sequence();
+                    let Some(last) = &self.last_sent_checkpoint else {
+                        return Err(StreamError::Tampered(
+                            "the checkpoint acknowledgment is invalid",
+                        ));
+                    };
+                    if ack.sequence() != last.sequence
+                        || ack.checkpoint_digest().as_bytes() != &last.digest
+                        || ack.snapshot() != last.snapshot
+                    {
+                        return Err(StreamError::Tampered(
+                            "the checkpoint acknowledgment is invalid",
+                        ));
+                    }
+                    self.confirm(ack.sequence(), last.digest)?;
+                }
+            }
+            EVIDENCE_SENT_MANIFEST | EVIDENCE_RECEIVED_MANIFEST => {
+                let manifest = JointManifest::decode_payload(evidence)
+                    .map_err(|_| StreamError::Tampered("the audit manifest is invalid"))?;
+                if manifest.session_id() != self.header.session_id()
+                    || manifest.connection_binding() != self.hello.connection_binding()
+                    || manifest.terminal_hello_digest() != self.header.terminal_hello_digest()
+                    || manifest.final_snapshot() != self.shared_snapshot()
+                {
+                    return Err(StreamError::Tampered("the audit manifest is invalid"));
+                }
+                let bytes = manifest
+                    .encode_payload()
+                    .map_err(|_| StreamError::Tampered("the audit manifest is invalid"))?
+                    .as_slice()
+                    .to_vec();
+                if kind == EVIDENCE_SENT_MANIFEST {
+                    self.manifest_evidence = Some(bytes);
+                } else {
+                    self.received_manifest_evidence = Some(bytes);
+                }
+            }
+            EVIDENCE_SENT_MANIFEST_SIGNATURE | EVIDENCE_RECEIVED_MANIFEST_SIGNATURE => {
+                let signature = ManifestSignature::decode_payload(evidence).map_err(|_| {
+                    StreamError::Tampered("the audit manifest signature is invalid")
+                })?;
+                if kind == EVIDENCE_SENT_MANIFEST_SIGNATURE {
+                    self.sent_manifest_signature = Some(signature);
+                } else {
+                    self.received_manifest_signature = Some(signature);
+                }
+            }
+            _ => {
+                return Err(StreamError::Tampered(
+                    "the audit container has an unknown checkpoint evidence kind",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records one bilaterally confirmed checkpoint. Confirmations arrive in
+    /// strictly increasing sequence order; the last two are kept for the
+    /// pair-level comparison (honest sessions diverge by at most one).
+    fn confirm(&mut self, sequence: u64, digest: [u8; DIGEST_LEN]) -> Result<(), StreamError> {
+        match self.last_confirmed {
+            None => self.last_confirmed = Some(Confirmed { sequence, digest }),
+            Some(current) if current.sequence == sequence => {
+                if current.digest != digest {
+                    return Err(StreamError::Tampered(
+                        "the checkpoint confirmations are inconsistent",
+                    ));
+                }
+            }
+            Some(current) if sequence > current.sequence => {
+                self.prev_confirmed = Some(current);
+                self.last_confirmed = Some(Confirmed { sequence, digest });
+            }
+            Some(_) => {
+                // Out of order: an honest session never confirms out of
+                // order, so the file is not an honest record.
+                return Err(StreamError::Tampered(
+                    "the checkpoint confirmations are out of order",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The fixed payload length of one shared control event kind.
+fn control_kind_payload_len(kind: u8, len: usize) -> bool {
+    match kind {
+        CONTROL_KIND_RESIZE => len == 4,
+        CONTROL_KIND_TERMINAL_HELLO => len == DIGEST_LEN,
+        CONTROL_KIND_TERMINAL_READY | CONTROL_KIND_TERMINAL_COMPLETE => len == 0,
+        CONTROL_KIND_TERMINAL_EXIT | CONTROL_KIND_CLOSE_REASON => len == 1,
+        _ => false,
+    }
+}
+
+/// The shared chain event hash (design section 17.1).
+fn shared_event_hash(
+    domain: &[u8],
+    previous: ChainHead,
+    stream_kind: u8,
+    direction: u8,
+    sequence: u64,
+    event_kind: u8,
+    canonical_payload: &[u8],
+) -> [u8; DIGEST_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(previous.as_bytes());
+    hasher.update([stream_kind]);
+    hasher.update([direction]);
+    hasher.update(sequence.to_be_bytes());
+    hasher.update([event_kind]);
+    hasher.update(canonical_payload);
+    hasher.finalize().into()
+}
+
+/// The local chain event hash (design section 17.2).
+fn local_event_hash(
+    previous: ChainHead,
+    local_sequence: u64,
+    time_ns: u64,
+    event_kind: u8,
+    kind_payload: &[u8],
+    related: ChainHead,
+) -> [u8; DIGEST_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(CHAIN_LOCAL_DOMAIN);
+    hasher.update(previous.as_bytes());
+    hasher.update(local_sequence.to_be_bytes());
+    hasher.update(time_ns.to_be_bytes());
+    hasher.update([event_kind]);
+    hasher.update(kind_payload);
+    hasher.update(related.as_bytes());
+    hasher.finalize().into()
+}
+
+fn sha256_32(data: &[u8]) -> [u8; DIGEST_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn verify_ed25519(
+    public_key: &Ed25519PublicKey,
+    input: &[u8],
+    signature: &Ed25519Signature,
+) -> bool {
+    identity::verify_ed25519_signature(public_key, input, signature)
+}
+
+// ---------------------------------------------------------------------------
+// Local ledger continuity anchoring (design sections 9.4 and 25.1)
+// ---------------------------------------------------------------------------
+
+/// Verifies that at least one provided file's ledger commit is part of the
+/// current machine's local ledger chain.
+fn anchor_pair(
+    controller: &VerifiedFile,
+    host: &VerifiedFile,
+    lookup: &dyn AnchorLookup,
+) -> AnchorReport {
+    let Some((root, identity)) = lookup.local_anchor() else {
+        return AnchorReport::default();
+    };
+    let local_fingerprint = identity.fingerprint();
+    let mut matched = false;
+    for file in [controller, host] {
+        let embedded = sha256_32(file.header.identity_pubkey().as_bytes());
+        if embedded != *local_fingerprint.as_bytes() {
+            continue;
+        }
+        matched = true;
+        if ledger_continuous(&root, &identity, file) {
+            return AnchorReport {
+                identity_matched: true,
+                ledger_continuous: true,
+            };
+        }
+    }
+    AnchorReport {
+        identity_matched: matched,
+        ledger_continuous: false,
+    }
+}
+
+/// Walks the local ledger chain backward from the current head to the file's
+/// commit. Every link must be a complete record signed by the local identity
+/// whose digests verify; a gap (deleted session), a fork or a tampered link
+/// fails the continuity check (design sections 12.4 and 12.5).
+fn ledger_continuous(root: &Path, identity: &AuditIdentity, file: &VerifiedFile) -> bool {
+    let Some(commit) = file.footer.as_ref().map(|footer| footer.commit) else {
+        return false;
+    };
+    if !identity.verify(commit.signing_input().as_slice(), commit.signature()) {
+        return false;
+    }
+    let Some((head_sequence, head_root)) = read_ledger_head(root) else {
+        return false;
+    };
+    let commit_sequence = commit.sequence();
+    let commit_root = ledger::ledger_root_of(&commit);
+    if commit_sequence == head_sequence {
+        return commit_root == head_root;
+    }
+    let Some(next_sequence) = head_sequence.checked_add(1) else {
+        return false;
+    };
+    if commit_sequence == next_sequence && commit.previous_root() == &head_root {
+        // The commit awaits the crash recovery of design section 12.4: it
+        // chains directly from the current head.
+        return true;
+    }
+    if commit_sequence > head_sequence {
+        return false;
+    }
+    let records = root.join(identity::RECORDS_DIR_NAME);
+    let mut target_sequence = head_sequence;
+    let mut target_root = head_root;
+    let mut steps = 0_u64;
+    while target_sequence > commit_sequence {
+        if steps >= MAX_ANCHOR_STEPS {
+            return false;
+        }
+        let Some(previous_root) = find_chain_link(&records, identity, target_sequence, target_root)
+        else {
+            return false;
+        };
+        target_sequence -= 1;
+        target_root = previous_root;
+        steps += 1;
+    }
+    commit_root == target_root
+}
+
+/// Finds the single record whose embedded commit is exactly the ledger link
+/// `(sequence, root)`, verifies its digests and signature and returns the
+/// previous root the link chains from.
+fn find_chain_link(
+    records: &Path,
+    identity: &AuditIdentity,
+    sequence: u64,
+    root: LedgerRoot,
+) -> Option<LedgerRoot> {
+    let entries = fs::read_dir(records).ok()?;
+    let mut previous_root: Option<LedgerRoot> = None;
+    let mut scanned = 0_usize;
+    for entry in entries {
+        let entry = entry.ok()?;
+        scanned += 1;
+        if scanned > MAX_ANCHOR_SCAN {
+            return None;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "yonaudit")
+        {
+            continue;
+        }
+        let Some((commit, seal_end, ledger_end, sealed_digest, final_digest)) =
+            inspect_anchor_record(&path)
+        else {
+            continue;
+        };
+        if commit.sequence() != sequence {
+            continue;
+        }
+        if ledger::ledger_root_of(&commit) != root {
+            // A legal commit at the right sequence with the wrong root means
+            // the chain diverged: fail closed.
+            return None;
+        }
+        // The link must be intact and signed by the local identity.
+        if !identity.verify(commit.signing_input().as_slice(), commit.signature()) {
+            return None;
+        }
+        if !verify_anchor_digests(&path, seal_end, ledger_end, &sealed_digest, &final_digest) {
+            return None;
+        }
+        if previous_root.is_some() {
+            // Two records claim the same chain position: a fork.
+            return None;
+        }
+        previous_root = Some(*commit.previous_root());
+    }
+    previous_root
+}
+
+/// Parses the bounded tail of one record file for its embedded commit and
+/// digest boundaries.
+fn inspect_anchor_record(
+    path: &Path,
+) -> Option<(
+    yonder_core::wire::audit::LedgerCommit,
+    u64,
+    u64,
+    Digest32,
+    Digest32,
+)> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    let len = meta.len();
+    if len < CONTAINER_HEADER_LEN as u64 {
+        return None;
+    }
+    let tail_len = usize::try_from(len.min(ANCHOR_TAIL_LEN as u64)).ok()?;
+    let mut file = File::open(path).ok()?;
+    file.seek(SeekFrom::End(-(tail_len as i64))).ok()?;
+    let mut tail = [0_u8; ANCHOR_TAIL_LEN];
+    file.read_exact(&mut tail[..tail_len]).ok()?;
+    let mut scan = tail_len;
+    while let Some(index) = tail[..scan]
+        .iter()
+        .rposition(|&byte| byte == FOOTER_MAGIC[0])
+    {
+        scan = index;
+        if !tail[scan..].starts_with(&FOOTER_MAGIC) {
+            continue;
+        }
+        let Ok(decoded) = decode_footer(&tail[scan..]) else {
+            continue;
+        };
+        let footer_start = usize::try_from(len).ok()? - tail_len + scan;
+        let seal_end = (footer_start + decoded.seal_end) as u64;
+        let ledger_end = (footer_start + decoded.ledger_end) as u64;
+        let commit = decoded.footer.ledger_commit;
+        return Some((
+            commit,
+            seal_end,
+            ledger_end,
+            *commit.sealed_record_digest(),
+            decoded.final_container_digest,
+        ));
+    }
+    None
+}
+
+/// Verifies the two prefix digests of one anchor record in a single streaming
+/// pass.
+fn verify_anchor_digests(
+    path: &Path,
+    seal_end: u64,
+    ledger_end: u64,
+    expected_sealed: &Digest32,
+    expected_final: &Digest32,
+) -> bool {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut hasher = Sha256::new();
+    let mut sealed_snapshot: Option<[u8; DIGEST_LEN]> = None;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut position = 0_u64;
+    loop {
+        if position == seal_end && sealed_snapshot.is_none() {
+            sealed_snapshot = Some(hasher.clone().finalize().into());
+        }
+        let remaining = ledger_end.saturating_sub(position);
+        if remaining == 0 {
+            break;
+        }
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let Ok(read) = file.read(&mut buffer[..want]) else {
+            return false;
+        };
+        if read == 0 {
+            break;
+        }
+        if sealed_snapshot.is_none() && position < seal_end {
+            let take = (seal_end - position).min(read as u64) as usize;
+            hasher.update(&buffer[..take]);
+            if take < read {
+                sealed_snapshot = Some(hasher.clone().finalize().into());
+                hasher.update(&buffer[take..read]);
+            }
+        } else {
+            hasher.update(&buffer[..read]);
+        }
+        position += read as u64;
+    }
+    if position != ledger_end || sealed_snapshot.is_none() {
+        return false;
+    }
+    let sealed = sealed_snapshot.expect("the seal snapshot was taken");
+    sealed == *expected_sealed.as_bytes()
+        && hasher.finalize().as_slice() == expected_final.as_bytes()
+}
+
+/// Reads the current local ledger head from `ledger.state`, read-only. The
+/// layout mirrors the private codec of `audit::ledger`; verify never writes
+/// ledger state.
+fn read_ledger_head(root: &Path) -> Option<(u64, LedgerRoot)> {
+    let path = root.join(identity::LEDGER_STATE_FILE_NAME);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    if meta.len() != LEDGER_STATE_LEN as u64 {
+        return None;
+    }
+    let mut bytes = [0_u8; LEDGER_STATE_LEN];
+    File::open(&path).ok()?.read_exact(&mut bytes).ok()?;
+    if bytes[..8] != *b"YONLEDG\0" {
+        return None;
+    }
+    if u16::from_be_bytes([bytes[8], bytes[9]]) != 1 {
+        return None;
+    }
+    let checksum = Sha256::digest(&bytes[..LEDGER_STATE_CHECKSUM_OFFSET]);
+    if checksum.as_slice() != &bytes[LEDGER_STATE_CHECKSUM_OFFSET..] {
+        return None;
+    }
+    let sequence = u64::from_be_bytes(bytes[10..18].try_into().ok()?);
+    let root = LedgerRoot::new(bytes[18..50].try_into().ok()?);
+    Some((sequence, root))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) mod tests {
+    use super::*;
+    use crate::audit::session::{
+        AuditError, ConnectionSecret, Ledger as SessionLedger, PersistentIdentity, RecordBatch,
+    };
+    use crate::audit::writer::AuditWriter;
+    use ed25519_dalek::{Signer as _, SigningKey as DalekSigningKey};
+    use tempfile::tempdir;
+    use yonder_core::wire::audit::{
+        AuditRole as WireRole, BindingDigest, LedgerRoot as WireRoot, ManifestEnding,
+    };
+
+    const CONNECTION_SECRET: &[u8] = b"authenticated-connection-secret-for-verify-tests";
+
+    // -----------------------------------------------------------------
+    // Session driver helpers
+    // -----------------------------------------------------------------
+
+    #[derive(Clone)]
+    pub struct TestIdentity(DalekSigningKey);
+
+    impl TestIdentity {
+        pub fn generate(counter: u8) -> Self {
+            let seed = [counter; 32];
+            Self(DalekSigningKey::from_bytes(&seed))
+        }
+    }
+
+    impl PersistentIdentity for TestIdentity {
+        fn public_key(&self) -> Ed25519PublicKey {
+            Ed25519PublicKey::new(self.0.verifying_key().to_bytes())
+        }
+
+        fn fingerprint(&self) -> IdentityFingerprint {
+            IdentityFingerprint::new(sha256_32(&self.0.verifying_key().to_bytes()))
+        }
+
+        fn sign(&self, input: &[u8]) -> Result<Ed25519Signature, AuditError> {
+            Ok(Ed25519Signature::new(self.0.sign(input).to_bytes()))
+        }
+    }
+
+    struct IdentityAdapter(AuditIdentity);
+
+    impl PersistentIdentity for IdentityAdapter {
+        fn public_key(&self) -> Ed25519PublicKey {
+            self.0.public_key()
+        }
+
+        fn fingerprint(&self) -> IdentityFingerprint {
+            self.0.fingerprint()
+        }
+
+        fn sign(&self, input: &[u8]) -> Result<Ed25519Signature, AuditError> {
+            Ok(self.0.sign(input))
+        }
+    }
+
+    /// An in-memory ledger for unanchored test sessions.
+    #[derive(Debug)]
+    pub struct MemoryLedger {
+        sequence: u64,
+        root: WireRoot,
+    }
+
+    impl Default for MemoryLedger {
+        fn default() -> Self {
+            Self {
+                sequence: 0,
+                root: WireRoot::new([0; DIGEST_LEN]),
+            }
+        }
+    }
+
+    impl SessionLedger for MemoryLedger {
+        fn snapshot(&self) -> Result<(u64, WireRoot), AuditError> {
+            Ok((self.sequence, self.root))
+        }
+
+        fn begin_commit(&mut self) -> Result<(u64, WireRoot), AuditError> {
+            Ok((self.sequence + 1, self.root))
+        }
+
+        fn finish_commit(
+            &mut self,
+            commit: &yonder_core::wire::audit::LedgerCommit,
+        ) -> Result<(), AuditError> {
+            self.sequence = commit.sequence();
+            self.root = WireRoot::new(sha256_32(commit.signing_input().as_slice()));
+            Ok(())
+        }
+    }
+
+    /// A ledger backed by the real on-disk ledger of an audit root. This test
+    /// adapter mirrors the production owned-commit lifecycle: the ledger is
+    /// moved into the lock guard and returned after the state advances.
+    struct RealLedgerAdapter {
+        inner: Option<crate::audit::ledger::Ledger>,
+        pending: Option<crate::audit::ledger::OwnedCommitSession>,
+    }
+
+    impl RealLedgerAdapter {
+        fn open(root: &Path) -> Self {
+            Self {
+                inner: Some(crate::audit::ledger::Ledger::open(root, &mut OsSecureRandom).unwrap()),
+                pending: None,
+            }
+        }
+    }
+
+    impl SessionLedger for RealLedgerAdapter {
+        fn snapshot(&self) -> Result<(u64, WireRoot), AuditError> {
+            let ledger = self
+                .inner
+                .as_ref()
+                .ok_or(AuditError::InvalidState("the ledger is mid-commit"))?;
+            let head = ledger.head();
+            Ok((head.sequence(), head.root()))
+        }
+
+        fn begin_commit(&mut self) -> Result<(u64, WireRoot), AuditError> {
+            let ledger = self
+                .inner
+                .take()
+                .ok_or(AuditError::InvalidState("the ledger is mid-commit"))?;
+            let session = ledger
+                .begin_owned_commit()
+                .map_err(|_| AuditError::LedgerCommitFailed)?;
+            let head = session.head();
+            self.pending = Some(session);
+            // The trait contract: the sequence and previous root the final
+            // commit itself must carry, i.e. the head advanced by one.
+            Ok((head.sequence() + 1, head.root()))
+        }
+
+        fn finish_commit(
+            &mut self,
+            commit: &yonder_core::wire::audit::LedgerCommit,
+        ) -> Result<(), AuditError> {
+            let session = self
+                .pending
+                .take()
+                .ok_or(AuditError::InvalidState("no pending commit session"))?;
+            let ledger = session
+                .advance(commit)
+                .map_err(|_| AuditError::LedgerCommitFailed)?;
+            self.inner = Some(ledger);
+            Ok(())
+        }
+    }
+
+    /// The identity and ledger wiring of one endpoint.
+    pub enum Endpoint {
+        /// Fresh identity plus an in-memory ledger.
+        Memory(u8),
+        /// The real protected identity and ledger of the given audit root.
+        Real(PathBuf),
+    }
+
+    pub struct SessionPair {
+        pub controller_path: PathBuf,
+        pub host_path: PathBuf,
+        pub records: PathBuf,
+    }
+
+    /// Opens one endpoint session with the given role.
+    fn open_endpoint(
+        endpoint: Endpoint,
+        role: WireRole,
+        binding: BindingDigest,
+    ) -> crate::audit::session::AuditSession {
+        match endpoint {
+            Endpoint::Memory(counter) => crate::audit::session::AuditSession::new(
+                role,
+                Box::new(TestIdentity::generate(counter)),
+                Box::new(MemoryLedger::default()),
+                binding,
+                1_700_000_000,
+                &mut SequentialRandom { counter },
+            )
+            .unwrap(),
+            Endpoint::Real(root) => {
+                let identity = IdentityAdapter(load_anchor_identity(&root).unwrap());
+                crate::audit::session::AuditSession::new(
+                    role,
+                    Box::new(identity),
+                    Box::new(RealLedgerAdapter::open(&root)),
+                    binding,
+                    1_700_000_000,
+                    &mut SequentialRandom { counter: 1 },
+                )
+                .unwrap()
+            }
+        }
+    }
+
+    fn handshake_until_readies(
+        controller: &mut crate::audit::session::AuditSession,
+        host: &mut crate::audit::session::AuditSession,
+    ) -> (
+        yonder_core::wire::audit::AuditReady,
+        yonder_core::wire::audit::AuditReady,
+    ) {
+        let hello_c = *controller.local_hello();
+        let contrib_c = controller.local_contribution().clone();
+        let hello_h = *host.local_hello();
+        let contrib_h = host.local_contribution().clone();
+        controller.receive_peer_hello(&hello_h, &contrib_h).unwrap();
+        host.receive_peer_hello(&hello_c, &contrib_c).unwrap();
+        let ready_c = controller
+            .compute_ready(ConnectionSecret::Authenticated(CONNECTION_SECRET))
+            .unwrap();
+        let ready_h = host
+            .compute_ready(ConnectionSecret::Authenticated(CONNECTION_SECRET))
+            .unwrap();
+        (ready_c, ready_h)
+    }
+
+    async fn append(writer: &AuditWriter, batch: RecordBatch<'_>) {
+        writer.append_batch(batch).await.unwrap();
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(out, "{byte:02x}").unwrap();
+        }
+        out
+    }
+
+    struct SequentialRandom {
+        counter: u8,
+    }
+
+    impl yonder_core::SecureRandom for SequentialRandom {
+        fn try_fill(&mut self, destination: &mut [u8]) -> Result<(), yonder_core::RandomError> {
+            for byte in destination {
+                *byte = self.counter;
+                self.counter = self.counter.wrapping_add(1);
+            }
+            Ok(())
+        }
+    }
+
+    struct RootAnchor(PathBuf);
+
+    impl AnchorLookup for RootAnchor {
+        fn local_anchor(&self) -> Option<(PathBuf, AuditIdentity)> {
+            let identity = load_anchor_identity(&self.0)?;
+            Some((self.0.clone(), identity))
+        }
+    }
+
+    struct NoAnchor;
+
+    impl AnchorLookup for NoAnchor {
+        fn local_anchor(&self) -> Option<(PathBuf, AuditIdentity)> {
+            None
+        }
+    }
+
+    /// Runs a complete bilateral session with the default display timeline
+    /// and finalizes both containers.
+    pub async fn build_full_pair(dir: &Path, controller: Endpoint, host: Endpoint) -> SessionPair {
+        let output: Vec<u8> = (0..18 * 1024).map(|index| (index % 11) as u8).collect();
+        let display: Vec<u8> = output.iter().map(|byte| byte | 0x80).collect();
+        build_pair_inner(dir, controller, host, &[display]).await
+    }
+
+    /// Runs a complete bilateral session whose controller display timeline is
+    /// exactly the given bytes.
+    pub async fn build_pair_with_controller_display(
+        dir: &Path,
+        controller: Endpoint,
+        host: Endpoint,
+        display: &[u8],
+    ) -> SessionPair {
+        build_pair_inner(dir, controller, host, &[display.to_vec()]).await
+    }
+
+    /// Runs a complete bilateral session whose controller display timeline is
+    /// recorded as the given chunks, one display record each.
+    pub async fn build_pair_with_controller_display_chunks(
+        dir: &Path,
+        controller: Endpoint,
+        host: Endpoint,
+        chunks: &[Vec<u8>],
+    ) -> SessionPair {
+        build_pair_inner(dir, controller, host, chunks).await
+    }
+
+    /// The shared bilateral session driver: handshake, header, terminal
+    /// lifecycle, input, the display timeline (one shared output stream plus
+    /// one display record per chunk), a resize, a bilaterally confirmed
+    /// checkpoint, terminal exit, direction close, joint manifest exchange
+    /// and acyclic finalization.
+    async fn build_pair_inner(
+        dir: &Path,
+        controller: Endpoint,
+        host: Endpoint,
+        display_chunks: &[Vec<u8>],
+    ) -> SessionPair {
+        let binding = BindingDigest::new([0x42; DIGEST_LEN]);
+        // Real endpoints write their records inside the audit root, so the
+        // ledger continuity walk can find them; otherwise a scratch records
+        // directory is used.
+        let records = match (&controller, &host) {
+            (Endpoint::Real(root), _) | (_, Endpoint::Real(root)) => {
+                root.join(identity::RECORDS_DIR_NAME)
+            }
+            _ => dir.join("records"),
+        };
+        let mut controller = open_endpoint(controller, WireRole::Controller, binding);
+        let mut host = open_endpoint(host, WireRole::Host, binding);
+
+        let (ready_c, ready_h) = handshake_until_readies(&mut controller, &mut host);
+        let session_id = controller.session_id().unwrap();
+        let mut controller_writer =
+            AuditWriter::open(&records, &session_id, WireRole::Controller).unwrap();
+        let mut host_writer = AuditWriter::open(&records, &session_id, WireRole::Host).unwrap();
+        let header_c = controller
+            .build_header(&ready_c, Digest32::new([1; DIGEST_LEN]))
+            .unwrap();
+        let header_h = host
+            .build_header(&ready_h, Digest32::new([1; DIGEST_LEN]))
+            .unwrap();
+        controller_writer.initialize(&header_c).await.unwrap();
+        host_writer.initialize(&header_h).await.unwrap();
+        controller.receive_peer_ready(&ready_h).unwrap();
+        host.receive_peer_ready(&ready_c).unwrap();
+
+        append(
+            &controller_writer,
+            controller.record_terminal_ready(100).unwrap(),
+        )
+        .await;
+        append(&host_writer, host.record_terminal_ready(110).unwrap()).await;
+
+        let input: Vec<u8> = (0..20 * 1024).map(|index| (index % 7) as u8).collect();
+        for chunk in input.chunks(4096) {
+            append(
+                &controller_writer,
+                controller.record_input(chunk, 200).unwrap(),
+            )
+            .await;
+        }
+        for chunk in input.chunks(2048) {
+            append(&host_writer, host.record_input(chunk, 210).unwrap()).await;
+        }
+        // The host's raw output and the controller's display timeline share
+        // the same canonical stream; the display records carry the chunks.
+        let raw: Vec<u8> = display_chunks.concat();
+        append(&host_writer, host.record_output(&raw, 300).unwrap()).await;
+        for chunk in display_chunks {
+            append(
+                &controller_writer,
+                controller
+                    .record_controller_output(chunk, chunk, 310)
+                    .unwrap(),
+            )
+            .await;
+        }
+        append(
+            &controller_writer,
+            controller
+                .record_display_write_outcome(true, raw.len() as u64, 320)
+                .unwrap(),
+        )
+        .await;
+        // A recorded resize on both sides.
+        append(
+            &controller_writer,
+            controller
+                .record_resize(DIRECTION_CTRL_TO_HOST, 100, 30, 330)
+                .unwrap(),
+        )
+        .await;
+        append(
+            &host_writer,
+            host.record_resize(DIRECTION_CTRL_TO_HOST, 100, 30, 331)
+                .unwrap(),
+        )
+        .await;
+
+        // A bilaterally confirmed checkpoint.
+        controller_writer.sync_all().await.unwrap();
+        let (checkpoint, evidence) = controller.build_checkpoint(1_000_000_000).unwrap();
+        append(&controller_writer, evidence).await;
+        let (ack, host_evidence) = host.receive_checkpoint(&checkpoint, 1_000_000_000).unwrap();
+        append(&host_writer, host_evidence).await;
+        host_writer.sync_all().await.unwrap();
+        let ack_evidence = controller
+            .receive_checkpoint_ack(&ack, 1_000_000_010)
+            .unwrap()
+            .unwrap();
+        append(&controller_writer, ack_evidence).await;
+
+        append(
+            &controller_writer,
+            controller.record_terminal_exit(0, 400).unwrap(),
+        )
+        .await;
+        append(&host_writer, host.record_terminal_exit(0, 410).unwrap()).await;
+        append(&controller_writer, controller.close_directions().unwrap()).await;
+        append(&host_writer, host.close_directions().unwrap()).await;
+
+        let (manifest_c, signature_c, evidence) = controller
+            .build_manifest(ManifestEnding::ShellExit(0), true, 500)
+            .unwrap();
+        append(&controller_writer, evidence).await;
+        let (manifest_h, signature_h, evidence) = host
+            .build_manifest(ManifestEnding::ShellExit(0), true, 501)
+            .unwrap();
+        append(&host_writer, evidence).await;
+        assert_eq!(manifest_c, manifest_h);
+        let evidence = controller
+            .receive_peer_manifest_pair(&manifest_c, &manifest_h, &signature_h, 510)
+            .unwrap();
+        append(&controller_writer, evidence).await;
+        let evidence = host
+            .receive_peer_manifest_pair(&manifest_h, &manifest_c, &signature_c, 511)
+            .unwrap();
+        append(&host_writer, evidence).await;
+
+        controller
+            .finalize_footer(
+                &mut controller_writer,
+                &manifest_c,
+                signature_c,
+                signature_h,
+            )
+            .await
+            .unwrap();
+        host.finalize_footer(&mut host_writer, &manifest_h, signature_h, signature_c)
+            .await
+            .unwrap();
+        drop(controller_writer);
+        drop(host_writer);
+        SessionPair {
+            controller_path: records.join(format!(
+                "{}.controller.yonaudit",
+                hex(session_id.as_bytes())
+            )),
+            host_path: records.join(format!("{}.host.yonaudit", hex(session_id.as_bytes()))),
+            records,
+        }
+    }
+
+    /// Runs a session up to a bilaterally confirmed checkpoint and stops,
+    /// leaving both files as verifiable interrupted prefixes (design
+    /// sections 20.4 and 22.4). The controller records one additional output
+    /// tail the host never saw.
+    pub async fn build_interrupted_pair(dir: &Path) -> SessionPair {
+        build_interrupted_pair_with(dir, 0x43).await
+    }
+
+    /// Builds an interrupted pair with a distinct binding seed, so different
+    /// calls produce different sessions.
+    pub async fn build_interrupted_pair_with(dir: &Path, seed: u8) -> SessionPair {
+        let binding = BindingDigest::new([seed; DIGEST_LEN]);
+        let records = dir.join("records");
+        let mut controller = open_endpoint(Endpoint::Memory(1), WireRole::Controller, binding);
+        let mut host = open_endpoint(Endpoint::Memory(101), WireRole::Host, binding);
+        let (ready_c, ready_h) = handshake_until_readies(&mut controller, &mut host);
+        let session_id = controller.session_id().unwrap();
+        let controller_writer =
+            AuditWriter::open(&records, &session_id, WireRole::Controller).unwrap();
+        let host_writer = AuditWriter::open(&records, &session_id, WireRole::Host).unwrap();
+        let header_c = controller
+            .build_header(&ready_c, Digest32::new([1; DIGEST_LEN]))
+            .unwrap();
+        let header_h = host
+            .build_header(&ready_h, Digest32::new([1; DIGEST_LEN]))
+            .unwrap();
+        controller_writer.initialize(&header_c).await.unwrap();
+        host_writer.initialize(&header_h).await.unwrap();
+        controller.receive_peer_ready(&ready_h).unwrap();
+        host.receive_peer_ready(&ready_c).unwrap();
+
+        append(
+            &controller_writer,
+            controller.record_terminal_ready(100).unwrap(),
+        )
+        .await;
+        append(&host_writer, host.record_terminal_ready(110).unwrap()).await;
+        let input = b"ls -la\n";
+        append(
+            &controller_writer,
+            controller.record_input(input, 200).unwrap(),
+        )
+        .await;
+        append(&host_writer, host.record_input(input, 210).unwrap()).await;
+        let output = b"total 4\r\n";
+        append(&host_writer, host.record_output(output, 300).unwrap()).await;
+        append(
+            &controller_writer,
+            controller
+                .record_controller_output(output, output, 310)
+                .unwrap(),
+        )
+        .await;
+
+        controller_writer.sync_all().await.unwrap();
+        let (checkpoint, evidence) = controller.build_checkpoint(1_000_000_000).unwrap();
+        append(&controller_writer, evidence).await;
+        let (ack, host_evidence) = host.receive_checkpoint(&checkpoint, 1_000_000_000).unwrap();
+        append(&host_writer, host_evidence).await;
+        host_writer.sync_all().await.unwrap();
+        let ack_evidence = controller
+            .receive_checkpoint_ack(&ack, 1_000_000_010)
+            .unwrap()
+            .unwrap();
+        append(&controller_writer, ack_evidence).await;
+
+        // The controller's unconfirmed local tail.
+        let tail = b"tail output only the controller saw\r\n";
+        append(
+            &controller_writer,
+            controller
+                .record_controller_output(tail, tail, 400)
+                .unwrap(),
+        )
+        .await;
+        drop(controller_writer);
+        drop(host_writer);
+        SessionPair {
+            controller_path: records.join(format!(
+                "{}.controller.yonaudit",
+                hex(session_id.as_bytes())
+            )),
+            host_path: records.join(format!("{}.host.yonaudit", hex(session_id.as_bytes()))),
+            records,
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Verification state matrix tests
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn complete_pair_with_anchor_is_verified_complete() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("audit-root");
+        // The real identity and ledger exist at the root.
+        crate::audit::ledger::Ledger::open(&root, &mut OsSecureRandom).unwrap();
+        let pair = build_full_pair(
+            dir.path(),
+            Endpoint::Real(root.clone()),
+            Endpoint::Memory(2),
+        )
+        .await;
+        let report = verify_files(
+            &pair.controller_path,
+            Some(&pair.host_path),
+            &RootAnchor(root),
+        )
+        .unwrap();
+        assert_eq!(report.state, VerificationState::VerifiedComplete);
+        assert!(report.anchor.identity_matched);
+        assert!(report.anchor.ledger_continuous);
+        assert_eq!(report.state.exit_code(), 0);
+        assert!(report.controller.as_ref().unwrap().finalized);
+        assert!(report.host.as_ref().unwrap().finalized);
+        assert!(!report.controller.as_ref().unwrap().truncated_tail);
+        let controller = report.controller.as_ref().unwrap();
+        assert_eq!(
+            controller.shared_counts[0], 2,
+            "one completed input block plus the final partial block"
+        );
+        assert!(controller.local_event_count > 0);
+        assert_eq!(
+            report.controller.as_ref().unwrap().role,
+            WireRole::Controller
+        );
+        assert_eq!(report.host.as_ref().unwrap().role, WireRole::Host);
+        assert!(report.session_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn complete_pair_without_anchor_is_consistent_complete_unanchored() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(3), Endpoint::Memory(103)).await;
+        let report = verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor).unwrap();
+        assert_eq!(
+            report.state,
+            VerificationState::ConsistentCompleteUnanchored
+        );
+        assert!(!report.anchor.identity_matched);
+        assert_eq!(report.state.exit_code(), 2);
+    }
+
+    #[tokio::test]
+    async fn complete_pair_with_foreign_identity_is_unanchored() {
+        // A forged pair with fresh identities can never be anchored to a
+        // machine whose identity differs (design sections 9.4 and 25.2).
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(4), Endpoint::Memory(104)).await;
+        let other = dir.path().join("other-root");
+        crate::audit::ledger::Ledger::open(&other, &mut OsSecureRandom).unwrap();
+        let report = verify_files(
+            &pair.controller_path,
+            Some(&pair.host_path),
+            &RootAnchor(other),
+        )
+        .unwrap();
+        assert_eq!(
+            report.state,
+            VerificationState::ConsistentCompleteUnanchored
+        );
+        assert!(!report.anchor.identity_matched);
+    }
+
+    #[tokio::test]
+    async fn interrupted_pair_is_matched_interrupted_prefix() {
+        let dir = tempdir().unwrap();
+        let pair = build_interrupted_pair(dir.path()).await;
+        let report = verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::MatchedInterruptedPrefix);
+        assert!(!report.controller.as_ref().unwrap().finalized);
+        assert!(!report.host.as_ref().unwrap().finalized);
+        let (sequence, _) = report
+            .controller
+            .as_ref()
+            .unwrap()
+            .last_confirmed_checkpoint
+            .unwrap();
+        assert_eq!(sequence, 1);
+        assert_eq!(report.state.exit_code(), 2);
+    }
+
+    #[tokio::test]
+    async fn single_file_is_intact_unpaired() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(5), Endpoint::Memory(105)).await;
+        let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::IntactUnpaired);
+        assert!(report.host.is_none());
+        assert_eq!(report.state.exit_code(), 2);
+
+        // An interrupted single file is also intact unpaired.
+        let dir = tempdir().unwrap();
+        let pair = build_interrupted_pair(dir.path()).await;
+        let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::IntactUnpaired);
+    }
+
+    #[tokio::test]
+    async fn swapped_peer_file_is_mismatch() {
+        let dir = tempdir().unwrap();
+        let first = build_full_pair(dir.path(), Endpoint::Memory(6), Endpoint::Memory(106)).await;
+        let dir = tempdir().unwrap();
+        let second = build_full_pair(dir.path(), Endpoint::Memory(7), Endpoint::Memory(107)).await;
+        let report =
+            verify_files(&first.controller_path, Some(&second.host_path), &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Mismatch);
+        assert_eq!(report.state.exit_code(), 3);
+        assert!(report.reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn same_role_pair_is_mismatch() {
+        let dir = tempdir().unwrap();
+        let first = build_full_pair(dir.path(), Endpoint::Memory(8), Endpoint::Memory(108)).await;
+        let dir = tempdir().unwrap();
+        let second = build_full_pair(dir.path(), Endpoint::Memory(9), Endpoint::Memory(109)).await;
+        let report = verify_files(
+            &first.controller_path,
+            Some(&second.controller_path),
+            &NoAnchor,
+        )
+        .unwrap();
+        assert_eq!(report.state, VerificationState::Mismatch);
+        assert_eq!(report.reason, Some("the two files have the same role"));
+    }
+
+    // -----------------------------------------------------------------
+    // Tamper and truncation tests
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn modified_event_is_tampered() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(10), Endpoint::Memory(110)).await;
+        let mut bytes = std::fs::read(&pair.controller_path).unwrap();
+        // Flip one byte inside the first record frame payload (after the
+        // frame header and the local record envelope).
+        let frame_offset = CONTAINER_HEADER_LEN + 4 + 1 + 40;
+        bytes[frame_offset] ^= 0x01;
+        std::fs::write(&pair.controller_path, &bytes).unwrap();
+        let report = verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+        assert_eq!(report.state.exit_code(), 4);
+        assert!(report.reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn modified_footer_digest_is_tampered() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(11), Endpoint::Memory(111)).await;
+        let mut bytes = std::fs::read(&pair.controller_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&pair.controller_path, &bytes).unwrap();
+        let report = verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+    }
+
+    #[tokio::test]
+    async fn truncated_mid_frame_is_an_interrupted_prefix() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(12), Endpoint::Memory(112)).await;
+        let bytes = std::fs::read(&pair.controller_path).unwrap();
+        // Cut the controller file inside the first record frame: the prefix
+        // stays verifiable and the tail is reported truncated.
+        let cut = CONTAINER_HEADER_LEN + 10;
+        std::fs::write(&pair.controller_path, &bytes[..cut]).unwrap();
+        let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::IntactUnpaired);
+        assert!(report.controller.as_ref().unwrap().truncated_tail);
+    }
+
+    #[tokio::test]
+    async fn interrupted_pair_from_different_sessions_is_mismatch() {
+        // Two interrupted sessions paired crosswise: the confirmed
+        // checkpoint prefixes cannot match.
+        let dir = tempdir().unwrap();
+        let first = build_interrupted_pair(dir.path()).await;
+        let dir = tempdir().unwrap();
+        let second = build_interrupted_pair_with(dir.path(), 0x44).await;
+        let report =
+            verify_files(&first.controller_path, Some(&second.host_path), &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Mismatch);
+    }
+
+    // -----------------------------------------------------------------
+    // Ledger continuity tests
+    // -----------------------------------------------------------------
+
+    /// The double-session ledger walk needs slightly more than the default
+    /// Windows test thread stack; run it on the project's 8 MiB runtime
+    /// thread size (the same size `yon` uses for its runtime thread).
+    #[test]
+    fn older_sessions_anchor_through_the_ledger_chain() {
+        let handle = std::thread::Builder::new()
+            .name("older-sessions-anchor".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(older_sessions_anchor_through_the_ledger_chain_async());
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    async fn older_sessions_anchor_through_the_ledger_chain_async() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("audit-root");
+        crate::audit::ledger::Ledger::open(&root, &mut OsSecureRandom).unwrap();
+        let first = build_full_pair(
+            dir.path(),
+            Endpoint::Real(root.clone()),
+            Endpoint::Memory(13),
+        )
+        .await;
+        let second = build_full_pair(
+            dir.path(),
+            Endpoint::Real(root.clone()),
+            Endpoint::Memory(14),
+        )
+        .await;
+        // The first session's controller commit is two links below the head;
+        // the walk reaches it through the second session's commit.
+        let report = verify_files(
+            &first.controller_path,
+            Some(&first.host_path),
+            &RootAnchor(root.clone()),
+        )
+        .unwrap();
+        assert_eq!(report.state, VerificationState::VerifiedComplete);
+        assert!(report.anchor.ledger_continuous);
+
+        // Deleting the intermediate session breaks the chain: the anchor
+        // fails and the pair is reported consistent but unanchored.
+        let _ = second;
+        let records = first.records.clone();
+        for entry in std::fs::read_dir(&records).unwrap() {
+            let path = entry.unwrap().path();
+            if path != first.controller_path && path != first.host_path {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let report = verify_files(
+            &first.controller_path,
+            Some(&first.host_path),
+            &RootAnchor(root),
+        )
+        .unwrap();
+        assert_eq!(
+            report.state,
+            VerificationState::ConsistentCompleteUnanchored
+        );
+        assert!(!report.anchor.ledger_continuous);
+    }
+
+    #[tokio::test]
+    async fn missing_local_identity_skips_anchoring() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(15), Endpoint::Memory(115)).await;
+        // An audit root without an identity file provides no anchor.
+        let empty = dir.path().join("empty-root");
+        std::fs::create_dir_all(&empty).unwrap();
+        let report = verify_files(
+            &pair.controller_path,
+            Some(&pair.host_path),
+            &RootAnchor(empty),
+        )
+        .unwrap();
+        assert_eq!(
+            report.state,
+            VerificationState::ConsistentCompleteUnanchored
+        );
+        assert!(!report.anchor.identity_matched);
+    }
+
+    #[tokio::test]
+    async fn corrupted_ledger_state_skips_anchoring() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("audit-root");
+        crate::audit::ledger::Ledger::open(&root, &mut OsSecureRandom).unwrap();
+        let pair = build_full_pair(
+            dir.path(),
+            Endpoint::Real(root.clone()),
+            Endpoint::Memory(16),
+        )
+        .await;
+        // Corrupt the ledger state checksum: the anchor must fail closed to
+        // the unanchored state instead of trusting the file.
+        let state = root.join(identity::LEDGER_STATE_FILE_NAME);
+        let mut bytes = std::fs::read(&state).unwrap();
+        bytes[10] ^= 0xFF;
+        std::fs::write(&state, &bytes).unwrap();
+        let report = verify_files(
+            &pair.controller_path,
+            Some(&pair.host_path),
+            &RootAnchor(root),
+        )
+        .unwrap();
+        assert_eq!(
+            report.state,
+            VerificationState::ConsistentCompleteUnanchored
+        );
+        assert!(!report.anchor.ledger_continuous);
+    }
+
+    // -----------------------------------------------------------------
+    // Streaming and structural tests
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn non_audit_files_are_format_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-an-audit");
+        std::fs::write(&path, b"this is not an audit container").unwrap();
+        assert!(matches!(
+            verify_files(&path, None, &NoAnchor),
+            Err(VerifyError::NotAnAuditContainer)
+        ));
+        let missing = dir.path().join("missing.yonaudit");
+        assert!(matches!(
+            verify_files(&missing, None, &NoAnchor),
+            Err(VerifyError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_record_types_and_trailing_bytes_are_tampered() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(17), Endpoint::Memory(117)).await;
+        // An unknown record type injected after the header.
+        let mut bytes = std::fs::read(&pair.controller_path).unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1_u32.to_be_bytes());
+        frame.push(0x1F); // unknown critical type
+        bytes.splice(CONTAINER_HEADER_LEN..CONTAINER_HEADER_LEN, frame);
+        std::fs::write(&pair.controller_path, &bytes).unwrap();
+        let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+
+        // Trailing garbage after a valid container.
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(18), Endpoint::Memory(118)).await;
+        let mut bytes = std::fs::read(&pair.controller_path).unwrap();
+        bytes.extend_from_slice(b"garbage");
+        std::fs::write(&pair.controller_path, &bytes).unwrap();
+        let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+    }
+
+    #[tokio::test]
+    async fn stream_frames_delivers_records_and_reports_truncation() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(19), Endpoint::Memory(119)).await;
+        let mut types = Vec::new();
+        let summary = stream_frames(&pair.controller_path, &mut |record_type, _| {
+            types.push(record_type);
+            Ok(StreamAction::Continue)
+        })
+        .unwrap();
+        assert!(!summary.truncated_tail);
+        assert!(types.contains(&RecordType::LocalDisplayBytes));
+        assert!(types.contains(&RecordType::SharedInputCommitment));
+
+        // A truncated file stops at the last complete frame.
+        let bytes = std::fs::read(&pair.controller_path).unwrap();
+        let cut = bytes.len() / 2;
+        let truncated = dir.path().join("truncated.yonaudit");
+        std::fs::write(&truncated, &bytes[..cut]).unwrap();
+        let mut count = 0;
+        let summary = stream_frames(&truncated, &mut |_, _| {
+            count += 1;
+            Ok(StreamAction::Continue)
+        })
+        .unwrap();
+        assert!(summary.truncated_tail);
+        assert!(count > 0);
+    }
+}

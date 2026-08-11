@@ -2347,7 +2347,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2386,7 +2386,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3694,7 +3694,7 @@ dependencies = [
 
 [[package]]
 name = "yonder-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "data-encoding",
  "governor",
@@ -3705,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "yonder-fuzz"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "libfuzzer-sys",
  "yonder-core",
@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "yonder-net"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "futures",
  "libp2p",

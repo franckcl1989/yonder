@@ -52,7 +52,7 @@ Audit/
 | `0x03` | `AuditReady` | 130 | session ID、对端 hello 摘要、format、会话签名 |
 | `0x04` | `Checkpoint` | 328 | 序号、四条共享链快照、本地链/账本摘要、会话签名 |
 | `0x05` | `CheckpointAck` | 296 | checkpoint 摘要、相同共享快照、会话签名 |
-| `0x06` | `JointManifest` | 399..=911 | 双方身份/会话键/绑定、企业标识、terminal 摘要、最终链、结束原因 |
+| `0x06` | `JointManifest` | 397 | 双方身份/会话键/绑定、terminal 摘要、最终链、结束原因 |
 | `0x07` | `ManifestSignature` | 64 | 对共同清单的会话签名 |
 | `0x08` | `LocalRecordSeal` | 329 | 本地链、共享链、清单和 sealed prefix 的本端封印 |
 | `0x09` | `LedgerCommit` | 233 | 前一根、session、record 摘要、对端身份、结果和持久签名 |
@@ -66,11 +66,13 @@ Audit/
 - `AuditReady`：`session_id[32] || peer_hello_digest[32] || format_version:u16 || signature[64]`。
 - `Checkpoint`：`session_id[32] || sequence:u64 || snapshot[160] || local_chain_head[32] || ledger_snapshot_digest[32] || signature[64]`。
 - `CheckpointAck`：`session_id[32] || sequence:u64 || checkpoint_digest[32] || snapshot[160] || signature[64]`。
-- `JointManifest`：`format_version:u16 || session_id[32] || controller_fingerprint[32] || host_fingerprint[32] || controller_session_key[32] || host_session_key[32] || connection_binding[32] || enterprise_len:u16 || enterprise[0..=512] || terminal_hello_digest[32] || final_snapshot[160] || ending_tag:u8 || ending_value:u8 || ended_normally:u8 || final_checkpoint_sequence:u64`。
+- `JointManifest`：`format_version:u16 || session_id[32] || controller_fingerprint[32] || host_fingerprint[32] || controller_session_key[32] || host_session_key[32] || connection_binding[32] || terminal_hello_digest[32] || final_snapshot[160] || ending_tag:u8 || ending_value:u8 || ended_normally:u8 || final_checkpoint_sequence:u64`。
 - `LocalRecordSeal`：`session_id[32] || role:u8 || final_local_root[32] || local_count:u64 || final_shared_roots[128] || manifest_digest[32] || sealed_prefix_digest[32] || signature[64]`。
 - `LedgerCommit`：`sequence:u64 || previous_root[32] || session_id[32] || manifest_digest[32] || sealed_record_digest[32] || peer_fingerprint[32] || result:u8 || signature[64]`。
 
 `snapshot` 按 Input、Output、Control、FileTransfer 固定顺序各包含 `count:u64 || head[32]`。角色只有 `1 Controller/2 Host`；ledger result 只有 `1 Normal/2 Interrupted/3 AuditFailed`；`ended_normally` 只有 `0/1`。结束类型为 `1 ShellExit` 或 `2 CloseReason`，关闭原因只有 `1 NormalShellExit/2 ControllerDetach/3 LocalInterrupt/4 ConnectionLost/5 AuditFailure`。签名覆盖对应 payload 除 signature 外的全部字段，并分别加 `yonder-audit-<message>-v2` 域前缀。实现必须在 `yonder-core::wire::audit` 用公开常量逐字段定义，并用 compile-time/golden/property/fuzz 锁住总长度；文档与代码任何不一致都视为发布阻塞缺陷。
+
+企业准入事实由双方签名容器头中的 `AuthMode::Enterprise` 表达。成员身份只在 relay 内用于准入判断，验证后立即清除；Enterprise Resolve 不向端点传播该身份，因此共同清单不得包含成员标识、提供商用户 ID 或由其派生的稳定值。
 
 握手固定为双方发送 `AuditHello` 和 `SecretContribution`，验证承诺与持久签名，按角色顺序计算相同 session ID/输入承诺键，安全创建并同步本地 header，交换并验证 `AuditReady`。只有双方 ready 成功，host 才能创建 PTY 并发送 TerminalReady。
 

@@ -1,5 +1,5 @@
 //! Bounded wire messages for the Yonder verifiable session audit protocol,
-//! Yonder 0.1.4 design sections 13 (audit session establishment), 20
+//! Yonder 0.2.0 design sections 13 (audit session establishment), 20
 //! (bilateral checkpoints), 21 (final joint manifest and local record seal),
 //! 12 (local ledger) and 23 (audit file format).
 //!
@@ -27,7 +27,7 @@
 //! 0x03  AuditReady         fixed 130 bytes (session confirmation, signed)
 //! 0x04  Checkpoint         fixed 328 bytes (pre-checkpoint snapshot, signed)
 //! 0x05  CheckpointAck      fixed 296 bytes (checkpoint confirmation, signed)
-//! 0x06  JointManifest      variable 399..=911 bytes (final joint manifest)
+//! 0x06  JointManifest      397 bytes (final joint manifest)
 //! 0x07  ManifestSignature  fixed 64 bytes (ephemeral session signature)
 //! 0x08  LocalRecordSeal    fixed 329 bytes (local record seal, signed)
 //! 0x09  LedgerCommit       fixed 233 bytes (persistent ledger commit, signed)
@@ -69,10 +69,6 @@ pub const ED25519_SIGNATURE_LEN: usize = 64;
 pub const SHARED_STREAMS: usize = 4;
 /// Frame header: tag plus big-endian payload length.
 pub const FRAME_HEADER_LEN: usize = 5;
-/// Upper bound in bytes of the normalized common enterprise identity that
-/// both sides can verify (design section 21.1). Empty means absent.
-pub const MAX_ENTERPRISE_IDENTITY_LEN: usize = 512;
-
 /// `AuditHello` payload: role, two public keys, nonce, ledger snapshot,
 /// connection binding, format offer, input commitment and signature.
 pub const AUDIT_HELLO_LEN: usize = 1
@@ -94,18 +90,15 @@ pub const CHECKPOINT_LEN: usize =
 /// receiver's shared snapshot and signature.
 pub const CHECKPOINT_ACK_LEN: usize =
     DIGEST_LEN * 2 + 8 + SHARED_STREAMS * (8 + DIGEST_LEN) + ED25519_SIGNATURE_LEN;
-/// Smallest `JointManifest` payload: an empty enterprise identity.
-pub const MANIFEST_MIN_LEN: usize = 2
+/// Fixed `JointManifest` payload.
+pub const MANIFEST_LEN: usize = 2
     + DIGEST_LEN * 4
     + ED25519_PUBLIC_KEY_LEN * 2
-    + 2
     + DIGEST_LEN
     + SHARED_STREAMS * (DIGEST_LEN + 8)
     + 2
     + 1
     + 8;
-/// Largest `JointManifest` payload with a maximal enterprise identity.
-pub const MAX_MANIFEST_LEN: usize = MANIFEST_MIN_LEN + MAX_ENTERPRISE_IDENTITY_LEN;
 /// `LocalRecordSeal` payload.
 pub const LOCAL_RECORD_SEAL_LEN: usize = DIGEST_LEN
     + 1
@@ -124,8 +117,7 @@ pub const MANIFEST_SIGNATURE_LEN: usize = ED25519_SIGNATURE_LEN;
 pub const CLOSE_NOTICE_LEN: usize = 1;
 /// `AuditError` payload.
 pub const AUDIT_ERROR_LEN: usize = 2;
-/// Every audit payload fits under this bound; the largest message is the
-/// `JointManifest` at [`MAX_MANIFEST_LEN`].
+/// Every audit payload fits under this bound.
 pub const MAX_AUDIT_PAYLOAD_LEN: usize = 1024;
 /// A complete framed audit message: header plus the maximum payload.
 pub const MAX_AUDIT_FRAME_LEN: usize = FRAME_HEADER_LEN + MAX_AUDIT_PAYLOAD_LEN;
@@ -150,13 +142,13 @@ pub const CHECKPOINT_SIGNING_LEN: usize =
     CHECKPOINT_DOMAIN.len() + CHECKPOINT_LEN - ED25519_SIGNATURE_LEN;
 pub const CHECKPOINT_ACK_SIGNING_LEN: usize =
     CHECKPOINT_ACK_DOMAIN.len() + CHECKPOINT_ACK_LEN - ED25519_SIGNATURE_LEN;
-pub const MANIFEST_SIGNING_INPUT_LEN: usize = MANIFEST_DOMAIN.len() + MAX_MANIFEST_LEN;
+pub const MANIFEST_SIGNING_INPUT_LEN: usize = MANIFEST_DOMAIN.len() + MANIFEST_LEN;
 pub const SEAL_SIGNING_LEN: usize =
     SEAL_DOMAIN.len() + LOCAL_RECORD_SEAL_LEN - ED25519_SIGNATURE_LEN;
 pub const LEDGER_COMMIT_SIGNING_LEN: usize =
     LEDGER_COMMIT_DOMAIN.len() + LEDGER_COMMIT_LEN - ED25519_SIGNATURE_LEN;
 
-/// The fixed error a 0.1.4 endpoint reports when the peer cannot open the
+/// The fixed error a 0.2.0 endpoint reports when the peer cannot open the
 /// mandatory audit substream (design section 14).
 pub const PEER_AUDIT_UNSUPPORTED_MESSAGE: &str =
     "peer does not support mandatory verifiable session audit";
@@ -229,12 +221,10 @@ impl AuditRole {
 }
 
 /// The authentication mode recorded in the container header (design
-/// section 23.2); enterprise mode additionally records the normalized common
-/// enterprise identity in the joint manifest.
+/// section 23.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AuthMode {
-    Standard = 0x01,
     Enterprise = 0x02,
 }
 
@@ -247,7 +237,6 @@ impl AuthMode {
     #[must_use]
     pub const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            0x01 => Some(Self::Standard),
             0x02 => Some(Self::Enterprise),
             _ => None,
         }
@@ -1298,7 +1287,7 @@ impl CheckpointAck {
 /// ephemeral session keys; the two signatures travel in separate
 /// `ManifestSignature` messages covering [`JointManifest::signing_input`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JointManifest<'a> {
+pub struct JointManifest {
     format_version: u16,
     session_id: SessionId,
     controller_fingerprint: IdentityFingerprint,
@@ -1306,7 +1295,6 @@ pub struct JointManifest<'a> {
     controller_session_key: Ed25519PublicKey,
     host_session_key: Ed25519PublicKey,
     connection_binding: BindingDigest,
-    enterprise_identity: &'a str,
     terminal_hello_digest: Digest32,
     final_snapshot: SharedSnapshot,
     ending: ManifestEnding,
@@ -1314,7 +1302,7 @@ pub struct JointManifest<'a> {
     final_checkpoint_sequence: u64,
 }
 
-impl<'a> JointManifest<'a> {
+impl JointManifest {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub const fn new(
@@ -1325,7 +1313,6 @@ impl<'a> JointManifest<'a> {
         controller_session_key: Ed25519PublicKey,
         host_session_key: Ed25519PublicKey,
         connection_binding: BindingDigest,
-        enterprise_identity: &'a str,
         terminal_hello_digest: Digest32,
         final_snapshot: SharedSnapshot,
         ending: ManifestEnding,
@@ -1340,7 +1327,6 @@ impl<'a> JointManifest<'a> {
             controller_session_key,
             host_session_key,
             connection_binding,
-            enterprise_identity,
             terminal_hello_digest,
             final_snapshot,
             ending,
@@ -1384,13 +1370,6 @@ impl<'a> JointManifest<'a> {
         &self.connection_binding
     }
 
-    /// The normalized common enterprise identity, or the empty string when
-    /// no enterprise identity is verifiable by both sides.
-    #[must_use]
-    pub fn enterprise_identity(&self) -> &str {
-        self.enterprise_identity
-    }
-
     #[must_use]
     pub const fn terminal_hello_digest(&self) -> &Digest32 {
         &self.terminal_hello_digest
@@ -1427,13 +1406,9 @@ impl<'a> JointManifest<'a> {
         Ok(WireBytes::new(bytes, cursor))
     }
 
-    /// Encodes the manifest payload, validating the frozen format version
-    /// and the enterprise identity bound.
+    /// Encodes the manifest payload, validating the frozen format version.
     pub fn encode_payload(&self) -> Result<WireBytes<MAX_AUDIT_PAYLOAD_LEN>, ProtocolError> {
         if self.format_version != AUDIT_FORMAT_VERSION {
-            return Err(ProtocolError::InvalidField(ProtocolField::Reserved));
-        }
-        if self.enterprise_identity.len() > MAX_ENTERPRISE_IDENTITY_LEN {
             return Err(ProtocolError::InvalidField(ProtocolField::Reserved));
         }
         let mut bytes = [0_u8; MAX_AUDIT_PAYLOAD_LEN];
@@ -1453,9 +1428,6 @@ impl<'a> JointManifest<'a> {
         );
         append(&mut bytes, &mut cursor, self.host_session_key.as_bytes());
         append(&mut bytes, &mut cursor, self.connection_binding.as_bytes());
-        let enterprise = self.enterprise_identity.as_bytes();
-        write_u16(&mut bytes, &mut cursor, enterprise.len() as u16);
-        append(&mut bytes, &mut cursor, enterprise);
         append(
             &mut bytes,
             &mut cursor,
@@ -1469,12 +1441,11 @@ impl<'a> JointManifest<'a> {
         Ok(WireBytes::new(bytes, cursor))
     }
 
-    /// Decodes one manifest payload of [`MANIFEST_MIN_LEN`]..=
-    /// [`MAX_MANIFEST_LEN`] bytes.
-    pub fn decode_payload(bytes: &'a [u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() < MANIFEST_MIN_LEN {
+    /// Decodes one fixed-length manifest payload.
+    pub fn decode_payload(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != MANIFEST_LEN {
             return Err(ProtocolError::InvalidLength {
-                expected: MANIFEST_MIN_LEN,
+                expected: MANIFEST_LEN,
                 actual: bytes.len(),
             });
         }
@@ -1494,24 +1465,7 @@ impl<'a> JointManifest<'a> {
         host_session_key.copy_from_slice(&bytes[130..162]);
         let mut connection_binding = [0_u8; DIGEST_LEN];
         connection_binding.copy_from_slice(&bytes[162..194]);
-        let enterprise_len = usize::from(u16::from_be_bytes([bytes[194], bytes[195]]));
-        if enterprise_len > MAX_ENTERPRISE_IDENTITY_LEN {
-            return Err(ProtocolError::InvalidField(ProtocolField::Reserved));
-        }
-        let tail_start = 196 + enterprise_len;
-        let expected = MANIFEST_MIN_LEN + enterprise_len;
-        if bytes.len() < expected {
-            return Err(ProtocolError::InvalidLength {
-                expected,
-                actual: bytes.len(),
-            });
-        }
-        if bytes.len() > expected {
-            return Err(ProtocolError::TrailingBytes);
-        }
-        let enterprise_identity = std::str::from_utf8(&bytes[196..tail_start])
-            .map_err(|_| ProtocolError::InvalidField(ProtocolField::Reserved))?;
-        let tail = &bytes[tail_start..];
+        let tail = &bytes[194..];
         let mut terminal_hello_digest = [0_u8; DIGEST_LEN];
         terminal_hello_digest.copy_from_slice(&tail[..32]);
         let final_snapshot = decode_snapshot(&tail[32..192]);
@@ -1531,7 +1485,6 @@ impl<'a> JointManifest<'a> {
             Ed25519PublicKey::new(controller_session_key),
             Ed25519PublicKey::new(host_session_key),
             BindingDigest::new(connection_binding),
-            enterprise_identity,
             Digest32::new(terminal_hello_digest),
             final_snapshot,
             ending,
@@ -1952,10 +1905,9 @@ impl LedgerCommit {
     }
 }
 
-/// One decoded audit substream message. The only borrowed field is the joint
-/// manifest's enterprise identity, which borrows the frame payload.
+/// One decoded audit substream message.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuditMessage<'a> {
+pub enum AuditMessage {
     /// The audit handshake opener (tag `0x01`).
     AuditHello(AuditHello),
     /// The raw input commitment secret contribution (tag `0x02`).
@@ -1967,7 +1919,7 @@ pub enum AuditMessage<'a> {
     /// The signed confirmation of one checkpoint (tag `0x05`).
     CheckpointAck(CheckpointAck),
     /// The final joint manifest (tag `0x06`).
-    JointManifest(JointManifest<'a>),
+    JointManifest(JointManifest),
     /// One ephemeral session signature over the joint manifest (tag `0x07`).
     ManifestSignature(ManifestSignature),
     /// The local record seal with its ephemeral session signature
@@ -1981,7 +1933,7 @@ pub enum AuditMessage<'a> {
     AuditError(AuditErrorCode),
 }
 
-impl AuditMessage<'_> {
+impl AuditMessage {
     /// Encodes a complete frame: tag, big-endian payload length and payload.
     pub fn encode(&self) -> Result<WireBytes<MAX_AUDIT_FRAME_LEN>, ProtocolError> {
         let (tag, payload) = match self {
@@ -2027,7 +1979,7 @@ impl AuditMessage<'_> {
 
     /// Decodes one complete frame, validating the tag, the payload length
     /// bound, the exact payload structure and the absence of trailing bytes.
-    pub fn decode_frame(frame: &[u8]) -> Result<AuditMessage<'_>, ProtocolError> {
+    pub fn decode_frame(frame: &[u8]) -> Result<AuditMessage, ProtocolError> {
         if frame.len() < FRAME_HEADER_LEN {
             return Err(ProtocolError::InvalidLength {
                 expected: FRAME_HEADER_LEN,
@@ -2060,7 +2012,7 @@ impl AuditMessage<'_> {
         Self::decode_payload(tag, &frame[FRAME_HEADER_LEN..])
     }
 
-    fn decode_payload(tag: u8, payload: &[u8]) -> Result<AuditMessage<'_>, ProtocolError> {
+    fn decode_payload(tag: u8, payload: &[u8]) -> Result<AuditMessage, ProtocolError> {
         let code = AuditTag::from_byte(tag).ok_or(ProtocolError::UnknownTag(tag))?;
         match code {
             AuditTag::AuditHello => {
@@ -2101,7 +2053,7 @@ fn close_notice_payload(reason: AuditCloseReason) -> WireBytes<MAX_AUDIT_PAYLOAD
     WireBytes::new(bytes, CLOSE_NOTICE_LEN)
 }
 
-fn decode_close_notice(payload: &[u8]) -> Result<AuditMessage<'_>, ProtocolError> {
+fn decode_close_notice(payload: &[u8]) -> Result<AuditMessage, ProtocolError> {
     let [reason] = payload else {
         return Err(ProtocolError::InvalidLength {
             expected: CLOSE_NOTICE_LEN,
@@ -2119,7 +2071,7 @@ fn audit_error_payload(code: AuditErrorCode) -> WireBytes<MAX_AUDIT_PAYLOAD_LEN>
     WireBytes::new(bytes, AUDIT_ERROR_LEN)
 }
 
-fn decode_audit_error(payload: &[u8]) -> Result<AuditMessage<'_>, ProtocolError> {
+fn decode_audit_error(payload: &[u8]) -> Result<AuditMessage, ProtocolError> {
     let bytes: [u8; AUDIT_ERROR_LEN] =
         payload
             .try_into()
@@ -2167,7 +2119,7 @@ pub fn validate_payload_len(tag: u8, len: usize) -> Result<(), ProtocolError> {
         AuditTag::AuditReady => len == AUDIT_READY_LEN,
         AuditTag::Checkpoint => len == CHECKPOINT_LEN,
         AuditTag::CheckpointAck => len == CHECKPOINT_ACK_LEN,
-        AuditTag::JointManifest => (MANIFEST_MIN_LEN..=MAX_MANIFEST_LEN).contains(&len),
+        AuditTag::JointManifest => len == MANIFEST_LEN,
         AuditTag::ManifestSignature => len == MANIFEST_SIGNATURE_LEN,
         AuditTag::LocalRecordSeal => len == LOCAL_RECORD_SEAL_LEN,
         AuditTag::LedgerCommit => len == LEDGER_COMMIT_LEN,
@@ -2243,7 +2195,7 @@ mod tests {
         )
     }
 
-    fn manifest() -> JointManifest<'static> {
+    fn manifest() -> JointManifest {
         JointManifest::new(
             AUDIT_FORMAT_VERSION,
             SessionId::new([1; DIGEST_LEN]),
@@ -2252,7 +2204,6 @@ mod tests {
             Ed25519PublicKey::new([4; ED25519_PUBLIC_KEY_LEN]),
             Ed25519PublicKey::new([5; ED25519_PUBLIC_KEY_LEN]),
             BindingDigest::new([6; DIGEST_LEN]),
-            "alice@wecom",
             Digest32::new([7; DIGEST_LEN]),
             snapshot([10, 20, 30, 40]),
             ManifestEnding::ShellExit(0),
@@ -2287,7 +2238,7 @@ mod tests {
         )
     }
 
-    fn frame(message: &AuditMessage<'_>) -> Vec<u8> {
+    fn frame(message: &AuditMessage) -> Vec<u8> {
         message.encode().unwrap().as_slice().to_vec()
     }
 
@@ -2439,15 +2390,9 @@ mod tests {
         assert!(validate_payload_len(AuditTag::CloseNotice.code(), 2).is_err());
         assert!(validate_payload_len(AuditTag::AuditError.code(), 2).is_ok());
         assert!(validate_payload_len(AuditTag::AuditError.code(), 3).is_err());
-        // The manifest is the only variable-length message.
-        assert!(validate_payload_len(AuditTag::JointManifest.code(), MANIFEST_MIN_LEN).is_ok());
-        assert!(validate_payload_len(AuditTag::JointManifest.code(), MAX_MANIFEST_LEN).is_ok());
-        assert!(
-            validate_payload_len(AuditTag::JointManifest.code(), MANIFEST_MIN_LEN - 1).is_err()
-        );
-        assert!(
-            validate_payload_len(AuditTag::JointManifest.code(), MAX_MANIFEST_LEN + 1).is_err()
-        );
+        assert!(validate_payload_len(AuditTag::JointManifest.code(), MANIFEST_LEN).is_ok());
+        assert!(validate_payload_len(AuditTag::JointManifest.code(), MANIFEST_LEN - 1).is_err());
+        assert!(validate_payload_len(AuditTag::JointManifest.code(), MANIFEST_LEN + 1).is_err());
         assert_eq!(
             validate_payload_len(0xFF, 0),
             Err(ProtocolError::UnknownTag(0xFF))
@@ -2631,119 +2576,30 @@ mod tests {
     }
 
     #[test]
-    fn manifest_enterprise_identity_bounds_and_utf8() {
-        let base = manifest();
-
-        // The empty identity means "absent" and round-trips at the minimum
-        // length.
-        let empty = JointManifest::new(
-            base.format_version(),
-            *base.session_id(),
-            *base.controller_fingerprint(),
-            *base.host_fingerprint(),
-            *base.controller_session_key(),
-            *base.host_session_key(),
-            *base.connection_binding(),
-            "",
-            *base.terminal_hello_digest(),
-            base.final_snapshot(),
-            base.ending(),
-            base.ended_normally(),
-            base.final_checkpoint_sequence(),
-        );
-        let encoded = frame(&AuditMessage::JointManifest(empty.clone()));
-        assert_eq!(encoded.len(), FRAME_HEADER_LEN + MANIFEST_MIN_LEN);
+    fn manifest_is_fixed_length_and_versioned() {
+        let manifest = manifest();
+        let encoded = frame(&AuditMessage::JointManifest(manifest.clone()));
+        assert_eq!(encoded.len(), FRAME_HEADER_LEN + MANIFEST_LEN);
         assert_eq!(
             AuditMessage::decode_frame(&encoded).unwrap(),
-            AuditMessage::JointManifest(empty)
+            AuditMessage::JointManifest(manifest.clone())
         );
 
-        // The maximal identity fits exactly; one byte more does not.
-        let maximum = "a".repeat(MAX_ENTERPRISE_IDENTITY_LEN);
-        let full = JointManifest::new(
-            base.format_version(),
-            *base.session_id(),
-            *base.controller_fingerprint(),
-            *base.host_fingerprint(),
-            *base.controller_session_key(),
-            *base.host_session_key(),
-            *base.connection_binding(),
-            &maximum,
-            *base.terminal_hello_digest(),
-            base.final_snapshot(),
-            base.ending(),
-            base.ended_normally(),
-            base.final_checkpoint_sequence(),
-        );
-        let encoded = frame(&AuditMessage::JointManifest(full.clone()));
-        assert_eq!(encoded.len(), FRAME_HEADER_LEN + MAX_MANIFEST_LEN);
-        assert_eq!(
-            AuditMessage::decode_frame(&encoded).unwrap(),
-            AuditMessage::JointManifest(full.clone())
-        );
-
-        let overlong = "b".repeat(MAX_ENTERPRISE_IDENTITY_LEN + 1);
-        assert_eq!(
-            AuditMessage::JointManifest(JointManifest::new(
-                base.format_version(),
-                *base.session_id(),
-                *base.controller_fingerprint(),
-                *base.host_fingerprint(),
-                *base.controller_session_key(),
-                *base.host_session_key(),
-                *base.connection_binding(),
-                &overlong,
-                *base.terminal_hello_digest(),
-                base.final_snapshot(),
-                base.ending(),
-                base.ended_normally(),
-                base.final_checkpoint_sequence(),
-            ))
-            .encode(),
-            Err(ProtocolError::InvalidField(ProtocolField::Reserved))
-        );
-
-        // A manifest declaring a different frozen format version is rejected.
-        let mut bytes = full.encode_payload().unwrap().as_slice().to_vec();
+        let mut bytes = manifest.encode_payload().unwrap().as_slice().to_vec();
         bytes[0..2].copy_from_slice(&1_u16.to_be_bytes());
         assert_eq!(
             JointManifest::decode_payload(&bytes),
             Err(ProtocolError::InvalidField(ProtocolField::Reserved))
         );
 
-        // A declared enterprise length beyond the protocol bound is rejected
-        // before any read.
-        let mut overlong_declared = full.encode_payload().unwrap().as_slice().to_vec();
-        overlong_declared[194..196].copy_from_slice(&0xFFFF_u16.to_be_bytes());
-        assert_eq!(
-            JointManifest::decode_payload(&overlong_declared),
-            Err(ProtocolError::InvalidField(ProtocolField::Reserved))
-        );
-
-        // A declared length inside the bound but beyond the remaining bytes
-        // is rejected before reading.
-        let mut truncated = full.encode_payload().unwrap().as_slice().to_vec();
-        truncated[194..196].copy_from_slice(&10_u16.to_be_bytes());
-        truncated.truncate(MANIFEST_MIN_LEN + 5);
-        assert!(matches!(
-            JointManifest::decode_payload(&truncated),
-            Err(ProtocolError::InvalidLength { .. })
-        ));
-
-        // Non-UTF-8 enterprise bytes are rejected.
-        let mut bad_utf8 = full.encode_payload().unwrap().as_slice().to_vec();
-        bad_utf8[196] = 0xFF;
-        assert_eq!(
-            JointManifest::decode_payload(&bad_utf8),
-            Err(ProtocolError::InvalidField(ProtocolField::Reserved))
-        );
-
-        // Trailing bytes after the manifest fields are rejected.
-        let mut trailing = full.encode_payload().unwrap().as_slice().to_vec();
+        let mut trailing = manifest.encode_payload().unwrap().as_slice().to_vec();
         trailing.push(0xAA);
         assert_eq!(
             JointManifest::decode_payload(&trailing),
-            Err(ProtocolError::TrailingBytes)
+            Err(ProtocolError::InvalidLength {
+                expected: MANIFEST_LEN,
+                actual: MANIFEST_LEN + 1,
+            })
         );
     }
 
@@ -2803,9 +2659,11 @@ mod tests {
             assert_eq!(AuditRole::from_byte(role.code()), Some(role));
         }
         assert_eq!(AuditRole::from_byte(0), None);
-        for mode in [AuthMode::Standard, AuthMode::Enterprise] {
-            assert_eq!(AuthMode::from_byte(mode.code()), Some(mode));
-        }
+        assert_eq!(
+            AuthMode::from_byte(AuthMode::Enterprise.code()),
+            Some(AuthMode::Enterprise)
+        );
+        assert_eq!(AuthMode::from_byte(1), None);
         assert_eq!(AuthMode::from_byte(0), None);
         for result in [
             SessionResult::Normal,
@@ -2916,7 +2774,7 @@ mod tests {
                 )
         }
 
-        fn arbitrary_manifest() -> impl Strategy<Value = JointManifest<'static>> {
+        fn arbitrary_manifest() -> impl Strategy<Value = JointManifest> {
             (
                 any::<[u8; 32]>(),
                 any::<[u8; 32]>(),
@@ -2929,7 +2787,6 @@ mod tests {
                 any::<u8>(),
                 any::<bool>(),
                 any::<u64>(),
-                prop::collection::vec(prop::char::range('a', 'z'), 0..=MAX_ENTERPRISE_IDENTITY_LEN),
             )
                 .prop_map(
                     |(
@@ -2944,9 +2801,7 @@ mod tests {
                         exit_code,
                         ended_normally,
                         checkpoint_sequence,
-                        enterprise_chars,
                     )| {
-                        let enterprise = enterprise_chars.into_iter().collect::<String>();
                         JointManifest::new(
                             AUDIT_FORMAT_VERSION,
                             SessionId::new(session),
@@ -2955,7 +2810,6 @@ mod tests {
                             Ed25519PublicKey::new(ctrl_key),
                             Ed25519PublicKey::new(host_key),
                             BindingDigest::new(binding),
-                            Box::leak(enterprise.into_boxed_str()),
                             Digest32::new(hello_digest),
                             snapshot,
                             ManifestEnding::ShellExit(exit_code),
@@ -2967,16 +2821,14 @@ mod tests {
         }
 
         /// The documented encoded payload length of every message kind.
-        fn documented_len(message: &AuditMessage<'_>) -> usize {
+        fn documented_len(message: &AuditMessage) -> usize {
             match message {
                 AuditMessage::AuditHello(_) => AUDIT_HELLO_LEN,
                 AuditMessage::SecretContribution(_) => SECRET_CONTRIBUTION_LEN,
                 AuditMessage::AuditReady(_) => AUDIT_READY_LEN,
                 AuditMessage::Checkpoint(_) => CHECKPOINT_LEN,
                 AuditMessage::CheckpointAck(_) => CHECKPOINT_ACK_LEN,
-                AuditMessage::JointManifest(manifest) => {
-                    MANIFEST_MIN_LEN + manifest.enterprise_identity().len()
-                }
+                AuditMessage::JointManifest(_) => MANIFEST_LEN,
                 AuditMessage::ManifestSignature(_) => MANIFEST_SIGNATURE_LEN,
                 AuditMessage::LocalRecordSeal(_) => LOCAL_RECORD_SEAL_LEN,
                 AuditMessage::LedgerCommit(_) => LEDGER_COMMIT_LEN,
@@ -2985,7 +2837,7 @@ mod tests {
             }
         }
 
-        fn arbitrary_message() -> impl Strategy<Value = AuditMessage<'static>> {
+        fn arbitrary_message() -> impl Strategy<Value = AuditMessage> {
             prop_oneof![
                 arbitrary_hello().prop_map(AuditMessage::AuditHello),
                 any::<[u8; 32]>().prop_map(|bytes| {
@@ -3143,34 +2995,6 @@ mod tests {
                 );
             }
 
-            #[test]
-            fn manifests_round_trip_every_enterprise_identity_length(
-                enterprise_len in 0_usize..=MAX_ENTERPRISE_IDENTITY_LEN,
-            ) {
-                let enterprise = "e".repeat(enterprise_len);
-                let manifest = JointManifest::new(
-                    AUDIT_FORMAT_VERSION,
-                    SessionId::new([1; DIGEST_LEN]),
-                    IdentityFingerprint::new([2; DIGEST_LEN]),
-                    IdentityFingerprint::new([3; DIGEST_LEN]),
-                    Ed25519PublicKey::new([4; ED25519_PUBLIC_KEY_LEN]),
-                    Ed25519PublicKey::new([5; ED25519_PUBLIC_KEY_LEN]),
-                    BindingDigest::new([6; DIGEST_LEN]),
-                    Box::leak(enterprise.into_boxed_str()),
-                    Digest32::new([7; DIGEST_LEN]),
-                    snapshot([10, 20, 30, 40]),
-                    ManifestEnding::ShellExit(0),
-                    true,
-                    9,
-                );
-                let encoded = AuditMessage::JointManifest(manifest.clone()).encode().unwrap();
-                prop_assert_eq!(
-                    encoded.as_slice().len(),
-                    FRAME_HEADER_LEN + MANIFEST_MIN_LEN + enterprise_len
-                );
-                let decoded = AuditMessage::decode_frame(encoded.as_slice()).unwrap();
-                prop_assert_eq!(decoded, AuditMessage::JointManifest(manifest));
-            }
         }
     }
 }

@@ -1,8 +1,36 @@
 # 实现验证记录
 
-日期：2026-07-27。当前本机环境：Windows x86_64，`rustc 1.97.0`、`cargo 1.97.1`；Linux 证据来自 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
+更新日期：2026-08-11。当前开发环境为 Windows x86_64；Linux 原生验证使用 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
 
-## 当前通过证据
+## 0.2.0 当前证据
+
+本节是 0.2.0 发布判断的唯一当前摘要。后续章节保存从 v0.1.1 基线继承的历史证据，用于回归比较和测试设计，但不得冒充新增企业准入、文件传输和企业审计代码已经通过的结果。0.2.0 尚未打 tag、尚未形成 release candidate，也尚未满足正式发布门禁。
+
+截至本次记录，Windows 隔离工作树已取得以下证据：
+
+- `cargo fmt --all -- --check`、fuzz workspace 格式检查、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 和 fuzz workspace 对应 Clippy 门禁全部通过。
+- `cargo test --workspace --all-targets --all-features` 在 11 个测试二进制中聚合执行 `974` 项：`969 passed / 5 ignored / 0 failed`；`yon` 库本身为 `571 passed / 2 ignored`，真实进程 E2E 为 `15 passed / 1 ignored`。另有 Criterion benchmark harness 的非测量执行路径成功。
+- `cargo test --workspace --doc` 通过，其中 `3` 个 compile-fail rustdoc 测试锁定 `RetryAfter`、`PakeSecret` 和连接码暴露生命周期的不变量。
+- 真实网络测试暴露并纠正了三项测试基础设施问题：普通模式脚本不再错误等待 enterprise-only 审计流，`TerminalReady` 获得绝对 `10s` 等待上限，取消/提示场景按真实子流关闭语义收尾且 relay 由 RAII 清理。裸 TCP readiness 探针已经移除，启动就绪只由真实 libp2p 身份握手和有界重试证明。
+- Windows 32 逻辑 CPU 的默认 libtest 自动并发会同时创建过多网络测试运行时并导致非产品性的 `10053` 握手中止；固定 `--test-threads=4` 后全套 `571/571` 通过。项目因此在 `.cargo/config.toml` 提供可由操作者覆盖的 `RUST_TEST_THREADS=4` 资源预算，并保留端到端网络场景的单许可隔离；未显式传测试线程参数的项目默认命令已再次以 `571 passed / 0 failed / 2 ignored` 通过。
+- fuzz 独立 workspace 的 package 与本地 `yonder-core`/`yonder-net` 精确版本已同步为 `0.2.0`；两份锁文件不新增或升级直接依赖，`cargo check --locked --offline` 与 Clippy 全 target/all feature 门禁通过。
+- `yonder-core` 当前执行 `138` 项：`137 passed / 1 ignored`。真实 libp2p relay 测试分别证明普通模式只发布标准 Resolve，企业模式只发布 Enterprise Resolve；第一方 Rust 源码扫描未发现 `unsafe` 块/函数/trait/impl、`todo!()` 或 `unimplemented!()`。
+- Rocky Linux 8.10 x86_64 真机使用同一隔离源码和锁文件通过 workspace 全 target/all feature Clippy 零警告；workspace 全量在 `11` 个测试二进制中聚合执行 `977` 项，结果为 `972 passed / 5 ignored / 0 failed`。其中 `yon` 库为 `576 passed / 2 ignored`，`yon-relay` 库为 `149/149`，真实进程 E2E 为 `13 passed / 1 ignored`，覆盖 Unix 原生 PTY、真实 shell、TCP/QUIC/WS/WSS、自签 IP WSS、传输回退、一次性码恢复及进程诊断隔离。
+- Linux 真机暴露并纠正了两项跨环境测试建模缺陷：root 可绕过 `0500` 目录写权限，因此权限回归先验证内核确实执行拒绝；临时 enterprise secret 目录在 Unix 显式设为 `0700`，生产 `0600` 文件和可信父目录校验保持不变。全 feature debug 测试进程因调试框架、64 MiB 场景线程栈与分配器保留达到约 `121 MiB`，会被生产 endpoint `96 MiB` 阈值误拒；实现现由编译期常量让 debug/sanitizer 构建仍有界于 `512 MiB`，优化非 sanitizer release 精确保持 endpoint `96 MiB`、relay `64 MiB`，且 release 模式定向测试已断言实际选择生产值。
+- 同一真机通过固定 digest 的官方 `rust:1.97.0-slim-bookworm` 容器和临时 `musl-tools`，以只读源码及独立 target 按冻结 release profile 构建 `x86_64-unknown-linux-musl`。`yon = 11,483,208 B`、SHA-256 `ff55e9c3a00377c880eaeda98b11c817a529265c5bc1044cc91e0f6018d590dc`；`yon-relay = 10,322,504 B`、SHA-256 `654f78d0e02dbd73877b004c635368da998c73c271ed367c56553ac5526ccace`。两者均为 stripped static PIE，ELF 不含 `INTERP` 或 `NEEDED`；空目录 version/help、relay identity 初始化/读取及 `0600` 权限 smoke 全部通过。
+- 上述静态 release 二进制完整通过自动化 network namespace/`sch_netem` 矩阵：公网 IPv4 为 `3222 ms Direct/QUIC`，单 NAT IPv4 为 `4158 ms Direct/QUIC`，严格双 stateful NAT 为 `8915 ms Relayed/TCP`，IPv6-only 为 `3172 ms Direct/QUIC`；四种拓扑均执行真实 relay、host、controller、shell 会话并低于 `20s` 硬上限，且按最后一次选路记录断言最终路径。
+- Linux 真实产品进程连续 `10` 轮逐轮传输 `8 MiB` 并逐字节校验，远程中位吞吐 `35,296,613 B/s`、本地 PTY 中位吞吐 `36,655,558 B/s`、比率 `0.955221`，通过 `384 KiB/s` 和 `0.70` 门槛；直接内存路径中位吞吐约 `1,115,627,243 B/s`。Criterion 观测 OPAQUE 登录往返 `25.319..26.444 ms`、16 KiB 固定复制 `1.3409..1.3851 us`、连接码编码 `207.65..210.28 ns`、解码 `89.923..91.391 ns`、八候选路径选择 `124.44..126.40 ns`。各 `11` 个冷启动样本中 `yon`/`yon-relay` 中位数约 `3.70 ms`/`3.58 ms`；独立 relay 空闲时为 `9,216 KiB RSS`、`0.0% CPU`、`1` 线程、`10` 个文件描述符，通过 `48 MiB`/`256 FD` 门槛。
+- 锁定的 `cargo-audit 0.22.2` 对生产 `509` 个 package 与 fuzz `366` 个 package 执行 `--deny warnings` 均通过，仅使用三项既有精确批准例外；锁定的 `cargo-deny 0.20.2` 对两份锁文件的 advisories、bans、licenses、sources 四类检查全部通过。安全例外图校验同步纠正为精确表达实际且已批准的双版本边界：OPAQUE/voprf 只能依赖 `curve25519-dalek 4.1.3`，`ed25519-dalek 3.0.0` 可独占依赖 `5.0.0`；生产与 fuzz 依赖图校验均返回 `true`。
+- 全部仓库 Bash 脚本在 Linux 临时 LF 副本中通过 `bash -n`；固定 `actionlint 1.7.12` 对 `ci.yml`、`release.yml` 和 `recover-release.yml` 零错误。测试机未安装 ShellCheck，因此本地不把 ShellCheck 写成已通过，候选 runner 仍须执行 workflow 的完整质量步骤。
+- 固定 MSRV `rustc 1.88.0` 在官方 `rust:1.88.0-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89` 基础上，以只读源码/registry、独立 target 和禁网构建完整通过 `x86_64-unknown-linux-musl` workspace `--all-targets --all-features`，fuzz workspace 在同一目标及 `clang++` 下通过全 target/all feature check；普通 Linux GNU workspace 与 fuzz check 也通过。该证据只覆盖 Linux x64，不能替代其余五个原生 MSRV runner。
+- 固定 `nightly-2026-07-22`、默认 Miri 隔离下，`yonder-core` 执行 `122 passed / 1 ignored / 0 failed`，另有 `3` 个 compile-fail doctest 通过。首次运行暴露 `secret_file` 从 relay 移入 core 后，原生 ACL/mode/symlink 测试被 Miri 收入而因隔离不支持 `mkdir` 失败；该整组测试只验证真实 OS 权限，不存在可等价解释执行的纯逻辑路径，因此现仅在 `cfg(miri)` 下排除，仍由普通测试和逐平台 coverage 完整执行，Miri 默认隔离未被关闭。
+- 同一 nightly 的 ASan 与 TSan 分别使用 `-Zbuild-std`、`--workspace --all-targets --all-features` 完整通过。ASan 首轮在全部 `576` 项 `yon` 库测试成功后，真实捕获验证夹具 `RealLedgerAdapter` 通过四次 `Box::leak` 遗留 `1256 B / 8 allocations`；测试适配器现与生产 `LedgerAdapter` 使用相同的 `OwnedCommitSession` 所有权模型，17 项定向审计验证通过，ASan 定向 `yon` 复验为 `576 passed / 2 ignored` 且零泄漏，随后全 workspace ASan 零内存/泄漏报告；全 workspace TSan 也零数据竞争报告。生产代码本身未使用该泄漏夹具，但门禁不再掩盖测试资源生命周期错误。
+
+正式候选前仍必须完成：五目标独立覆盖率、其余五个发布目标的原生构建与静态链接检查及 MSRV、四个 fuzz target 各 `30min`；Rocky Linux 真机的真实企业准入、文件传输、双端审计和长时间资源稳定性；macOS Intel/Apple Silicon 及 Windows ARM64 的原生终端、文件和审计路径；企业微信和飞书真实自建应用的成功、拒绝、超时及无降级验证；最终六平台单文件归档、SBOM、许可证清单、checksum 和 provenance。项目所有者还将补充一项 0.2.0 release 目标，在纳入并验证前不得正式发布。
+
+## v0.1.1 发布基线历史证据
+
+以下结果对应 v0.1.1 及其形成过程中的提交。它们证明既有远程终端基线并为 0.2.0 回归提供比较数据，但凡文本中出现“当前源码”“当前工作树”均应按该条记录时的历史提交理解，不能外推到 0.2.0。
 
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` 通过。
@@ -51,7 +79,7 @@
 - Rocky Linux 8/OpenSSL `1.1.1k FIPS` 复现了旧运维命令受系统 `openssl.cnf` 影响而同时生成 `CA:TRUE` 与 `CA:FALSE` 两个 `Basic Constraints` 的畸形自签证书；WebPKI 精确返回 `ExtensionValueInvalid`。改用独立最小 OpenSSL 配置后，证书只有一个 `CA:FALSE`、精确 IP SAN 和 `serverAuth`；当前 release 构建以该 DER/PKCS#8 材料完成真实 WSS relay、host、controller、TLS 信任和远端 shell 会话。CLI 错误链已分别保留私钥编码、证书 WebPKI 解析、SAN 和 rustls 配置根因。
 - Rocky Linux 真机进一步使用 `128` 个独立 network namespace 和来源 `/32`，在不关闭 rust-libp2p 原生 reservation 限速的情况下真实建立 `128/128` 个 reservation/registration。最初共享的 `250ms` 永久 Ping 使 relay 单核 CPU 达 `6.4637%`；修正为 endpoint `1s`、relay `15s` 且一个成功样本即可保留已建立候选后，复测 relay RSS `15,724 KiB`、峰值 `15,724 KiB`、`138` FD、30 秒空闲单核 CPU `0.8998%`，全部通过绝对上限。host 稳态 RSS 最小/中位/p95/最大为 `7,388/7,792/8,224/10,092 KiB`，启动 HWM 为 `26,600/27,184/27,672/29,552 KiB`，最大附加峰值 `22,164 KiB`；测试后 namespace、bridge、进程和临时秘密文件残留均为 `0`。
 
-## 覆盖率现状
+## v0.1.1 覆盖率历史
 
 - Windows `rustc 1.99.0-nightly (2026-07-20)` 与 `cargo-llvm-cov 0.8.7` 对当前工作树在真实用户权限下运行 workspace all-target/all-feature 测试与 benchmark smoke，并通过硬门禁：line `95.184070% (8222/8638)`、function `98.371041% (1087/1105)`、region `90.119908% (10973/12176)`、branch `81.896552% (760/928)`；每文件 line 最低为 `yon/src/host.rs` 的 `79.098361% (772/976)`，没有文件低于 `75%`。新增测试真实触发 UTF-8 有界批处理的超大块、容量刷新、直接写失败、批量写失败、残缺序列写失败与最终 flush 失败，未排除生产代码或降低门槛；报告保存在 `target/coverage-buffer-nightly.json`。CI 固定的 `nightly-2026-07-22` 及其他原生目标仍必须由新自动 CI 与候选 workflow 独立复验，不能沿用本机数字。
 - 未覆盖内容仍集中在需要真实 TTY、精确网络故障时序、已认证连接替换和不可由 safe 公共 API 构造的上游错误状态。当前审核没有通过伪造非法状态、执行“若调用即失败”的保护闭包或排除生产模块来追求数字；认证、会话消费点、秘密边界、并发关闭和资源上限继续由定向、属性、模糊、sanitizer、真实进程与网络证据补充覆盖率百分比。
@@ -71,7 +99,7 @@
 - 手动候选 `30247052349` 在同一提交上已通过 quality、六目标原生构建、四个非 Windows coverage、六目标 MSRV、Miri、ASan/TSan、供应链、Linux/Windows 性能、SBOM、许可证和 namespace/netem 网络矩阵。该轮 Windows 的真实终端调度使 line 为 `95.160917% (8220/8638)`、function 为 `98.280543% (1086/1105)`、branch 为 `81.573276% (757/928)`，但 region 为 `89.996715% (10958/12176)`，离门槛只差一个已覆盖 region；依赖图因此正确跳过四个 `30min` release fuzz job 和候选聚合，不能把该轮称为成功候选。
 - 当前工作树继续增加真实可达的 PTY 生命周期与 Windows 控制台输出回归：第二次取得唯一输入句柄必须返回 `TaskStopped`，child-exit 与输入复制任务的 oneshot 发送端异常销毁必须返回 `TaskPanicked`；流式输出适配器统一处理字节直通、完整 UTF-8、跨块多字节、非法续字节、有效前缀、残缺尾部和底层写入/刷新失败。新增错误传播测试使用同一个生产泛型实例执行此前未被调度命中的有界批处理失败路径，使本机 region 相对上述候选低值增加 `15` 个并在门槛上方保留 `14` 个；测试没有直接篡改生产私有状态制造不可达状态，也没有排除生产代码或降低门槛，最终提交仍须由锁定的 `nightly-2026-07-22` 五目标自动 CI 重新复验。
 
-## 候选与剩余交付项
+## v0.1.1 候选与发布历史
 
 - 手动候选 `30247052349` 除上述 Windows region 门槛外的质量、原生构建、性能、网络和供应链矩阵均成功；四个并行 `30min` fuzz job 尚未执行，六平台候选聚合也未生成。当前修复必须先通过新自动 CI，再重新执行完整候选；候选成功后才允许创建并推送 `v0.1.1` 标签。
 - 手动候选 `29901282778` 对提交 `aa824c420ba49d558a55b06831cc2a7c31591de4` 的 quality、六目标原生构建、五目标 coverage、六目标 MSRV、Miri、ASan/TSan、供应链和 namespace/netem 网络矩阵均成功；Linux 性能因上述同进程 RSS 测试隔离缺陷在第六轮被阻断，Windows 性能与 20 个五小时 fuzz shard 随后因候选已不可能聚合而主动取消。该次失败没有降低生产 relay 的 `64 MiB` 内存连接保护；当前修正改为真实独立 relay 进程并保留完整安全策略，仍须在新提交上重跑整个候选矩阵。
@@ -84,6 +112,6 @@
 - 正式 Release 已独立复核：恰好 `19` 个发布文件，`18` 条 SHA-256 全匹配，`SHA256SUMS` 自身摘要为 `bf99ae75bf155dba41cccde1b029b21d52f70890513b986673ef92fdbff54ef0`，`12` 个归档各恰好一个规范名称可执行文件，两个 SBOM 均为正确 component 的 CycloneDX `1.5`，`Cargo.lock` 与标签源码一致。正式入口为 `https://github.com/franckcl1989/yonder/releases/tag/v0.1.0`。
 - Rocky Linux 8.10 x86_64 对当前 relay 源码执行了真实进程生命周期门禁：新建 identity mode 为 `0600`；进程先同步安装 SIGINT/SIGTERM/SIGHUP 监听并记录 `relay_signal_handlers_installed`，再构造 libp2p 网络；测试逐项在该安装事件后立即发送三种真实信号，均在 `5s` 绝对上限内成功退出并分别记录一次 `relay_shutdown_requested` 与 `relay_stopped`。临时把 identity 放宽为 `0640` 后，`identity show` 以非零状态拒绝读取并报告不可信访问权限。最终审查另发现并修复 Unix 仅检查文件 mode、未验证直接父目录替换权限的不一致；当前实现还要求父目录禁止 group/other 写入且 owner 为 `root` 或文件 owner，并拒绝非普通文件，Rocky Linux relay 全包 `56/56` 与 workspace Clippy 通过。
 
-## 当前结论
+## 0.1.x 历史结论
 
-当前产品主路径、真实 PTY/ConPTY、四种 relay transport、自签 IP WSS、直连优先与严格 relay fallback、一次性 OPAQUE、relay restart/Reclaim/Conflict、不可信 relay 边界、资源限制、有界关闭、秘密文件和跨平台配置均已有定向、真实进程、跨平台候选和正式发布证据。`v0.1.0` 标签固定在 `429a78dcaebd5ffd5aec792d0d468cf9e30257ab`；正式标签矩阵、累计 `100h` 的长 fuzz、两平台真实进程性能、六平台单二进制归档、checksum、SBOM、许可证和 provenance 消费方验证均已完成，GitHub Release 已正式发布。后续主分支的发布自动化加固与测试稳定性修复不移动该标签，也不改变已发布产品二进制。
+0.1.x 产品主路径、真实 PTY/ConPTY、四种 relay transport、自签 IP WSS、直连优先与严格 relay fallback、一次性 OPAQUE、relay restart/Reclaim/Conflict、不可信 relay 边界、资源限制、有界关闭、秘密文件和跨平台配置均已有定向、真实进程、跨平台候选和正式发布证据。`v0.1.0` 标签固定在 `429a78dcaebd5ffd5aec792d0d468cf9e30257ab`；该历史发布的标签矩阵、长 fuzz、两平台真实进程性能、六平台单二进制归档、checksum、SBOM、许可证和 provenance 消费方验证均已完成。上述结论不覆盖 0.2.0 新增能力；0.2.0 的当前判断只取本文件首节。

@@ -5225,6 +5225,9 @@ dependencies = [
  "axum",
  "axum-server",
  "clap",
+ "config",
+ "data-encoding",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",
@@ -5259,6 +5262,7 @@ dependencies = [
  "governor",
  "proptest",
  "rand 0.8.7",
+ "tempfile",
  "thiserror 2.0.19",
  "zeroize",
 ]

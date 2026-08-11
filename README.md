@@ -7,7 +7,7 @@ Yonder 是一个跨平台、一次授权的点对点远程终端。项目发布�
 
 双方只需能够访问同一个 relay。Yonder 会同时尝试 QUIC、TCP、WebSocket 和安全 WebSocket，在 relay circuit 建立后继续通过 DCUtR 尝试直连，并根据连通性、延迟、抖动和路径类型选出最终连接；无法直连时继续使用端到端加密的 relay circuit。
 
-完整的生产部署、全字段配置、证书、服务托管、升级回滚与故障排查说明见 [Yonder 0.1.1 运维与使用手册](docs/operations-manual.md)。
+Yonder 0.2.0 在基础远程终端之外提供 Active 会话内的单文件上传/下载，以及可选的企业微信/飞书成员准入模式。企业模式强制两个 endpoint 生成可双边验证的本地审计记录；普通模式不创建审计状态。完整的生产部署、全字段配置、企业回调、证书、文件操作、审计、服务托管、升级回滚与故障排查说明见 [Yonder 0.2.0 运维与使用手册](docs/operations-manual.md)。
 
 ## 快速开始
 
@@ -79,17 +79,23 @@ printf 'XXXX-XXXX-XXXX-XXXX\necho hello\nexit\n' | \
 
 Windows ConPTY 不能在保留尾部输出的同时可靠地把管道关闭映射为 shell EOF，因此 Windows 非交互内容必须像上例一样显式包含 `exit`；Unix 会额外把输入半关闭传递为 PTY EOF。
 
+交互会话中按 `Ctrl+]` 再按 `u` 上传单个文件，按 `Ctrl+]` 再按 `d` 下载，按 `Ctrl+]` 再按 `?` 查看本地控制，按 `Ctrl+]` 再按 `.` 结束会话。文件传输流式运行、校验 SHA-256、使用同目录私有临时文件并且永不覆盖已有目标；取消或普通传输错误不会结束远程终端。
+
 配置优先级固定为环境变量、当前目录配置文件、系统配置文件。Linux 系统目录是 `/etc/yonder`，macOS 是 `/Library/Application Support/Yonder`，Windows 是 `%PROGRAMDATA%\Yonder`；文件名分别为 `yon.toml` 和 `yon-relay.toml`。Windows 的 `PROGRAMDATA` 必须存在且是非空绝对路径，否则无法安全定位系统层并会直接启动失败。`yon` 使用 `YON_` 前缀，relay 使用 `YON_RELAY_`；嵌套字段用 `__`，列表用逗号，例如 `YON_RELAYS`、`YON_RELAY_REGISTRY__CAPACITY`。相对路径相对于提供该字段的配置文件目录解析，环境变量中的相对路径相对于当前目录解析。
 
-endpoint 可配置一到八个属于同一 PeerId 的 relay 传输地址；`yon-relay` 的 `listen` 与可被客户端拨号的 `external` 也都必须各提供一到八个地址。WSS 地址使用 `/tcp/<PORT>/tls/ws`；endpoint 配置 `wss_ca`，relay 配置 `wss_certificate` 和 `wss_private_key`。证书、信任锚和私钥可使用 DER 或 PEM；证书链与轮换期信任锚可使用有序列表。`*_der` 旧键在 `0.1.x` 继续兼容，高优先级的新键可覆盖低优先级旧键，同一层同时提供新旧键则拒绝启动。未知字段、非法文件、非 UTF-8、超过 64 KiB 的配置或无效组合都会使启动失败，不会静默降级。
+endpoint 可配置一到八个属于同一 PeerId 的 relay 传输地址；`yon-relay` 的 `listen` 与可被客户端拨号的 `external` 也都必须各提供一到八个地址。WSS 地址使用 `/tcp/<PORT>/tls/ws`；endpoint 配置 `wss_ca`，relay 配置 `wss_certificate` 和 `wss_private_key`。证书、信任锚和私钥可使用 DER 或 PEM；证书链与轮换期信任锚可使用有序列表。`*_der` 旧键在 `0.2.0` 继续兼容，高优先级的新键可覆盖低优先级旧键，同一层同时提供新旧键则拒绝启动。未知字段、非法文件、非 UTF-8、超过 64 KiB 的配置或无效组合都会使启动失败，不会静默降级。
 
 只有 WSS 需要这组运维侧证书。自签证书可以使用：relay 配置带 `CA:FALSE`、`serverAuth` 和正确 SAN 的自签叶证书及私钥，两个 endpoint 把同一证书配置为 `wss_ca`。使用私有 CA 时，endpoint 改为信任该 CA。通过 IP 连接必须有对应 `IP SAN`，通过域名连接必须有对应 `DNS SAN`；只设置 `CN` 无效。relay 会在监听前使用 rustls 官方类型解析并实际构造 TLS 配置，校验证书/私钥匹配和每个 WSS external 的 SAN；有效期、用途、证书链与信任关系由真实客户端 TLS 握手最终验证，失败时关闭连接且绝不降级为明文。服务端支持叶证书优先的完整证书链，endpoint 最多同时加载八个信任锚用于证书轮换。
+
+在 `yon-relay.toml` 中加入 `[enterprise_auth]` 会把 relay 切换为企业模式；普通 Resolve 与企业 Resolve 不会同时开放。企业模式至少配置企业微信或飞书中的一个应用、一个 relay 自行终止 TLS 的 HTTPS callback listener，以及浏览器和企业平台可达的外部 HTTPS origin。企业平台 secret 和 callback 私钥必须放在独立的私有文件中。完整字段、固定 callback URL 和权限要求见运维手册；企业模式不支持 OAuth 失败后降级到普通准入。
 
 ## 安全模型
 
 relay 始终被视为不可信基础设施。它可以观察双方地址、PeerId、时序和流量大小，也可以拒绝或中断服务；终端内容和控制消息则由两个 `yon` 端点之间的 libp2p 身份认证与 OPAQUE 连接码认证共同保护。
 
 连接码每次 `yon host` 启动重新生成，只允许一个成功建立的终端会话消费。Yonder 不提权，远端 shell 使用被控端当前用户、当前权限、工作目录和环境。
+
+企业成员准入只控制主控端的 Enterprise Resolve，不是通用 IAM、RBAC、设备信任或抗 DDoS 边界，也不限制 host 申请 relay reservation。企业终端在 PTY 创建前强制建立双端审计；原始键盘字节和文件内容不落盘，双端共同事实以会话私有承诺、哈希链、签名和连续账本保护。使用 `yon audit verify` 离线校验配对记录，使用 `yon audit replay` 通过 `vt100` 安全状态机回放主控画面；不要把审计容器中的原始控制字节直接写入终端。
 
 完整威胁模型、协议和依赖例外见 [设计规范](docs/design/README.md)。
 
