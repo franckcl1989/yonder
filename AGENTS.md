@@ -254,3 +254,22 @@
 - 仓库采用 `LICENSE-MIT` 与 `LICENSE-APACHE` 双许可证文本。已批准发布工具 `cargo-about 0.9.1`，仅启用 `cli`，用于生成独立 `THIRD-PARTY-LICENSES.html`；许可证资产必须纳入 checksum 和 provenance，但不得放入单二进制归档。
 - 网络验证采用经批准的风险驱动成对矩阵：每种传输、关键 NAT/地址族拓扑、故障类别及 Direct/Relayed 结果都必须有真实代表组合和最终选路断言，不要求制造低价值的完整笛卡尔积。中继不可信行为通过端到端认证流的篡改/截断测试与真实网络延迟、丢包、乱序、断连和重置验证；禁止为注入中继内部明文钩子而 fork 或重写官方 `libp2p-relay`。
 - tag workflow 只有在性能、资源、四目标各 `30min` 的发布 fuzz、风险驱动网络与故障矩阵、五目标覆盖率和六目标原生发布证据全部通过后才允许自动创建正式 GitHub Release。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
+
+## 已确认的 0.2.0 产品与发布基线
+
+- `0.2.0` 必须从 `v0.1.1` 独立重建；已撤回 `0.1.2`、`0.1.3`、`0.1.4` 的源码、提交、设计和测试只可作为审计材料，不得整提交 cherry-pick 或沿用其完成结论。
+- 普通 relay/会话保持 `v0.1.1` 终端、认证、隐私和 wire 兼容；增加原生单文件传输，审计默认关闭且不产生本地状态。
+- 企业 relay 只提供 Enterprise Resolve，支持企业微信和飞书自建应用，有效内部成员验证失败关闭且禁止回退普通 Resolve。企业会话必须由 `0.2.0` 双端在 Terminal Active 前完成可验证审计。
+- 新增协议 ID 固定为 `/yonder/enterprise-resolve/2.0.0`、`/yonder/file-transfer/2.0.0`、`/yonder/audit/2.0.0`；拒绝版本使用过的扩展协议不得作为兼容回退。既有 auth/terminal/registry/普通 resolve 协议保持不变。
+- 文件传输固定使用交互式 `Ctrl+] u/d/?`，独立已认证子流、每会话一个传输、`64 KiB` 流式块、SHA-256、安全临时文件和 no-replace 提交；失败/取消不得结束终端。
+- 企业审计只存在于端点，不把终端/文件/审计内容交给 relay；不保存原始输入，使用会话私有 HMAC 承诺，保存完整输出，使用持久身份/账本、周期检查点、共同清单、双签名和安全离线 verify/replay。Windows 必须复用并验证受保护 DACL，不能可靠保护时失败关闭。
+- 企业 provider 集合允许启动期有界动态分发；终端、文件和审计热路径使用静态分发。各状态由单一 owner 持有，任务间只使用有界 channel；审计磁盘 writer 在 Tokio runtime 外执行并对 append-before-effect 返回确认。
+- 正式 release 后硬删除 GitHub `v0.1.2`、`v0.1.3` Releases/tags，以 `--force-with-lease` 把 `main` 清理为 `v0.1.1 -> v0.2.0`，并删除相关 Actions runs、临时分支/worktree 和本地悬空对象。发布前只允许软撤回，以保留审计和借鉴材料。
+
+## 已确认的 0.2.0 直接依赖
+
+- 企业 HTTP：`reqwest 0.13.4`（`json,query,rustls-no-provider`）、`axum 0.8.9`（`http1,json,query,tokio,tracing`）、`axum-server 0.8.0`（`tls-rustls-no-provider`）、`open 5.4.1`（无 feature）、`serde_json 1.0.151`（`std`）。全部 `default-features = false`。Rustls provider 必须安装 workspace 已有 ring 实现；禁止旁路手写 Hyper HTTP 栈。
+- 文件传输把既有 `tempfile 3.27.0` 提升为 `yon` 生产依赖，继续 `default-features = false, features = ["getrandom"]`，用于同目录安全临时文件和成熟 no-replace 提交。
+- 审计：`ed25519-dalek 3.0.0`（`zeroize`）、`fs4 1.1.0`（`sync`）、`hkdf 0.13.0`（无 feature）、`hmac 0.13.0`（`zeroize`）、`sha2 0.11.0`（无 feature）、`vt100 0.16.2`（无 feature）；全部 `default-features = false`。
+- `sha2 0.10.9` 只作为 `opaque-ke 4.0.1` 公开 Digest 0.10 约束的兼容别名保留；文件与审计等新代码统一使用 `sha2 0.11.0`。禁止让 legacy digest 类型扩散到其他模块。
+- 上述依赖版本已于 2026-08-11 核实为采用范围内的最新稳定版本，MSRV 不高于 workspace 1.88，许可证兼容现有策略。实施后仍必须以实际 lockfile 完成安全、许可证、feature、静态链接、体积、性能与分配审计。

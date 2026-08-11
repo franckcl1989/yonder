@@ -28,5 +28,20 @@
 | R-024 | relay 秘密文件在受支持平台 fail-closed | `SecretFilePolicy` + `IdentityStore` | Unix 0600、可信且不可被 group/other 写入的直接父目录；Windows protected DACL/可信 owner | Unix mode/父目录/普通文件、Windows ACL 正反测试、原生 config check、空目录 identity smoke |
 | R-025 | relay 可生产托管且可低噪声观测 | relay root task + aggregate observations | 跨平台停止信号；2s shutdown；60s 低基数汇总 | Unix/Windows 原生信号 E2E、聚合计数、拓扑配置拒绝、停止期限 |
 | R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | 两个二进制 config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |
+| R-027 | relay 普通/企业模式互斥且企业模式只提供 Enterprise Resolve | yon-relay service + config | `/yonder/enterprise-resolve/2.0.0` | 模式隔离、旧 connect 拒绝、旧 host 注册、进程 E2E |
+| R-028 | 企业事务内存单次、与子流绑定、断连/超时/重启失效 | yon-relay enterprise owner | Created..Completed/失败态 | 全转换、重放、重复回调、容量、假时钟、EOF 清理 |
+| R-029 | 企业微信/飞书只放行可确认的有效内部成员 | `EnterpriseProvider` adapters | OAuth callback + typed HTTPS exchange | 双平台 fixture 故障矩阵 + 两平台真实自建应用正反验收 |
+| R-030 | 企业回调只开放两个 HTTPS GET 路径且无敏感日志 | yon-relay callback | 固定 path/state/code | TLS loopback、404/400/405、no-store、泄露负断言 |
+| R-031 | 企业 secret 和审计文件跨平台强制保护 | `SecretFilePolicy` + audit store | Unix 0700/0600；Windows protected DACL | Unix mode/owner/symlink、Windows owner/ACE 正反原生测试 |
+| R-032 | controller 提示/选择 provider、先显示 URL、浏览器打开失败可继续 | yon enterprise UI | Providers/Select/Authenticate | 单/双 provider、非 TTY、open 失败、心跳与零污染测试 |
+| R-033 | 活动交互会话原生单文件上传/下载 | yon file actor | `/yonder/file-transfer/2.0.0` | 上传/下载 E2E、错误/取消不结束终端、新旧互操作 |
+| R-034 | 文件流式 64 KiB、SHA-256、安全临时文件和 no-replace | `FileTransferBackend` | Open/Data/Finish/Committed | 多块/空文件、竞态、symlink、源变化、磁盘/权限故障 |
+| R-035 | 本地控制命名空间跨平台一致且非交互字节透明 | terminal frontend | `Ctrl+] u/d/?/./Ctrl+]` | 跨块状态属性测试、PTY/ConPTY 原生 E2E、未知选择器 |
+| R-036 | 仅企业会话强制双端审计，普通会话零审计副作用 | yon audit/session | `/yonder/audit/2.0.0` | 普通回归、企业握手/旧端拒绝、目录缺失/不可写失败关闭 |
+| R-037 | 原始输入不落盘，双端以会话私有 HMAC 承诺一致 | audit observer/crypto | Input shared chain | 内容边界、承诺一致、无 key 离线猜测不可验证测试 |
+| R-038 | 输出/控制/文件事实链、周期检查点、共同清单和双签名 | audit session/wire | Hello..LedgerCommit | wire golden/property/fuzz、乱序/重复/mismatch、完整/中断 E2E |
+| R-039 | 持久身份和串行连续账本抵抗本地静默改写/分叉 | audit identity/ledger | identity + ledger + record container | 竞争、崩溃恢复、回滚/fork 检测、签名/链篡改矩阵 |
+| R-040 | 离线 verify 六状态和 vt100 安全 replay | yon audit CLI | `.yonaudit` format 2 | 退出码、截断/逐字节篡改、OSC52/DCS/查询过滤、原生 smoke |
+| R-041 | 0.2.0 产物与历史只建立在 v0.1.1 和本基线上 | release workflow | v0.1.1 -> v0.2.0 | commit provenance、六 target 资产、撤回 release/tag/run 清理审计 |
 
 实现任务只有同时关联至少一个需求 ID、一个责任 package 和一个验证项才能进入开发。该矩阵是可追踪的当前基线，不是凌驾于产品目标之上的不可变规则；真实实现、网络或运维证据证明现有条目不合理时，应同时修订需求、设计、实现和验证，而不是为保持旧文本牺牲远程终端的正确性与可用性。发现需求没有可执行证据时视为设计缺口，不能用人工目测关闭。

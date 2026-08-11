@@ -29,7 +29,7 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 
 ## 依赖声明规则
 
-- 版本为 2026-07-22 核实的稳定版；Cargo 使用精确版本和受审 `Cargo.lock`。只有 `libp2p-stream` 是已批准的 alpha 例外。
+- 0.1.1 依赖版本沿用既有审计；0.2.0 新增依赖于 2026-08-11 核实稳定版本。Cargo 使用精确版本和受审 `Cargo.lock`。只有 `libp2p-stream` 是已批准的 alpha 例外。
 - 每个直接依赖都写 `default-features = false`，只打开下表 feature。兼容性例外 `rand 0.8.7` 和 `sha2 0.10.9` 由 `opaque-ke` 的公开 trait 主版本决定。
 - Rust 项目 MSRV 固定为 `1.88`。直接依赖最高声明 1.86，但锁定树中的 `time 0.3.53` 要求 1.88；CI 必须用 1.88 和当前 stable 分别构建。
 - 所有生产依赖是 Rust crate 或系统 API wrapper，不要求用户安装 OpenSSL、C runtime、动态网络库或其他第三方运行时。
@@ -39,29 +39,41 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | crate | 精确版本与 feature | 放置/用途 | 选择与影响 |
 | --- | --- | --- | --- |
 | `backon` | `1.6.0`; `std,tokio-sleep` | `yon`; controller 重连、查询与认证退避 | Apache-2.0，维护活跃；替代手写退避。冷路径，小型 fastrand jitter，无原生库；不让共享网络 crate 或 fuzz 构建承担未使用依赖 |
+| `axum` | `0.8.9`; `http1,json,query,tokio,tracing` | `yon-relay`; 企业 OAuth HTTPS callback router | MIT，Tokio/Tower 生态标准；替代手写 HTTP server/router。只在企业 relay 启动，HTTP/2、form、multipart、macros 未启用 |
+| `axum-server` | `0.8.0`; `tls-rustls-no-provider` | `yon-relay`; callback TLS listener | MIT，成熟 Axum server；复用锁定树唯一 ring provider，避免 OpenSSL/原生动态库及手写 TLS accept loop |
 | `clap` | `4.6.4`; `color,derive,error-context,help,std,suggestions,usage` | 两个 binary；CLI | MIT/Apache-2.0，事实标准；替代手写解析。主要增加启动/体积，不在数据热路径 |
 | `config` | `0.15.25`; `toml` | `yonder-config`；严格分层配置 | MIT/Apache-2.0，成熟；替代手写 TOML、环境变量嵌套与合并。只在启动冷路径，禁用 async/json/yaml 等未使用能力 |
 | `crossterm` | `0.29.0`; `bracketed-paste,events,windows` | `yon`; raw mode、尺寸、显示恢复与终端事件控制序列 | MIT，成熟跨平台；替代平台终端 FFI 及手写 ANSI 序列。只在 controller 链接 |
 | `crossterm_winapi` | `0.9.1`; 无 feature | `yon` Windows；console input/output mode 保存与恢复 | MIT，Crossterm 同生态的 safe wrapper，已是锁定树中的传递依赖；替代第一方 Win32 FFI/`unsafe`，只在 Windows controller 链接，不新增 package |
 | `data-encoding` | `2.11.0`; `std` | `yonder-core`; Crockford Base32 | MIT，成熟、零拷贝 API；替代手写编码表。影响极小 |
+| `ed25519-dalek` | `3.0.0`; `zeroize` | `yon`; 持久审计身份与会话签名 | BSD-3-Clause，RustCrypto，最新稳定主版本；只在企业审计路径，使用 Digest 0.11/curve25519 5，与 libp2p 的 2.x/4.x 传递版本职责隔离 |
+| `fs4` | `1.1.0`; `sync` | `yon`; 审计账本跨进程文件锁 | MIT/Apache-2.0，成熟 safe wrapper；替代第一方 flock/LockFileEx FFI，仅在 runtime 外短临界区 |
 | `futures` | `0.3.33`; `async-await,std` | `yonder-net`; libp2p stream I/O | MIT/Apache-2.0，Rust 异步基础库；不引入 executor |
 | `governor` | `0.10.4`; `std` | `yonder-core`; relay/query/auth GCRA | MIT，成熟；替代手写令牌桶。只用 direct limiter，不用 keyed store/等待队列；已测 direct limiter 40 B、调用约 30 ns |
+| `hkdf` | `0.13.0`; 无 feature | `yon`; 企业审计输入承诺键派生 | MIT/Apache-2.0，RustCrypto；替代手写 HKDF，只处理每会话 32B 秘密冷路径 |
+| `hmac` | `0.13.0`; `zeroize` | `yon`; 不落盘键盘输入承诺 | MIT/Apache-2.0，RustCrypto；替代手写 MAC，固定 HMAC-SHA-256 |
 | `libp2p` | `0.56.0`; `autonat,dcutr,dns,ed25519,identify,macros,memory-connection-limits,noise,ping,quic,relay,tcp,tokio,upnp,websocket,yamux` | `yonder-net`; 完整网络栈 | MIT，官方 rust-libp2p；替代自研传输、NAT、加密、relay。是主要体积/编译成本，纯单二进制可分发 |
 | `libp2p-stream` | `0.4.0-alpha`; 无 feature | `yonder-net`; 应用子流 | MIT，rust-libp2p 官方 alpha；替代手写 ConnectionHandler/multistream。API 被 trait 隔离，存在受限预发布例外 |
 | `opaque-ke` | `4.0.1`; `argon2,ristretto255` | `yon`; RFC 9807 PAKE adapter | MIT/Apache-2.0，RustCrypto/Meta 实现；替代自研密码协议。认证冷路径约 19 MiB 临时内存，不让 relay 编译该依赖 |
+| `open` | `5.4.1`; 无 feature | `yon`; 把已显示的企业授权 URL 交给系统浏览器 | MIT，跨平台成熟；仅 best-effort 冷路径，不承载 OAuth secret/state，不启用额外路径规范化 feature |
 | `portable-pty` | `0.9.0`; 无 feature | `yon`; PTY 和 child | MIT，WezTerm 使用的跨平台实现；替代 Unix/ConPTY FFI。第三方含平台 unsafe，只在 `yon` 链接 |
 | `rand` | `0.8.7`; `getrandom` | `yonder-core`; OPAQUE 兼容 CSPRNG | MIT/Apache-2.0；0.8 最新修复补丁，因 opaque-ke Rand 0.8 约束不能用全局 0.10。系统熵路径无额外运行时 |
 | `rpassword` | `7.5.4`; 无 feature | `yon`; 隐藏 code 输入 | Apache-2.0，成熟跨平台；替代平台 console 手写。仅启动冷路径 |
+| `reqwest` | `0.13.4`; `json,query,rustls-no-provider` | `yon-relay`; 企业平台 HTTPS API | MIT/Apache-2.0，主流高层客户端；替代手写 Hyper 状态机，严格 HTTPS/超时/响应上限；使用锁定树 ring provider，无 OpenSSL |
 | `rustls-pki-types` | `1.15.0`; `alloc` | `yonder-net`; DER/PEM 证书链、信任锚与私钥边界解析 | MIT/Apache-2.0，rustls 官方类型；拒绝混合 PEM 块，先校验再调用 libp2p websocket 避免无效 key 触发其 panic API |
 | `rustls-webpki` (`webpki`) | `0.103.13`; 无 feature | `yonder-net`; WSS external DNS/IP SAN 启动校验 | ISC，rustls 官方 Web PKI 实现，维护活跃、MSRV 1.71；替代自研 X.509/SAN 解析和名称匹配。已存在于锁定的 rustls 传递树，本次只增加直接依赖边，不增加包、原生库或运行时热路径成本 |
 | `serde` | `1.0.229`; `derive,std` | 两个 binary；类型安全配置 schema | MIT/Apache-2.0，事实标准；只为启动配置反序列化启用 derive/std，不进入终端数据热路径 |
-| `sha2` | `0.10.9`; 无 feature | `yon`; OPAQUE SHA-512 | MIT/Apache-2.0；因 opaque-ke Digest 0.10 公开约束使用兼容主版本最新补丁，不让 relay 编译该依赖 |
-| `tempfile` | `3.27.0`; `getrandom` | `yon-relay` 身份原子写入、`yon` CLI 集成测试 | MIT/Apache-2.0，成熟；替代跨平台临时文件/rename 竞态手写。只在 init 冷路径或测试构建 |
+| `serde_json` | `1.0.151`; `std` | `yon-relay`; 企业平台类型化 JSON | MIT/Apache-2.0，Serde 官方 JSON；响应先受字节上限约束，禁止字符串搜索字段 |
+| `sha2` | `0.11.0`; 无 feature | `yon`; 文件 SHA-256 与企业审计 | MIT/Apache-2.0，RustCrypto 最新稳定；流式哈希，不按文件大小分配 |
+| `sha2-legacy` (`sha2`) | `0.10.9`; 无 feature | `yon::pake`; OPAQUE SHA-512 | MIT/Apache-2.0；仅因 opaque-ke Digest 0.10 公开约束保留的兼容别名，禁止用于新代码 |
+| `tempfile` | `3.27.0`; `getrandom` | relay identity 与 `yon` 文件接收 | MIT/Apache-2.0，成熟；同目录安全临时文件及 `persist_noclobber` 替代 TOCTOU/手写随机名，文件数据仍流式 |
 | `thiserror` | `2.0.19`; `std` | 所有 package；结构化错误 | MIT/Apache-2.0，成熟 derive；替代重复 Display/Error 样板，无运行时分配要求 |
-| `tokio` | `1.53.1`; `io-std,io-util,macros,rt,signal,sync,time` | 网络库和 binaries；runtime/I/O | MIT，成熟；current-thread runtime，避免手写 reactor。阻塞池上限 4 |
+| `tokio` | `1.53.1`; `io-std,io-util,macros,net,rt,signal,sync,time` | 网络库和 binaries；runtime/I/O | MIT，成熟；`net` 只为企业 callback listener；current-thread runtime，避免手写 reactor。阻塞池上限 4 |
 | `tokio-util` | `0.7.18`; `compat,io-util,rt` | `yonder-net`/`yon`; I/O 适配、取消、任务跟踪 | MIT，Tokio 官方；替代手写 bridge/cancellation。duplex 固定容量一次分配 |
 | `tracing` | `0.1.44`; `std` | `yon`、`yon-relay`、`yonder-net`；结构化诊断 | MIT，生态标准；字段白名单确保秘密和终端数据不记录，纯领域 package 不承担未使用依赖 |
 | `tracing-subscriber` | `0.3.23`; `ansi,fmt` | 两个 binary；文本日志 | MIT，官方 subscriber；只在进程边界，默认简洁 stderr |
+| `url` | `2.5.8`; 无 feature | `yon-relay`; OAuth URL 构造/约束 | MIT/Apache-2.0，事实标准；替代字符串拼接和 query 手写，冷路径 |
+| `vt100` | `0.16.2`; 无 feature | `yon`; 审计安全离线重放 | MIT，成熟 VT100 虚拟屏幕；完整拥有 parser/screen，第一方只渲染可见状态，绝不重发原 escape |
 | `zeroize` | `1.9.0`; `alloc,derive` | `yonder-core`; 小型秘密清除 | MIT/Apache-2.0，RustCrypto；`alloc` 用于立即包裹 rpassword/Clap 交出的 code String，避免手写 volatile 清除。不承诺 swap/core dump 清除 |
 
 `governor` 同时用于 relay 查询和被控端认证启动限速。此前“只允许链接 relay”的约束被本冻结替换：不用它就只能手写 auth 限速，违反不造轮子目标。`yon` 增加的已测最小静态体积约 13.5 KiB，收益大于该成本。
@@ -83,6 +95,9 @@ Safe Rust 能消除第一方未定义行为和数据竞争类别，但第三方 
 | 编码与秘密输入 | `data-encoding` 拥有 Crockford Base32，`rpassword` 拥有跨平台隐藏输入 | 第一方只定义连接码分组/别名/领域不变量和秘密生命周期；禁止手写编码表或控制台隐藏输入 |
 | WSS 密钥材料 | rustls 官方类型拥有 DER/PEM 和私钥类型，WebPKI 拥有证书与 DNS/IP 名称校验，libp2p websocket/rustls 拥有真实 TLS 握手 | 第一方只做有界读取、链顺序、配置组合、错误保真和启动前 fail-closed；禁止自研 X.509、SAN 匹配或 TLS |
 | CLI、错误与诊断 | Clap 拥有命令解析/help/suggestion，`thiserror` 拥有结构化错误样板，Tracing 拥有诊断事件/subscriber | 第一方只定义领域 newtype、退出码、秘密脱敏和终端画面隔离；禁止手写 argv parser、裸字符串跨边界错误或 Active 期日志污染 |
+| 企业 HTTPS/OAuth | Reqwest 拥有客户端、Rustls/Tower 拥有 TLS/HTTP，Axum/axum-server 拥有 callback routing/listener，URL/Serde JSON 拥有结构解析 | 第一方只定义提供商 trait、官方 API 字段、成员有效语义、事务 owner、限额和脱敏；禁止直接使用 Hyper 拼装客户端/服务器、手写 URL/JSON/TLS |
+| 原生文件传输 | Tempfile 拥有安全临时文件和 no-replace 提交，SHA2 拥有流式摘要，标准库拥有普通文件流 | 第一方只定义 wire、路径/权限产品语义、单传输状态和终端公平性；禁止 shell/ZMODEM 注入、随机文件名、先检查后 rename 或自研摘要 |
+| 可验证审计 | Ed25519-dalek、HKDF/HMAC/SHA2、fs4、vt100 分别拥有签名/派生/MAC/哈希、跨平台锁和 VT 屏幕解析 | 第一方只定义会话绑定、事实链、检查点、容器/账本、append-before-effect 和安全可见状态渲染；禁止自研密码原语、文件锁、VT parser 或重发原始 escape |
 | 验证工具 | Proptest、Criterion、libp2p-swarm-test、cargo-fuzz、Miri、sanitizer 和 LLVM coverage 分别拥有性质生成、统计基准、真实 Swarm、模糊与内存/竞态/覆盖工具能力 | 第一方只定义 Yonder 不变量、样本、绝对门槛和失败判定；禁止用 mock 百分比、单次计时或设计评审替代真实协议、PTY、网络和原生平台证据 |
 
 当前审查结论是：第一方代码的主要剩余体量属于连接码/OPAQUE/终端会话状态机、relay 注册与查询语义、直连优先选路、资源边界、产品进度和跨能力故障编排，这些都是 Yonder 特有的产品协议，不能由单一上游 crate 直接替代。任何新增第一方底层平台、协议、解析、限速、重试、终端按键翻译或加密实现都必须先证明上述成熟能力确实无法覆盖，并经过单独设计审批。
