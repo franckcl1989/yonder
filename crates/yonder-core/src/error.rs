@@ -30,6 +30,8 @@ pub enum DomainError {
     InvalidTerminalValue,
     #[error("a serialized PeerId must contain between 1 and 64 bytes")]
     InvalidPeerIdLength,
+    #[error("enterprise mode requires at least one configured provider")]
+    NoEnterpriseProvider,
 }
 
 /// Fixed fields used by the versioned application protocols.
@@ -41,6 +43,15 @@ pub enum ProtocolField {
     Reserved,
     TerminalDimension,
     TerminalValue,
+    EnterpriseProvider,
+    EnterpriseProviders,
+    AuthorizationUrl,
+    FileTransferPath,
+    FileTransferFileName,
+    FileTransferSize,
+    FileTransferDigest,
+    FileTransferErrorCode,
+    FileTransferData,
 }
 
 /// Errors returned by bounded wire decoders.

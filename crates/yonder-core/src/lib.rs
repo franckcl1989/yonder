@@ -6,6 +6,7 @@
 pub mod code;
 pub mod diagnostic;
 pub mod domain;
+pub mod enterprise;
 pub mod error;
 pub mod pake;
 pub mod random;
@@ -20,6 +21,7 @@ pub mod wire;
 pub use code::{ConnectionCode, Locator, PakeSecret};
 pub use diagnostic::write_error_report;
 pub use domain::{PeerIdBytes, RetryAfter, TerminalSize, TerminalValue};
+pub use enterprise::{EnterpriseProvider, EnterpriseProviders};
 pub use error::{CodeError, DomainError, ProtocolError};
 pub use pake::Pake;
 pub use random::{IdentitySeed, OsSecureRandom, RandomError, SecureRandom};
