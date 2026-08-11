@@ -293,7 +293,8 @@ impl ReplayMachine {
     }
 
     fn run(&mut self, path: &Path, mut output: Option<&mut dyn Write>) -> Result<(), RunError> {
-        stream_frames(path, &mut |record_type, payload| {
+        let mut display_error = None;
+        let stream_result = stream_frames(path, &mut |record_type, payload| {
             match record_type {
                 RecordType::LocalDisplayBytes => {
                     let display = payload
@@ -303,8 +304,22 @@ impl ReplayMachine {
                     self.display_bytes += display.len() as u64;
                     self.parser.process(display);
                     if let Some(output) = output.as_deref_mut() {
-                        render_screen(self.parser.screen(), self.viewport, &mut WriterRef(output))?;
-                        if poll_interrupt()? {
+                        if let Err(error) = render_screen(
+                            self.parser.screen(),
+                            self.viewport,
+                            &mut WriterRef(output),
+                        ) {
+                            display_error = Some(error);
+                            return Err(StreamError::Tampered("the replay display failed"));
+                        }
+                        let interrupted = match poll_interrupt() {
+                            Ok(interrupted) => interrupted,
+                            Err(error) => {
+                                display_error = Some(error);
+                                return Err(StreamError::Tampered("the replay display failed"));
+                            }
+                        };
+                        if interrupted {
                             self.interrupted = true;
                             return Ok(StreamAction::Stop);
                         }
@@ -318,14 +333,25 @@ impl ReplayMachine {
                     let rows = u16::from_be_bytes([payload[43], payload[44]]);
                     let (rows, cols) = clamp_size(rows, cols);
                     self.parser.screen_mut().set_size(rows, cols);
-                    if let Some(output) = output.as_deref_mut() {
-                        render_screen(self.parser.screen(), self.viewport, &mut WriterRef(output))?;
+                    if let Some(output) = output.as_deref_mut()
+                        && let Err(error) = render_screen(
+                            self.parser.screen(),
+                            self.viewport,
+                            &mut WriterRef(output),
+                        )
+                    {
+                        display_error = Some(error);
+                        return Err(StreamError::Tampered("the replay display failed"));
                     }
                 }
                 _ => {}
             }
             Ok(StreamAction::Continue)
-        })?;
+        });
+        if let Some(error) = display_error {
+            return Err(RunError::Display(error));
+        }
+        stream_result?;
         Ok(())
     }
 
@@ -541,7 +567,37 @@ mod tests {
     use crate::audit::verify::tests::{
         Endpoint, build_pair_with_controller_display, build_pair_with_controller_display_chunks,
     };
+    use std::fs;
     use tempfile::tempdir;
+    use yonder_core::wire::audit_container::{CONTAINER_HEADER_LEN, encode_frame_header};
+
+    fn frame(record_type: RecordType, payload: &[u8]) -> Vec<u8> {
+        let mut frame = encode_frame_header(1 + payload.len() as u32).to_vec();
+        frame.push(record_type.code());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn write_test_stream(source: &Path, target: &Path, frames: &[Vec<u8>]) {
+        let source = fs::read(source).unwrap();
+        let mut bytes = source[..CONTAINER_HEADER_LEN].to_vec();
+        for frame in frames {
+            bytes.extend_from_slice(frame);
+        }
+        fs::write(target, bytes).unwrap();
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("expected display failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("expected display failure"))
+        }
+    }
 
     #[test]
     fn vt100_consumes_dangerous_sequences_without_rendering_their_payloads() {
@@ -575,7 +631,84 @@ mod tests {
     #[test]
     fn replay_dimensions_are_bounded() {
         assert_eq!(clamp_size(0, 0), (1, 1));
+        assert_eq!(clamp_size(24, 80), (24, 80));
         assert_eq!(clamp_size(u16::MAX, u16::MAX), (MAX_ROWS, MAX_COLS));
+    }
+
+    #[test]
+    fn callbacks_account_for_every_filtered_side_effect() {
+        let mut callbacks = ReplayCallbacks::default();
+        let mut parser = vt100::Parser::new(2, 2, 0);
+        callbacks.audible_bell(parser.screen_mut());
+        callbacks.visual_bell(parser.screen_mut());
+        callbacks.resize(parser.screen_mut(), (9, 9));
+        callbacks.set_window_icon_name(parser.screen_mut(), b"icon");
+        callbacks.set_window_title(parser.screen_mut(), b"title");
+        callbacks.copy_to_clipboard(parser.screen_mut(), b"c", b"secret");
+        callbacks.paste_from_clipboard(parser.screen_mut(), b"c");
+        callbacks.unhandled_char(parser.screen_mut(), '\u{fffd}');
+        callbacks.unhandled_control(parser.screen_mut(), 0xff);
+        callbacks.unhandled_escape(parser.screen_mut(), Some(b'?'), None, b'x');
+        callbacks.unhandled_csi(parser.screen_mut(), None, None, &[&[1]], 'x');
+        callbacks.unhandled_osc(parser.screen_mut(), &[b"unknown"]);
+
+        assert_eq!(callbacks.bells, 2);
+        assert_eq!(callbacks.filtered.title, 2);
+        assert_eq!(callbacks.filtered.clipboard, 2);
+        assert_eq!(callbacks.filtered.resize_request, 1);
+        assert_eq!(callbacks.filtered.unhandled, 5);
+        assert_eq!(callbacks.filtered.total(), 10);
+    }
+
+    #[test]
+    fn renderer_emits_bounded_styles_colors_and_cursor_states() {
+        let mut parser = vt100::Parser::new(2, 3, 0);
+        parser.process(b"\x1b[1;2;3;4;7;38;5;123;48;2;1;2;3mA\xe7\x95\x8c\x1b[?25l");
+        let mut rendered = Vec::new();
+        render_screen(parser.screen(), (1, 2), &mut rendered).unwrap();
+        assert!(!rendered.is_empty());
+        assert!(safe_visible_text(parser.screen()).contains("A"));
+
+        parser.process(b"\x1b[0m\x1b[?25h\rB");
+        rendered.clear();
+        render_screen(parser.screen(), (u16::MAX, u16::MAX), &mut rendered).unwrap();
+        assert!(!rendered.is_empty());
+    }
+
+    #[test]
+    fn run_error_mapping_preserves_stream_and_display_causes() {
+        assert!(matches!(
+            map_run_error(RunError::Stream(StreamError::Tampered("bad stream"))),
+            ReplayError::Stream(StreamError::Tampered("bad stream"))
+        ));
+        assert!(matches!(
+            map_run_error(RunError::Display(io::Error::other("bad display"))),
+            ReplayError::Display(error) if error.kind() == io::ErrorKind::Other
+        ));
+    }
+
+    #[test]
+    fn refusal_policy_accepts_only_the_replayable_states() {
+        assert_eq!(
+            refusal_reason(VerificationState::VerifiedComplete, false),
+            None
+        );
+        assert_eq!(
+            refusal_reason(VerificationState::ConsistentCompleteUnanchored, false),
+            None
+        );
+        assert_eq!(
+            refusal_reason(VerificationState::IntactUnpaired, true),
+            None
+        );
+        for state in [
+            VerificationState::IntactUnpaired,
+            VerificationState::MatchedInterruptedPrefix,
+            VerificationState::Mismatch,
+            VerificationState::Tampered,
+        ] {
+            assert!(refusal_reason(state, false).is_some());
+        }
     }
 
     #[tokio::test]
@@ -602,7 +735,139 @@ mod tests {
             VerificationState::ConsistentCompleteUnanchored
         );
         assert_eq!(report.display_records, 2);
+        assert_eq!(
+            report.display_bytes,
+            chunks.iter().map(Vec::len).sum::<usize>() as u64
+        );
+        assert!(!report.unpaired);
+        assert!(!report.interrupted);
+        assert_eq!(report.final_screen, (30, 100));
         assert!(report.final_text.contains("final red"));
+    }
+
+    #[tokio::test]
+    async fn intact_controller_record_replays_without_a_peer_file() {
+        let directory = tempdir().unwrap();
+        let pair = build_pair_with_controller_display(
+            directory.path(),
+            Endpoint::Memory(3),
+            Endpoint::Memory(103),
+            b"unpaired display",
+        )
+        .await;
+        let result = replay_session(&ReplayConfig {
+            controller_path: pair.controller_path,
+            peer_path: None,
+        })
+        .unwrap();
+        let ReplayResult::Replayed(report) = result else {
+            panic!("an intact controller record must be replayable without its peer");
+        };
+        assert_eq!(report.state, VerificationState::IntactUnpaired);
+        assert!(report.unpaired);
+        assert!(report.final_text.contains("unpaired display"));
+    }
+
+    #[tokio::test]
+    async fn mismatched_pair_is_refused_before_any_display_is_rendered() {
+        let directory = tempdir().unwrap();
+        let first = build_pair_with_controller_display(
+            directory.path(),
+            Endpoint::Memory(4),
+            Endpoint::Memory(104),
+            b"first",
+        )
+        .await;
+        let other_directory = tempdir().unwrap();
+        let second = build_pair_with_controller_display(
+            other_directory.path(),
+            Endpoint::Memory(5),
+            Endpoint::Memory(105),
+            b"second",
+        )
+        .await;
+        let result = replay_session(&ReplayConfig {
+            controller_path: first.controller_path,
+            peer_path: Some(second.host_path),
+        })
+        .unwrap();
+        assert!(matches!(
+            result,
+            ReplayResult::Refused {
+                state: VerificationState::Mismatch,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_machine_rejects_malformed_local_records_and_display_failures() {
+        let directory = tempdir().unwrap();
+        let pair = build_pair_with_controller_display(
+            directory.path(),
+            Endpoint::Memory(6),
+            Endpoint::Memory(106),
+            b"source",
+        )
+        .await;
+
+        let short_display = directory.path().join("short-display.yonaudit");
+        write_test_stream(
+            &pair.controller_path,
+            &short_display,
+            &[frame(RecordType::LocalDisplayBytes, b"short")],
+        );
+        assert!(matches!(
+            ReplayMachine::new(24, 80).run(&short_display, None),
+            Err(RunError::Stream(StreamError::Tampered(
+                "the display record is invalid"
+            )))
+        ));
+
+        let short_resize = directory.path().join("short-resize.yonaudit");
+        write_test_stream(
+            &pair.controller_path,
+            &short_resize,
+            &[frame(
+                RecordType::LocalResizeEvent,
+                &[0; RESIZE_RECORD_LEN - 1],
+            )],
+        );
+        assert!(matches!(
+            ReplayMachine::new(24, 80).run(&short_resize, None),
+            Err(RunError::Stream(StreamError::Tampered(
+                "the resize record is invalid"
+            )))
+        ));
+
+        let mut resize = [0_u8; RESIZE_RECORD_LEN];
+        resize[41..43].copy_from_slice(&u16::MAX.to_be_bytes());
+        resize[43..45].copy_from_slice(&0_u16.to_be_bytes());
+        let valid = directory.path().join("valid-local.yonaudit");
+        let mut display = vec![0_u8; LOCAL_RECORD_PREFIX_LEN];
+        display.extend_from_slice(b"visible");
+        write_test_stream(
+            &pair.controller_path,
+            &valid,
+            &[
+                frame(RecordType::LocalResizeEvent, &resize),
+                frame(RecordType::LocalDisplayBytes, &display),
+            ],
+        );
+        let mut output = Vec::new();
+        let mut machine = ReplayMachine::new(24, 80);
+        machine.run(&valid, Some(&mut output)).unwrap();
+        let report = machine.report(VerificationState::IntactUnpaired, true);
+        assert_eq!(report.final_screen, (1, MAX_COLS));
+        assert_eq!(report.display_records, 1);
+        assert_eq!(report.display_bytes, 7);
+        assert!(report.final_text.contains("visible"));
+        assert!(!output.is_empty());
+
+        assert!(matches!(
+            ReplayMachine::new(24, 80).run(&valid, Some(&mut FailingWriter)),
+            Err(RunError::Display(error)) if error.kind() == io::ErrorKind::Other
+        ));
     }
 
     #[tokio::test]

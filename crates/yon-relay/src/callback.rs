@@ -474,11 +474,18 @@ pub enum CallbackServerError {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        CallbackHandler, CallbackResult, CallbackServer, CallbackServerError,
-        MAX_CALLBACK_CONNECTIONS, MAX_CALLBACK_QUERY_BYTES, query_param,
+        CALLBACK_CONNECTION_TIMEOUT, CallbackHandler, CallbackResult, CallbackServer,
+        CallbackServerError, CallbackSource, LimitedAddress, LimitedListener,
+        MAX_CALLBACK_CONNECTIONS, MAX_CALLBACK_QUERY_BYTES, MAX_CALLBACK_STATE_BYTES, query_param,
     };
     use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
+    use axum::extract::connect_info::Connected as _;
+    use axum_server::AddrListener as _;
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Semaphore;
     use url::Url;
     use yonder_core::{EnterpriseProvider, EnterpriseProviders, SecretDocument};
 
@@ -486,23 +493,45 @@ mod tests {
     const TEST_KEY_DER: &[u8] = include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
     const TEST_CA_DER: &[u8] = include_bytes!("../../yon/tests/fixtures/localhost-test-ca.der");
 
-    #[derive(Clone, Copy)]
-    struct StubHandler(CallbackResult);
+    struct RoutingHandler;
 
-    impl CallbackHandler for StubHandler {
+    impl CallbackHandler for RoutingHandler {
         fn handle<'a>(
             &'a self,
             _provider: EnterpriseProvider,
-            _code: &'a str,
+            code: &'a str,
             _state: &'a str,
             _source: std::net::IpAddr,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CallbackResult> + Send + 'a>>
         {
-            Box::pin(std::future::ready(self.0))
+            let result = match code {
+                "admitted" => CallbackResult::Admitted,
+                "rejected" => CallbackResult::Rejected,
+                "invalid-state" => CallbackResult::InvalidState,
+                "platform" => CallbackResult::Platform,
+                "limited" => CallbackResult::Limited,
+                _ => CallbackResult::Rejected,
+            };
+            Box::pin(std::future::ready(result))
         }
     }
 
-    async fn server_with(listen: std::net::SocketAddr) -> CallbackServer {
+    fn pem(label: &str, der: &[u8]) -> Vec<u8> {
+        let encoded = data_encoding::BASE64.encode(der);
+        let mut document = format!("-----BEGIN {label}-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            document.push_str(std::str::from_utf8(chunk).unwrap());
+            document.push('\n');
+        }
+        document.push_str(&format!("-----END {label}-----\n"));
+        document.into_bytes()
+    }
+
+    fn config_with(
+        listen: std::net::SocketAddr,
+        certificates: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+    ) -> EnterpriseAuthConfig {
         let providers = EnterpriseProviders::new(true, false).unwrap();
         let secrets = ProviderSecrets::new(
             providers,
@@ -510,84 +539,261 @@ mod tests {
             None,
         )
         .unwrap();
-        let config = EnterpriseAuthConfig::new(
+        EnterpriseAuthConfig::new(
             listen,
             CallbackExternalUrl::new(Url::parse("https://relay.example.test").unwrap()).unwrap(),
-            vec![SecretDocument::new(TEST_CERT_DER.to_vec())],
-            SecretDocument::new(TEST_KEY_DER.to_vec()),
+            certificates.into_iter().map(SecretDocument::new).collect(),
+            SecretDocument::new(private_key),
             providers,
             secrets,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn server_with(listen: std::net::SocketAddr) -> CallbackServer {
+        let config = config_with(listen, vec![TEST_CERT_DER.to_vec()], TEST_KEY_DER.to_vec());
         CallbackServer::from_config(&config).await.unwrap()
     }
 
     #[test]
-    fn query_parser_and_capacity_have_the_frozen_bounds() {
+    fn callback_results_query_parser_and_capacity_have_the_frozen_values() {
         assert_eq!(MAX_CALLBACK_CONNECTIONS, 16);
         assert_eq!(MAX_CALLBACK_QUERY_BYTES, 1024);
+        assert_eq!(MAX_CALLBACK_STATE_BYTES, 128);
+        assert_eq!(CALLBACK_CONNECTION_TIMEOUT, Duration::from_secs(10));
+        for (result, text) in [
+            (CallbackResult::Admitted, "admitted"),
+            (CallbackResult::Rejected, "rejected"),
+            (CallbackResult::InvalidState, "invalid-state"),
+            (CallbackResult::Platform, "platform"),
+            (CallbackResult::Limited, "limited"),
+        ] {
+            assert_eq!(result.as_str(), text);
+        }
         assert_eq!(
             query_param("code=a+value&state=b", "code").as_deref(),
             Some("a value")
+        );
+        assert_eq!(
+            query_param("code=first&code=second", "code").as_deref(),
+            Some("first")
         );
         assert_eq!(query_param("state=b", "code"), None);
     }
 
     #[tokio::test]
-    async fn invalid_or_mixed_tls_material_fails_before_bind() {
-        let providers = EnterpriseProviders::new(true, false).unwrap();
-        let secrets = ProviderSecrets::new(
-            providers,
-            Some(std::path::PathBuf::from("wecom.secret")),
-            None,
-        )
+    async fn tls_documents_accept_consistent_pem_or_der_and_reject_other_material() {
+        let listen = "127.0.0.1:0".parse().unwrap();
+        let der = CallbackServer::from_config(&config_with(
+            listen,
+            vec![TEST_CERT_DER.to_vec()],
+            TEST_KEY_DER.to_vec(),
+        ))
+        .await
         .unwrap();
-        let config = EnterpriseAuthConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            CallbackExternalUrl::new(Url::parse("https://relay.example.test").unwrap()).unwrap(),
-            vec![SecretDocument::new(b"not-a-certificate".to_vec())],
-            SecretDocument::new(TEST_KEY_DER.to_vec()),
-            providers,
-            secrets,
-        )
+        assert_eq!(der.listen(), listen);
+        assert!(format!("{der:?}").contains("127.0.0.1:0"));
+
+        let pem_server = CallbackServer::from_config(&config_with(
+            listen,
+            vec![pem("CERTIFICATE", TEST_CERT_DER)],
+            pem("PRIVATE KEY", TEST_KEY_DER),
+        ))
+        .await
         .unwrap();
+        assert_eq!(pem_server.listen(), listen);
+
+        let invalid = config_with(
+            listen,
+            vec![b"not-a-certificate".to_vec()],
+            TEST_KEY_DER.to_vec(),
+        );
         assert!(matches!(
-            CallbackServer::from_config(&config).await,
+            CallbackServer::from_config(&invalid).await,
+            Err(CallbackServerError::InvalidTlsMaterial)
+        ));
+        let mixed = config_with(
+            listen,
+            vec![pem("CERTIFICATE", TEST_CERT_DER)],
+            TEST_KEY_DER.to_vec(),
+        );
+        assert!(matches!(
+            CallbackServer::from_config(&mixed).await,
             Err(CallbackServerError::InvalidTlsMaterial)
         ));
     }
 
     #[tokio::test]
-    async fn real_https_callback_routes_through_axum_and_is_not_cached() {
+    async fn bind_reports_an_occupied_callback_address() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        let server = server_with(address).await;
+        assert!(matches!(
+            server.bind().await,
+            Err(CallbackServerError::Bind {
+                address: failed,
+                ..
+            }) if failed == address
+        ));
+    }
+
+    #[tokio::test]
+    async fn real_https_callback_routes_validate_inputs_and_are_not_cached() {
         let server = server_with("127.0.0.1:0".parse().unwrap()).await;
         let (listener, bound) = server.bind().await.unwrap();
+        assert!(format!("{listener:?}").contains("LimitedListener"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(server.serve_on(
-            listener,
-            Arc::new(StubHandler(CallbackResult::Admitted)),
-            async move {
+        let task = tokio::spawn(
+            server.serve_on(listener, Arc::new(RoutingHandler), async move {
                 let _ = shutdown_rx.await;
-            },
-        ));
+            }),
+        );
         let certificate = reqwest::Certificate::from_der(TEST_CA_DER).unwrap();
         let client = reqwest::Client::builder()
             .add_root_certificate(certificate)
             .https_only(true)
             .build()
             .unwrap();
-        let url = format!(
-            "https://localhost:{}/yonder/callback/wecom?code=ok&state=state",
-            bound.port()
-        );
-        let response = client.get(url).send().await.unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.headers()["cache-control"], "no-store");
+        let base = format!("https://localhost:{}", bound.port());
+        for (provider, code, status) in [
+            ("wecom", "admitted", reqwest::StatusCode::OK),
+            ("feishu", "rejected", reqwest::StatusCode::OK),
+            ("wecom", "invalid-state", reqwest::StatusCode::BAD_REQUEST),
+            (
+                "wecom",
+                "platform",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("wecom", "limited", reqwest::StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let response = client
+                .get(format!(
+                    "{base}/yonder/callback/{provider}?code={code}&state=state"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                "default-src 'none'"
+            );
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert!(response.text().await.unwrap().contains("Yonder"));
+        }
+
+        let bad_paths = [
+            "/yonder/callback/wecom",
+            "/yonder/callback/wecom?state=state",
+            "/yonder/callback/wecom?code=admitted",
+            "/yonder/callback/wecom?code=&state=state",
+            "/yonder/callback/wecom?code=admitted&state=",
+        ];
+        for path in bad_paths {
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        let oversized_query = "q".repeat(MAX_CALLBACK_QUERY_BYTES + 1);
+        let oversized_code = "c".repeat(crate::verifier::MAX_AUTHORIZATION_CODE_BYTES + 1);
+        let oversized_state = "s".repeat(MAX_CALLBACK_STATE_BYTES + 1);
+        for path in [
+            format!("/yonder/callback/wecom?{oversized_query}"),
+            format!("/yonder/callback/wecom?code={oversized_code}&state=state"),
+            format!("/yonder/callback/wecom?code=admitted&state={oversized_state}"),
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
         assert_eq!(
-            response.headers()["content-security-policy"],
-            "default-src 'none'"
+            client
+                .post(format!("{base}/yonder/callback/wecom"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
         );
-        assert!(response.text().await.unwrap().contains("Yonder"));
+        assert_eq!(
+            client
+                .get(format!("{base}/unknown"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn limited_listener_carries_capacity_addresses_io_and_deadlines() {
+        let listener = LimitedListener::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.get_local_addr().unwrap();
+        assert!(format!("{address:?}").contains(&address.socket.to_string()));
+        assert_eq!(
+            CallbackSource::connect_info(address.clone()).0,
+            address.socket.ip()
+        );
+
+        let rebound = LimitedListener::bind_to(LimitedAddress {
+            socket: "127.0.0.1:0".parse().unwrap(),
+            permits: Arc::new(Semaphore::new(1)),
+        })
+        .await
+        .unwrap();
+        assert_ne!(rebound.get_local_addr().unwrap().socket.port(), 0);
+
+        let mut client = TcpStream::connect(address.socket).await.unwrap();
+        let (mut server, remote) = listener.accept_stream().await.unwrap();
+        assert_eq!(remote.socket.ip(), client.local_addr().unwrap().ip());
+        client.write_all(b"request").await.unwrap();
+        let mut request = [0_u8; 7];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        server.write_all(b"reply").await.unwrap();
+        server.flush().await.unwrap();
+        let mut reply = [0_u8; 5];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        server.deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        server.deadline.as_mut().await;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            server.read(&mut byte).await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        server.deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        server.deadline.as_mut().await;
+        assert_eq!(
+            server.write(b"x").await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        server.deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        server.deadline.as_mut().await;
+        assert_eq!(
+            server.flush().await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        server.shutdown().await.unwrap();
+
+        listener.permits.close();
+        let error = listener.accept_stream().await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 }
