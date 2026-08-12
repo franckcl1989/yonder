@@ -2797,7 +2797,7 @@ pub(crate) mod tests {
     pub async fn build_full_pair(dir: &Path, controller: Endpoint, host: Endpoint) -> SessionPair {
         let output: Vec<u8> = (0..18 * 1024).map(|index| (index % 11) as u8).collect();
         let display: Vec<u8> = output.iter().map(|byte| byte | 0x80).collect();
-        build_pair_inner(dir, controller, host, &[display]).await
+        Box::pin(build_pair_inner(dir, controller, host, &[display])).await
     }
 
     /// Runs a complete bilateral session whose controller display timeline is
@@ -2808,7 +2808,7 @@ pub(crate) mod tests {
         host: Endpoint,
         display: &[u8],
     ) -> SessionPair {
-        build_pair_inner(dir, controller, host, &[display.to_vec()]).await
+        Box::pin(build_pair_inner(dir, controller, host, &[display.to_vec()])).await
     }
 
     /// Runs a complete bilateral session whose controller display timeline is
@@ -2819,7 +2819,7 @@ pub(crate) mod tests {
         host: Endpoint,
         chunks: &[Vec<u8>],
     ) -> SessionPair {
-        build_pair_inner(dir, controller, host, chunks).await
+        Box::pin(build_pair_inner(dir, controller, host, chunks)).await
     }
 
     /// The shared bilateral session driver: handshake, header, terminal
