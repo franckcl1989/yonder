@@ -161,18 +161,6 @@ mod tests {
         peer_id_bytes,
     };
 
-    fn enterprise_host_case_timeout() -> Duration {
-        // This is only the aggregate test-harness watchdog. LLVM coverage
-        // instrumentation can make the complete Windows enterprise fixture
-        // exceed two minutes; every product protocol deadline inside the
-        // fixture remains unchanged and is asserted independently.
-        if cfg!(coverage_nightly) {
-            Duration::from_secs(300)
-        } else {
-            Duration::from_secs(120)
-        }
-    }
-
     struct FailingOutput;
 
     #[test]
@@ -3303,22 +3291,33 @@ mod tests {
                     Err(_) => panic!("locator resolve substream never opened"),
                 };
                 let mut stream = stream.into_tokio();
-                stream
-                    .write_all(&ResolveRequest::new(locator).encode())
-                    .await
-                    .unwrap();
-                stream.shutdown().await.unwrap();
                 let mut response = Vec::new();
-                stream.read_to_end(&mut response).await.unwrap();
+                drive_test_node(&mut self.node, async {
+                    stream
+                        .write_all(&ResolveRequest::new(locator).encode())
+                        .await
+                        .unwrap();
+                    stream.shutdown().await.unwrap();
+                    stream.read_to_end(&mut response).await.unwrap();
+                })
+                .await;
                 match ResolveResponse::decode(&response).unwrap() {
                     ResolveResponse::Resolved(peer) => {
                         return PeerId::from_bytes(peer.as_bytes()).unwrap();
                     }
                     ResolveResponse::Unavailable => {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(200)),
+                        )
+                        .await;
                     }
                     ResolveResponse::Retry(after) => {
-                        tokio::time::sleep(Duration::from_millis(u64::from(after.millis()))).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(u64::from(after.millis()))),
+                        )
+                        .await;
                     }
                 }
             }
@@ -3395,35 +3394,53 @@ mod tests {
                     .client_start(&target, code.secret())
                     .map_err(|_| ())?;
                 let hello = AuthClientHello::new(nonce, ke1).encode();
-                match stream.write_all(&hello).await {
+                match drive_test_node(&mut self.node, stream.write_all(&hello)).await {
                     Ok(()) => {}
                     Err(_) => {
                         if tokio::time::Instant::now() >= deadline {
                             return Err(());
                         }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(200)),
+                        )
+                        .await;
                         continue;
                     }
                 }
-                stream.flush().await.map_err(|_| ())?;
+                drive_test_node(&mut self.node, stream.flush())
+                    .await
+                    .map_err(|_| ())?;
                 let mut tag = [0_u8; 1];
-                match tokio::time::timeout_at(deadline, stream.read_exact(&mut tag)).await {
+                match tokio::time::timeout_at(
+                    deadline,
+                    drive_test_node(&mut self.node, stream.read_exact(&mut tag)),
+                )
+                .await
+                {
                     Ok(Ok(_)) => {}
                     _ => {
                         if tokio::time::Instant::now() >= deadline {
                             return Err(());
                         }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(200)),
+                        )
+                        .await;
                         continue;
                     }
                 }
                 let response = match tag[0] {
                     0x01 => {
                         let mut rest = [0_u8; PROCEED_LEN - 1];
-                        tokio::time::timeout_at(deadline, stream.read_exact(&mut rest))
-                            .await
-                            .map_err(|_| ())?
-                            .map_err(|_| ())?;
+                        tokio::time::timeout_at(
+                            deadline,
+                            drive_test_node(&mut self.node, stream.read_exact(&mut rest)),
+                        )
+                        .await
+                        .map_err(|_| ())?
+                        .map_err(|_| ())?;
                         let mut frame = [0_u8; PROCEED_LEN];
                         frame[0] = tag[0];
                         frame[1..].copy_from_slice(&rest);
@@ -3431,10 +3448,13 @@ mod tests {
                     }
                     0x02 => {
                         let mut rest = [0_u8; RETRY_LEN - 1];
-                        tokio::time::timeout_at(deadline, stream.read_exact(&mut rest))
-                            .await
-                            .map_err(|_| ())?
-                            .map_err(|_| ())?;
+                        tokio::time::timeout_at(
+                            deadline,
+                            drive_test_node(&mut self.node, stream.read_exact(&mut rest)),
+                        )
+                        .await
+                        .map_err(|_| ())?
+                        .map_err(|_| ())?;
                         let mut frame = [0_u8; RETRY_LEN];
                         frame[0] = tag[0];
                         frame[1..].copy_from_slice(&rest);
@@ -3480,12 +3500,16 @@ mod tests {
                 PakeContext::new(code.locator(), &controller, &target, &nonce, target_nonce);
             match self.pake.client_finish(state, ke2, context.as_bytes()) {
                 Ok((ke3, session_key)) => {
-                    stream.write_all(&ke3).await.map_err(|_| ())?;
-                    stream.flush().await.map_err(|_| ())?;
+                    drive_test_node(&mut self.node, async {
+                        stream.write_all(&ke3).await?;
+                        stream.flush().await
+                    })
+                    .await
+                    .map_err(|_| ())?;
                     let mut acknowledgement = [0_u8; 1];
                     tokio::time::timeout(
                         Duration::from_secs(10),
-                        stream.read_exact(&mut acknowledgement),
+                        drive_test_node(&mut self.node, stream.read_exact(&mut acknowledgement)),
                     )
                     .await
                     .map_err(|_| ())?
@@ -3496,8 +3520,12 @@ mod tests {
                     drop(session_key);
                 }
                 Err(_) => {
-                    stream.write_all(&[0xAB; KE3_LEN]).await.map_err(|_| ())?;
-                    stream.flush().await.map_err(|_| ())?;
+                    drive_test_node(&mut self.node, async {
+                        stream.write_all(&[0xAB; KE3_LEN]).await?;
+                        stream.flush().await
+                    })
+                    .await
+                    .map_err(|_| ())?;
                 }
             }
             Ok(response)
@@ -4102,9 +4130,11 @@ mod tests {
                 runtime.block_on(async {
                     let local = tokio::task::LocalSet::new();
                     let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-                    tokio::time::timeout(
-                        enterprise_host_case_timeout(),
-                        local.run_until(async {
+                    let stage = Arc::new(Mutex::new("starting"));
+                    let scenario_stage = Arc::clone(&stage);
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(120),
+                        local.run_until(async move {
                             const EXIT_CODE: u32 = 7;
                             const OUTPUT: &[u8] = b"scripted-host-output";
                             const INPUT: &[u8] = b"scripted-controller-input";
@@ -4164,6 +4194,7 @@ mod tests {
                             let mut pake = OpaquePake;
                             let (advertised, code) =
                                 create_advertisement(locator, &target, &mut pake).unwrap();
+                            *scenario_stage.lock().unwrap() = "host-advertised";
 
                             let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
                             let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
@@ -4190,15 +4221,21 @@ mod tests {
                             }
                             let (host_done_tx, mut host_done_rx) = oneshot::channel();
 
+                            let controller_stage = Arc::clone(&scenario_stage);
                             let controller = tokio::task::spawn_local(async move {
+                                let mark = |next| {
+                                    *controller_stage.lock().unwrap() = next;
+                                };
                                 let mut controller =
                                     ScriptedController::connect(&relay_address).await;
+                                mark("controller-connected");
                                 let resolved = controller.resolve_locator(locator).await;
                                 assert_eq!(
                                     resolved, host_peer,
                                     "the locator must resolve to the host"
                                 );
                                 controller.reach_host(host_peer).await;
+                                mark("controller-reached-host");
                                 let response = controller
                                     .auth_exchange(host_peer, &code)
                                     .await
@@ -4207,6 +4244,7 @@ mod tests {
                                     response.proceed_parts().is_some(),
                                     "the authentication must proceed and confirm"
                                 );
+                                mark("controller-authenticated");
 
                                 let mut data = controller
                                     .open(host_peer, TERMINAL_DATA_PROTOCOL)
@@ -4216,13 +4254,18 @@ mod tests {
                                     .open(host_peer, TERMINAL_CONTROL_PROTOCOL)
                                     .await
                                     .into_tokio();
+                                mark("terminal-streams-open");
                                 let hello = TerminalHello::new(
                                     TerminalSize::new(80, 24).unwrap(),
                                     TerminalValue::new("xterm").unwrap(),
                                     TerminalValue::new("truecolor").unwrap(),
                                 );
-                                control.write_all(hello.encode().as_slice()).await.unwrap();
-                                control.flush().await.unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    control.write_all(hello.encode().as_slice()).await?;
+                                    control.flush().await
+                                })
+                                .await
+                                .unwrap();
                                 // The mandatory audit handshake (design sections 13 and
                                 // 14): the audit substream is opened and the handshake
                                 // completes before TerminalReady is awaited.
@@ -4245,7 +4288,13 @@ mod tests {
                                 )
                                 .await
                                 .unwrap();
-                                audit.record_terminal_hello(hello_digest).await.unwrap();
+                                mark("audit-established");
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_terminal_hello(hello_digest),
+                                )
+                                .await
+                                .unwrap();
                                 let mut ready = [0_u8; 1];
                                 drive_test_node(&mut controller.node, data.read_exact(&mut ready))
                                     .await
@@ -4255,7 +4304,13 @@ mod tests {
                                     TerminalReady::ENCODED,
                                     "the host must flush TerminalReady"
                                 );
-                                audit.record_terminal_ready().await.unwrap();
+                                mark("terminal-ready");
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_terminal_ready(),
+                                )
+                                .await
+                                .unwrap();
 
                                 if ending == EnterpriseControllerEnding::CheckpointThenComplete {
                                     drive_active_audit_checkpoint(&mut controller, &audit).await;
@@ -4263,14 +4318,25 @@ mod tests {
 
                                 if ending == EnterpriseControllerEnding::ControllerDetach {
                                     let mut output = [0_u8; OUTPUT.len()];
-                                    data.read_exact(&mut output).await.unwrap();
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        data.read_exact(&mut output),
+                                    )
+                                    .await
+                                    .unwrap();
                                     assert_eq!(&output, OUTPUT);
-                                    audit.record_raw_output(&output).await.unwrap();
-                                    audit.record_display_bytes(&output).await.unwrap();
-                                    audit
-                                        .record_display_write_outcome(true, output.len() as u64)
-                                        .await
-                                        .unwrap();
+                                    drive_test_node(&mut controller.node, async {
+                                        audit.record_raw_output(&output).await?;
+                                        audit.record_display_bytes(&output).await?;
+                                        audit
+                                            .record_display_write_outcome(
+                                                true,
+                                                output.len() as u64,
+                                            )
+                                            .await
+                                    })
+                                    .await
+                                    .unwrap();
                                     let finalize = audit.close_and_finalize(
                                         ManifestEnding::CloseReason(
                                             AuditCloseReason::ControllerDetach,
@@ -4350,17 +4416,30 @@ mod tests {
                                 // Controller input is legal only after TerminalReady and
                                 // the mandatory audit path remain healthy. The matching
                                 // records preserve the host receive chain (section 18.1).
-                                audit.record_input(INPUT).await.unwrap();
-                                data.write_all(INPUT).await.unwrap();
-                                data.flush().await.unwrap();
-                                audit
-                                    .record_send_outcome(
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_input(INPUT),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    data.write_all(INPUT).await?;
+                                    data.flush().await?;
+                                    Ok::<(), std::io::Error>(())
+                                })
+                                .await
+                                .unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_send_outcome(
                                         DIRECTION_CTRL_TO_HOST,
                                         true,
                                         INPUT.len() as u64,
-                                    )
-                                    .await
-                                    .unwrap();
+                                    ),
+                                )
+                                .await
+                                .unwrap();
+                                mark("terminal-input-sent");
 
                                 // File transfer over the real session connection (0.2.0
                                 // file-transfer semantics on the bridge substream queue).
@@ -4376,13 +4455,16 @@ mod tests {
                                     .open(host_peer, FILE_TRANSFER_PROTOCOL)
                                     .await
                                     .into_tokio();
-                                send_wire_frame(
-                                    &mut file,
-                                    &FileTransferMessage::UploadOpen {
-                                        destination: &destination,
-                                        file_name: "upload-source.bin",
-                                        declared_size: upload_bytes.len() as u64,
-                                    },
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(
+                                        &mut file,
+                                        &FileTransferMessage::UploadOpen {
+                                            destination: &destination,
+                                            file_name: "upload-source.bin",
+                                            declared_size: upload_bytes.len() as u64,
+                                        },
+                                    ),
                                 )
                                 .await;
                                 let upload_start = FileTransferFacts {
@@ -4396,24 +4478,42 @@ mod tests {
                                     file_name: "upload-source.bin",
                                     error_code: 0,
                                 };
-                                audit
-                                    .record_file_transfer(&upload_start, None)
-                                    .await
-                                    .unwrap();
-                                expect_wire_control(&mut file, &FileTransferMessage::Ready).await;
-                                for chunk in upload_bytes.chunks(65536) {
-                                    send_wire_data(&mut file, chunk).await;
-                                }
-                                send_wire_frame(
-                                    &mut file,
-                                    &FileTransferMessage::Finish {
-                                        actual_size: upload_bytes.len() as u64,
-                                        digest: sha256_bytes(&upload_bytes),
-                                    },
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&upload_start, None),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    expect_wire_control(&mut file, &FileTransferMessage::Ready),
                                 )
                                 .await;
-                                expect_wire_control(&mut file, &FileTransferMessage::Committed)
+                                mark("upload-ready");
+                                for chunk in upload_bytes.chunks(65536) {
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        send_wire_data(&mut file, chunk),
+                                    )
                                     .await;
+                                }
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(
+                                        &mut file,
+                                        &FileTransferMessage::Finish {
+                                            actual_size: upload_bytes.len() as u64,
+                                            digest: sha256_bytes(&upload_bytes),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                drive_test_node(
+                                    &mut controller.node,
+                                    expect_wire_control(&mut file, &FileTransferMessage::Committed),
+                                )
+                                .await;
+                                mark("upload-committed");
                                 let upload_end = FileTransferFacts {
                                     transfer_id: upload_id,
                                     direction: FILE_DIRECTION_UPLOAD,
@@ -4425,21 +4525,34 @@ mod tests {
                                     file_name: "upload-source.bin",
                                     error_code: 0,
                                 };
-                                audit.record_file_transfer(&upload_end, None).await.unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&upload_end, None),
+                                )
+                                .await
+                                .unwrap();
                                 drop(file);
 
                                 let mut file = controller
                                     .open(host_peer, FILE_TRANSFER_PROTOCOL)
                                     .await
                                     .into_tokio();
-                                send_wire_frame(
-                                    &mut file,
-                                    &FileTransferMessage::DownloadOpen {
-                                        source: &download_source,
-                                    },
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(
+                                        &mut file,
+                                        &FileTransferMessage::DownloadOpen {
+                                            source: &download_source,
+                                        },
+                                    ),
                                 )
                                 .await;
-                                let offer = read_wire_frame(&mut file).await;
+                                let offer = drive_test_node(
+                                    &mut controller.node,
+                                    read_wire_frame(&mut file),
+                                )
+                                .await;
+                                mark("download-offered");
                                 let download_name =
                                     match FileTransferMessage::decode_frame(&offer).unwrap() {
                                         FileTransferMessage::DownloadOffer {
@@ -4468,15 +4581,31 @@ mod tests {
                                     file_name: &download_name,
                                     error_code: 0,
                                 };
-                                audit
-                                    .record_file_transfer(&download_start, None)
-                                    .await
-                                    .unwrap();
-                                send_wire_frame(&mut file, &FileTransferMessage::Ready).await;
-                                let received =
-                                    receive_download_bytes(&mut file, download_bytes.len() as u64)
-                                        .await;
-                                send_wire_frame(&mut file, &FileTransferMessage::Committed).await;
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&download_start, None),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(&mut file, &FileTransferMessage::Ready),
+                                )
+                                .await;
+                                let received = drive_test_node(
+                                    &mut controller.node,
+                                    receive_download_bytes(
+                                        &mut file,
+                                        download_bytes.len() as u64,
+                                    ),
+                                )
+                                .await;
+                                mark("download-received");
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(&mut file, &FileTransferMessage::Committed),
+                                )
+                                .await;
                                 let download_end = FileTransferFacts {
                                     transfer_id: download_id,
                                     direction: FILE_DIRECTION_DOWNLOAD,
@@ -4490,62 +4619,104 @@ mod tests {
                                     file_name: &download_name,
                                     error_code: 0,
                                 };
-                                audit
-                                    .record_file_transfer(&download_end, None)
-                                    .await
-                                    .unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&download_end, None),
+                                )
+                                .await
+                                .unwrap();
                                 drop(file);
                                 assert_eq!(
                                     received, download_bytes,
                                     "the downloaded bytes must match"
                                 );
+                                mark("file-transfers-complete");
 
                                 // The pty output, one resize, and the controller-completion
                                 // handshake that lets the host return the exit code.
                                 let mut output = [0_u8; OUTPUT.len()];
-                                data.read_exact(&mut output).await.unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    data.read_exact(&mut output),
+                                )
+                                .await
+                                .unwrap();
                                 assert_eq!(&output, OUTPUT);
+                                mark("terminal-output-received");
                                 // The controller output records (design section 18.4) so
                                 // the shared chains match the host's send records.
-                                audit.record_raw_output(&output).await.unwrap();
-                                audit.record_display_bytes(&output).await.unwrap();
-                                audit
-                                    .record_display_write_outcome(true, output.len() as u64)
-                                    .await
-                                    .unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    audit.record_raw_output(&output).await?;
+                                    audit.record_display_bytes(&output).await?;
+                                    audit
+                                        .record_display_write_outcome(true, output.len() as u64)
+                                        .await
+                                })
+                                .await
+                                .unwrap();
                                 let resize = TerminalSize::new(100, 30).unwrap();
-                                audit
-                                    .record_resize(
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_resize(
                                         DIRECTION_CTRL_TO_HOST,
                                         resize.columns(),
                                         resize.rows(),
-                                    )
-                                    .await
-                                    .unwrap();
-                                control
-                                    .write_all(&TerminalResize::new(resize).encode())
-                                    .await
-                                    .unwrap();
-                                control.flush().await.unwrap();
+                                    ),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    control
+                                        .write_all(&TerminalResize::new(resize).encode())
+                                        .await?;
+                                    control.flush().await
+                                })
+                                .await
+                                .unwrap();
                                 exit_flag.store(true, Ordering::Relaxed);
                                 let mut exit = [0_u8; 5];
-                                control.read_exact(&mut exit).await.unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    control.read_exact(&mut exit),
+                                )
+                                .await
+                                .unwrap();
                                 assert_eq!(TerminalExit::decode(&exit).unwrap().code(), EXIT_CODE);
-                                audit.record_terminal_exit(EXIT_CODE as u8).await.unwrap();
-                                audit.record_terminal_complete().await.unwrap();
-                                control.write_all(&TerminalComplete::ENCODED).await.unwrap();
-                                control.flush().await.unwrap();
+                                mark("terminal-exit-received");
+                                drive_test_node(&mut controller.node, async {
+                                    audit.record_terminal_exit(EXIT_CODE as u8).await?;
+                                    audit.record_terminal_complete().await
+                                })
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    control.write_all(&TerminalComplete::ENCODED).await?;
+                                    control.flush().await
+                                })
+                                .await
+                                .unwrap();
                                 let mut trailing = [0_u8; 1];
                                 assert_eq!(
-                                    control.read(&mut trailing).await.unwrap(),
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        control.read(&mut trailing),
+                                    )
+                                    .await
+                                    .unwrap(),
                                     0,
                                     "the host must shut down the control half after the completion"
                                 );
                                 assert_eq!(
-                                    data.read(&mut trailing).await.unwrap(),
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        data.read(&mut trailing),
+                                    )
+                                    .await
+                                    .unwrap(),
                                     0,
                                     "the host must shut down the data half after the shell exit"
                                 );
+                                mark("terminal-streams-closed");
                                 if ending == EnterpriseControllerEnding::AuditFinalizeStreamEnd {
                                     drop(audit);
                                     loop {
@@ -4576,6 +4747,7 @@ mod tests {
                                         _ = controller.node.next_event() => {}
                                     }
                                 }
+                                mark("audit-finalized");
                                 loop {
                                     tokio::select! {
                                         result = &mut host_done_rx => {
@@ -4585,6 +4757,7 @@ mod tests {
                                         _ = controller.node.next_event() => {}
                                     }
                                 }
+                                mark("host-completed");
                             });
 
                             let mut progress = NoopProgress;
@@ -4640,6 +4813,7 @@ mod tests {
                             controller
                                 .await
                                 .expect("the scripted controller must finish");
+                            *scenario_stage.lock().unwrap() = "controller-joined";
                             if matches!(
                                 ending,
                                 EnterpriseControllerEnding::Complete
@@ -4677,10 +4851,16 @@ mod tests {
                             }
 
                             relay.stop().await;
+                            *scenario_stage.lock().unwrap() = "relay-stopped";
                         }),
                     )
-                    .await
-                    .expect("the in-process happy path must finish");
+                    .await;
+                    if result.is_err() {
+                        panic!(
+                            "the in-process happy path must finish (last stage: {})",
+                            *stage.lock().unwrap()
+                        );
+                    }
                 });
             })
             .unwrap()

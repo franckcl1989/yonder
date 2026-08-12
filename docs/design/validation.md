@@ -33,6 +33,8 @@
 
 项目所有者已确认 `0.2.0` 没有企业准入、文件传输和双端审计之外的新增发布目标；同时因无法提供企业微信或飞书自建应用，真实平台联调不再作为本版本发布硬门槛。当前自动证据只证明类型化 provider 适配、真实 HTTPS/TLS callback、OAuth 单次事务与故障矩阵，不能表述为平台官方环境已认证；真实成功、拒绝、超时及无降级验证保留为部署方首次生产启用前的强制验收。
 
+提交 `9f47367301256766c7d35f9c0f89cb77baa6930b` 的 CI 运行 `31585721316` 已通过全部 `24/24` 项，包括五个独立原生 coverage target、六目标 MSRV build/link、三平台完整测试、Miri、ASan/TSan、供应链和短 fuzz。其候选 Release 运行 `31587728344` 在 Windows coverage 的 `653` 项测试中有 `652` 项通过，但完整企业会话测试在聚合看门时间内偶发停滞，因此发布 fuzz 和候选资产聚合按门禁停止，未创建 Release。复核确认测试专用 `ScriptedController` 在部分认证、终端、文件和审计 I/O 等待期间没有同步 poll libp2p node；夹具已改为在每个可能等待远端推进的边界同时驱动 node，并把聚合看门恢复为普通和 coverage 一致的 `120s`。修正后 Windows 普通与 LLVM coverage 插桩二进制分别连续执行该完整会话 `20` 次且全部通过，单次分别不超过 `19.6s` 与 `20.1s`；同模块全部 `11` 个进程内场景及全 workspace Clippy 通过。正式证据仍以修正提交重新执行的完整 CI 和 Release workflow 为准，不沿用失败运行的完成结论。
+
 正式候选前仍必须完成：五目标独立覆盖率、其余五个发布目标的原生构建与静态链接检查及 MSRV、四个 fuzz target 各 `30min`；Rocky Linux 真机的文件传输、双端审计和长时间资源稳定性；macOS Intel/Apple Silicon 及 Windows ARM64 的原生终端、文件和审计路径；最终六平台单文件归档、SBOM、许可证清单、checksum 和 provenance。
 
 ## v0.1.1 发布基线历史证据
