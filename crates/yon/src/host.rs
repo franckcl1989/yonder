@@ -161,6 +161,18 @@ mod tests {
         peer_id_bytes,
     };
 
+    fn enterprise_host_case_timeout() -> Duration {
+        // This is only the aggregate test-harness watchdog. LLVM coverage
+        // instrumentation can make the complete Windows enterprise fixture
+        // exceed two minutes; every product protocol deadline inside the
+        // fixture remains unchanged and is asserted independently.
+        if cfg!(coverage_nightly) {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(120)
+        }
+    }
+
     struct FailingOutput;
 
     #[test]
@@ -4091,7 +4103,7 @@ mod tests {
                     let local = tokio::task::LocalSet::new();
                     let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
                     tokio::time::timeout(
-                        Duration::from_secs(120),
+                        enterprise_host_case_timeout(),
                         local.run_until(async {
                             const EXIT_CODE: u32 = 7;
                             const OUTPUT: &[u8] = b"scripted-host-output";

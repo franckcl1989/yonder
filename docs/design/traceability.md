@@ -30,7 +30,7 @@
 | R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | 两个二进制 config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |
 | R-027 | relay 普通/企业模式互斥且企业模式只提供 Enterprise Resolve | yon-relay service + config | `/yonder/enterprise-resolve/2.0.0` | 模式隔离、旧 connect 拒绝、旧 host 注册、进程 E2E |
 | R-028 | 企业事务内存单次、与子流绑定、断连/超时/重启失效 | yon-relay enterprise owner | Created..Completed/失败态 | 全转换、重放、重复回调、容量、假时钟、EOF 清理 |
-| R-029 | 企业微信/飞书只放行可确认的有效内部成员 | `EnterpriseProvider` adapters | OAuth callback + typed HTTPS exchange | 双平台 fixture 故障矩阵 + 两平台真实自建应用正反验收 |
+| R-029 | 企业微信/飞书只放行可确认的有效内部成员 | `EnterpriseProvider` adapters | OAuth callback + typed HTTPS exchange | 双平台类型化 fixture、真实 HTTPS/TLS callback 与故障矩阵；真实自建应用正反验收是首次生产启用门槛，不计入 0.2.0 发布证据 |
 | R-030 | 企业回调只开放两个 HTTPS GET 路径且无敏感日志 | yon-relay callback | 固定 path/state/code | TLS loopback、404/400/405、no-store、泄露负断言 |
 | R-031 | 企业 secret 和审计文件跨平台强制保护 | `SecretFilePolicy` + audit store | Unix 0700/0600；Windows protected DACL | Unix mode/owner/symlink、Windows owner/ACE 正反原生测试 |
 | R-032 | controller 提示/选择 provider、先显示 URL、浏览器打开失败可继续 | yon enterprise UI | Providers/Select/Authenticate | 单/双 provider、非 TTY、open 失败、心跳与零污染测试 |

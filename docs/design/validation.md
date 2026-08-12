@@ -31,7 +31,9 @@
 - 企业审计建立阶段原先把身份/账本打开、记录排他创建、header `sync_all` 与全部握手消息共同塞进单个 `10s` 预算，在真实磁盘和并发门禁下会把正常本地安全存储延迟误判为对端超时。当前整体建立预算修正为 `30s`，每个独立 wire 交换仍为 `10s`；controller 与 host 共用同一常量和绝对 deadline，不改变 TerminalReady、OPAQUE 或其他协议的既有 `10s` 上限。上述真实双端周期场景已包含该建立路径。
 - 当前隔离工作树在 Windows x86_64、`rustc 1.97.1` 上再次完整通过锁定依赖的 workspace 全 target/all feature 测试与 benchmark smoke，并通过同范围 Clippy `-D warnings`。Rocky Linux 8.10 x86_64 真机随后使用固定 `nightly-2026-07-22`、干净 instrumentation target 和同一源码执行 workspace 全 target/all feature/branch coverage；`yon` 库运行 `660` 项、零失败，工作区其余测试二进制、集成测试和 benchmark harness 全部成功。聚合 line 为 `95.043720% (22609/23788)`、function 为 `97.779605% (2378/2432)`、region 为 `91.732914% (30925/33712)`、branch 为 `82.787482% (2275/2748)`；每文件 line 最低为 `yon/src/host.rs` 的 `81.740277% (1240/1517)`，全部越过已批准硬门槛。新增证据覆盖固定审计目录错误分类、无效 Ed25519 公钥、空输入、输入/输出共同的 1 MiB checkpoint 触发、错误阶段 checkpoint/ack、未验证对端 manifest 时禁止封存、企业帮助/中断/上传/下载快捷键真实落盘、宽字符回放 continuation cell，以及文件传输不可用/不支持/支持三态 UI 编排和基目录消失后的无副作用恢复；没有排除生产代码、降低门槛或把其他平台结果合并进 Linux 数字。
 
-正式候选前仍必须完成：五目标独立覆盖率、其余五个发布目标的原生构建与静态链接检查及 MSRV、四个 fuzz target 各 `30min`；Rocky Linux 真机的真实企业准入、文件传输、双端审计和长时间资源稳定性；macOS Intel/Apple Silicon 及 Windows ARM64 的原生终端、文件和审计路径；企业微信和飞书真实自建应用的成功、拒绝、超时及无降级验证；最终六平台单文件归档、SBOM、许可证清单、checksum 和 provenance。项目所有者还将补充一项 0.2.0 release 目标，在纳入并验证前不得正式发布。
+项目所有者已确认 `0.2.0` 没有企业准入、文件传输和双端审计之外的新增发布目标；同时因无法提供企业微信或飞书自建应用，真实平台联调不再作为本版本发布硬门槛。当前自动证据只证明类型化 provider 适配、真实 HTTPS/TLS callback、OAuth 单次事务与故障矩阵，不能表述为平台官方环境已认证；真实成功、拒绝、超时及无降级验证保留为部署方首次生产启用前的强制验收。
+
+正式候选前仍必须完成：五目标独立覆盖率、其余五个发布目标的原生构建与静态链接检查及 MSRV、四个 fuzz target 各 `30min`；Rocky Linux 真机的文件传输、双端审计和长时间资源稳定性；macOS Intel/Apple Silicon 及 Windows ARM64 的原生终端、文件和审计路径；最终六平台单文件归档、SBOM、许可证清单、checksum 和 provenance。
 
 ## v0.1.1 发布基线历史证据
 
