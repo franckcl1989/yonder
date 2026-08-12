@@ -469,6 +469,13 @@ fn print_verification_report(
     report: &yon::audit::verify::VerificationReport,
 ) -> Result<(), AppError> {
     let mut output = std::io::stdout().lock();
+    write_verification_report(&mut output, report)
+}
+
+fn write_verification_report(
+    output: &mut impl std::io::Write,
+    report: &yon::audit::verify::VerificationReport,
+) -> Result<(), AppError> {
     if let Some(session_id) = &report.session_id {
         writeln!(output, "session: {}", hex_digest(session_id.as_bytes()))
             .map_err(AppError::AuditOutput)?;
@@ -512,6 +519,13 @@ fn print_verification_report(
 
 fn print_replay_report(report: &yon::audit::replay::ReplayReport) -> Result<(), AppError> {
     let mut output = std::io::stdout().lock();
+    write_replay_report(&mut output, report)
+}
+
+fn write_replay_report(
+    output: &mut impl std::io::Write,
+    report: &yon::audit::replay::ReplayReport,
+) -> Result<(), AppError> {
     writeln!(output, "verification: {}", report.state.name()).map_err(AppError::AuditOutput)?;
     if report.unpaired {
         writeln!(
@@ -929,10 +943,11 @@ mod tests {
     use super::{
         AppError, AuditCommand, Cli, Command, ConfigCommand, ConnectionCodeArgument,
         ENDPOINT_SCHEMA, LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
-        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, map_controller_error,
-        open_diagnostic_log, portable_process_exit, process_result, read_ca, read_ca_document,
-        read_connection_code_from, run, terminal_supports_progress, validate_diagnostic_output,
-        write_remote_exit_warning,
+        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, hex_digest,
+        map_controller_error, open_diagnostic_log, portable_process_exit, process_result, read_ca,
+        read_ca_document, read_connection_code_from, run, terminal_supports_progress,
+        validate_diagnostic_output, write_remote_exit_warning, write_replay_report,
+        write_verification_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -1555,6 +1570,90 @@ mod tests {
         }
         assert!(write_remote_exit_warning(&mut FailAfterReports::new(0), 256).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audit_reports_render_every_optional_fact_without_raw_session_content() {
+        use yon::audit::replay::{FilteredControls, ReplayReport};
+        use yon::audit::verify::{AnchorReport, FileReport, VerificationReport, VerificationState};
+        use yonder_core::wire::audit::{AuditRole, IdentityFingerprint, ManifestEnding, SessionId};
+
+        let controller = FileReport {
+            path: PathBuf::from("controller.yonaudit"),
+            role: AuditRole::Controller,
+            fingerprint: IdentityFingerprint::new([1; 32]),
+            utc_start_seconds: 1,
+            shared_counts: [2, 3, 4, 5],
+            local_event_count: 6,
+            finalized: true,
+            truncated_tail: true,
+            last_confirmed_checkpoint: Some((7, [2; 32])),
+            ending: Some(ManifestEnding::ShellExit(0)),
+            ended_normally: true,
+        };
+        let host = FileReport {
+            role: AuditRole::Host,
+            path: PathBuf::from("host.yonaudit"),
+            truncated_tail: false,
+            ..controller.clone()
+        };
+        let verification = VerificationReport {
+            state: VerificationState::Mismatch,
+            session_id: Some(SessionId::new([0xAB; 32])),
+            controller: Some(controller),
+            host: Some(host),
+            anchor: AnchorReport {
+                identity_matched: true,
+                ledger_continuous: true,
+            },
+            reason: Some("the records differ"),
+        };
+        let mut output = Vec::new();
+        write_verification_report(&mut output, &verification).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!("session: {}", hex_digest(&[0xAB; 32]))));
+        assert!(output.contains("controller: controller.yonaudit finalized=true"));
+        assert!(output.contains("host: host.yonaudit finalized=true"));
+        assert!(output.contains("controller: truncated tail; verified prefix retained"));
+        assert!(output.contains("verification: MISMATCH"));
+        assert!(output.contains("reason: the records differ"));
+        assert!(output.contains("anchor: identity-matched=true ledger-continuous=true"));
+
+        let replay = ReplayReport {
+            state: VerificationState::IntactUnpaired,
+            unpaired: true,
+            interrupted: true,
+            filtered: FilteredControls {
+                title: 1,
+                clipboard: 2,
+                resize_request: 3,
+                unhandled: 4,
+            },
+            bells: 5,
+            display_records: 6,
+            display_bytes: 7,
+            final_screen: (24, 80),
+            final_text: "must not be printed".to_owned(),
+        };
+        let mut output = Vec::new();
+        write_replay_report(&mut output, &replay).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("verification: INTACT_UNPAIRED"));
+        assert!(output.contains("warning: no peer file was provided"));
+        assert!(output.contains("display: 6 records, 7 bytes; final screen: 24x80"));
+        assert!(output.contains("filtered controls: title=1 clipboard=2 resize=3 unhandled=4"));
+        assert!(output.contains("suppressed bells: 5"));
+        assert!(output.contains("replay stopped by Ctrl+C"));
+        assert!(!output.contains("must not be printed"));
+
+        assert!(matches!(
+            write_verification_report(&mut FailingWriter, &verification),
+            Err(AppError::AuditOutput(_))
+        ));
+        assert!(matches!(
+            write_replay_report(&mut FailingWriter, &replay),
+            Err(AppError::AuditOutput(_))
+        ));
     }
 
     #[test]

@@ -520,6 +520,18 @@ pub fn verify_files(
             return Err(map_walk_error(error).expect_err("only tampered maps to a report"));
         }
     };
+    verify_walk_pair(local_walk, peer_walk, anchor)
+}
+
+/// Applies the bilateral consistency rules after both containers have
+/// independently passed their cryptographic and structural walk. Keeping
+/// this decision boundary separate makes every cross-file binding directly
+/// testable without weakening the per-file verifier.
+fn verify_walk_pair(
+    local_walk: VerifiedFile,
+    peer_walk: VerifiedFile,
+    anchor: &dyn AnchorLookup,
+) -> Result<VerificationReport, VerifyError> {
     let (controller, host) = match (local_walk.header.role(), peer_walk.header.role()) {
         (AuditRole::Controller, AuditRole::Host) => (local_walk, peer_walk),
         (AuditRole::Host, AuditRole::Controller) => (peer_walk, local_walk),
@@ -2375,7 +2387,8 @@ fn read_ledger_head(root: &Path) -> Option<(u64, LedgerRoot)> {
 pub(crate) mod tests {
     use super::*;
     use crate::audit::session::{
-        AuditError, ConnectionSecret, Ledger as SessionLedger, PersistentIdentity, RecordBatch,
+        AuditError, ConnectionSecret, FILE_DIRECTION_UPLOAD, FileTransferFacts,
+        Ledger as SessionLedger, PersistentIdentity, RecordBatch,
     };
     use crate::audit::writer::AuditWriter;
     use ed25519_dalek::{Signer as _, SigningKey as DalekSigningKey};
@@ -2383,6 +2396,7 @@ pub(crate) mod tests {
     use yonder_core::wire::audit::{
         AuditRole as WireRole, BindingDigest, LedgerRoot as WireRoot, ManifestEnding,
     };
+    use yonder_core::wire::audit_container::ContainerReader;
 
     const CONNECTION_SECRET: &[u8] = b"authenticated-connection-secret-for-verify-tests";
 
@@ -2755,6 +2769,38 @@ pub(crate) mod tests {
             host.record_resize(DIRECTION_CTRL_TO_HOST, 100, 30, 331)
                 .unwrap(),
         )
+        .await;
+
+        // A completed file transfer exercises the fourth shared chain in
+        // every complete-pair fixture. Box this additional async fixture
+        // step so the already-large test future remains below the native
+        // test-thread stack bound on Windows.
+        Box::pin(async {
+            let file = FileTransferFacts {
+                transfer_id: 7,
+                direction: FILE_DIRECTION_UPLOAD,
+                kind: FILE_KIND_SUCCESS,
+                declared_size: 4096,
+                final_size: 4096,
+                digest: Digest32::new([0xA7; DIGEST_LEN]),
+                remote_path: "remote/final.bin",
+                file_name: "source.bin",
+                error_code: 0,
+            };
+            append(
+                &controller_writer,
+                controller
+                    .record_file_transfer(&file, Some("local/source.bin"), 340)
+                    .unwrap(),
+            )
+            .await;
+            append(
+                &host_writer,
+                host.record_file_transfer(&file, Some("local/final.bin"), 341)
+                    .unwrap(),
+            )
+            .await;
+        })
         .await;
 
         // A bilaterally confirmed checkpoint.
@@ -3300,5 +3346,1165 @@ pub(crate) mod tests {
         .unwrap();
         assert!(summary.truncated_tail);
         assert!(count > 0);
+    }
+
+    fn walked_pair(pair: &SessionPair) -> (VerifiedFile, VerifiedFile) {
+        (
+            walk_file(&pair.controller_path).unwrap(),
+            walk_file(&pair.host_path).unwrap(),
+        )
+    }
+
+    fn replace_header(
+        file: &VerifiedFile,
+        session_id: Option<SessionId>,
+        peer_identity: Option<Ed25519PublicKey>,
+        peer_session: Option<Ed25519PublicKey>,
+        ready: Option<yonder_core::wire::audit::AuditReady>,
+    ) -> AuditContainerHeader {
+        let header = &file.header;
+        AuditContainerHeader::new(
+            header.role(),
+            session_id.unwrap_or(*header.session_id()),
+            *header.identity_pubkey(),
+            *header.session_pubkey(),
+            peer_identity.unwrap_or(*header.peer_identity_pubkey()),
+            peer_session.unwrap_or(*header.peer_session_pubkey()),
+            header.ledger_sequence(),
+            *header.previous_ledger_root(),
+            header.utc_start_seconds(),
+            header.auth_mode(),
+            *header.terminal_hello_digest(),
+            *header.audit_hello(),
+            ready.unwrap_or(*header.audit_ready()),
+        )
+        .with_header_signature(*header.header_signature())
+    }
+
+    fn hello_with_binding(hello: &AuditHello, binding: BindingDigest) -> AuditHello {
+        AuditHello::new(
+            hello.role(),
+            *hello.persistent_audit_key(),
+            *hello.session_key(),
+            *hello.nonce(),
+            hello.ledger_sequence(),
+            *hello.ledger_root(),
+            binding,
+            hello.format_version(),
+            *hello.input_commitment(),
+            *hello.signature(),
+        )
+    }
+
+    #[test]
+    fn verification_state_names_and_walk_errors_are_stable() {
+        let states = [
+            (VerificationState::VerifiedComplete, "VERIFIED_COMPLETE", 0),
+            (
+                VerificationState::ConsistentCompleteUnanchored,
+                "CONSISTENT_COMPLETE_UNANCHORED",
+                2,
+            ),
+            (
+                VerificationState::MatchedInterruptedPrefix,
+                "MATCHED_INTERRUPTED_PREFIX",
+                2,
+            ),
+            (VerificationState::IntactUnpaired, "INTACT_UNPAIRED", 2),
+            (VerificationState::Mismatch, "MISMATCH", 3),
+            (VerificationState::Tampered, "TAMPERED", 4),
+        ];
+        for (state, name, exit_code) in states {
+            assert_eq!(state.name(), name);
+            assert_eq!(state.exit_code(), exit_code);
+        }
+
+        let report = map_walk_error(StreamError::Tampered("changed")).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+        assert_eq!(report.reason, Some("changed"));
+        assert!(matches!(
+            map_walk_error(StreamError::NotAnAuditContainer),
+            Err(VerifyError::NotAnAuditContainer)
+        ));
+        assert!(matches!(
+            map_walk_error(StreamError::Io(io::Error::other("read failed"))),
+            Err(VerifyError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pair_decision_rejects_each_header_and_handshake_mismatch() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(20), Endpoint::Memory(120)).await;
+
+        let (mut controller, host) = walked_pair(&pair);
+        controller.header = replace_header(
+            &controller,
+            Some(SessionId::new([0xA1; DIGEST_LEN])),
+            None,
+            None,
+            None,
+        );
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the session IDs do not match"));
+
+        let (mut controller, host) = walked_pair(&pair);
+        controller.header = replace_header(
+            &controller,
+            None,
+            Some(Ed25519PublicKey::new([0xA2; DIGEST_LEN])),
+            None,
+            None,
+        );
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the embedded identities do not match"));
+
+        let (mut controller, host) = walked_pair(&pair);
+        controller.header = replace_header(
+            &controller,
+            None,
+            None,
+            Some(Ed25519PublicKey::new([0xA3; DIGEST_LEN])),
+            None,
+        );
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(
+            report.reason,
+            Some("the embedded session keys do not match")
+        );
+
+        let (mut controller, host) = walked_pair(&pair);
+        controller.hello = hello_with_binding(&controller.hello, BindingDigest::new([0xA4; 32]));
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the connection binding does not match"));
+
+        for mutate_controller in [true, false] {
+            let (mut controller, mut host) = walked_pair(&pair);
+            let file = if mutate_controller {
+                &mut controller
+            } else {
+                &mut host
+            };
+            let old = *file.header.audit_ready();
+            let ready = yonder_core::wire::audit::AuditReady::new(
+                *old.session_id(),
+                Digest32::new([0xA5; DIGEST_LEN]),
+                old.format_version(),
+                *old.signature(),
+            );
+            file.header = replace_header(file, None, None, None, Some(ready));
+            let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+            assert_eq!(
+                report.reason,
+                Some("the audit handshake confirmations do not match")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_decision_rejects_each_footer_mismatch() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(21), Endpoint::Memory(121)).await;
+
+        let (controller, mut host) = walked_pair(&pair);
+        host.footer.as_mut().unwrap().manifest_bytes[0] ^= 1;
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the joint manifests differ"));
+
+        let (mut controller, mut host) = walked_pair(&pair);
+        controller.footer.as_mut().unwrap().manifest_bytes = vec![0];
+        host.footer.as_mut().unwrap().manifest_bytes = vec![0];
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+        assert_eq!(report.reason, Some("the joint manifest is invalid"));
+
+        let (mut controller, mut host) = walked_pair(&pair);
+        controller.footer.as_mut().unwrap().manifest_bytes[34] ^= 1;
+        host.footer.as_mut().unwrap().manifest_bytes[34] ^= 1;
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(
+            report.reason,
+            Some("the embedded identities do not match the joint manifest")
+        );
+
+        let (controller, mut host) = walked_pair(&pair);
+        host.footer.as_mut().unwrap().host_signature = ManifestSignature::new(
+            Ed25519Signature::new([0xA6; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the manifest signatures differ"));
+
+        let (mut controller, host) = walked_pair(&pair);
+        let footer = controller.footer.as_mut().unwrap();
+        let commit = footer.commit;
+        footer.commit = yonder_core::wire::audit::LedgerCommit::new(
+            commit.sequence(),
+            *commit.previous_root(),
+            *commit.session_id(),
+            *commit.manifest_digest(),
+            *commit.sealed_record_digest(),
+            IdentityFingerprint::new([0xA7; DIGEST_LEN]),
+            commit.result(),
+            *commit.signature(),
+        );
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(
+            report.reason,
+            Some("the ledger commits do not match the peer identities")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_pair_decision_checks_manifest_evidence_and_signature_slots() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(22), Endpoint::Memory(122)).await;
+        let bad_signature = ManifestSignature::new(Ed25519Signature::new(
+            [0xA8; yonder_core::wire::audit::ED25519_SIGNATURE_LEN],
+        ));
+
+        let (controller, mut host) = walked_pair(&pair);
+        host.footer = None;
+        host.manifest_evidence = Some(vec![0]);
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the joint manifests differ"));
+
+        let (controller, mut host) = walked_pair(&pair);
+        host.footer = None;
+        host.sent_manifest_signature = Some(bad_signature);
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the manifest signatures differ"));
+
+        let (controller, mut host) = walked_pair(&pair);
+        host.footer = None;
+        host.received_manifest_signature = Some(bad_signature);
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the manifest signatures differ"));
+
+        let (mut controller, host) = walked_pair(&pair);
+        controller.footer = None;
+        controller.sent_manifest_signature = Some(bad_signature);
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the manifest signatures differ"));
+
+        let (mut controller, host) = walked_pair(&pair);
+        controller.footer = None;
+        controller.received_manifest_signature = Some(bad_signature);
+        let report = verify_walk_pair(controller, host, &NoAnchor).unwrap();
+        assert_eq!(report.reason, Some("the manifest signatures differ"));
+    }
+
+    #[tokio::test]
+    async fn common_checkpoint_selection_accepts_only_the_bilateral_prefix() {
+        let dir = tempdir().unwrap();
+        let pair = build_interrupted_pair(dir.path()).await;
+        let (mut controller, mut host) = walked_pair(&pair);
+        let confirmed = controller.last_confirmed.unwrap();
+
+        controller.last_confirmed = None;
+        host.last_confirmed = None;
+        assert_eq!(
+            last_common_confirmed(&controller, &host),
+            Ok((0, [0; DIGEST_LEN]))
+        );
+
+        controller.last_confirmed = Some(confirmed);
+        assert!(last_common_confirmed(&controller, &host).is_err());
+        host.last_confirmed = Some(Confirmed {
+            sequence: confirmed.sequence,
+            digest: [0xB1; DIGEST_LEN],
+        });
+        assert!(last_common_confirmed(&controller, &host).is_err());
+
+        host.last_confirmed = Some(confirmed);
+        assert_eq!(
+            last_common_confirmed(&controller, &host),
+            Ok((confirmed.sequence, confirmed.digest))
+        );
+
+        controller.prev_confirmed = Some(confirmed);
+        controller.last_confirmed = Some(Confirmed {
+            sequence: confirmed.sequence + 1,
+            digest: [0xB2; DIGEST_LEN],
+        });
+        assert_eq!(
+            last_common_confirmed(&controller, &host),
+            Ok((confirmed.sequence, confirmed.digest))
+        );
+        controller.prev_confirmed = None;
+        assert!(last_common_confirmed(&controller, &host).is_err());
+
+        controller.last_confirmed = Some(confirmed);
+        host.prev_confirmed = Some(confirmed);
+        host.last_confirmed = Some(Confirmed {
+            sequence: confirmed.sequence + 1,
+            digest: [0xB3; DIGEST_LEN],
+        });
+        assert_eq!(
+            last_common_confirmed(&controller, &host),
+            Ok((confirmed.sequence, confirmed.digest))
+        );
+        host.prev_confirmed = None;
+        assert!(last_common_confirmed(&controller, &host).is_err());
+    }
+
+    fn first_payload(path: &Path, wanted: RecordType) -> Vec<u8> {
+        let mut found = None;
+        stream_frames(path, &mut |record_type, payload| {
+            if record_type == wanted && found.is_none() {
+                found = Some(payload.to_vec());
+            }
+            Ok(StreamAction::Continue)
+        })
+        .unwrap();
+        found.expect("the complete fixture contains the requested record")
+    }
+
+    fn assert_tampered(result: Result<(), StreamError>) {
+        assert!(matches!(result, Err(StreamError::Tampered(_))));
+    }
+
+    fn session_signing_key(counter: u8) -> DalekSigningKey {
+        let mut seed = [0_u8; 32];
+        for (offset, byte) in seed.iter_mut().enumerate() {
+            *byte = counter
+                .wrapping_add(64)
+                .wrapping_add(u8::try_from(offset).unwrap());
+        }
+        DalekSigningKey::from_bytes(&seed)
+    }
+
+    fn checkpoint_evidence(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut evidence = Vec::with_capacity(5 + payload.len());
+        evidence.push(kind);
+        evidence.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        evidence.extend_from_slice(payload);
+        evidence
+    }
+
+    fn signed_checkpoint(
+        signer: u8,
+        session_id: SessionId,
+        sequence: u64,
+        snapshot: SharedSnapshot,
+        local_chain_head: ChainHead,
+        ledger_snapshot_digest: Digest32,
+    ) -> Checkpoint {
+        let checkpoint = Checkpoint::new(
+            session_id,
+            sequence,
+            snapshot,
+            local_chain_head,
+            ledger_snapshot_digest,
+            Ed25519Signature::new([0; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        checkpoint.with_signature(Ed25519Signature::new(
+            session_signing_key(signer)
+                .sign(checkpoint.signing_input().as_slice())
+                .to_bytes(),
+        ))
+    }
+
+    fn signed_checkpoint_ack(
+        signer: u8,
+        session_id: SessionId,
+        sequence: u64,
+        checkpoint_digest: Digest32,
+        snapshot: SharedSnapshot,
+    ) -> CheckpointAck {
+        let ack = CheckpointAck::new(
+            session_id,
+            sequence,
+            checkpoint_digest,
+            snapshot,
+            Ed25519Signature::new([0; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        ack.with_signature(Ed25519Signature::new(
+            session_signing_key(signer)
+                .sign(ack.signing_input().as_slice())
+                .to_bytes(),
+        ))
+    }
+
+    fn ledger_snapshot_digest(verifier: &ChainVerifier) -> Digest32 {
+        let mut bytes = [0_u8; 8 + DIGEST_LEN];
+        bytes[..8].copy_from_slice(&verifier.header.ledger_sequence().to_be_bytes());
+        bytes[8..].copy_from_slice(verifier.header.previous_ledger_root().as_bytes());
+        Digest32::new(sha256_32(&bytes))
+    }
+
+    #[tokio::test]
+    async fn header_binding_checks_reject_each_independent_signature_boundary() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(23), Endpoint::Memory(123)).await;
+        let walked = walk_file(&pair.controller_path).unwrap();
+        assert!(check_header_bindings(&walked.header, &walked.hello).is_ok());
+
+        let mismatched_hello = hello_with_binding(&walked.hello, BindingDigest::new([0xC1; 32]));
+        assert_tampered(check_header_bindings(&walked.header, &mismatched_hello));
+
+        let ready = yonder_core::wire::audit::AuditReady::new(
+            SessionId::new([0xC2; 32]),
+            *walked.header.audit_ready().peer_audit_hello_digest(),
+            walked.header.audit_ready().format_version(),
+            *walked.header.audit_ready().signature(),
+        );
+        let header = replace_header(&walked, None, None, None, Some(ready));
+        assert_tampered(check_header_bindings(&header, header.audit_hello()));
+
+        let old = walked.header.audit_ready();
+        let ready = yonder_core::wire::audit::AuditReady::new(
+            *old.session_id(),
+            *old.peer_audit_hello_digest(),
+            old.format_version(),
+            Ed25519Signature::new([0xC3; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        let header = replace_header(&walked, None, None, None, Some(ready));
+        assert_tampered(check_header_bindings(&header, header.audit_hello()));
+
+        let header = replace_header(&walked, None, None, None, None).with_header_signature(
+            Ed25519Signature::new([0xC4; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        assert_tampered(check_header_bindings(&header, header.audit_hello()));
+    }
+
+    #[tokio::test]
+    async fn chain_verifier_rejects_corruption_in_every_shared_stream() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(24), Endpoint::Memory(124)).await;
+        let walked = walk_file(&pair.controller_path).unwrap();
+        let make = || ChainVerifier::new(walked.header, walked.hello);
+
+        for record_type in [
+            RecordType::SharedInputCommitment,
+            RecordType::SharedOutputBlock,
+        ] {
+            let original = first_payload(&pair.controller_path, record_type);
+            let mut payload = original.clone();
+            payload[0] = 0;
+            assert_tampered(make().process_frame(record_type, &payload));
+
+            let mut payload = original.clone();
+            payload[8] ^= 1;
+            assert_tampered(make().process_frame(record_type, &payload));
+
+            let mut payload = original.clone();
+            payload[49] ^= 1;
+            assert_tampered(make().process_frame(record_type, &payload));
+
+            let mut payload = original;
+            payload[81] ^= 1;
+            assert_tampered(make().process_frame(record_type, &payload));
+        }
+
+        let original = first_payload(&pair.controller_path, RecordType::SharedControlEvent);
+        let mut payload = original.clone();
+        payload[0] = 0;
+        assert_tampered(make().process_frame(RecordType::SharedControlEvent, &payload));
+        let mut payload = original.clone();
+        payload[8] ^= 1;
+        assert_tampered(make().process_frame(RecordType::SharedControlEvent, &payload));
+        let mut payload = original.clone();
+        payload[9] = 0xFF;
+        assert_tampered(make().process_frame(RecordType::SharedControlEvent, &payload));
+        let mut payload = original;
+        let last = payload.len() - 1;
+        payload[last] ^= 1;
+        assert_tampered(make().process_frame(RecordType::SharedControlEvent, &payload));
+
+        let mut file = Vec::new();
+        file.push(0);
+        file.extend_from_slice(&1_u64.to_be_bytes());
+        file.push(FILE_KIND_SUCCESS);
+        file.extend_from_slice(&7_u64.to_be_bytes());
+        file.extend_from_slice(&8_u64.to_be_bytes());
+        file.extend_from_slice(&8_u64.to_be_bytes());
+        file.extend_from_slice(&[0xD1; DIGEST_LEN]);
+        file.extend_from_slice(&1_u16.to_be_bytes());
+        file.extend_from_slice(b"r");
+        file.extend_from_slice(&1_u16.to_be_bytes());
+        file.extend_from_slice(b"f");
+        file.extend_from_slice(&0_u16.to_be_bytes());
+        file.extend_from_slice(&[0; 2 * DIGEST_LEN]);
+        assert_tampered(make().process_frame(RecordType::SharedFileTransferEvent, &file));
+        file[0] = DIRECTION_CTRL_TO_HOST;
+        file[9] = 0xFF;
+        assert_tampered(make().process_frame(RecordType::SharedFileTransferEvent, &file));
+        file[9] = FILE_KIND_SUCCESS;
+        file[8] = 2;
+        assert_tampered(make().process_frame(RecordType::SharedFileTransferEvent, &file));
+        file[8] = 1;
+        let last = file.len() - 1;
+        file[last] ^= 1;
+        assert_tampered(make().process_frame(RecordType::SharedFileTransferEvent, &file));
+    }
+
+    #[tokio::test]
+    async fn chain_verifier_rejects_each_local_envelope_and_batch_mismatch() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(25), Endpoint::Memory(125)).await;
+        let walked = walk_file(&pair.controller_path).unwrap();
+        let make = || ChainVerifier::new(walked.header, walked.hello);
+
+        assert_tampered(make().process_frame(RecordType::LocalDisplayBytes, &[0; 39]));
+        let mut display = vec![0; SPLIT_PREFIX_LEN];
+        display[8] = 1;
+        assert_tampered(make().process_frame(RecordType::LocalDisplayBytes, &display));
+
+        for record_type in [
+            RecordType::LocalInputCommitment,
+            RecordType::LocalSendOutcome,
+            RecordType::LocalPtyWriteOutcome,
+            RecordType::LocalDisplayWriteOutcome,
+            RecordType::LocalResizeEvent,
+            RecordType::LocalLifecycleEvent,
+            RecordType::LocalKeyAction,
+            RecordType::LocalConnectionState,
+            RecordType::LocalAuditError,
+            RecordType::LocalFileTransferEvent,
+            RecordType::LocalCloseEvent,
+            RecordType::CheckpointEvidence,
+        ] {
+            assert_tampered(make().process_frame(record_type, &[0; SPLIT_PREFIX_LEN]));
+        }
+
+        let mut send = vec![0; SPLIT_PREFIX_LEN + 10];
+        send[SPLIT_PREFIX_LEN] = DIRECTION_CTRL_TO_HOST;
+        send[8] = 1;
+        assert_tampered(make().process_frame(RecordType::LocalSendOutcome, &send));
+
+        let mut pty = vec![0; SPLIT_PREFIX_LEN + 9];
+        pty[8] = 1;
+        assert_tampered(make().process_frame(RecordType::LocalPtyWriteOutcome, &pty));
+        assert_tampered(make().process_frame(RecordType::LocalDisplayWriteOutcome, &pty));
+
+        let mut resize = vec![0; SPLIT_PREFIX_LEN + 5];
+        resize[SPLIT_PREFIX_LEN] = DIRECTION_CTRL_TO_HOST;
+        resize[8] = 1;
+        assert_tampered(make().process_frame(RecordType::LocalResizeEvent, &resize));
+
+        let mut verifier = make();
+        verifier.input_batch = Some(BatchState {
+            related: ChainHead::new([1; DIGEST_LEN]),
+            saw_block: false,
+        });
+        assert_tampered(verifier.flush_input_batch());
+        let mut verifier = make();
+        verifier.output_batch = Some(BatchState {
+            related: ChainHead::new([2; DIGEST_LEN]),
+            saw_block: true,
+        });
+        assert_tampered(verifier.flush_output_batch());
+        let mut verifier = make();
+        verifier.input_batch = Some(BatchState {
+            related: ChainHead::new([3; DIGEST_LEN]),
+            saw_block: true,
+        });
+        assert_tampered(verifier.flush_input_batch());
+        let mut verifier = make();
+        verifier.output_batch = Some(BatchState {
+            related: ChainHead::new([4; DIGEST_LEN]),
+            saw_block: false,
+        });
+        assert_tampered(verifier.flush_output_batch());
+
+        let mut verifier = make();
+        assert_tampered(verifier.process_evidence(&[]));
+        assert_tampered(verifier.process_evidence(&[0xFF, 0, 0, 0, 0]));
+
+        let mut verifier = make();
+        verifier.confirm(1, [1; DIGEST_LEN]).unwrap();
+        verifier.confirm(1, [1; DIGEST_LEN]).unwrap();
+        assert_tampered(verifier.confirm(1, [2; DIGEST_LEN]));
+        verifier.confirm(2, [3; DIGEST_LEN]).unwrap();
+        assert_tampered(verifier.confirm(1, [1; DIGEST_LEN]));
+
+        for (kind, len, expected) in [
+            (CONTROL_KIND_RESIZE, 4, true),
+            (CONTROL_KIND_TERMINAL_HELLO, DIGEST_LEN, true),
+            (CONTROL_KIND_TERMINAL_READY, 0, true),
+            (CONTROL_KIND_TERMINAL_COMPLETE, 0, true),
+            (CONTROL_KIND_TERMINAL_EXIT, 1, true),
+            (CONTROL_KIND_CLOSE_REASON, 1, true),
+            (0xFF, 0, false),
+            (CONTROL_KIND_RESIZE, 3, false),
+        ] {
+            assert_eq!(control_kind_payload_len(kind, len), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_rejects_every_signed_binding_mismatch() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(27), Endpoint::Memory(127)).await;
+        let walked = walk_file(&pair.controller_path).unwrap();
+        let header = walked.header;
+        let hello = walked.hello;
+        let fresh = || ChainVerifier::new(header, hello);
+        let verifier = fresh();
+        let session_id = *verifier.header.session_id();
+        let snapshot = verifier.shared_snapshot();
+        let local_head = verifier.local_head;
+        let ledger_digest = ledger_snapshot_digest(&verifier);
+
+        let valid = signed_checkpoint(27, session_id, 1, snapshot, local_head, ledger_digest);
+        let mut accepted = fresh();
+        accepted
+            .process_evidence(&checkpoint_evidence(
+                EVIDENCE_SENT_CHECKPOINT,
+                valid.encode_payload().as_slice(),
+            ))
+            .unwrap();
+
+        let invalid_signature = Checkpoint::new(
+            session_id,
+            1,
+            snapshot,
+            local_head,
+            ledger_digest,
+            Ed25519Signature::new([0; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        assert_tampered(fresh().process_evidence(&checkpoint_evidence(
+            EVIDENCE_SENT_CHECKPOINT,
+            invalid_signature.encode_payload().as_slice(),
+        )));
+
+        let mut different_streams = [StreamSnapshot::new(0, zero_head()); SHARED_STREAMS];
+        different_streams[0] = StreamSnapshot::new(1, ChainHead::new([0x71; DIGEST_LEN]));
+        for checkpoint in [
+            signed_checkpoint(
+                27,
+                SessionId::new([0x72; DIGEST_LEN]),
+                1,
+                snapshot,
+                local_head,
+                ledger_digest,
+            ),
+            signed_checkpoint(27, session_id, 2, snapshot, local_head, ledger_digest),
+            signed_checkpoint(
+                27,
+                session_id,
+                1,
+                SharedSnapshot::new(different_streams),
+                local_head,
+                ledger_digest,
+            ),
+            signed_checkpoint(
+                27,
+                session_id,
+                1,
+                snapshot,
+                local_head,
+                Digest32::new([0x73; DIGEST_LEN]),
+            ),
+            signed_checkpoint(
+                27,
+                session_id,
+                1,
+                snapshot,
+                ChainHead::new([0x74; DIGEST_LEN]),
+                ledger_digest,
+            ),
+        ] {
+            assert_tampered(fresh().process_evidence(&checkpoint_evidence(
+                EVIDENCE_SENT_CHECKPOINT,
+                checkpoint.encode_payload().as_slice(),
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ack_verifier_rejects_every_sequence_and_reference_mismatch() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(28), Endpoint::Memory(128)).await;
+        let walked = walk_file(&pair.controller_path).unwrap();
+        let header = walked.header;
+        let hello = walked.hello;
+        let session_id = *header.session_id();
+        let snapshot = SharedSnapshot::new([StreamSnapshot::new(0, zero_head()); SHARED_STREAMS]);
+        let digest = Digest32::new([0x81; DIGEST_LEN]);
+        let reference = CheckpointRef {
+            sequence: 1,
+            digest: *digest.as_bytes(),
+            snapshot,
+        };
+        let sent_ack = signed_checkpoint_ack(28, session_id, 1, digest, snapshot);
+        let received_ack = signed_checkpoint_ack(128, session_id, 1, digest, snapshot);
+
+        let sent_state = || {
+            let mut verifier = ChainVerifier::new(header, hello);
+            verifier.last_checkpoint_seq = 1;
+            verifier.last_received_checkpoint = Some(reference);
+            verifier
+        };
+        sent_state()
+            .process_evidence(&checkpoint_evidence(
+                EVIDENCE_SENT_CHECKPOINT_ACK,
+                sent_ack.encode_payload().as_slice(),
+            ))
+            .unwrap();
+
+        let invalid_signature = CheckpointAck::new(
+            session_id,
+            1,
+            digest,
+            snapshot,
+            Ed25519Signature::new([0; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        assert_tampered(sent_state().process_evidence(&checkpoint_evidence(
+            EVIDENCE_SENT_CHECKPOINT_ACK,
+            invalid_signature.encode_payload().as_slice(),
+        )));
+
+        for ack in [
+            signed_checkpoint_ack(28, SessionId::new([0x82; DIGEST_LEN]), 1, digest, snapshot),
+            signed_checkpoint_ack(28, session_id, 0, digest, snapshot),
+            signed_checkpoint_ack(28, session_id, 2, digest, snapshot),
+            signed_checkpoint_ack(
+                28,
+                session_id,
+                1,
+                Digest32::new([0x83; DIGEST_LEN]),
+                snapshot,
+            ),
+        ] {
+            assert_tampered(sent_state().process_evidence(&checkpoint_evidence(
+                EVIDENCE_SENT_CHECKPOINT_ACK,
+                ack.encode_payload().as_slice(),
+            )));
+        }
+        let mut duplicate = sent_state();
+        duplicate.last_sent_ack_seq = 1;
+        assert_tampered(duplicate.process_evidence(&checkpoint_evidence(
+            EVIDENCE_SENT_CHECKPOINT_ACK,
+            sent_ack.encode_payload().as_slice(),
+        )));
+        let mut missing = sent_state();
+        missing.last_received_checkpoint = None;
+        assert_tampered(missing.process_evidence(&checkpoint_evidence(
+            EVIDENCE_SENT_CHECKPOINT_ACK,
+            sent_ack.encode_payload().as_slice(),
+        )));
+
+        let received_state = || {
+            let mut verifier = ChainVerifier::new(header, hello);
+            verifier.last_checkpoint_seq = 1;
+            verifier.last_sent_checkpoint = Some(reference);
+            verifier
+        };
+        received_state()
+            .process_evidence(&checkpoint_evidence(
+                EVIDENCE_RECEIVED_CHECKPOINT_ACK,
+                received_ack.encode_payload().as_slice(),
+            ))
+            .unwrap();
+        let mut duplicate = received_state();
+        duplicate.last_received_ack_seq = 1;
+        assert_tampered(duplicate.process_evidence(&checkpoint_evidence(
+            EVIDENCE_RECEIVED_CHECKPOINT_ACK,
+            received_ack.encode_payload().as_slice(),
+        )));
+        let mut missing = received_state();
+        missing.last_sent_checkpoint = None;
+        assert_tampered(missing.process_evidence(&checkpoint_evidence(
+            EVIDENCE_RECEIVED_CHECKPOINT_ACK,
+            received_ack.encode_payload().as_slice(),
+        )));
+        let wrong_snapshot = signed_checkpoint_ack(
+            128,
+            session_id,
+            1,
+            digest,
+            SharedSnapshot::new(different_snapshot()),
+        );
+        assert_tampered(received_state().process_evidence(&checkpoint_evidence(
+            EVIDENCE_RECEIVED_CHECKPOINT_ACK,
+            wrong_snapshot.encode_payload().as_slice(),
+        )));
+    }
+
+    fn different_snapshot() -> [StreamSnapshot; SHARED_STREAMS] {
+        let mut streams = [StreamSnapshot::new(0, zero_head()); SHARED_STREAMS];
+        streams[1] = StreamSnapshot::new(1, ChainHead::new([0x84; DIGEST_LEN]));
+        streams
+    }
+
+    fn frame_spans(bytes: &[u8]) -> Vec<(usize, usize, RecordType)> {
+        let mut reader = ContainerReader::new(bytes).unwrap();
+        let mut spans = Vec::new();
+        while let Some(frame) = reader.next_frame().unwrap() {
+            let frame_len = RECORD_FRAME_HEADER_LEN + 1 + frame.payload.len();
+            let end = reader.position();
+            spans.push((end - frame_len, end, frame.record_type));
+        }
+        spans
+    }
+
+    #[tokio::test]
+    async fn tampered_peer_file_is_reported_without_discarding_the_local_report() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(29), Endpoint::Memory(129)).await;
+        let mut bytes = fs::read(&pair.host_path).unwrap();
+        let frame_offset = CONTAINER_HEADER_LEN + RECORD_FRAME_HEADER_LEN + SPLIT_PREFIX_LEN;
+        bytes[frame_offset] ^= 1;
+        fs::write(&pair.host_path, bytes).unwrap();
+
+        let report = verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+        assert!(report.controller.is_some());
+        assert!(report.host.is_none());
+    }
+
+    #[tokio::test]
+    async fn byte_level_header_seal_and_commit_mutations_are_tampered() {
+        for (counter, target) in [(30, "header"), (31, "seal"), (32, "commit")] {
+            let dir = tempdir().unwrap();
+            let pair = build_full_pair(
+                dir.path(),
+                Endpoint::Memory(counter),
+                Endpoint::Memory(counter.wrapping_add(100)),
+            )
+            .await;
+            let mut bytes = fs::read(&pair.controller_path).unwrap();
+            match target {
+                "header" => {
+                    let utc_offset = 8 + 2 + 1 + 32 + 4 * 32 + 8 + 32;
+                    bytes[utc_offset] ^= 1;
+                }
+                "seal" => {
+                    let mut reader = ContainerReader::new(&bytes).unwrap();
+                    while reader.next_frame().unwrap().is_some() {}
+                    let seal_end = reader.footer().unwrap().seal_end;
+                    bytes[seal_end - LOCAL_RECORD_SEAL_LEN + 12] ^= 1;
+                }
+                "commit" => {
+                    let mut reader = ContainerReader::new(&bytes).unwrap();
+                    while reader.next_frame().unwrap().is_some() {}
+                    let ledger_end = reader.footer().unwrap().ledger_end;
+                    bytes[ledger_end - LEDGER_COMMIT_LEN + 7] ^= 1;
+                }
+                _ => unreachable!(),
+            }
+            fs::write(&pair.controller_path, bytes).unwrap();
+            let report =
+                verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor).unwrap();
+            assert_eq!(report.state, VerificationState::Tampered, "{target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_and_reordered_record_frames_are_tampered() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(33), Endpoint::Memory(133)).await;
+        let bytes = fs::read(&pair.controller_path).unwrap();
+        let spans = frame_spans(&bytes);
+        let mut deleted = bytes.clone();
+        deleted.drain(spans[1].0..spans[1].1);
+        fs::write(&pair.controller_path, deleted).unwrap();
+        assert_eq!(
+            verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor)
+                .unwrap()
+                .state,
+            VerificationState::Tampered
+        );
+
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(34), Endpoint::Memory(134)).await;
+        let bytes = fs::read(&pair.controller_path).unwrap();
+        let input_spans: Vec<_> = frame_spans(&bytes)
+            .into_iter()
+            .filter(|(_, _, kind)| *kind == RecordType::SharedInputCommitment)
+            .map(|(start, end, _)| (start, end))
+            .collect();
+        assert_eq!(input_spans.len(), 2);
+        assert_eq!(
+            input_spans[0].1 - input_spans[0].0,
+            input_spans[1].1 - input_spans[1].0
+        );
+        let mut reordered = bytes.clone();
+        let first = bytes[input_spans[0].0..input_spans[0].1].to_vec();
+        let second = bytes[input_spans[1].0..input_spans[1].1].to_vec();
+        reordered.splice(input_spans[1].0..input_spans[1].1, first);
+        reordered.splice(input_spans[0].0..input_spans[0].1, second);
+        fs::write(&pair.controller_path, reordered).unwrap();
+        assert_eq!(
+            verify_files(&pair.controller_path, Some(&pair.host_path), &NoAnchor)
+                .unwrap()
+                .state,
+            VerificationState::Tampered
+        );
+    }
+
+    #[tokio::test]
+    async fn footer_verifier_rejects_each_manifest_seal_and_commit_binding() {
+        use yonder_core::wire::audit::{LedgerCommit, LocalRecordSeal};
+
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(26), Endpoint::Memory(126)).await;
+        let controller = walk_file(&pair.controller_path).unwrap();
+
+        for offset in [2, 34, 98, 162, 194, 226] {
+            let mut footer = controller.footer.clone().unwrap();
+            footer.manifest_bytes[offset] ^= 1;
+            assert!(matches!(
+                verify_footer(&pair.controller_path, &controller, footer),
+                Err(StreamError::Tampered(_))
+            ));
+        }
+        let host = walk_file(&pair.host_path).unwrap();
+        for offset in [34, 98] {
+            let mut footer = host.footer.clone().unwrap();
+            footer.manifest_bytes[offset] ^= 1;
+            assert!(matches!(
+                verify_footer(&pair.host_path, &host, footer),
+                Err(StreamError::Tampered(_))
+            ));
+        }
+
+        let mut footer = controller.footer.clone().unwrap();
+        footer.controller_signature = ManifestSignature::new(Ed25519Signature::new(
+            [0xD2; yonder_core::wire::audit::ED25519_SIGNATURE_LEN],
+        ));
+        assert!(matches!(
+            verify_footer(&pair.controller_path, &controller, footer),
+            Err(StreamError::Tampered(_))
+        ));
+        let mut footer = controller.footer.clone().unwrap();
+        footer.host_signature = ManifestSignature::new(Ed25519Signature::new(
+            [0xD3; yonder_core::wire::audit::ED25519_SIGNATURE_LEN],
+        ));
+        assert!(matches!(
+            verify_footer(&pair.controller_path, &controller, footer),
+            Err(StreamError::Tampered(_))
+        ));
+
+        let original = controller.footer.as_ref().unwrap().seal;
+        let make_seal = |session_id, local_head, local_count, shared, manifest, signature| {
+            LocalRecordSeal::new(
+                session_id,
+                original.role(),
+                local_head,
+                local_count,
+                shared,
+                manifest,
+                *original.sealed_prefix_digest(),
+                signature,
+            )
+        };
+        let cases = [
+            make_seal(
+                SessionId::new([0xD4; DIGEST_LEN]),
+                *original.final_local_event_root(),
+                original.local_event_count(),
+                *original.final_shared_roots(),
+                *original.joint_manifest_digest(),
+                *original.signature(),
+            ),
+            make_seal(
+                *original.session_id(),
+                ChainHead::new([0xD5; DIGEST_LEN]),
+                original.local_event_count(),
+                *original.final_shared_roots(),
+                *original.joint_manifest_digest(),
+                *original.signature(),
+            ),
+            make_seal(
+                *original.session_id(),
+                *original.final_local_event_root(),
+                original.local_event_count(),
+                [ChainHead::new([0xD6; DIGEST_LEN]); 4],
+                *original.joint_manifest_digest(),
+                *original.signature(),
+            ),
+            make_seal(
+                *original.session_id(),
+                *original.final_local_event_root(),
+                original.local_event_count(),
+                *original.final_shared_roots(),
+                Digest32::new([0xD7; DIGEST_LEN]),
+                *original.signature(),
+            ),
+            make_seal(
+                *original.session_id(),
+                *original.final_local_event_root(),
+                original.local_event_count(),
+                *original.final_shared_roots(),
+                *original.joint_manifest_digest(),
+                Ed25519Signature::new([0xD8; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+            ),
+        ];
+        for seal in cases {
+            let mut footer = controller.footer.clone().unwrap();
+            footer.seal = seal;
+            assert!(matches!(
+                verify_footer(&pair.controller_path, &controller, footer),
+                Err(StreamError::Tampered(_))
+            ));
+        }
+
+        let original = controller.footer.as_ref().unwrap().commit;
+        let make_commit = |session_id, manifest_digest, signature| {
+            LedgerCommit::new(
+                original.sequence(),
+                *original.previous_root(),
+                session_id,
+                manifest_digest,
+                *original.sealed_record_digest(),
+                *original.peer_identity_fingerprint(),
+                original.result(),
+                signature,
+            )
+        };
+        for commit in [
+            make_commit(
+                SessionId::new([0xD9; DIGEST_LEN]),
+                *original.manifest_digest(),
+                *original.signature(),
+            ),
+            make_commit(
+                *original.session_id(),
+                Digest32::new([0xDA; DIGEST_LEN]),
+                *original.signature(),
+            ),
+            make_commit(
+                *original.session_id(),
+                *original.manifest_digest(),
+                Ed25519Signature::new([0xDB; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+            ),
+        ] {
+            let mut footer = controller.footer.clone().unwrap();
+            footer.commit = commit;
+            assert!(matches!(
+                verify_footer(&pair.controller_path, &controller, footer),
+                Err(StreamError::Tampered(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_evidence_requires_matching_payloads_and_both_signatures() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(27), Endpoint::Memory(127)).await;
+
+        let mut verified = walk_file(&pair.controller_path).unwrap();
+        verified.received_manifest_evidence = Some(vec![0]);
+        assert_tampered(verify_manifest_evidence(&verified));
+
+        let mut verified = walk_file(&pair.controller_path).unwrap();
+        verified.sent_manifest_signature = Some(ManifestSignature::new(Ed25519Signature::new(
+            [0xDC; yonder_core::wire::audit::ED25519_SIGNATURE_LEN],
+        )));
+        assert_tampered(verify_manifest_evidence(&verified));
+
+        let mut verified = walk_file(&pair.controller_path).unwrap();
+        verified.received_manifest_evidence = None;
+        assert_tampered(verify_manifest_evidence(&verified));
+
+        let mut verified = walk_file(&pair.controller_path).unwrap();
+        verified.received_manifest_signature = Some(ManifestSignature::new(Ed25519Signature::new(
+            [0xDD; yonder_core::wire::audit::ED25519_SIGNATURE_LEN],
+        )));
+        assert_tampered(verify_manifest_evidence(&verified));
+    }
+
+    #[test]
+    fn local_ledger_head_rejects_every_structural_boundary() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(identity::LEDGER_STATE_FILE_NAME);
+        assert!(read_ledger_head(dir.path()).is_none());
+
+        fs::create_dir(&path).unwrap();
+        assert!(read_ledger_head(dir.path()).is_none());
+        fs::remove_dir(&path).unwrap();
+
+        fs::write(&path, [0_u8; LEDGER_STATE_LEN - 1]).unwrap();
+        assert!(read_ledger_head(dir.path()).is_none());
+
+        let mut state = [0_u8; LEDGER_STATE_LEN];
+        state[..8].copy_from_slice(b"YONLEDG\0");
+        state[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        state[10..18].copy_from_slice(&17_u64.to_be_bytes());
+        state[18..50].copy_from_slice(&[0xA5; DIGEST_LEN]);
+        let checksum = Sha256::digest(&state[..LEDGER_STATE_CHECKSUM_OFFSET]);
+        state[LEDGER_STATE_CHECKSUM_OFFSET..].copy_from_slice(&checksum);
+        fs::write(&path, state).unwrap();
+        assert_eq!(
+            read_ledger_head(dir.path()),
+            Some((17, LedgerRoot::new([0xA5; DIGEST_LEN])))
+        );
+
+        let mut invalid = state;
+        invalid[0] ^= 1;
+        fs::write(&path, invalid).unwrap();
+        assert!(read_ledger_head(dir.path()).is_none());
+
+        let mut invalid = state;
+        invalid[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        fs::write(&path, invalid).unwrap();
+        assert!(read_ledger_head(dir.path()).is_none());
+
+        let mut invalid = state;
+        invalid[LEDGER_STATE_CHECKSUM_OFFSET] ^= 1;
+        fs::write(&path, invalid).unwrap();
+        assert!(read_ledger_head(dir.path()).is_none());
+    }
+
+    #[test]
+    fn anchor_record_and_digest_boundaries_fail_closed() {
+        let dir = tempdir().unwrap();
+        let record = dir.path().join("record.yonaudit");
+        assert!(inspect_anchor_record(&record).is_none());
+        assert!(!verify_anchor_digests(
+            &record,
+            0,
+            0,
+            &Digest32::new([0; DIGEST_LEN]),
+            &Digest32::new([0; DIGEST_LEN]),
+        ));
+
+        fs::create_dir(&record).unwrap();
+        assert!(inspect_anchor_record(&record).is_none());
+        fs::remove_dir(&record).unwrap();
+
+        fs::write(&record, [0_u8; CONTAINER_HEADER_LEN - 1]).unwrap();
+        assert!(inspect_anchor_record(&record).is_none());
+
+        let mut invalid_footer = vec![0_u8; CONTAINER_HEADER_LEN + FOOTER_MAGIC.len()];
+        let footer_start = invalid_footer.len() - FOOTER_MAGIC.len();
+        invalid_footer[footer_start..].copy_from_slice(&FOOTER_MAGIC);
+        fs::write(&record, invalid_footer).unwrap();
+        assert!(inspect_anchor_record(&record).is_none());
+
+        let bytes = b"0123456789";
+        fs::write(&record, bytes).unwrap();
+        let empty = Digest32::new(Sha256::digest([]).into());
+        let whole = Digest32::new(Sha256::digest(bytes).into());
+        assert!(verify_anchor_digests(
+            &record,
+            0,
+            bytes.len() as u64,
+            &empty,
+            &whole,
+        ));
+        let first = Digest32::new(Sha256::digest(&bytes[..5]).into());
+        assert!(verify_anchor_digests(
+            &record,
+            5,
+            bytes.len() as u64,
+            &first,
+            &whole,
+        ));
+        assert!(!verify_anchor_digests(
+            &record,
+            5,
+            bytes.len() as u64 + 1,
+            &first,
+            &whole,
+        ));
+        assert!(!verify_anchor_digests(
+            &record,
+            bytes.len() as u64 + 1,
+            bytes.len() as u64,
+            &whole,
+            &whole,
+        ));
     }
 }

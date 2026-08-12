@@ -28,6 +28,7 @@ use backon::{BackoffBuilder as _, ConstantBuilder};
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::io::IsTerminal as _;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -722,6 +723,9 @@ struct PreparedController {
     control: ApplicationStream,
     data: ApplicationStream,
     audit: Option<ApplicationStream>,
+    /// Test and embedding seam for isolating audit artifacts. Production
+    /// sessions leave this unset and use the platform audit directory.
+    audit_root_override: Option<PathBuf>,
 }
 
 async fn prepare_controller(
@@ -805,6 +809,7 @@ async fn prepare_controller(
         control,
         data,
         audit,
+        audit_root_override: None,
     })
 }
 
@@ -1051,6 +1056,7 @@ async fn run_terminal(
         control,
         data,
         audit: audit_stream,
+        audit_root_override,
     } = prepared;
     let driver = &mut driver;
     let self_peer = driver.peer_id();
@@ -1070,6 +1076,7 @@ async fn run_terminal(
                     &hello,
                     binding,
                     self_peer,
+                    audit_root_override.as_deref(),
                 ),
             ) => result?,
         }
@@ -2852,11 +2859,16 @@ async fn establish_audit_and_terminal(
     hello: &TerminalHello,
     binding: ConnectionBinding,
     self_peer: PeerId,
+    audit_root_override: Option<&Path>,
 ) -> Result<Option<AuditObserver>, ControllerError> {
     control_write.write_all(hello.encode().as_slice()).await?;
     control_write.flush().await?;
     let digest = Digest32::new(Sha256::digest(hello.encode().as_slice()).into());
     let audit = if let Some(audit_stream) = audit_stream {
+        let audit_root = match audit_root_override {
+            Some(root) => root.to_path_buf(),
+            None => crate::audit::observer::platform_audit_root()?,
+        };
         // The opaque tokio stream is boxed before the handshake so the
         // handshake future never holds the stream's inline buffers.
         let audit_stream: Box<dyn AuditStreamIo> = Box::new(audit_stream.into_tokio());
@@ -2869,7 +2881,7 @@ async fn establish_audit_and_terminal(
                 binding.peer(),
                 crate::audit::observer::utc_start_seconds(),
                 digest,
-                &crate::audit::observer::platform_audit_root()?,
+                &audit_root,
                 &mut OsSecureRandom,
             ),
         )
@@ -3253,27 +3265,28 @@ mod tests {
         fail_transfer_startup, fallback_transport, file_transfer_ready, finish_local_input_eof,
         finish_terminal, finish_terminal_output, flush_delayed_output, handle_processed_input,
         handle_transfer_event, local_terminal_hello, local_terminal_hello_with,
-        native_display_restore_commands, next_retry_delay, platform_open,
+        native_display_restore_commands, next_retry_delay, platform_open, prepare_controller,
         prepare_controller_session, probe_file_transfer_capability, process_local_input_chunk,
         read_auth_response, read_local_input, read_remote_exit, restore_native_display,
-        run_controller, run_controller_session, run_controller_with_progress,
+        run_controller, run_controller_session, run_controller_with_progress, run_terminal,
         run_until_interrupted, terminal_environment, terminal_environment_from,
         transfer_summary_line, wait_for_remote_completion_deadline, write_local_ui,
         write_native_display_restore,
     };
+    use crate::audit::observer::{AuditObserver, CloseNoticeHandling};
     use crate::file_semantics::BaseDirectory;
     use crate::local_control::{LocalAction, LocalControlInput, LocalInputChunk, ModalPhase};
     use crate::network::{
-        EndpointDriver, RelayConnection, build_endpoint, connect_configured_relay,
+        EndpointDriver, RelayAccessMode, RelayConnection, build_endpoint, connect_configured_relay,
         wait_for_reservation,
     };
     use crate::pake::{OpaquePake, OpaqueRegistration};
     use crate::progress::NoopProgress;
     use crate::progress::OperationProgress;
     use crate::protocol::EnterpriseResolveUi as _;
-    use crate::protocol::allocate_locator;
+    use crate::protocol::{ResolveDeadline, ResolvedTarget, allocate_locator, resolve_peer};
     use crate::transfer::TransferOutcome;
-    use crate::transfer_prompt::AppendOutcome;
+    use crate::transfer_prompt::{AppendOutcome, DelayedOutputBuffer};
     use sha2::{Digest as _, Sha256};
     use std::cell::Cell;
     use std::fs;
@@ -3292,6 +3305,9 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
     use tokio::sync::oneshot;
     use yon_relay::{RelayServeConfig, RelayServiceError, run_relay_until};
+    use yonder_core::wire::audit::{
+        AUDIT_PROTOCOL, AuditCloseReason, AuditRole, Digest32, ManifestEnding,
+    };
     use yonder_core::wire::auth::AuthServerResponse;
     use yonder_core::wire::auth::{
         AuthClientFinish, AuthClientHello, Authenticated, CLIENT_HELLO_LEN, KE3_LEN, PakeContext,
@@ -3315,8 +3331,9 @@ mod tests {
     use yonder_core::{OsSecureRandom, Pake, PeerIdBytes, SecureRandom};
     use yonder_net::{
         ApplicationStream, ApplicationStreamError, ApplicationStreams, ConnectedPoint,
-        ConnectionId, EndpointRelayAddress, EndpointRelaySet, IncomingApplicationStreams, Keypair,
-        Libp2pApplicationStreams, NetworkBuildError, PeerId, WssTransportConfig, peer_id_bytes,
+        ConnectionId, DirectUpgradePolicy, EndpointRelayAddress, EndpointRelaySet,
+        IncomingApplicationStreams, Keypair, Libp2pApplicationStreams, NetworkBuildError, PeerId,
+        WssTransportConfig, peer_id_bytes,
     };
 
     // The fixed session state with the 0.2.0 audit observer: the
@@ -4372,6 +4389,111 @@ mod tests {
 
         assert_eq!(completed, local_payload);
         assert_eq!(local_output, remote_payload);
+    }
+
+    async fn establish_audit_pair() -> (
+        Arc<AuditObserver>,
+        Arc<AuditObserver>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let controller = Keypair::generate_ed25519().public().to_peer_id();
+        let host = Keypair::generate_ed25519().public().to_peer_id();
+        let (host_half, controller_half) = tokio::io::duplex(256 * 1024);
+        let digest = Digest32::new([0xCE; 32]);
+        let controller_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let controller_root = controller_dir.path().join("audit");
+        let host_root = host_dir.path().join("audit");
+        let mut controller_random = OsSecureRandom;
+        let mut host_random = OsSecureRandom;
+        let (controller_result, host_result) = tokio::join!(
+            Box::pin(AuditObserver::establish(
+                controller_half,
+                AuditRole::Controller,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &controller_root,
+                &mut controller_random,
+            )),
+            Box::pin(AuditObserver::establish(
+                host_half,
+                AuditRole::Host,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &host_root,
+                &mut host_random,
+            )),
+        );
+        (
+            Arc::new(controller_result.unwrap()),
+            Arc::new(host_result.unwrap()),
+            controller_dir,
+            host_dir,
+        )
+    }
+
+    #[test]
+    fn audit_failure_stops_further_remote_output_from_reaching_the_display() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (controller_audit, _host_audit, _controller_dir, _host_dir) =
+                        establish_audit_pair().await;
+                    let pump_audit = Arc::clone(&controller_audit);
+                    let (host_half, controller_half) = tokio::io::duplex(64 * 1024);
+                    let (mut controller_read, _controller_write) =
+                        tokio::io::split(controller_half);
+                    let (_peer_read, mut peer_write) = tokio::io::split(host_half);
+                    let (mut output_write, mut output_read) = tokio::io::duplex(64 * 1024);
+
+                    let pump = tokio::task::spawn(async move {
+                        copy_remote_output(
+                            &mut controller_read,
+                            &mut output_write,
+                            &mut RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes),
+                            &mut DelayedOutputBuffer::new(DELAYED_OUTPUT_CAP),
+                            &mut false,
+                            &None,
+                            Some(&pump_audit),
+                        )
+                        .await
+                    });
+
+                    let first = b"remote-output-first";
+                    peer_write.write_all(first).await.unwrap();
+                    let mut shown = vec![0_u8; first.len()];
+                    output_read.read_exact(&mut shown).await.unwrap();
+                    assert_eq!(shown, first);
+
+                    controller_audit
+                        .fail_closed(None, AuditCloseReason::AuditFailure)
+                        .await;
+                    assert!(controller_audit.has_failed().await);
+
+                    peer_write.write_all(b"remote-output-second").await.unwrap();
+                    let result = tokio::time::timeout(Duration::from_secs(10), pump)
+                        .await
+                        .expect("the output pump must stop after audit failure")
+                        .expect("the output pump must not panic");
+                    assert!(matches!(result, Err(ControllerError::Audit(_))));
+                    let mut trailing = Vec::new();
+                    output_read.read_to_end(&mut trailing).await.unwrap();
+                    assert!(trailing.is_empty());
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     fn local_chunk(bytes: &[u8]) -> LocalInputChunk {
@@ -7820,6 +7942,8 @@ mod tests {
         data_incoming: &mut IncomingApplicationStreams,
         control_incoming: &mut IncomingApplicationStreams,
         file_incoming: &mut IncomingApplicationStreams,
+        audit_incoming: Option<&mut IncomingApplicationStreams>,
+        audit_root: Option<&Path>,
         locator: Locator,
         registration: &OpaqueRegistration,
         target: &PeerIdBytes,
@@ -7886,6 +8010,36 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(12)).await;
             return;
         }
+        let audit = match audit_incoming {
+            Some(incoming) => {
+                let (audit_peer, audit_stream) = drive_drained(driver, incoming.next())
+                    .await
+                    .expect("the audit protocol registration ended");
+                assert_eq!(audit_peer, controller);
+                let digest = Digest32::new(Sha256::digest(hello.encode().as_slice()).into());
+                let host_peer = driver.peer_id();
+                let observer = drive_drained(
+                    driver,
+                    AuditObserver::establish(
+                        audit_stream.into_tokio(),
+                        AuditRole::Host,
+                        controller,
+                        host_peer,
+                        crate::audit::observer::utc_start_seconds(),
+                        digest,
+                        audit_root.expect("enterprise host audit needs an isolated root"),
+                        &mut OsSecureRandom,
+                    ),
+                )
+                .await
+                .unwrap();
+                drive_drained(driver, observer.record_terminal_hello(digest))
+                    .await
+                    .unwrap();
+                Some(observer)
+            }
+            None => None,
+        };
         let data = data.1.into_tokio();
         let (mut data_read, mut data_write) = tokio::io::split(data);
         let (mut control_read, mut control_write) = tokio::io::split(control);
@@ -7894,11 +8048,31 @@ mod tests {
             data_write.flush().await.unwrap();
         })
         .await;
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(driver, audit.record_terminal_ready())
+                .await
+                .unwrap();
+            drive_drained(driver, audit.record_raw_output(script.output.as_slice()))
+                .await
+                .unwrap();
+        }
         data_write
             .write_all(script.output.as_slice())
             .await
             .unwrap();
         data_write.flush().await.unwrap();
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(
+                driver,
+                audit.record_send_outcome(
+                    crate::audit::session::DIRECTION_HOST_TO_CTRL,
+                    true,
+                    script.output.len() as u64,
+                ),
+            )
+            .await
+            .unwrap();
+        }
         match ending {
             HostEnding::CloseDataSilently => {
                 let _ = data_write.shutdown().await;
@@ -7940,10 +8114,25 @@ mod tests {
                         break;
                     }
                     script.recorded_input.lock().unwrap().extend_from_slice(&data_buffer[..read]);
+                    if let Some(audit) = audit.as_ref() {
+                        drive_drained(driver, audit.record_input(&data_buffer[..read])).await.unwrap();
+                        drive_drained(driver, audit.record_pty_write_outcome(true, read as u64)).await.unwrap();
+                        drive_drained(driver, audit.record_raw_output(&data_buffer[..read])).await.unwrap();
+                    }
                     // The scripted host echoes the typed bytes back without
                     // a PTY.
                     data_write.write_all(&data_buffer[..read]).await.unwrap();
                     data_write.flush().await.unwrap();
+                    if let Some(audit) = audit.as_ref() {
+                        drive_drained(
+                            driver,
+                            audit.record_send_outcome(
+                                crate::audit::session::DIRECTION_HOST_TO_CTRL,
+                                true,
+                                read as u64,
+                            ),
+                        ).await.unwrap();
+                    }
                 }
                 result = control_read.read(&mut control_buffer) => {
                     let read = match result {
@@ -7965,6 +8154,16 @@ mod tests {
                             .try_into()
                             .unwrap();
                         let resize = TerminalResize::decode(&frame).unwrap();
+                        if let Some(audit) = audit.as_ref() {
+                            drive_drained(
+                                driver,
+                                audit.record_resize(
+                                    crate::audit::session::DIRECTION_CTRL_TO_HOST,
+                                    resize.size().columns(),
+                                    resize.size().rows(),
+                                ),
+                            ).await.unwrap();
+                        }
                         *script.resize.lock().unwrap() = Some(resize.size());
                     }
                 }
@@ -7988,6 +8187,11 @@ mod tests {
 
         // -- completion: exit code, data EOF, TerminalComplete, control
         // close; the controller returns the exit code.
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(driver, audit.record_terminal_exit(script.exit_code as u8))
+                .await
+                .unwrap();
+        }
         drive_drained(driver, async {
             control_write
                 .write_all(&TerminalExit::new(script.exit_code).encode())
@@ -8002,7 +8206,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(complete, TerminalComplete::ENCODED);
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(driver, audit.record_terminal_complete())
+                .await
+                .unwrap();
+        }
         let _ = control_write.shutdown().await;
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(
+                driver,
+                audit.close_and_finalize(
+                    ManifestEnding::ShellExit(script.exit_code as u8),
+                    true,
+                    CloseNoticeHandling::Receiver,
+                ),
+            )
+            .await
+            .unwrap();
+        }
     }
 
     /// Registers the scripted host on the in-process relay: a real
@@ -8162,6 +8383,8 @@ mod tests {
                                 &mut data_incoming,
                                 &mut control_incoming,
                                 &mut file_incoming,
+                                None,
+                                None,
                                 locator,
                                 &registration,
                                 &target,
@@ -8311,6 +8534,180 @@ mod tests {
     }
 
     #[test]
+    fn in_process_enterprise_controller_runs_the_complete_audited_terminal() {
+        let _test_guard = crate::in_process_test_guard();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let local = tokio::task::LocalSet::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(120),
+                        local.run_until(async {
+                            const EXIT_CODE: u32 = 31;
+                            const OUTPUT: &[u8] = b"enterprise-host-output> ";
+                            const INPUT: &[u8] = b"enterprise controller input\n";
+
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let (
+                                mut host_driver,
+                                mut host_streams,
+                                locator,
+                                registration,
+                                target,
+                                mut host_pake,
+                                code,
+                            ) = register_scripted_host(&relays).await;
+                            let mut auth_incoming = host_streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming =
+                                host_streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                host_streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming =
+                                host_streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+                            let mut audit_incoming = host_streams.accept(AUDIT_PROTOCOL).unwrap();
+                            let host_audit_dir = tempdir().unwrap();
+                            let host_audit_root = host_audit_dir.path().join("audit");
+
+                            let recorded_input = Arc::new(Mutex::new(Vec::new()));
+                            let resize = Arc::new(Mutex::new(None));
+                            let host_script = HostScript {
+                                exit_code: EXIT_CODE,
+                                output: OUTPUT.to_vec(),
+                                upload_destination: String::new(),
+                                upload_file_name: String::new(),
+                                upload_bytes: Vec::new(),
+                                download_source: String::new(),
+                                download_file_name: String::new(),
+                                download_bytes: Vec::new(),
+                                recorded_input: Arc::clone(&recorded_input),
+                                resize,
+                                retry_auth_once: false,
+                            };
+
+                            let (mut script_input, frontend_input) = tokio::io::duplex(64 * 1024);
+                            let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
+                            let restored = Rc::new(Cell::new(false));
+                            let frontend = SessionFrontend {
+                                input: frontend_input,
+                                output: frontend_output,
+                                size: Rc::new(Cell::new((80, 24))),
+                                restored: Rc::clone(&restored),
+                            };
+                            let cancellation = tokio_util::sync::CancellationToken::new();
+                            let controller_audit_dir = tempdir().unwrap();
+
+                            let controller = async {
+                                let (mut driver, mut streams) = build_endpoint(
+                                    Keypair::generate_ed25519(),
+                                    WssTransportConfig::client(None),
+                                )
+                                .unwrap();
+                                let relay_connection =
+                                    connect_relay_with_retry(&mut driver, &relays).await;
+                                let host = resolve_peer(
+                                    &mut driver,
+                                    &mut streams,
+                                    &relay_connection,
+                                    code.locator(),
+                                    ResolveDeadline::controller(),
+                                )
+                                .await
+                                .unwrap();
+                                let mut progress = NoopProgress;
+                                let mut prepared = prepare_controller(
+                                    driver,
+                                    streams,
+                                    relay_connection.address(),
+                                    ResolvedTarget::new(host, RelayAccessMode::Enterprise),
+                                    &code,
+                                    DirectUpgradePolicy::Disabled,
+                                    &mut progress,
+                                )
+                                .await
+                                .unwrap();
+                                prepared.audit_root_override =
+                                    Some(controller_audit_dir.path().join("audit"));
+                                let hello = TerminalHello::new(
+                                    TerminalSize::new(80, 24).unwrap(),
+                                    TerminalValue::new("xterm").unwrap(),
+                                    TerminalValue::new("truecolor").unwrap(),
+                                );
+                                run_terminal(
+                                    prepared,
+                                    hello,
+                                    frontend,
+                                    &mut progress,
+                                    &cancellation,
+                                )
+                                .await
+                            };
+                            let host = serve_scripted_host(
+                                &mut host_driver,
+                                &mut auth_incoming,
+                                &mut data_incoming,
+                                &mut control_incoming,
+                                &mut file_incoming,
+                                Some(&mut audit_incoming),
+                                Some(&host_audit_root),
+                                locator,
+                                &registration,
+                                &target,
+                                &mut host_pake,
+                                &host_script,
+                                HostEnding::Complete,
+                                None,
+                            );
+                            let interaction = async {
+                                let mut seen = read_output_until(&mut script_output, OUTPUT).await;
+                                script_input.write_all(INPUT).await.unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(read_output_until(&mut script_output, INPUT).await);
+                                drop(script_input);
+                                seen.extend(drain_output_until_closed(&mut script_output).await);
+                                seen
+                            };
+
+                            let (controller_result, (), seen) = tokio::join!(
+                                Box::pin(controller),
+                                Box::pin(host),
+                                Box::pin(interaction),
+                            );
+                            assert_eq!(controller_result.unwrap(), EXIT_CODE);
+                            assert!(restored.get(), "the display must be restored");
+                            assert_eq!(*recorded_input.lock().unwrap(), INPUT);
+                            assert!(seen.windows(OUTPUT.len()).any(|window| window == OUTPUT));
+                            assert!(seen.windows(INPUT.len()).any(|window| window == INPUT));
+
+                            relay.stop().await;
+                        }),
+                    )
+                    .await
+                    .expect("the enterprise controller session must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn in_process_controller_session_ends_cleanly_on_local_input_eof() {
         let _test_guard = crate::in_process_test_guard();
         // The combined controller and audit futures exceed the default test
@@ -8402,6 +8799,8 @@ mod tests {
                                 &mut data_incoming,
                                 &mut control_incoming,
                                 &mut file_incoming,
+                                None,
+                                None,
                                 locator,
                                 &registration,
                                 &target,
@@ -8568,6 +8967,8 @@ mod tests {
                                 &mut data_incoming,
                                 &mut control_incoming,
                                 &mut file_incoming,
+                                None,
+                                None,
                                 locator,
                                 &registration,
                                 &target,
@@ -8693,6 +9094,8 @@ mod tests {
                                 &mut data_incoming,
                                 &mut control_incoming,
                                 &mut file_incoming,
+                                None,
+                                None,
                                 locator,
                                 &registration,
                                 &target,
@@ -8815,6 +9218,8 @@ mod tests {
                                 &mut data_incoming,
                                 &mut control_incoming,
                                 &mut file_incoming,
+                                None,
+                                None,
                                 locator,
                                 &registration,
                                 &target,
@@ -8965,6 +9370,8 @@ mod tests {
                                 &mut data_incoming,
                                 &mut control_incoming,
                                 &mut file_incoming,
+                                None,
+                                None,
                                 locator,
                                 &registration,
                                 &target,

@@ -1186,8 +1186,8 @@ async fn expect_frame<T>(
 mod tests {
     use super::*;
     use crate::audit::session::{
-        FILE_DIRECTION_DOWNLOAD, FILE_DIRECTION_UPLOAD, FILE_KIND_SUCCESS, KEY_ACTION_DETACH,
-        LIFECYCLE_KIND_ACTIVE_DETACH,
+        CONNECTION_STATE_LOST, FILE_DIRECTION_DOWNLOAD, FILE_DIRECTION_UPLOAD, FILE_KIND_SUCCESS,
+        KEY_ACTION_DETACH, LIFECYCLE_KIND_ACTIVE_DETACH,
     };
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1697,5 +1697,278 @@ mod tests {
         assert_eq!(LIFECYCLE_KIND_ACTIVE_DETACH, 0x05);
         assert_eq!(AUDIT_PROTOCOL, "/yonder/audit/2.0.0");
         assert_eq!(AUDIT_FORMAT_VERSION, 2);
+    }
+
+    #[test]
+    fn observer_recording_and_failure_boundaries_are_complete() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let controller_root = test_root();
+                    let host_root = test_root();
+                    let (controller, host) = establish_pair(&controller_root, &host_root).await;
+                    let digest = Digest32::new([0xAB; 32]);
+                    record_lifecycle(&controller, &host, digest).await;
+
+                    assert!(controller.record_input(&[]).await.is_ok());
+                    assert!(controller.record_raw_output(&[]).await.is_ok());
+                    assert!(controller.record_display_bytes(&[]).await.is_ok());
+                    assert!(controller.send_due_checkpoint().await.is_ok());
+
+                    controller.record_input(b"input").await.unwrap();
+                    controller
+                        .record_send_outcome(DIRECTION_CTRL_TO_HOST, true, 5)
+                        .await
+                        .unwrap();
+                    host.record_input(b"input").await.unwrap();
+                    host.record_pty_write_outcome(true, 5).await.unwrap();
+
+                    let segmented = vec![0x5A; MAX_LOCAL_OUTPUT_SEGMENT + 1];
+                    host.record_raw_output(&segmented).await.unwrap();
+                    controller.record_raw_output(&segmented).await.unwrap();
+                    controller.record_display_bytes(&segmented).await.unwrap();
+                    controller
+                        .record_display_write_outcome(true, segmented.len() as u64)
+                        .await
+                        .unwrap();
+                    controller
+                        .record_key_action(KEY_ACTION_DETACH)
+                        .await
+                        .unwrap();
+                    controller
+                        .record_lifecycle(LIFECYCLE_KIND_ACTIVE_DETACH)
+                        .await
+                        .unwrap();
+                    controller
+                        .record_connection_state(CONNECTION_STATE_LOST)
+                        .await
+                        .unwrap();
+
+                    let close = AuditMessage::CloseNotice(AuditCloseReason::ConnectionLost)
+                        .encode()
+                        .unwrap();
+                    assert_eq!(
+                        controller.handle_frame(close.as_slice()).await.unwrap(),
+                        FrameEvent::Close(AuditCloseReason::ConnectionLost)
+                    );
+                    assert_eq!(
+                        FinalizationKind::classify(
+                            AuditMessage::decode_frame(close.as_slice()).unwrap()
+                        ),
+                        FinalizationKind::CloseNotice
+                    );
+
+                    let failure =
+                        AuditMessage::AuditError(AuditErrorCode::AuditSessionBindingMismatch)
+                            .encode()
+                            .unwrap();
+                    assert_eq!(
+                        controller.handle_frame(failure.as_slice()).await.unwrap(),
+                        FrameEvent::PeerAuditError(AuditErrorCode::AuditSessionBindingMismatch)
+                    );
+                    let hello = {
+                        let core = controller.core.lock().await;
+                        *core.session.local_hello()
+                    };
+                    let unexpected = AuditMessage::AuditHello(hello).encode().unwrap();
+                    assert!(matches!(
+                        controller.handle_frame(unexpected.as_slice()).await,
+                        Err(AuditError::InvalidState(_))
+                    ));
+
+                    controller
+                        .defer_frame(close.as_slice().to_vec())
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        controller.defer_frame(close.as_slice().to_vec()).await,
+                        Err(AuditError::InvalidState(_))
+                    ));
+                    assert_eq!(
+                        controller.read_finalization_frame().await.unwrap(),
+                        Some(close.as_slice().to_vec())
+                    );
+
+                    controller
+                        .close_interrupted(AuditCloseReason::ConnectionLost)
+                        .await;
+                    controller
+                        .close_interrupted(AuditCloseReason::ConnectionLost)
+                        .await;
+                    host.fail_closed(
+                        Some(AuditErrorCode::AuditCheckpointMismatch),
+                        AuditCloseReason::AuditFailure,
+                    )
+                    .await;
+                    assert!(host.has_failed().await);
+                    host.fail_closed(None, AuditCloseReason::AuditFailure).await;
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_recording_transition_fails_the_observer_closed() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+
+        controller.close_directions().await.unwrap();
+        assert!(matches!(
+            controller.record_terminal_ready().await,
+            Err(AuditError::InvalidState(_))
+        ));
+        assert!(controller.has_failed().await);
+        let frame = host.wait_for_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            AuditMessage::decode_frame(&frame).unwrap(),
+            AuditMessage::CloseNotice(AuditCloseReason::AuditFailure)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unexpected_finalization_message_is_rejected_before_manifest_processing() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, _host) = establish_pair(&controller_root, &host_root).await;
+        let unexpected = AuditMessage::AuditError(AuditErrorCode::AuditRecordWriteFailed)
+            .encode()
+            .unwrap();
+        controller
+            .defer_frame(unexpected.as_slice().to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .read_until_kind(&[FinalizationKind::JointManifest])
+                .await,
+            Err(AuditError::InvalidState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn audit_frame_io_rejects_every_incomplete_boundary() {
+        let (writer, mut reader) = duplex(64);
+        drop(writer);
+        assert!(read_one_frame(&mut reader).await.unwrap().is_none());
+
+        let (mut writer, mut reader) = duplex(64);
+        writer.write_all(&[1, 2]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert!(matches!(
+            read_one_frame(&mut reader).await,
+            Err(AuditError::Protocol(_))
+        ));
+
+        let close = AuditMessage::CloseNotice(AuditCloseReason::ConnectionLost)
+            .encode()
+            .unwrap();
+        let (mut writer, mut reader) = duplex(64);
+        writer
+            .write_all(&close.as_slice()[..FRAME_HEADER_LEN])
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        assert!(matches!(
+            read_one_frame(&mut reader).await,
+            Err(AuditError::Substream(_))
+        ));
+
+        let (mut writer, mut reader) = duplex(64);
+        write_frame_to(
+            &mut writer,
+            &AuditMessage::CloseNotice(AuditCloseReason::ConnectionLost),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            expect_frame(&mut reader, |message| match message {
+                AuditMessage::AuditHello(hello) => Some(hello),
+                _ => None,
+            })
+            .await,
+            Err(AuditError::HandshakeInvalid)
+        ));
+
+        let (mut writer, reader) = duplex(64);
+        drop(reader);
+        assert!(matches!(
+            write_frame_to(
+                &mut writer,
+                &AuditMessage::CloseNotice(AuditCloseReason::ConnectionLost),
+            )
+            .await,
+            Err(AuditError::Substream(_))
+        ));
+    }
+
+    #[test]
+    fn observer_storage_errors_map_to_the_fixed_public_categories() {
+        use crate::audit::identity::AuditIdentityError;
+        use crate::audit::ledger::AuditLedgerError;
+
+        assert!(matches!(
+            map_ledger_error(AuditLedgerError::AuditLedgerInvalid),
+            AuditError::LedgerInvalid
+        ));
+        assert!(matches!(
+            map_ledger_error(AuditLedgerError::AuditLedgerConflict),
+            AuditError::LedgerConflict
+        ));
+        assert!(matches!(
+            map_ledger_error(AuditLedgerError::AuditLedgerPermissions),
+            AuditError::LedgerInvalid
+        ));
+        for (identity, expected) in [
+            (
+                AuditIdentityError::AuditIdentityMissing,
+                AuditErrorCode::AuditIdentityMissing,
+            ),
+            (
+                AuditIdentityError::AuditIdentityInvalid,
+                AuditErrorCode::AuditIdentityInvalid,
+            ),
+            (
+                AuditIdentityError::AuditIdentityPermissions,
+                AuditErrorCode::AuditIdentityPermissions,
+            ),
+            (
+                AuditIdentityError::AuditDirectoryUnavailable,
+                AuditErrorCode::AuditDirectoryUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                map_ledger_error(AuditLedgerError::Identity(identity)).code(),
+                Some(expected)
+            );
+        }
+        for error in [
+            AuditLedgerError::LockFailed(io::Error::other("lock")),
+            AuditLedgerError::UnlockFailed(io::Error::other("unlock")),
+            AuditLedgerError::StateReadFailed(io::Error::other("state")),
+            AuditLedgerError::RecordReadFailed(io::Error::other("record")),
+        ] {
+            assert!(matches!(
+                map_ledger_error(error),
+                AuditError::DirectoryUnavailable(_)
+            ));
+        }
+        assert!(matches!(
+            map_ledger_error(AuditLedgerError::AuditLedgerCommitFailed(io::Error::other(
+                "commit"
+            ))),
+            AuditError::LedgerCommitFailed
+        ));
+        assert!(matches!(
+            blocking_storage_error(),
+            AuditError::DirectoryUnavailable(_)
+        ));
     }
 }

@@ -22,7 +22,7 @@ use crate::transfer::{TransferConfig, handle_download_from_open, handle_upload_f
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -675,6 +675,110 @@ mod tests {
                     assert_eq!(output, terminal_payload);
                     assert_eq!(exit.code(), EXIT_CODE);
                     assert_eq!(captured.unwrap(), controller_payload);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn establish_audit_pair() -> (
+        Arc<AuditObserver>,
+        Arc<AuditObserver>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let controller = Keypair::generate_ed25519().public().to_peer_id();
+        let host = Keypair::generate_ed25519().public().to_peer_id();
+        let (host_half, controller_half) = tokio::io::duplex(256 * 1024);
+        let digest = Digest32::new([0xCD; 32]);
+        let controller_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let controller_root = controller_dir.path().join("audit");
+        let host_root = host_dir.path().join("audit");
+        let mut controller_random = OsSecureRandom;
+        let mut host_random = OsSecureRandom;
+        let (controller_result, host_result) = tokio::join!(
+            Box::pin(AuditObserver::establish(
+                controller_half,
+                AuditRole::Controller,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &controller_root,
+                &mut controller_random,
+            )),
+            Box::pin(AuditObserver::establish(
+                host_half,
+                AuditRole::Host,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &host_root,
+                &mut host_random,
+            )),
+        );
+        (
+            Arc::new(controller_result.unwrap()),
+            Arc::new(host_result.unwrap()),
+            controller_dir,
+            host_dir,
+        )
+    }
+
+    #[test]
+    fn audit_failure_stops_further_input_from_reaching_the_pty() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (_controller_audit, host_audit, _controller_dir, _host_dir) =
+                        establish_audit_pair().await;
+                    let pump_audit = Arc::clone(&host_audit);
+                    let (host_half, controller_half) = tokio::io::duplex(64 * 1024);
+                    let (mut host_data_read, _host_data_write) = tokio::io::split(host_half);
+                    let (_controller_data_read, mut controller_data_write) =
+                        tokio::io::split(controller_half);
+                    let (pty_write, mut pty_read) = tokio::io::duplex(64 * 1024);
+
+                    let pump = tokio::task::spawn(async move {
+                        copy_controller_input(
+                            &mut host_data_read,
+                            &mut DuplexInput(pty_write),
+                            Some(&pump_audit),
+                        )
+                        .await
+                    });
+
+                    let first = b"first-input-chunk";
+                    controller_data_write.write_all(first).await.unwrap();
+                    let mut captured = vec![0_u8; first.len()];
+                    pty_read.read_exact(&mut captured).await.unwrap();
+                    assert_eq!(captured, first);
+
+                    host_audit
+                        .fail_closed(None, AuditCloseReason::AuditFailure)
+                        .await;
+                    assert!(host_audit.has_failed().await);
+
+                    controller_data_write
+                        .write_all(b"second-input-chunk")
+                        .await
+                        .unwrap();
+                    let result = tokio::time::timeout(Duration::from_secs(10), pump)
+                        .await
+                        .expect("the input pump must stop after audit failure")
+                        .expect("the input pump must not panic");
+                    assert!(matches!(result, Err(HostError::Audit(_))));
+                    let mut trailing = Vec::new();
+                    pty_read.read_to_end(&mut trailing).await.unwrap();
+                    assert!(trailing.is_empty());
                 });
             })
             .unwrap()
@@ -2831,11 +2935,7 @@ mod tests {
     // a code the test itself created.
     // ------------------------------------------------------------------
 
-    use super::{
-        FileSubstreamIo, InboundProtocols, acknowledge_and_wait_for_terminal_streams, authenticate,
-        bridge_terminal, drive_session_inputs, read_auth_hello, run_host_session, start_terminal,
-        wait_for_auth, wait_for_controller_quiescence,
-    };
+    use super::{FileSubstreamIo, HostSession, run_host_session};
     use crate::network::{
         EndpointDriver, RelayConnection, build_endpoint, connect_configured_relay,
         wait_for_reservation,
@@ -3294,6 +3394,7 @@ mod tests {
         exit_flag: Arc<AtomicBool>,
         exit_code: u32,
         input_write: Mutex<Option<DuplexStream>>,
+        resized: Arc<Mutex<Option<TerminalSize>>>,
     }
 
     impl TerminalBackend for ScriptedBackend {
@@ -3305,7 +3406,7 @@ mod tests {
                 exit_flag: Arc::clone(&self.exit_flag),
                 exit_code: self.exit_code,
                 input_write: self.input_write.lock().unwrap().take(),
-                resized: None,
+                resized: Arc::clone(&self.resized),
                 exited: false,
             })
         }
@@ -3316,7 +3417,7 @@ mod tests {
         exit_flag: Arc<AtomicBool>,
         exit_code: u32,
         input_write: Option<DuplexStream>,
-        resized: Option<TerminalSize>,
+        resized: Arc<Mutex<Option<TerminalSize>>>,
         exited: bool,
     }
 
@@ -3332,7 +3433,7 @@ mod tests {
         }
 
         async fn resize(&mut self, size: TerminalSize) -> Result<(), TerminalError> {
-            self.resized = Some(size);
+            *self.resized.lock().unwrap() = Some(size);
             Ok(())
         }
 
@@ -3347,7 +3448,10 @@ mod tests {
             // The shell may only exit after the scripted resize has been
             // applied, so the bridge processes the resize before the
             // completion handshake regardless of select ordering.
-            if self.resized.is_some() && self.exit_flag.load(Ordering::Relaxed) && !self.exited {
+            if self.resized.lock().unwrap().is_some()
+                && self.exit_flag.load(Ordering::Relaxed)
+                && !self.exited
+            {
                 self.exited = true;
                 return Ok(PtyEvent::exited(self.exit_code));
             }
@@ -3819,11 +3923,13 @@ mod tests {
                             let (input_write, input_read) = tokio::io::duplex(64 * 1024);
                             let exit_flag = Arc::new(AtomicBool::new(false));
                             let input_read = Arc::new(Mutex::new(Some(input_read)));
+                            let resized = Arc::new(Mutex::new(None));
                             let backend = ScriptedBackend {
                                 output: OUTPUT.to_vec(),
                                 exit_flag: Arc::clone(&exit_flag),
                                 exit_code: EXIT_CODE,
                                 input_write: Mutex::new(Some(input_write)),
+                                resized: Arc::clone(&resized),
                             };
 
                             let (mut driver, mut streams) =
@@ -3851,14 +3957,9 @@ mod tests {
                                 streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
                             let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
                             let mut audit_incoming = streams.accept(AUDIT_PROTOCOL).unwrap();
-                            let mut incoming = InboundProtocols {
-                                auth: &mut auth_incoming,
-                                data: &mut data_incoming,
-                                control: &mut control_incoming,
-                                file: &mut file_incoming,
-                            };
                             let controller_audit_root = tempdir().unwrap().path().join("audit");
                             let host_audit_root = tempdir().unwrap().path().join("audit");
+                            let (host_done_tx, mut host_done_rx) = oneshot::channel();
 
                             let controller = tokio::task::spawn_local(async move {
                                 let mut controller =
@@ -4136,107 +4237,43 @@ mod tests {
                                         _ = controller.node.next_event() => {}
                                     }
                                 }
+                                loop {
+                                    tokio::select! {
+                                        result = &mut host_done_rx => {
+                                            result.expect("the host completion signal must arrive");
+                                            break;
+                                        }
+                                        _ = controller.node.next_event() => {}
+                                    }
+                                }
                             });
 
-                            let (controller_peer, mut auth_stream) =
-                                wait_for_auth(&mut driver, &mut incoming, &lease)
-                                    .await
-                                    .expect("the auth wait must not fail")
-                                    .expect("an authenticated controller must arrive");
-                            let binding = wait_for_controller_quiescence(
-                                &mut driver,
-                                &mut incoming,
-                                controller_peer,
-                            )
-                            .await
-                            .expect("the controller direct upgrade must settle");
-                            let hello = drive_session_inputs(
-                                &mut driver,
-                                binding,
-                                &mut incoming,
-                                read_auth_hello(&mut auth_stream),
-                            )
-                            .await
-                            .expect("the auth hello read must not fail")
-                            .expect("the controller must send a valid hello");
-                            drive_session_inputs(
-                                &mut driver,
-                                binding,
-                                &mut incoming,
-                                authenticate(
-                                    &mut auth_stream,
-                                    hello,
-                                    advertised.locator,
-                                    &target,
-                                    controller_peer,
-                                    &advertised.registration,
-                                    &mut pake,
-                                ),
-                            )
-                            .await
-                            .expect("the authentication exchange must not fail")
-                            .expect("the real code must authenticate");
-                            let (data, control) = acknowledge_and_wait_for_terminal_streams(
-                                &mut driver,
-                                binding,
-                                &mut incoming,
-                                controller_peer,
-                                auth_stream,
-                            )
-                            .await
-                            .expect("the controller must open both terminal streams");
-                            let self_peer = driver.peer_id();
-                            let (mut pty, base, data, control, audit) = drive_session_inputs(
-                                &mut driver,
-                                binding,
-                                &mut incoming,
-                                start_terminal(
-                                    &backend,
-                                    data,
-                                    control,
-                                    &mut audit_incoming,
-                                    binding,
-                                    self_peer,
-                                    RelayAccessMode::Enterprise,
-                                    Some(&host_audit_root),
-                                ),
-                            )
-                            .await
-                            .expect("the terminal start must not fail")
-                            .expect("the controller must send a valid terminal hello");
-                            let exit_code = bridge_terminal(
-                                &mut driver,
-                                binding,
-                                &mut incoming,
-                                &mut pty,
-                                data,
-                                control,
-                                base.as_ref(),
-                                audit.as_ref(),
-                            )
-                            .await
-                            .expect("the terminal bridge must complete");
-                            // The host-side audit finalization (design sections 21 and
-                            // 22.1). The driver is polled throughout so the peer's
-                            // finalization frames arrive.
-                            let finalize = audit
-                                .as_ref()
-                                .expect("enterprise mode must establish audit")
-                                .close_and_finalize(
-                                    ManifestEnding::ShellExit(EXIT_CODE as u8),
-                                    true,
-                                    CloseNoticeHandling::Receiver,
-                                );
-                            tokio::pin!(finalize);
-                            loop {
-                                tokio::select! {
-                                    result = &mut finalize => {
-                                        result.expect("the host audit finalization must complete");
-                                        break;
-                                    }
-                                    _ = driver.next() => {}
-                                }
-                            }
+                            let mut progress = NoopProgress;
+                            let mut session = HostSession {
+                                driver: &mut driver,
+                                streams: &mut streams,
+                                auth_incoming: &mut auth_incoming,
+                                data_incoming: &mut data_incoming,
+                                control_incoming: &mut control_incoming,
+                                file_incoming: &mut file_incoming,
+                                audit_incoming: &mut audit_incoming,
+                                relays: &relays,
+                                relay_lease: lease,
+                                relay_access: RelayAccessMode::Enterprise,
+                                advertised,
+                                target,
+                                pake: &mut pake,
+                                backend: &backend,
+                                audit_root_override: Some(host_audit_root),
+                            };
+                            let exit_code = session
+                                .run(&mut progress)
+                                .await
+                                .expect("the complete host session must finish");
+                            drop(session);
+                            host_done_tx
+                                .send(())
+                                .expect("the scripted controller must remain alive");
                             assert_eq!(
                                 exit_code, EXIT_CODE,
                                 "the shell exit code must reach the host"
@@ -4246,7 +4283,7 @@ mod tests {
                                 .await
                                 .expect("the scripted controller must finish");
                             assert_eq!(
-                                pty.resized,
+                                *resized.lock().unwrap(),
                                 Some(TerminalSize::new(100, 30).unwrap()),
                                 "the resize must reach the session before the completion"
                             );
@@ -4383,6 +4420,7 @@ async fn run_host_session<B: TerminalBackend>(
         target,
         pake: &mut pake,
         backend: &backend,
+        audit_root_override: None,
     };
     let result = session.run(progress).await;
     let relay = session.relay_lease.relay().peer();
@@ -4802,6 +4840,9 @@ struct HostSession<'a, B> {
     target: PeerIdBytes,
     pake: &'a mut OpaquePake,
     backend: &'a B,
+    /// Test and embedding seam for isolating audit artifacts. Production
+    /// sessions leave this unset and use the platform audit directory.
+    audit_root_override: Option<PathBuf>,
 }
 
 struct InboundProtocols<'a> {
@@ -4831,6 +4872,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             target,
             pake,
             backend,
+            audit_root_override,
         } = self;
         let limiter = DirectRateLimiter::new(RateLimit::authentication());
         let mut session = TargetSession::new();
@@ -4974,7 +5016,10 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             let self_peer = driver.peer_id();
             let audit_root = match relay_access {
                 RelayAccessMode::Standard => None,
-                RelayAccessMode::Enterprise => Some(crate::audit::observer::platform_audit_root()?),
+                RelayAccessMode::Enterprise => Some(match audit_root_override.as_ref() {
+                    Some(root) => root.clone(),
+                    None => crate::audit::observer::platform_audit_root()?,
+                }),
             };
             let result = drive_session_inputs(
                 driver,

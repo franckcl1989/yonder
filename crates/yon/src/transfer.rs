@@ -1,4 +1,4 @@
-﻿//! Native file transfer orchestration for the 0.2.0 controller and host
+//! Native file transfer orchestration for the 0.2.0 controller and host
 //! (design sections 10.3, 10.5, 11, 12, 13, 14, 15, 16 and 17).
 //!
 //! This module owns the complete run of one file transfer over an already
@@ -1954,7 +1954,11 @@ mod tests {
     use tokio::io::{ReadBuf, duplex};
     use tokio::sync::Notify;
 
+    use crate::audit::observer::AuditObserver;
     use crate::file_semantics::CHUNK_SIZE;
+    use yonder_core::OsSecureRandom;
+    use yonder_core::wire::audit::{AuditRole, Digest32};
+    use yonder_net::Keypair;
 
     // ------------------------------------------------------------------
     // Shared fixtures.
@@ -2032,6 +2036,53 @@ mod tests {
 
     fn path_string(path: &Path) -> String {
         path.to_str().unwrap().to_owned()
+    }
+
+    async fn establish_audit_pair() -> (
+        Arc<AuditObserver>,
+        Arc<AuditObserver>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let controller = Keypair::generate_ed25519().public().to_peer_id();
+        let host = Keypair::generate_ed25519().public().to_peer_id();
+        let (host_half, controller_half) = duplex(256 * 1024);
+        let binding = Digest32::new([0xCF; 32]);
+        let started_at = crate::audit::observer::utc_start_seconds();
+        let controller_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let controller_root = controller_dir.path().join("audit");
+        let host_root = host_dir.path().join("audit");
+        let mut controller_random = OsSecureRandom;
+        let mut host_random = OsSecureRandom;
+        let (controller_result, host_result) = tokio::join!(
+            Box::pin(AuditObserver::establish(
+                controller_half,
+                AuditRole::Controller,
+                controller,
+                host,
+                started_at,
+                binding,
+                &controller_root,
+                &mut controller_random,
+            )),
+            Box::pin(AuditObserver::establish(
+                host_half,
+                AuditRole::Host,
+                controller,
+                host,
+                started_at,
+                binding,
+                &host_root,
+                &mut host_random,
+            )),
+        );
+        (
+            Arc::new(controller_result.unwrap()),
+            Arc::new(host_result.unwrap()),
+            controller_dir,
+            host_dir,
+        )
     }
 
     /// Reads a file into a `Vec` and chunks it for wire `Data` frames.
@@ -2277,6 +2328,164 @@ mod tests {
                 TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn audited_transfer_end_records_every_terminal_outcome() {
+        let (controller, host, _controller_dir, _host_dir) = establish_audit_pair().await;
+        let facts = TransferAuditFacts {
+            started: true,
+            remote_path: Some("remote/path".to_owned()),
+            file_name: Some("file.bin".to_owned()),
+            declared_size: Some(17),
+            digest: Some(sha256(b"audited payload")),
+        };
+
+        for outcome in [
+            TransferOutcome::Committed { bytes: 17 },
+            TransferOutcome::Cancelled,
+            TransferOutcome::Failed(FileTransferErrorCode::WriteFailed),
+        ] {
+            tokio::join!(
+                record_transfer_end(
+                    Some(controller.as_ref()),
+                    FILE_DIRECTION_UPLOAD,
+                    &facts,
+                    outcome,
+                ),
+                record_transfer_end(Some(host.as_ref()), FILE_DIRECTION_UPLOAD, &facts, outcome,),
+            );
+            assert!(!controller.has_failed().await);
+            assert!(!host.has_failed().await);
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_and_download_complete_through_bilateral_audit() {
+        let config = test_config();
+        let base = BaseDirectory::capture().unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let upload_source_dir = tempdir().unwrap();
+        let upload_host_dir = tempdir().unwrap();
+        let upload_source_path = upload_source_dir.path().join("source.bin");
+        write_pattern_file(&upload_source_path, 4097);
+        let mut upload_source = SourceFile::open(&upload_source_path).unwrap();
+        let upload_destination = path_string(&upload_host_dir.path().join("received.bin"));
+        let (controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
+            establish_audit_pair().await;
+        let (mut controller_stream, mut host_stream) = duplex(64 * 1024);
+        let (controller_outcome, host_outcome) = tokio::join!(
+            run_upload_audited(
+                &mut controller_stream,
+                &config,
+                &mut upload_source,
+                &upload_destination,
+                "source.bin",
+                &cancel,
+                Some(controller_audit.as_ref()),
+            ),
+            async {
+                let open = read_frame(
+                    &mut host_stream,
+                    ReadMode::Control {
+                        budget: config.control_timeout,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                let OwnedMessage::UploadOpen {
+                    destination,
+                    file_name,
+                    declared_size,
+                } = open
+                else {
+                    panic!("expected upload open");
+                };
+                let open = FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: &file_name,
+                    declared_size,
+                };
+                handle_upload_from_open(
+                    &mut host_stream,
+                    &config,
+                    &base,
+                    &cancel,
+                    &open,
+                    Some(host_audit.as_ref()),
+                )
+                .await
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Committed { bytes: 4097 }
+        );
+        assert_eq!(host_outcome, controller_outcome);
+        assert_eq!(
+            fs::read(&upload_destination).unwrap(),
+            fs::read(&upload_source_path).unwrap()
+        );
+        assert!(!controller_audit.has_failed().await);
+        assert!(!host_audit.has_failed().await);
+
+        let download_source_dir = tempdir().unwrap();
+        let download_target_dir = tempdir().unwrap();
+        let download_source_path = download_source_dir.path().join("remote.bin");
+        write_pattern_file(&download_source_path, 8193);
+        let download_source = path_string(&download_source_path);
+        let download_target = path_string(&download_target_dir.path().join("local.bin"));
+        let (controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
+            establish_audit_pair().await;
+        let (mut controller_stream, mut host_stream) = duplex(64 * 1024);
+        let (controller_outcome, host_outcome) = tokio::join!(
+            run_download_audited(
+                &mut controller_stream,
+                &config,
+                &base,
+                &download_source,
+                Some(&download_target),
+                &cancel,
+                Some(controller_audit.as_ref()),
+            ),
+            async {
+                let open = read_frame(
+                    &mut host_stream,
+                    ReadMode::Control {
+                        budget: config.control_timeout,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                let OwnedMessage::DownloadOpen { source } = open else {
+                    panic!("expected download open");
+                };
+                let open = FileTransferMessage::DownloadOpen { source: &source };
+                handle_download_from_open(
+                    &mut host_stream,
+                    &config,
+                    &base,
+                    &cancel,
+                    &open,
+                    Some(host_audit.as_ref()),
+                )
+                .await
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Committed { bytes: 8193 }
+        );
+        assert_eq!(host_outcome, controller_outcome);
+        assert_eq!(
+            fs::read(&download_target).unwrap(),
+            fs::read(&download_source_path).unwrap()
+        );
+        assert!(!controller_audit.has_failed().await);
+        assert!(!host_audit.has_failed().await);
     }
 
     // ------------------------------------------------------------------

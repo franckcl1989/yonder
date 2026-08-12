@@ -4244,6 +4244,211 @@ mod tests {
         );
     }
 
+    #[test]
+    fn audit_error_codes_and_clones_preserve_every_public_category() {
+        let categorized = [
+            (
+                AuditError::IdentityMissing,
+                AuditErrorCode::AuditIdentityMissing,
+            ),
+            (
+                AuditError::IdentityInvalid,
+                AuditErrorCode::AuditIdentityInvalid,
+            ),
+            (
+                AuditError::IdentityPermissions,
+                AuditErrorCode::AuditIdentityPermissions,
+            ),
+            (
+                AuditError::LedgerInvalid,
+                AuditErrorCode::AuditLedgerInvalid,
+            ),
+            (
+                AuditError::LedgerConflict,
+                AuditErrorCode::AuditLedgerConflict,
+            ),
+            (
+                AuditError::DirectoryUnavailable(io::Error::other("directory")),
+                AuditErrorCode::AuditDirectoryUnavailable,
+            ),
+            (
+                AuditError::RecordCreateFailed(io::Error::other("create")),
+                AuditErrorCode::AuditRecordCreateFailed,
+            ),
+            (
+                AuditError::RecordWriteFailed(io::Error::other("write")),
+                AuditErrorCode::AuditRecordWriteFailed,
+            ),
+            (
+                AuditError::RecordSyncFailed(io::Error::other("sync")),
+                AuditErrorCode::AuditRecordSyncFailed,
+            ),
+            (
+                AuditError::peer_unsupported(),
+                AuditErrorCode::AuditProtocolUnsupported,
+            ),
+            (
+                AuditError::HandshakeInvalid,
+                AuditErrorCode::AuditHandshakeInvalid,
+            ),
+            (
+                AuditError::SessionBindingMismatch,
+                AuditErrorCode::AuditSessionBindingMismatch,
+            ),
+            (
+                AuditError::CheckpointMismatch,
+                AuditErrorCode::AuditCheckpointMismatch,
+            ),
+            (
+                AuditError::PeerSignatureInvalid,
+                AuditErrorCode::AuditPeerSignatureInvalid,
+            ),
+            (
+                AuditError::FinalManifestMismatch,
+                AuditErrorCode::AuditFinalManifestMismatch,
+            ),
+            (
+                AuditError::LedgerCommitFailed,
+                AuditErrorCode::AuditLedgerCommitFailed,
+            ),
+            (AuditError::ReplayUnsafe, AuditErrorCode::AuditReplayUnsafe),
+            (
+                AuditError::ContainerInvalid,
+                AuditErrorCode::AuditContainerInvalid,
+            ),
+        ];
+        for (error, code) in categorized {
+            assert_eq!(error.code(), Some(code));
+            assert_eq!(error.clone().code(), Some(code));
+        }
+
+        let uncategorized = [
+            AuditError::RandomSource(RandomError),
+            AuditError::Protocol(ProtocolError::InvalidLength {
+                expected: 1,
+                actual: 0,
+            }),
+            AuditError::Substream(io::Error::other("stream")),
+            AuditError::SegmentTooLarge,
+            AuditError::InvalidState("state"),
+            AuditError::FailedClosed,
+            AuditError::WriterTerminated,
+        ];
+        for error in uncategorized {
+            assert_eq!(error.code(), None);
+            assert_eq!(error.clone().code(), None);
+        }
+    }
+
+    #[test]
+    fn record_payloads_and_bounded_collectors_enforce_their_limits() {
+        let inline = Payload::Inline {
+            bytes: [0; MAX_INLINE_PAYLOAD_LEN],
+            len: 3,
+        };
+        let boxed = Payload::Boxed(vec![1, 2, 3, 4].into_boxed_slice());
+        let split = Payload::Split {
+            prefix: [0; SPLIT_PREFIX_LEN],
+            body: &[1, 2],
+        };
+        assert_eq!(inline.len(), 3);
+        assert_eq!(boxed.len(), 4);
+        assert_eq!(split.len(), SPLIT_PREFIX_LEN + 2);
+        assert!(!inline.is_empty());
+        assert!(
+            Payload::Inline {
+                bytes: [0; MAX_INLINE_PAYLOAD_LEN],
+                len: 0,
+            }
+            .is_empty()
+        );
+
+        let mut batch = RecordBatch::default();
+        assert!(batch.is_empty());
+        assert!(matches!(
+            batch.push_inline(RecordType::LocalKeyAction, &[0; MAX_INLINE_PAYLOAD_LEN + 1]),
+            Err(AuditError::InvalidState(_))
+        ));
+        for _ in 0..MAX_RECORDS_PER_STEP {
+            batch
+                .push_inline(RecordType::LocalKeyAction, &[KEY_ACTION_HELP])
+                .unwrap();
+        }
+        assert_eq!(batch.len(), MAX_RECORDS_PER_STEP);
+        assert!(matches!(
+            batch.push_inline(RecordType::LocalKeyAction, &[KEY_ACTION_HELP]),
+            Err(AuditError::InvalidState(_))
+        ));
+        assert_eq!(batch.iter().count(), MAX_RECORDS_PER_STEP);
+
+        let block = CompletedBlock {
+            payload: [0; SHARED_INPUT_RECORD_LEN],
+            head: ChainHead::new([7; DIGEST_LEN]),
+        };
+        let mut collector = BlockCollector::new();
+        assert_eq!(collector.last_head(), None);
+        for _ in 0..MAX_BLOCKS_PER_SEGMENT {
+            collector.push(block).unwrap();
+        }
+        assert_eq!(collector.last_head(), Some(block.head));
+        assert!(matches!(
+            collector.push(block),
+            Err(AuditError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn normalizer_and_session_phases_reject_operations_after_their_boundary() {
+        let mut normalizer = Normalizer::default();
+        normalizer.feed(b"partial", |_| {}).unwrap();
+        let mut tail = Vec::new();
+        assert!(
+            normalizer
+                .finish(|bytes| tail.extend_from_slice(bytes))
+                .unwrap()
+        );
+        assert_eq!(tail, b"partial");
+        assert!(matches!(
+            normalizer.feed(b"late", |_| {}),
+            Err(AuditError::InvalidState(_))
+        ));
+        assert!(matches!(
+            normalizer.finish(|_| {}),
+            Err(AuditError::InvalidState(_))
+        ));
+
+        let mut session = test_session(AuditRole::Controller, 88, test_binding(88));
+        assert_eq!(session.role(), AuditRole::Controller);
+        assert_eq!(session.session_id(), None);
+        assert!(session.input_key().is_none());
+        assert_eq!(session.local_event_count(), 0);
+        assert_eq!(session.local_chain_head(), zero_head());
+        assert!(matches!(
+            session.record_key_action(KEY_ACTION_HELP, 1),
+            Err(AuditError::InvalidState(_))
+        ));
+        let records = session
+            .fail_closed_records(
+                AuditErrorCode::AuditRecordWriteFailed,
+                AuditCloseReason::AuditFailure,
+                2,
+            )
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(matches!(
+            session.record_connection_state(CONNECTION_STATE_LOST, 3),
+            Err(AuditError::FailedClosed)
+        ));
+        assert!(matches!(
+            session.fail_closed_records(
+                AuditErrorCode::AuditRecordWriteFailed,
+                AuditCloseReason::AuditFailure,
+                4,
+            ),
+            Err(AuditError::FailedClosed)
+        ));
+    }
+
     /// Walks one container, collecting the decoded shared chains per
     /// stream, the manifest and the footer.
     fn walk_container(

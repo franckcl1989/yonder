@@ -1220,4 +1220,57 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, AuditError::InvalidState(_)));
     }
+
+    #[tokio::test]
+    async fn writer_metadata_policy_mapping_and_poison_replies_are_typed() {
+        let dir = tempdir().unwrap();
+        let records = dir.path().join("records");
+        let writer = AuditWriter::open(&records, &test_session_id(), AuditRole::Host).unwrap();
+        assert_eq!(writer.session_id(), test_session_id());
+        assert_eq!(writer.role(), AuditRole::Host);
+        assert_eq!(writer.record_path().parent(), Some(records.as_path()));
+
+        assert_eq!(
+            policy_io_error(SecretFileError::Insecure).kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            policy_io_error(SecretFileError::Platform(io::Error::other("platform"))).kind(),
+            io::ErrorKind::Other
+        );
+        assert!(matches!(
+            map_directory_policy(SecretFileError::Insecure),
+            AuditError::DirectoryUnavailable(_)
+        ));
+        assert!(matches!(
+            map_record_policy(SecretFileError::Insecure),
+            AuditError::RecordCreateFailed(_)
+        ));
+
+        let (reply, result) = oneshot::channel();
+        reject(
+            Request::Initialize {
+                header: Box::new([]),
+                reply,
+            },
+            AuditError::WriterTerminated,
+        );
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(AuditError::WriterTerminated)
+        ));
+
+        let (reply, result) = oneshot::channel();
+        reject(
+            Request::WriteSeal {
+                seal: Box::new([]),
+                reply,
+            },
+            AuditError::WriterTerminated,
+        );
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(AuditError::WriterTerminated)
+        ));
+    }
 }

@@ -998,6 +998,64 @@ mod tests {
     }
 
     #[test]
+    fn commit_inputs_debug_output_and_sequence_overflow_are_bounded() {
+        let input = test_commit_input([0x31; 32]);
+        assert_eq!(input.session_id(), SessionId::new([0x31; 32]));
+        assert_eq!(input.manifest_digest(), Digest32::new([0x11; 32]));
+        assert_eq!(input.sealed_record_digest(), Digest32::new([0x22; 32]));
+        assert_eq!(
+            input.peer_identity_fingerprint(),
+            IdentityFingerprint::new([0x33; 32])
+        );
+        assert_eq!(input.result(), SessionResult::Normal);
+
+        let root = test_root();
+        let ledger = Ledger::open(&root, &mut OsSecureRandom).unwrap();
+        let debug = format!("{ledger:?}");
+        assert!(debug.contains("Ledger"));
+        assert!(!debug.contains(root.to_string_lossy().as_ref()));
+
+        let mut commit = ledger.begin_owned_commit().unwrap();
+        assert_eq!(commit.head().sequence(), 0);
+        commit.head.sequence = u64::MAX;
+        assert!(matches!(
+            commit.commit(&input),
+            Err(AuditLedgerError::AuditLedgerInvalid)
+        ));
+        let ledger = commit.into_ledger();
+        assert_eq!(ledger.head().sequence(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_policy_errors_map_to_their_fixed_ledger_categories() {
+        for mapped in [
+            map_lock_policy(SecretFileError::Insecure),
+            map_state_policy(SecretFileError::Insecure),
+            map_record_policy(SecretFileError::Insecure),
+            map_commit_policy(SecretFileError::Insecure),
+        ] {
+            assert!(matches!(mapped, AuditLedgerError::AuditLedgerPermissions));
+        }
+        assert!(matches!(
+            map_lock_policy(SecretFileError::Platform(io::Error::other("lock"))),
+            AuditLedgerError::LockFailed(_)
+        ));
+        assert!(matches!(
+            map_state_policy(SecretFileError::Platform(io::Error::other("state"))),
+            AuditLedgerError::StateReadFailed(_)
+        ));
+        assert!(matches!(
+            map_record_policy(SecretFileError::Platform(io::Error::other("record"))),
+            AuditLedgerError::RecordReadFailed(_)
+        ));
+        assert!(matches!(
+            map_commit_policy(SecretFileError::Platform(io::Error::other("commit"))),
+            AuditLedgerError::AuditLedgerCommitFailed(_)
+        ));
+    }
+
+    #[test]
     fn commits_chain_and_advance_the_head() {
         let root = test_root();
         let mut ledger = Ledger::open(&root, &mut OsSecureRandom).unwrap();
