@@ -713,6 +713,7 @@ async fn sync_file(file: &mut impl AsyncFile) -> Result<(), AuditError> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::sync::Mutex as AsyncMutex;
@@ -721,9 +722,7 @@ mod tests {
         Ed25519PublicKey, Ed25519Signature, IdentityFingerprint, LedgerRoot, ManifestEnding,
         SessionResult, SharedSnapshot, StreamSnapshot,
     };
-    use yonder_core::wire::audit_container::{
-        CONTAINER_HEADER_LEN, ContainerReader, MAX_RAW_OUTPUT_PAYLOAD_LEN,
-    };
+    use yonder_core::wire::audit_container::{ContainerReader, MAX_RAW_OUTPUT_PAYLOAD_LEN};
 
     const ZERO_HEAD: ChainHead = ChainHead::new([0; DIGEST_LEN]);
     const ZERO_ROOT: LedgerRoot = LedgerRoot::new([0; DIGEST_LEN]);
@@ -1060,41 +1059,59 @@ mod tests {
         assert!(state.syncs >= 1, "the header sync happened");
     }
 
-    /// An instrumented file that fails every write after `fail_after` bytes.
+    /// An instrumented file whose write and sync failures can be enabled
+    /// after a specific writer phase has completed.
     struct FailingFile {
-        written: usize,
-        fail_after: usize,
+        fail_writes: Arc<AtomicBool>,
+        fail_syncs: Arc<AtomicBool>,
     }
 
     impl AsyncFile for FailingFile {
-        async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-            if self.written >= self.fail_after {
+        async fn write_all(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            if self.fail_writes.load(Ordering::Relaxed) {
                 return Err(io::Error::other("test disk full"));
             }
-            self.written += bytes.len();
             Ok(())
         }
 
         async fn sync_all(&mut self) -> io::Result<()> {
-            Ok(())
+            if self.fail_syncs.load(Ordering::Relaxed) {
+                Err(io::Error::other("test sync failure"))
+            } else {
+                Ok(())
+            }
         }
+    }
+
+    fn failing_writer(
+        name: &'static str,
+        fail_writes: Arc<AtomicBool>,
+        fail_syncs: Arc<AtomicBool>,
+    ) -> AuditWriter {
+        AuditWriter::spawn(
+            PathBuf::from(name),
+            test_session_id(),
+            AuditRole::Host,
+            FailingFile {
+                fail_writes,
+                fail_syncs,
+            },
+            8,
+        )
     }
 
     #[tokio::test]
     async fn writer_errors_propagate_and_poison_all_later_requests() {
-        let writer = AuditWriter::spawn(
-            PathBuf::from("failing.yonaudit"),
-            test_session_id(),
-            AuditRole::Host,
-            FailingFile {
-                written: 0,
-                fail_after: CONTAINER_HEADER_LEN,
-            },
-            8,
+        let fail_writes = Arc::new(AtomicBool::new(false));
+        let writer = failing_writer(
+            "failing.yonaudit",
+            Arc::clone(&fail_writes),
+            Arc::new(AtomicBool::new(false)),
         );
         let header = test_header();
         writer.initialize(&header).await.unwrap();
         // The next write fails and the error is returned synchronously.
+        fail_writes.store(true, Ordering::Relaxed);
         let error = writer
             .append(RecordType::LocalKeyAction, b"boom")
             .await
@@ -1116,6 +1133,91 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, AuditError::RecordWriteFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn every_fatal_writer_phase_poison_is_propagated() {
+        let fail_writes = Arc::new(AtomicBool::new(true));
+        let writer = failing_writer(
+            "initialize-failure.yonaudit",
+            Arc::clone(&fail_writes),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            writer.initialize(&test_header()).await,
+            Err(AuditError::RecordWriteFailed(_))
+        ));
+        assert!(matches!(
+            writer.sync_all().await,
+            Err(AuditError::RecordWriteFailed(_))
+        ));
+
+        let fail_syncs = Arc::new(AtomicBool::new(false));
+        let writer = failing_writer(
+            "sync-failure.yonaudit",
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&fail_syncs),
+        );
+        writer.initialize(&test_header()).await.unwrap();
+        fail_syncs.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            writer.sync_all().await,
+            Err(AuditError::RecordSyncFailed(_))
+        ));
+
+        let fail_writes = Arc::new(AtomicBool::new(false));
+        let writer = failing_writer(
+            "manifest-failure.yonaudit",
+            Arc::clone(&fail_writes),
+            Arc::new(AtomicBool::new(false)),
+        );
+        writer.initialize(&test_header()).await.unwrap();
+        fail_writes.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            writer
+                .write_manifest_and_signatures(
+                    &test_manifest(),
+                    &test_signature(),
+                    &test_signature()
+                )
+                .await,
+            Err(AuditError::RecordWriteFailed(_))
+        ));
+
+        let fail_writes = Arc::new(AtomicBool::new(false));
+        let writer = failing_writer(
+            "seal-failure.yonaudit",
+            Arc::clone(&fail_writes),
+            Arc::new(AtomicBool::new(false)),
+        );
+        writer.initialize(&test_header()).await.unwrap();
+        writer
+            .write_manifest_and_signatures(&test_manifest(), &test_signature(), &test_signature())
+            .await
+            .unwrap();
+        fail_writes.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            writer.write_seal(&test_seal()).await,
+            Err(AuditError::RecordWriteFailed(_))
+        ));
+
+        let fail_writes = Arc::new(AtomicBool::new(false));
+        let writer = failing_writer(
+            "commit-failure.yonaudit",
+            Arc::clone(&fail_writes),
+            Arc::new(AtomicBool::new(false)),
+        );
+        writer.initialize(&test_header()).await.unwrap();
+        writer
+            .write_manifest_and_signatures(&test_manifest(), &test_signature(), &test_signature())
+            .await
+            .unwrap();
+        writer.write_seal(&test_seal()).await.unwrap();
+        fail_writes.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            writer.write_ledger_commit(&test_commit()).await,
+            Err(AuditError::RecordWriteFailed(_))
+        ));
     }
 
     #[tokio::test]
@@ -1155,6 +1257,8 @@ mod tests {
             8,
         );
         writer.initialize(&test_header()).await.unwrap();
+        let error = writer.initialize(&test_header()).await.unwrap_err();
+        assert!(matches!(error, AuditError::InvalidState(_)));
 
         // The seal before the manifest is refused.
         let error = writer.write_seal(&test_seal()).await.unwrap_err();
@@ -1164,6 +1268,11 @@ mod tests {
             .write_manifest_and_signatures(&test_manifest(), &test_signature(), &test_signature())
             .await
             .unwrap();
+        let error = writer
+            .write_manifest_and_signatures(&test_manifest(), &test_signature(), &test_signature())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuditError::InvalidState(_)));
         writer.write_seal(&test_seal()).await.unwrap();
         // Records after finalization started are refused.
         let error = writer
@@ -1186,6 +1295,13 @@ mod tests {
             BlockingFile::new(state.clone(), release.clone()),
             8,
         );
+        let error = writer.sync_all().await.unwrap_err();
+        assert!(matches!(error, AuditError::InvalidState(_)));
+        let error = writer
+            .write_manifest_and_signatures(&test_manifest(), &test_signature(), &test_signature())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuditError::InvalidState(_)));
         let error = writer
             .append(RecordType::LocalKeyAction, b"early")
             .await

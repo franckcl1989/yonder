@@ -677,7 +677,7 @@ mod tests {
         let mut parser = vt100::Parser::new(2, 3, 0);
         parser.process(b"\x1b[1;2;3;4;7;38;5;123;48;2;1;2;3mA\xe7\x95\x8c\x1b[?25l");
         let mut rendered = Vec::new();
-        render_screen(parser.screen(), (1, 2), &mut rendered).unwrap();
+        render_screen(parser.screen(), (1, 3), &mut rendered).unwrap();
         assert!(!rendered.is_empty());
         assert!(safe_visible_text(parser.screen()).contains("A"));
 

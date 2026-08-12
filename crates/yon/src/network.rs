@@ -135,6 +135,11 @@ pub struct ConnectionBinding {
 }
 
 impl ConnectionBinding {
+    #[cfg(test)]
+    pub(crate) const fn for_test(peer: PeerId, connection: ConnectionId) -> Self {
+        Self { peer, connection }
+    }
+
     #[must_use]
     pub const fn peer(self) -> PeerId {
         self.peer

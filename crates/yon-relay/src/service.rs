@@ -2376,6 +2376,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn enterprise_callback_bind_failure_stops_the_relay() {
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         // Regression test for the callback listener failure escalation:
         // the callback listener is occupied, so the startup bind fails and
         // run_relay_until stops with the EnterpriseCallback error instead
@@ -2404,6 +2406,16 @@ mod tests {
             error,
             RelayServiceError::EnterpriseCallback(CallbackServerError::Bind { .. })
         ));
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_enterprise_mode\""));
+        assert!(text.contains("providers=1"));
+        assert!(text.contains("event=\"relay_starting\""));
+        assert!(text.contains("relay_mode=\"enterprise\""));
+        assert!(text.contains("listen_count=1"));
+        assert!(text.contains("external_count=1"));
+        assert!(text.contains("registration_capacity="));
+        assert!(text.contains("resolve_concurrency="));
+        assert!(text.contains("circuit_capacity="));
     }
 
     #[tokio::test(flavor = "current_thread")]

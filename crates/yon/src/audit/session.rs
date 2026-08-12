@@ -287,7 +287,7 @@ pub enum AuditError {
     #[error("the audit session binding does not match the authenticated connection")]
     SessionBindingMismatch,
     /// `AuditCheckpointMismatch` (design section 30).
-    #[error("the peer checkpoint does not match the local shared chains")]
+    #[error("the peer checkpoint is invalid")]
     CheckpointMismatch,
     /// `AuditPeerSignatureInvalid` (design section 30).
     #[error("the peer audit signature is invalid")]
@@ -1008,6 +1008,14 @@ enum Phase {
     Failed,
 }
 
+/// Whether a received checkpoint is an asynchronously delivered running
+/// observation or the exact shared prefix after the closing barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointPolicy {
+    Observation,
+    ExactPrefix,
+}
+
 // ---------------------------------------------------------------------------
 // The session
 // ---------------------------------------------------------------------------
@@ -1057,7 +1065,8 @@ pub struct AuditSession {
     // Checkpoints.
     next_checkpoint_sequence: u64,
     last_checkpoint_time_ns: u64,
-    last_confirmed_checkpoint_sequence: u64,
+    last_confirmed_sent_checkpoint_sequence: u64,
+    last_confirmed_received_checkpoint_sequence: u64,
     last_received_checkpoint: Option<(u64, Digest32)>,
     last_sent_checkpoint: Option<Checkpoint>,
     checkpoint_shared_bytes: u64,
@@ -1152,7 +1161,8 @@ impl AuditSession {
             last_block: [None; SHARED_STREAMS],
             next_checkpoint_sequence: 1,
             last_checkpoint_time_ns: 0,
-            last_confirmed_checkpoint_sequence: 0,
+            last_confirmed_sent_checkpoint_sequence: 0,
+            last_confirmed_received_checkpoint_sequence: 0,
             last_received_checkpoint: None,
             last_sent_checkpoint: None,
             checkpoint_shared_bytes: 0,
@@ -1217,11 +1227,19 @@ impl AuditSession {
         )
     }
 
-    /// The number of the last checkpoint confirmed by both sides, or zero
-    /// when no checkpoint was ever confirmed.
+    /// The greatest sequence confirmed in either independent direction, or
+    /// zero when no checkpoint was confirmed. The manifest retains this
+    /// compact wire summary; sent and received confirmation state remains
+    /// separate internally.
     #[must_use]
     pub const fn last_confirmed_checkpoint_sequence(&self) -> u64 {
-        self.last_confirmed_checkpoint_sequence
+        if self.last_confirmed_sent_checkpoint_sequence
+            >= self.last_confirmed_received_checkpoint_sequence
+        {
+            self.last_confirmed_sent_checkpoint_sequence
+        } else {
+            self.last_confirmed_received_checkpoint_sequence
+        }
     }
 
     /// Whether the handshake completed (design section 13.5): the session
@@ -1925,14 +1943,35 @@ impl AuditSession {
     /// pre-evidence head, so the evidence record can never reference the
     /// checkpoint itself (non-self-referencing).
     ///
-    /// Ordering invariant: build the checkpoint after the last shared-fact
-    /// record and send it before any further record, so the peer's state at
-    /// checkpoint receive time matches the snapshot.
+    /// The snapshot is the sender's signed observation. Independent libp2p
+    /// substreams do not provide cross-stream ordering, so a running-phase
+    /// receiver may already have observed later terminal or file facts when
+    /// this checkpoint arrives.
     pub fn build_checkpoint<'a>(
         &mut self,
         now_ns: u64,
     ) -> Result<(Checkpoint, RecordBatch<'a>), AuditError> {
-        self.require_recordable()?;
+        self.build_checkpoint_with_policy(now_ns, CheckpointPolicy::Observation)
+    }
+
+    /// Builds the exact checkpoint after both byte directions have crossed
+    /// the close barrier and the final shared snapshot is stable.
+    pub fn build_final_checkpoint<'a>(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(Checkpoint, RecordBatch<'a>), AuditError> {
+        self.build_checkpoint_with_policy(now_ns, CheckpointPolicy::ExactPrefix)
+    }
+
+    fn build_checkpoint_with_policy<'a>(
+        &mut self,
+        now_ns: u64,
+        policy: CheckpointPolicy,
+    ) -> Result<(Checkpoint, RecordBatch<'a>), AuditError> {
+        match policy {
+            CheckpointPolicy::Observation => self.require_recordable()?,
+            CheckpointPolicy::ExactPrefix => self.require_phase(Phase::Finalizing)?,
+        }
         let session_id = self
             .session_id
             .ok_or(AuditError::InvalidState("session ID not computed"))?;
@@ -1964,22 +2003,54 @@ impl AuditSession {
         Ok((checkpoint, batch))
     }
 
-    /// Design section 20.3 (receiver side): verifies a peer checkpoint
-    /// (signature, session ID and the same-stream counts and heads), appends
-    /// the received-checkpoint evidence and returns the signed
-    /// `CheckpointAck` with the matching snapshot together with the
-    /// sent-ack evidence record.
+    /// Design section 20.3 (receiver side): verifies a running-phase peer
+    /// checkpoint (signature, session ID and independent sender sequence),
+    /// appends the received-checkpoint evidence and returns the signed
+    /// `CheckpointAck` over the sender's snapshot together with the sent-ack
+    /// evidence record.
     ///
     /// A duplicate retransmission of the last received checkpoint is
     /// acknowledged again without new evidence; a skipped or mismatching
-    /// sequence, session ID, snapshot or signature records the mismatch and
-    /// fails the session closed (design section 20.3).
+    /// sequence, session ID or signature records the mismatch and fails the
+    /// session closed (design section 20.3). The receiver deliberately does
+    /// not compare the snapshot with its current chains: terminal, file and
+    /// audit traffic use independent substreams and have no cross-stream
+    /// arrival order.
     pub fn receive_checkpoint<'a>(
         &mut self,
         checkpoint: &Checkpoint,
         now_ns: u64,
     ) -> Result<(CheckpointAck, RecordBatch<'a>), AuditError> {
-        self.require_recordable()?;
+        self.receive_checkpoint_with_policy(checkpoint, now_ns, CheckpointPolicy::Observation)
+    }
+
+    /// Receives the closing checkpoint after the terminal and file streams
+    /// have reached their close barrier. At that point no shared fact may be
+    /// in flight, so the peer snapshot must equal the local final snapshot.
+    pub fn receive_final_checkpoint<'a>(
+        &mut self,
+        checkpoint: &Checkpoint,
+        now_ns: u64,
+    ) -> Result<(CheckpointAck, RecordBatch<'a>), AuditError> {
+        self.receive_checkpoint_with_policy(checkpoint, now_ns, CheckpointPolicy::ExactPrefix)
+    }
+
+    fn receive_checkpoint_with_policy<'a>(
+        &mut self,
+        checkpoint: &Checkpoint,
+        now_ns: u64,
+        policy: CheckpointPolicy,
+    ) -> Result<(CheckpointAck, RecordBatch<'a>), AuditError> {
+        match policy {
+            CheckpointPolicy::Observation => {
+                if !matches!(self.phase, Phase::Active | Phase::Finalizing) {
+                    return Err(AuditError::InvalidState(
+                        "checkpoint observation outside an active session",
+                    ));
+                }
+            }
+            CheckpointPolicy::ExactPrefix => self.require_phase(Phase::Finalizing)?,
+        }
         let session_id = self
             .session_id
             .ok_or(AuditError::InvalidState("session ID not computed"))?;
@@ -1999,6 +2070,11 @@ impl AuditSession {
         {
             return self.fail_checkpoint();
         }
+        if policy == CheckpointPolicy::ExactPrefix
+            && checkpoint.snapshot() != self.shared_snapshot()
+        {
+            return self.fail_checkpoint();
+        }
         let digest = Digest32::new(sha256_32(checkpoint.encode_payload().as_slice()));
         let expected = self
             .last_received_checkpoint
@@ -2015,14 +2091,10 @@ impl AuditSession {
             }
             return self.fail_checkpoint();
         }
-        if checkpoint.snapshot() != self.shared_snapshot() {
-            return self.fail_checkpoint();
-        }
         self.last_received_checkpoint = Some((checkpoint.sequence(), digest));
-        // The receiver commits to the checkpoint with its ack, so both
-        // sides record the same final confirmed checkpoint sequence for
-        // the joint manifest (design section 21.1).
-        self.last_confirmed_checkpoint_sequence = checkpoint.sequence();
+        // The receiver commits to this sender-direction checkpoint with its
+        // ack. The direction remains independent until manifest summary.
+        self.last_confirmed_received_checkpoint_sequence = checkpoint.sequence();
         let mut batch = RecordBatch::new();
         self.push_evidence(
             &mut batch,
@@ -2042,7 +2114,7 @@ impl AuditSession {
 
     /// Design section 20.3 (sender side): verifies the peer `CheckpointAck`
     /// against the last sent checkpoint: session ID, sequence, checkpoint
-    /// digest and the receiver's same-stream snapshot. On success the
+    /// digest and the receiver's signed copy of the sender snapshot. On success the
     /// checkpoint becomes a bilaterally confirmed checkpoint and the
     /// received-ack evidence is returned for appending. A duplicate ack is
     /// ignored; any mismatch records the mismatch and fails the session
@@ -2052,7 +2124,14 @@ impl AuditSession {
         ack: &CheckpointAck,
         now_ns: u64,
     ) -> Result<Option<RecordBatch<'a>>, AuditError> {
-        self.require_recordable()?;
+        if !matches!(self.phase, Phase::Active | Phase::Finalizing) {
+            return match self.phase {
+                Phase::Failed => Err(AuditError::FailedClosed),
+                _ => Err(AuditError::InvalidState(
+                    "checkpoint acknowledgment outside an active session",
+                )),
+            };
+        }
         let session_id = self
             .session_id
             .ok_or(AuditError::InvalidState("session ID not computed"))?;
@@ -2082,12 +2161,11 @@ impl AuditSession {
         {
             return self.fail_checkpoint();
         }
-        if self.last_confirmed_checkpoint_sequence >= ack.sequence() {
+        if self.last_confirmed_sent_checkpoint_sequence >= ack.sequence() {
             // Duplicate ack for an already confirmed checkpoint: ignore.
             return Ok(None);
         }
-        self.last_confirmed_checkpoint_sequence = ack.sequence();
-        self.last_sent_checkpoint = None;
+        self.last_confirmed_sent_checkpoint_sequence = ack.sequence();
         let mut batch = RecordBatch::new();
         self.push_evidence(
             &mut batch,
@@ -2240,7 +2318,7 @@ impl AuditSession {
             self.shared_snapshot(),
             ending,
             ended_normally,
-            self.last_confirmed_checkpoint_sequence,
+            self.last_confirmed_checkpoint_sequence(),
         );
         manifest.encode_payload()?;
         let signature = self.sign_with_session_key(manifest.signing_input()?.as_slice());
@@ -3701,6 +3779,26 @@ mod tests {
     }
 
     #[test]
+    fn normalizer_completes_a_partial_block_then_streams_whole_blocks() {
+        let mut normalizer = Normalizer::new();
+        normalizer.feed(&[0x11; 7], |_| unreachable!()).unwrap();
+        let bytes = vec![0x22; 2 * CANONICAL_BLOCK_LEN];
+        let mut completed = Vec::new();
+        normalizer
+            .feed(&bytes, |block| completed.push(block.to_vec()))
+            .unwrap();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(&completed[0][..7], &[0x11; 7]);
+        assert_eq!(normalizer.partial_len(), 7);
+        assert!(
+            normalizer
+                .finish(|block| completed.push(block.to_vec()))
+                .unwrap()
+        );
+        assert_eq!(completed.len(), 3);
+    }
+
+    #[test]
     fn empty_directions_produce_no_blocks() {
         let binding = test_binding(0x42);
         let mut session = test_session(AuditRole::Controller, 10, binding);
@@ -3709,6 +3807,39 @@ mod tests {
         let batch = session.close_directions().unwrap();
         assert!(batch.is_empty());
         assert!(host.close_directions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_local_observation_has_a_typed_record() {
+        let binding = test_binding(0x42);
+        let mut session = test_session(AuditRole::Controller, 71, binding);
+        let mut host = test_session(AuditRole::Host, 171, binding);
+        handshake(&mut session, &mut host);
+
+        let lifecycle = session
+            .record_local_lifecycle(0x7f, ChainHead::new([3; DIGEST_LEN]), 1)
+            .unwrap();
+        let key = session.record_key_action(0x7e, 2).unwrap();
+        let connection = session.record_connection_state(0x7d, 3).unwrap();
+        let error = session
+            .record_local_audit_error(AuditErrorCode::AuditRecordWriteFailed, 4)
+            .unwrap();
+        assert_eq!(
+            lifecycle.iter().next().unwrap().record_type,
+            RecordType::LocalLifecycleEvent
+        );
+        assert_eq!(
+            key.iter().next().unwrap().record_type,
+            RecordType::LocalKeyAction
+        );
+        assert_eq!(
+            connection.iter().next().unwrap().record_type,
+            RecordType::LocalConnectionState
+        );
+        assert_eq!(
+            error.iter().next().unwrap().record_type,
+            RecordType::LocalAuditError
+        );
     }
 
     #[test]
@@ -3802,7 +3933,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_mismatch_fails_closed() {
+    fn running_checkpoint_tolerates_cross_stream_progress_but_final_mismatch_fails_closed() {
         let binding = test_binding(0x45);
         let mut controller = test_session(AuditRole::Controller, 13, binding);
         let mut host = test_session(AuditRole::Host, 113, binding);
@@ -3813,7 +3944,12 @@ mod tests {
         let chunk = vec![0x33; 16 * 1024];
         controller.record_input(&chunk, 10).unwrap();
         let (checkpoint, _) = controller.build_checkpoint(1_000_000_000).unwrap();
-        let result = host.receive_checkpoint(&checkpoint, 1_000_000_000);
+        let (ack, _) = host.receive_checkpoint(&checkpoint, 1_000_000_000).unwrap();
+        assert_eq!(ack.snapshot(), checkpoint.snapshot());
+        assert!(!host.has_failed());
+
+        host.close_directions().unwrap();
+        let result = host.receive_final_checkpoint(&checkpoint, 1_000_000_001);
         assert!(matches!(result, Err(AuditError::CheckpointMismatch)));
         assert!(host.has_failed());
         assert!(matches!(
@@ -3835,6 +3971,120 @@ mod tests {
             Err(AuditError::CheckpointMismatch)
         ));
         assert!(controller.has_failed());
+    }
+
+    #[test]
+    fn checkpoint_and_ack_security_fields_fail_closed_independently() {
+        fn exchange(
+            binding: BindingDigest,
+        ) -> (AuditSession, AuditSession, Checkpoint, CheckpointAck) {
+            let mut controller = test_session(AuditRole::Controller, 70, binding);
+            let mut host = test_session(AuditRole::Host, 170, binding);
+            handshake(&mut controller, &mut host);
+            let (checkpoint, _) = controller.build_checkpoint(1).unwrap();
+            let (ack, _) = host.receive_checkpoint(&checkpoint, 2).unwrap();
+            (controller, host, checkpoint, ack)
+        }
+
+        let binding = test_binding(0x71);
+
+        // The same endpoint keys on a different authenticated connection
+        // produce a valid signature over a different session ID.
+        let (_, mut receiver, _, _) = exchange(binding);
+        let (_, _, foreign_checkpoint, _) = exchange(test_binding(0x72));
+        assert!(matches!(
+            receiver.receive_checkpoint(&foreign_checkpoint, 3),
+            Err(AuditError::CheckpointMismatch)
+        ));
+        assert!(receiver.has_failed());
+
+        // A correctly signed checkpoint may not skip the expected sequence.
+        let mut controller = test_session(AuditRole::Controller, 70, binding);
+        let mut host = test_session(AuditRole::Host, 170, binding);
+        handshake(&mut controller, &mut host);
+        controller.build_checkpoint(1).unwrap();
+        let (skipped, _) = controller.build_checkpoint(2).unwrap();
+        assert!(matches!(
+            host.receive_checkpoint(&skipped, 3),
+            Err(AuditError::CheckpointMismatch)
+        ));
+
+        // A payload-preserving decode with a changed signature is rejected.
+        let (_, mut host, checkpoint, _) = exchange(binding);
+        let mut bytes = checkpoint.encode_payload().as_slice().to_vec();
+        *bytes.last_mut().unwrap() ^= 1;
+        let forged = Checkpoint::decode_payload(&bytes).unwrap();
+        assert!(matches!(
+            host.receive_checkpoint(&forged, 3),
+            Err(AuditError::CheckpointMismatch)
+        ));
+
+        // Ack checks are deliberately ordered so each independent security
+        // field is rejected before a later signature failure can mask it.
+        let (mut controller, _, _, ack) = exchange(binding);
+        let mut bytes = ack.encode_payload().as_slice().to_vec();
+        bytes[0] ^= 1;
+        let wrong_session = CheckpointAck::decode_payload(&bytes).unwrap();
+        assert!(matches!(
+            controller.receive_checkpoint_ack(&wrong_session, 4),
+            Err(AuditError::CheckpointMismatch)
+        ));
+
+        let (mut controller, _, _, ack) = exchange(binding);
+        let mut bytes = ack.encode_payload().as_slice().to_vec();
+        bytes[39] ^= 1;
+        let wrong_sequence = CheckpointAck::decode_payload(&bytes).unwrap();
+        assert!(matches!(
+            controller.receive_checkpoint_ack(&wrong_sequence, 4),
+            Err(AuditError::CheckpointMismatch)
+        ));
+
+        for offset in [40, 72] {
+            let (mut controller, _, _, ack) = exchange(binding);
+            let mut bytes = ack.encode_payload().as_slice().to_vec();
+            bytes[offset] ^= 1;
+            let wrong_commitment = CheckpointAck::decode_payload(&bytes).unwrap();
+            assert!(matches!(
+                controller.receive_checkpoint_ack(&wrong_commitment, 4),
+                Err(AuditError::CheckpointMismatch)
+            ));
+        }
+
+        let (mut controller, _, _, ack) = exchange(binding);
+        let mut bytes = ack.encode_payload().as_slice().to_vec();
+        *bytes.last_mut().unwrap() ^= 1;
+        let forged = CheckpointAck::decode_payload(&bytes).unwrap();
+        assert!(matches!(
+            controller.receive_checkpoint_ack(&forged, 4),
+            Err(AuditError::CheckpointMismatch)
+        ));
+
+        // An otherwise valid ack is invalid without an outstanding local
+        // checkpoint, while an exact duplicate after confirmation is benign.
+        let (_, _, _, ack) = exchange(binding);
+        let mut no_pending = test_session(AuditRole::Controller, 70, binding);
+        let mut peer = test_session(AuditRole::Host, 170, binding);
+        handshake(&mut no_pending, &mut peer);
+        assert!(matches!(
+            no_pending.receive_checkpoint_ack(&ack, 4),
+            Err(AuditError::InvalidState(
+                "no checkpoint awaiting confirmation"
+            ))
+        ));
+
+        let (mut controller, _, _, ack) = exchange(binding);
+        assert!(
+            controller
+                .receive_checkpoint_ack(&ack, 4)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            controller
+                .receive_checkpoint_ack(&ack, 5)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3884,6 +4134,7 @@ mod tests {
         let mut session = test_session(AuditRole::Controller, 16, binding);
         let mut host = test_session(AuditRole::Host, 116, binding);
         handshake(&mut session, &mut host);
+        assert!(session.record_input(&[], 0).unwrap().is_empty());
         // 64 chunks of 16 KiB of input complete 64 blocks, far past 1 MiB.
         let chunk = vec![0x5A; 16 * 1024];
         let mut due = false;
@@ -3892,6 +4143,78 @@ mod tests {
             due |= session.checkpoint_due(1);
         }
         assert!(due, "the 1 MiB size trigger marks a checkpoint due");
+
+        let mut output = test_session(AuditRole::Controller, 17, binding);
+        let mut output_host = test_session(AuditRole::Host, 117, binding);
+        handshake(&mut output, &mut output_host);
+        for _ in 0..64 {
+            output.record_output(&chunk, 1).unwrap();
+        }
+        assert!(
+            output.checkpoint_due(1),
+            "output bytes share the same 1 MiB checkpoint trigger"
+        );
+    }
+
+    #[test]
+    fn checkpoint_messages_are_rejected_outside_active_or_finalizing_phases() {
+        let binding = test_binding(0x49);
+        let mut controller = test_session(AuditRole::Controller, 18, binding);
+        let mut host = test_session(AuditRole::Host, 118, binding);
+        handshake(&mut controller, &mut host);
+        let (checkpoint, _) = controller.build_checkpoint(1).unwrap();
+        let (ack, _) = host.receive_checkpoint(&checkpoint, 2).unwrap();
+
+        let mut fresh = test_session(AuditRole::Host, 119, binding);
+        assert!(matches!(
+            fresh.receive_checkpoint(&checkpoint, 3),
+            Err(AuditError::InvalidState(
+                "checkpoint observation outside an active session"
+            ))
+        ));
+        assert!(matches!(
+            fresh.receive_checkpoint_ack(&ack, 4),
+            Err(AuditError::InvalidState(
+                "checkpoint acknowledgment outside an active session"
+            ))
+        ));
+        fresh
+            .fail_closed_records(
+                AuditErrorCode::AuditRecordWriteFailed,
+                AuditCloseReason::AuditFailure,
+                5,
+            )
+            .unwrap();
+        assert!(matches!(
+            fresh.receive_checkpoint_ack(&ack, 6),
+            Err(AuditError::FailedClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn footer_prefix_requires_a_verified_peer_manifest() {
+        let dir = tempdir().unwrap();
+        let records = dir.path().join("records");
+        let binding = test_binding(0x4A);
+        let mut controller = test_session(AuditRole::Controller, 19, binding);
+        let mut host = test_session(AuditRole::Host, 120, binding);
+        handshake_with_header(&mut controller, &mut host);
+        controller.close_directions().unwrap();
+        host.close_directions().unwrap();
+        let (manifest, signature, _) = controller
+            .build_manifest(ManifestEnding::ShellExit(0), true, 1)
+            .unwrap();
+        let session_id = *manifest.session_id();
+        let mut writer = AuditWriter::open(&records, &session_id, AuditRole::Controller).unwrap();
+
+        assert!(matches!(
+            controller
+                .write_footer_prefix(&mut writer, &manifest, signature, signature)
+                .await,
+            Err(AuditError::InvalidState(
+                "the peer manifest was not received and verified"
+            ))
+        ));
     }
 
     #[test]
@@ -4079,6 +4402,106 @@ mod tests {
         assert_eq!(decoded.remote_path, "/home/alice/notes.txt");
         assert_eq!(decoded.file_name, "notes.txt");
         assert_eq!(decoded.final_size, 1000);
+    }
+
+    #[test]
+    fn file_transfer_audit_rejects_every_unbounded_path_field() {
+        fn facts<'a>(remote_path: &'a str, file_name: &'a str) -> FileTransferFacts<'a> {
+            FileTransferFacts {
+                transfer_id: 8,
+                direction: FILE_DIRECTION_DOWNLOAD,
+                kind: FILE_KIND_SUCCESS,
+                declared_size: 1,
+                final_size: 1,
+                digest: Digest32::new([8; DIGEST_LEN]),
+                remote_path,
+                file_name,
+                error_code: 0,
+            }
+        }
+
+        let binding = test_binding(0x63);
+        let mut controller = test_session(AuditRole::Controller, 23, binding);
+        let mut host = test_session(AuditRole::Host, 123, binding);
+        handshake(&mut controller, &mut host);
+
+        let remote_path = "r".repeat(MAX_PROTOCOL_PATH_LEN + 1);
+        let file_name = "f".repeat(MAX_PROTOCOL_FILE_NAME_LEN + 1);
+        assert!(matches!(
+            controller.record_file_transfer(&facts(&remote_path, "ok"), None, 1),
+            Err(AuditError::SegmentTooLarge)
+        ));
+        assert!(matches!(
+            controller.record_file_transfer(&facts("/ok", &file_name), None, 2),
+            Err(AuditError::SegmentTooLarge)
+        ));
+
+        let local_path = "l".repeat(MAX_LOCAL_PATH_LEN + 1);
+        assert!(matches!(
+            controller.record_file_transfer(&facts("/ok", "ok"), Some(&local_path), 3),
+            Err(AuditError::SegmentTooLarge)
+        ));
+    }
+
+    #[test]
+    fn terminal_segments_and_shared_decoders_enforce_every_size_boundary() {
+        let binding = test_binding(0x64);
+        let mut controller = test_session(AuditRole::Controller, 24, binding);
+        let mut host = test_session(AuditRole::Host, 124, binding);
+        handshake(&mut controller, &mut host);
+
+        let oversized_input = vec![0; MAX_INPUT_SEGMENT + 1];
+        assert!(matches!(
+            controller.record_input(&oversized_input, 1),
+            Err(AuditError::SegmentTooLarge)
+        ));
+        let oversized_output = vec![0; MAX_LOCAL_OUTPUT_SEGMENT + 1];
+        assert!(matches!(
+            controller.record_output(&oversized_output, 2),
+            Err(AuditError::SegmentTooLarge)
+        ));
+        assert!(matches!(
+            controller.record_controller_output(&[], &oversized_output, 3),
+            Err(AuditError::SegmentTooLarge)
+        ));
+        assert!(matches!(
+            controller.record_display_bytes(&oversized_output, 4),
+            Err(AuditError::SegmentTooLarge)
+        ));
+
+        assert!(matches!(
+            decode_shared_input(&[]),
+            Err(AuditError::ContainerInvalid)
+        ));
+        assert!(matches!(
+            decode_shared_output(&[]),
+            Err(AuditError::ContainerInvalid)
+        ));
+        assert!(matches!(
+            decode_shared_control(&[]),
+            Err(AuditError::ContainerInvalid)
+        ));
+
+        let facts = FileTransferFacts {
+            transfer_id: 9,
+            direction: FILE_DIRECTION_UPLOAD,
+            kind: FILE_KIND_SUCCESS,
+            declared_size: 1,
+            final_size: 1,
+            digest: Digest32::new([9; DIGEST_LEN]),
+            remote_path: "/ok",
+            file_name: "ok",
+            error_code: 0,
+        };
+        let batch = controller.record_file_transfer(&facts, None, 5).unwrap();
+        let mut payload = shared_payloads(&batch, RecordType::SharedFileTransferEvent)
+            .pop()
+            .unwrap();
+        payload.push(0);
+        assert!(matches!(
+            decode_shared_file(&payload),
+            Err(AuditError::ContainerInvalid)
+        ));
     }
 
     /// A full bilateral session through real writers: handshake, recording,

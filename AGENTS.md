@@ -263,6 +263,7 @@
 - 新增协议 ID 固定为 `/yonder/enterprise-resolve/2.0.0`、`/yonder/file-transfer/2.0.0`、`/yonder/audit/2.0.0`；拒绝版本使用过的扩展协议不得作为兼容回退。既有 auth/terminal/registry/普通 resolve 协议保持不变。
 - 文件传输固定使用交互式 `Ctrl+] u/d/?`，独立已认证子流、每会话一个传输、`64 KiB` 流式块、SHA-256、安全临时文件和 no-replace 提交；失败/取消不得结束终端。
 - 企业审计只存在于端点，不把终端/文件/审计内容交给 relay；不保存原始输入，使用会话私有 HMAC 承诺，保存完整输出，使用持久身份/账本、周期检查点、共同清单、双签名和安全离线 verify/replay。Windows 必须复用并验证受保护 DACL，不能可靠保护时失败关闭。
+- 企业审计整体建立预算固定为绝对 `30s`，包含身份/账本、记录创建、header 持久化与握手；单个审计 wire 读写继续固定为绝对 `10s`。运行期 checkpoint 是发送方签名观察与接收方签名回执，不要求接收瞬间本地快照相同；关闭必须先形成共享事实屏障、结清旧运行期交换，再以精确相同快照完成新的最终 checkpoint。sent/received 的序号和确认状态必须在运行时与离线验证中独立建模，双文件 interrupted 验证按方向交叉匹配并证明快照是双方链前缀。
 - 企业 provider 集合允许启动期有界动态分发；终端、文件和审计热路径使用静态分发。各状态由单一 owner 持有，任务间只使用有界 channel；审计磁盘 writer 在 Tokio runtime 外执行并对 append-before-effect 返回确认。
 - 正式 release 后硬删除 GitHub `v0.1.2`、`v0.1.3` Releases/tags，以 `--force-with-lease` 把 `main` 清理为 `v0.1.1 -> v0.2.0`，并删除相关 Actions runs、临时分支/worktree 和本地悬空对象。发布前只允许软撤回，以保留审计和借鉴材料。
 

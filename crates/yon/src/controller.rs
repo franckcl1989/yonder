@@ -1,5 +1,5 @@
 use crate::audit::observer::{
-    AUDIT_CHECKPOINT_POLL, AuditObserver, CloseNoticeHandling, FrameEvent,
+    AUDIT_CHECKPOINT_POLL, AUDIT_ESTABLISH_TIMEOUT, AuditObserver, CloseNoticeHandling, FrameEvent,
 };
 use crate::audit::session::{
     AuditError, DIRECTION_CTRL_TO_HOST, KEY_ACTION_DETACH, KEY_ACTION_DOWNLOAD, KEY_ACTION_HELP,
@@ -1145,8 +1145,13 @@ async fn run_terminal(
                 }
                 event = async {
                     tokio::select! {
+                        biased;
                         () = cancellation.cancelled() => TerminalPumpEvent::Cancelled,
                         event = driver.next() => TerminalPumpEvent::Driver(event),
+                        result = tokio::time::timeout(AUDIT_CHECKPOINT_POLL, &mut audit_frames),
+                            if audit.is_some() => {
+                            TerminalPumpEvent::Audit(result)
+                        }
                         result = process_local_input_chunk(
                             &mut input,
                             &mut data_write,
@@ -1172,10 +1177,6 @@ async fn run_terminal(
                         result = poll_inflight_transfer(&mut transfer),
                             if session_ui.direction.is_some() => {
                             TerminalPumpEvent::Transfer(result)
-                        }
-                        result = tokio::time::timeout(AUDIT_CHECKPOINT_POLL, &mut audit_frames),
-                            if audit.is_some() => {
-                            TerminalPumpEvent::Audit(result)
                         }
                     }
                 } => {
@@ -1262,7 +1263,10 @@ async fn run_terminal(
                                             Err(error) => break Err(error),
                                         }
                                     }
-                                    Err(error) => break Err(error),
+                                    Err(error) => {
+                                        detached = matches!(error, ControllerError::Interrupted);
+                                        break Err(error);
+                                    }
                                 }
                             }
                             Ok(LocalInputSignal::Eof) => {
@@ -1279,14 +1283,7 @@ async fn run_terminal(
                                     Err(error) => break Err(error),
                                 }
                             }
-                            Err(error) => {
-                                // Only the `Ctrl+] .` detach produces
-                                // Interrupted from the local input path; the
-                                // close path distinguishes it from the
-                                // shutdown signal.
-                                detached = matches!(error, ControllerError::Interrupted);
-                                break Err(error);
-                            }
+                            Err(error) => break Err(error),
                         },
                         TerminalPumpEvent::RemoteOutput(result) => {
                             if let Err(error) = result {
@@ -1650,10 +1647,14 @@ async fn process_local_input_chunk(
                 .await?;
         }
         let length = processed.remote_bytes.as_slice().len() as u64;
-        if let Err(error) = data_write
-            .write_all(processed.remote_bytes.as_slice())
-            .await
-        {
+        let send = async {
+            data_write
+                .write_all(processed.remote_bytes.as_slice())
+                .await?;
+            data_write.flush().await
+        }
+        .await;
+        if let Err(error) = send {
             if let Some(audit) = audit {
                 let _ = audit
                     .record_send_outcome(DIRECTION_CTRL_TO_HOST, false, length)
@@ -1661,7 +1662,6 @@ async fn process_local_input_chunk(
             }
             return Err(error.into());
         }
-        data_write.flush().await?;
         if let Some(audit) = audit {
             audit
                 .record_send_outcome(DIRECTION_CTRL_TO_HOST, true, length)
@@ -1691,7 +1691,14 @@ async fn finish_local_input_eof(
             audit.record_input(finished.remote_bytes.as_slice()).await?;
         }
         let length = finished.remote_bytes.as_slice().len() as u64;
-        if let Err(error) = data_write.write_all(finished.remote_bytes.as_slice()).await {
+        let send = async {
+            data_write
+                .write_all(finished.remote_bytes.as_slice())
+                .await?;
+            data_write.flush().await
+        }
+        .await;
+        if let Err(error) = send {
             if let Some(audit) = audit {
                 let _ = audit
                     .record_send_outcome(DIRECTION_CTRL_TO_HOST, false, length)
@@ -1699,7 +1706,6 @@ async fn finish_local_input_eof(
             }
             return Err(error.into());
         }
-        data_write.flush().await?;
         if let Some(audit) = audit {
             audit
                 .record_send_outcome(DIRECTION_CTRL_TO_HOST, true, length)
@@ -1756,8 +1762,19 @@ async fn copy_remote_output(
             if let Some(audit) = audit {
                 audit.record_display_bytes(&display).await?;
             }
-            terminal_output.write(output, &display).await?;
-            output.flush().await?;
+            if let Err(error) = async {
+                terminal_output.write(output, &display).await?;
+                output.flush().await
+            }
+            .await
+            {
+                if let Some(audit) = audit {
+                    let _ = audit
+                        .record_display_write_outcome(false, display.len() as u64)
+                        .await;
+                }
+                return Err(error.into());
+            }
             if let Some(audit) = audit {
                 audit
                     .record_display_write_outcome(true, display.len() as u64)
@@ -2217,8 +2234,19 @@ async fn flush_delayed_output(
     if let Some(audit) = audit {
         audit.record_display_bytes(&display).await?;
     }
-    terminal_output.write(output, &display).await?;
-    output.flush().await?;
+    let displayed = async {
+        terminal_output.write(output, &display).await?;
+        output.flush().await
+    }
+    .await;
+    if let Err(error) = displayed {
+        if let Some(audit) = audit {
+            let _ = audit
+                .record_display_write_outcome(false, display.len() as u64)
+                .await;
+        }
+        return Err(error.into());
+    }
     if let Some(audit) = audit {
         audit
             .record_display_write_outcome(true, display.len() as u64)
@@ -2873,7 +2901,7 @@ async fn establish_audit_and_terminal(
         // handshake future never holds the stream's inline buffers.
         let audit_stream: Box<dyn AuditStreamIo> = Box::new(audit_stream.into_tokio());
         let audit = tokio::time::timeout(
-            EXCHANGE_TIMEOUT,
+            AUDIT_ESTABLISH_TIMEOUT,
             AuditObserver::establish(
                 audit_stream,
                 AuditRole::Controller,
@@ -3252,33 +3280,40 @@ mod tests {
         ActiveTerminalConnectionEvent, CapabilityCache, ControllerConfig, ControllerError,
         ControllerStage, CrosstermFrontend, DELAYED_OUTPUT_CAP, DisplayModeGuard, EndpointError,
         EndpointEvent, EnterpriseControllerUi, FILE_TRANSFER_ALREADY_ACTIVE,
-        FILE_TRANSFER_UNAVAILABLE, LOCAL_CONTROL_HELP, LocalInputHandling, LocalInputSignal,
-        PROMPT_BANNER_DOWNLOAD, PROMPT_BANNER_UPLOAD, PROMPT_DOWNLOAD_SOURCE, PROMPT_UPLOAD_SOURCE,
-        PathPromptFlow, PromptProgress, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion,
-        RemoteTerminalOutput, RemoteTerminalOutputMode, TerminalFrontend, TransferNotReady,
-        TransferUi, UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch, abort_prompt_for_overflow,
+        FILE_TRANSFER_UNAVAILABLE, FILE_TRANSFER_UNSUPPORTED, LOCAL_CONTROL_HELP,
+        LocalInputHandling, LocalInputSignal, PROMPT_BANNER_DOWNLOAD, PROMPT_BANNER_UPLOAD,
+        PROMPT_DOWNLOAD_SOURCE, PROMPT_UPLOAD_SOURCE, PathPromptFlow, PromptProgress,
+        REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
+        RemoteTerminalOutputMode, TerminalFrontend, TransferNotReady, TransferUi,
+        UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch, abort_prompt_for_overflow,
         active_terminal_connection_event, await_remote_completion, await_until,
-        changed_terminal_size, complete_after_output_eof, complete_terminal_control_io,
-        controller_fallback_required, copy_remote_output, copy_terminal_resizes,
-        decode_terminal_exit, default_terminal_value, direct_fallback_required, end_transfer_modal,
-        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
-        fail_transfer_startup, fallback_transport, file_transfer_ready, finish_local_input_eof,
-        finish_terminal, finish_terminal_output, flush_delayed_output, handle_processed_input,
+        begin_file_transfer_modal, begin_transfer, changed_terminal_size,
+        complete_after_output_eof, complete_terminal_control_io, controller_fallback_required,
+        copy_remote_output, copy_terminal_resizes, decode_terminal_exit, default_terminal_value,
+        direct_fallback_required, end_transfer_modal, enter_raw_mode_before,
+        exchange_terminal_ready, exchange_terminal_ready_timed, fail_transfer_startup,
+        fallback_transport, file_transfer_ready, finish_local_input_eof, finish_terminal,
+        finish_terminal_output, flush_delayed_output, handle_processed_input,
         handle_transfer_event, local_terminal_hello, local_terminal_hello_with,
         native_display_restore_commands, next_retry_delay, platform_open, prepare_controller,
         prepare_controller_session, probe_file_transfer_capability, process_local_input_chunk,
         read_auth_response, read_local_input, read_remote_exit, restore_native_display,
         run_controller, run_controller_session, run_controller_with_progress, run_terminal,
         run_until_interrupted, terminal_environment, terminal_environment_from,
-        transfer_summary_line, wait_for_remote_completion_deadline, write_local_ui,
-        write_native_display_restore,
+        transfer_summary_line, wait_for_audit_frame, wait_for_remote_completion_deadline,
+        write_local_ui, write_native_display_restore,
     };
-    use crate::audit::observer::{AuditObserver, CloseNoticeHandling};
+    use crate::audit::observer::{AuditObserver, CloseNoticeHandling, FrameEvent};
+    use crate::audit::session::{
+        AuditError, KEY_ACTION_DOWNLOAD, KEY_ACTION_HELP, KEY_ACTION_INTERRUPT, KEY_ACTION_UPLOAD,
+        OUTCOME_FAILED, OUTCOME_OK,
+    };
+    use crate::audit::verify::{StreamAction, stream_frames};
     use crate::file_semantics::BaseDirectory;
     use crate::local_control::{LocalAction, LocalControlInput, LocalInputChunk, ModalPhase};
     use crate::network::{
-        EndpointDriver, RelayAccessMode, RelayConnection, build_endpoint, connect_configured_relay,
-        wait_for_reservation,
+        ConnectionBinding, EndpointDriver, RelayAccessMode, RelayConnection, build_endpoint,
+        connect_configured_relay, wait_for_reservation,
     };
     use crate::pake::{OpaquePake, OpaqueRegistration};
     use crate::progress::NoopProgress;
@@ -3306,8 +3341,9 @@ mod tests {
     use tokio::sync::oneshot;
     use yon_relay::{RelayServeConfig, RelayServiceError, run_relay_until};
     use yonder_core::wire::audit::{
-        AUDIT_PROTOCOL, AuditCloseReason, AuditRole, Digest32, ManifestEnding,
+        AUDIT_PROTOCOL, AuditCloseReason, AuditErrorCode, AuditRole, Digest32, ManifestEnding,
     };
+    use yonder_core::wire::audit_container::RecordType;
     use yonder_core::wire::auth::AuthServerResponse;
     use yonder_core::wire::auth::{
         AuthClientFinish, AuthClientHello, Authenticated, CLIENT_HELLO_LEN, KE3_LEN, PakeContext,
@@ -4692,6 +4728,124 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_transfer_modal_preflight_preserves_ui_and_substream_boundaries() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let (mut driver, mut streams) = build_endpoint(
+            Keypair::generate_ed25519(),
+            WssTransportConfig::client(None),
+        )
+        .unwrap();
+        let binding =
+            ConnectionBinding::for_test(driver.peer_id(), ConnectionId::new_unchecked(0xF11E));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let base = Some(BaseDirectory::capture().unwrap());
+
+        let mut unavailable = TransferUi::new(true, true, true);
+        let _ = unavailable.control.process(local_chunk(b"\x1du"));
+        let mut output = CountingWriter::default();
+        begin_file_transfer_modal(
+            TransferDirection::Upload,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut unavailable,
+            &None,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output
+                .bytes
+                .windows(FILE_TRANSFER_UNAVAILABLE.len())
+                .any(|window| window == FILE_TRANSFER_UNAVAILABLE.as_bytes())
+        );
+        assert_eq!(unavailable.control.modal_phase(), None);
+
+        let mut unsupported = TransferUi::new(true, true, true);
+        let _ = unsupported.control.process(local_chunk(b"\x1dd"));
+        unsupported.capability = CapabilityCache::Unsupported;
+        output.bytes.clear();
+        begin_file_transfer_modal(
+            TransferDirection::Download,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut unsupported,
+            &base,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output
+                .bytes
+                .windows(FILE_TRANSFER_UNSUPPORTED.len())
+                .any(|window| window == FILE_TRANSFER_UNSUPPORTED.as_bytes())
+        );
+        assert_eq!(unsupported.control.modal_phase(), None);
+
+        let mut supported = TransferUi::new(true, true, true);
+        let _ = supported.control.process(local_chunk(b"\x1du"));
+        supported.capability = CapabilityCache::Supported;
+        output.bytes.clear();
+        begin_file_transfer_modal(
+            TransferDirection::Upload,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut supported,
+            &base,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(supported.direction, Some(TransferDirection::Upload));
+        assert!(supported.flow.is_some());
+        assert!(
+            output
+                .bytes
+                .windows(PROMPT_BANNER_UPLOAD.len())
+                .any(|window| window == PROMPT_BANNER_UPLOAD.as_bytes())
+        );
+
+        let mut disappeared = TransferUi::new(true, true, true);
+        let _ = disappeared.control.process(local_chunk(b"\x1du"));
+        output.bytes.clear();
+        let missing_base = None;
+        let cancel = AtomicBool::new(false);
+        let mut transfer: Option<Pin<Box<dyn Future<Output = TransferOutcome>>>> = None;
+        begin_transfer(
+            TransferDirection::Upload,
+            "source.bin".to_owned(),
+            None,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut disappeared,
+            &cancellation,
+            &missing_base,
+            &cancel,
+            &mut transfer,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(transfer.is_none());
+        assert_eq!(disappeared.control.modal_phase(), None);
+        assert!(
+            output
+                .bytes
+                .windows(FILE_TRANSFER_UNAVAILABLE.len())
+                .any(|window| window == FILE_TRANSFER_UNAVAILABLE.as_bytes())
+        );
+    }
+
     #[test]
     fn prompt_flow_uses_the_selector_remainder_as_initial_input() {
         let mut flow = PathPromptFlow::new(TransferDirection::Upload);
@@ -5158,6 +5312,85 @@ mod tests {
         let mut received = Vec::new();
         peer_read.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"\x1d");
+    }
+
+    #[test]
+    fn audited_local_input_flush_failures_record_failed_send_outcomes() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (controller_audit, host_audit, controller_dir, host_dir) =
+                            establish_audit_pair().await;
+
+                        let mut session_ui = TransferUi::new(true, true, true);
+                        let mut input = &b"input"[..];
+                        let mut data_write = CountingWriter::failing_flush();
+                        assert!(matches!(
+                            process_local_input_chunk(
+                                &mut input,
+                                &mut data_write,
+                                &mut session_ui.control,
+                                &mut session_ui.pending_input,
+                                Some(&controller_audit),
+                            )
+                            .await,
+                            Err(ControllerError::Io(_))
+                        ));
+
+                        let mut session_ui = TransferUi::new(true, true, true);
+                        let _ = session_ui.control.process(local_chunk(b"\x1d"));
+                        let mut data_write = CountingWriter::failing_flush();
+                        let mut output = CountingWriter::default();
+                        let mut terminal_output =
+                            RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+                        assert!(matches!(
+                            finish_local_input_eof(
+                                &mut data_write,
+                                &mut output,
+                                &mut terminal_output,
+                                &mut session_ui,
+                                Some(&controller_audit),
+                            )
+                            .await,
+                            Err(ControllerError::Io(_))
+                        ));
+
+                        controller_audit
+                            .close_interrupted(AuditCloseReason::ConnectionLost)
+                            .await;
+                        drop(controller_audit);
+                        drop(host_audit);
+
+                        let record =
+                            fs::read_dir(controller_dir.path().join("audit").join("records"))
+                                .unwrap()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .path();
+                        let mut failures = 0_u8;
+                        stream_frames(&record, &mut |record_type, payload| {
+                            let local = payload.get(40..).unwrap_or_default();
+                            if record_type == RecordType::LocalSendOutcome
+                                && local.get(1) == Some(&OUTCOME_FAILED)
+                            {
+                                failures += 1;
+                            }
+                            Ok(StreamAction::Continue)
+                        })
+                        .unwrap();
+                        assert_eq!(failures, 2, "both flush failures must be recorded");
+                        drop(host_dir);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6667,6 +6900,189 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn audited_delayed_display_records_flush_success_and_failure() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (controller_audit, host_audit, controller_dir, host_dir) =
+                            establish_audit_pair().await;
+
+                        let mut session_ui = TransferUi::new(true, true, true);
+                        assert_eq!(session_ui.delayed.append(b"visible"), AppendOutcome::Ok);
+                        let mut output = CountingWriter::default();
+                        let mut terminal_output =
+                            RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+                        flush_delayed_output(
+                            &mut session_ui,
+                            &mut output,
+                            &mut terminal_output,
+                            Some(&controller_audit),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert_eq!(session_ui.delayed.append(b"failure"), AppendOutcome::Ok);
+                        let mut output = CountingWriter::failing_flush();
+                        assert!(matches!(
+                            flush_delayed_output(
+                                &mut session_ui,
+                                &mut output,
+                                &mut terminal_output,
+                                Some(&controller_audit),
+                            )
+                            .await,
+                            Err(ControllerError::Io(_))
+                        ));
+
+                        controller_audit
+                            .close_interrupted(AuditCloseReason::ConnectionLost)
+                            .await;
+                        drop(controller_audit);
+                        drop(host_audit);
+
+                        let record =
+                            fs::read_dir(controller_dir.path().join("audit").join("records"))
+                                .unwrap()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .path();
+                        let mut outcomes = Vec::new();
+                        stream_frames(&record, &mut |record_type, payload| {
+                            if record_type == RecordType::LocalDisplayWriteOutcome
+                                && let Some(outcome) = payload.get(40)
+                            {
+                                outcomes.push(*outcome);
+                            }
+                            Ok(StreamAction::Continue)
+                        })
+                        .unwrap();
+                        assert_eq!(outcomes, [OUTCOME_OK, OUTCOME_FAILED]);
+                        drop(host_dir);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn enterprise_local_shortcuts_are_all_persisted_in_the_audit_record() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (controller_audit, host_audit, controller_dir, host_dir) =
+                            establish_audit_pair().await;
+                        let mut output = CountingWriter::default();
+                        let mut terminal_output =
+                            RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+                        let cancel = AtomicBool::new(false);
+
+                        let mut help_ui = TransferUi::new(true, true, true);
+                        let help = help_ui.control.process(local_chunk(b"\x1d?"));
+                        assert_eq!(help.action, LocalAction::ShowHelp);
+                        assert_eq!(
+                            handle_processed_input(
+                                help,
+                                &mut output,
+                                &mut terminal_output,
+                                &mut help_ui,
+                                &cancel,
+                                Some(&controller_audit),
+                            )
+                            .await
+                            .unwrap(),
+                            LocalInputHandling::Done
+                        );
+
+                        let mut interrupt_ui = TransferUi::new(true, true, true);
+                        let _ = interrupt_ui.control.process(local_chunk(b"\x1du"));
+                        interrupt_ui.control.enter_transfer().unwrap();
+                        let interrupt = interrupt_ui.control.process(local_chunk(b"\x03"));
+                        assert_eq!(interrupt.action, LocalAction::CancelOp);
+                        handle_processed_input(
+                            interrupt,
+                            &mut output,
+                            &mut terminal_output,
+                            &mut interrupt_ui,
+                            &cancel,
+                            Some(&controller_audit),
+                        )
+                        .await
+                        .unwrap();
+
+                        for (selector, direction) in [
+                            (b"\x1du".as_slice(), TransferDirection::Upload),
+                            (b"\x1dd".as_slice(), TransferDirection::Download),
+                        ] {
+                            let mut session_ui = TransferUi::new(true, true, true);
+                            let processed = session_ui.control.process(local_chunk(selector));
+                            assert_eq!(
+                                handle_processed_input(
+                                    processed,
+                                    &mut output,
+                                    &mut terminal_output,
+                                    &mut session_ui,
+                                    &cancel,
+                                    Some(&controller_audit),
+                                )
+                                .await
+                                .unwrap(),
+                                LocalInputHandling::StartModal(direction)
+                            );
+                        }
+
+                        controller_audit
+                            .close_interrupted(AuditCloseReason::ConnectionLost)
+                            .await;
+                        drop(controller_audit);
+                        drop(host_audit);
+
+                        let record =
+                            fs::read_dir(controller_dir.path().join("audit").join("records"))
+                                .unwrap()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .path();
+                        let mut actions = Vec::new();
+                        stream_frames(&record, &mut |record_type, payload| {
+                            if record_type == RecordType::LocalKeyAction
+                                && let Some(action) = payload.get(40)
+                            {
+                                actions.push(*action);
+                            }
+                            Ok(StreamAction::Continue)
+                        })
+                        .unwrap();
+                        assert_eq!(
+                            actions,
+                            [
+                                KEY_ACTION_HELP,
+                                KEY_ACTION_INTERRUPT,
+                                KEY_ACTION_UPLOAD,
+                                KEY_ACTION_DOWNLOAD,
+                            ]
+                        );
+                        drop(host_dir);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn end_transfer_modal_bells_an_abandoned_prefix_and_stays_quiet_otherwise() {
         let mut session_ui = TransferUi::new(true, true, true);
@@ -7630,12 +8046,27 @@ mod tests {
     enum HostEnding {
         /// On data EOF: TerminalExit, data close, TerminalComplete, control close.
         Complete,
+        /// Keep the Active session alive through a periodic checkpoint,
+        /// then complete the same full terminal flow.
+        CheckpointThenComplete,
         /// Close data right after Ready and never send TerminalExit.
         CloseDataSilently,
         /// Read the terminal hello but never send TerminalReady.
         StallHandshake,
         /// Keep everything open after Ready.
         Stall,
+        /// Finalize after the controller's local detach escape.
+        ControllerDetach,
+        /// Finalize after the controller's cancellation token fires.
+        ControllerInterrupt,
+        /// Close the controller's local display before the first host output.
+        ControllerDisplayFailure,
+        /// Fail the mandatory enterprise audit after TerminalReady.
+        AuditFailure,
+        /// Drop the mandatory enterprise audit stream without a close notice.
+        AuditStreamEnd,
+        /// Drop the audit stream after terminal completion but before finalization.
+        AuditFinalizeStreamEnd,
     }
 
     /// Reads the controller's rendered output until `needle` appears.
@@ -8010,7 +8441,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(12)).await;
             return;
         }
-        let audit = match audit_incoming {
+        let mut audit = match audit_incoming {
             Some(incoming) => {
                 let (audit_peer, audit_stream) = drive_drained(driver, incoming.next())
                     .await
@@ -8073,6 +8504,39 @@ mod tests {
             .await
             .unwrap();
         }
+        if ending == HostEnding::AuditFailure {
+            let audit = audit
+                .as_ref()
+                .expect("the audit-failure scenario requires enterprise audit");
+            drive_drained(
+                driver,
+                audit.fail_closed(
+                    Some(AuditErrorCode::AuditRecordWriteFailed),
+                    AuditCloseReason::AuditFailure,
+                ),
+            )
+            .await;
+        }
+        if ending == HostEnding::AuditStreamEnd {
+            drop(audit.take());
+        }
+        if matches!(
+            ending,
+            HostEnding::AuditFailure | HostEnding::AuditStreamEnd
+        ) {
+            let mut buffer = [0_u8; 4096];
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match drive_drained(driver, data_read.read(&mut buffer)).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .await
+            .expect("the controller must close terminal data after audit failure");
+            return;
+        }
         match ending {
             HostEnding::CloseDataSilently => {
                 let _ = data_write.shutdown().await;
@@ -8082,7 +8546,15 @@ mod tests {
             // The stall keeps the session Active while the scenario drives
             // the controller.
             HostEnding::Stall => {}
-            HostEnding::Complete | HostEnding::StallHandshake => {}
+            HostEnding::Complete
+            | HostEnding::CheckpointThenComplete
+            | HostEnding::ControllerDetach
+            | HostEnding::ControllerInterrupt
+            | HostEnding::ControllerDisplayFailure
+            | HostEnding::StallHandshake
+            | HostEnding::AuditFailure
+            | HostEnding::AuditStreamEnd
+            | HostEnding::AuditFinalizeStreamEnd => {}
         }
 
         // -- the terminal session loop: echo controller data input, record
@@ -8096,20 +8568,35 @@ mod tests {
         let mut dump_sent = false;
         let mut pending_file: Option<(PeerId, ApplicationStream)> = None;
         let mut control_pending = Vec::new();
+        let mut audit_frames = Box::pin(wait_for_audit_frame(audit.as_ref()));
         let mut data_buffer = [0_u8; 4096];
         let mut control_buffer = [0_u8; 16];
+        let mut data_open = true;
+        let mut control_open = true;
         loop {
             tokio::select! {
                 _ = driver.next() => {}
-                result = data_read.read(&mut data_buffer) => {
+                result = data_read.read(&mut data_buffer), if data_open => {
                     let read = match result {
                         Ok(read) => read,
                         Err(_) if matches!(ending, HostEnding::Stall) => return,
                         Err(error) => panic!("scripted terminal data read failed: {error}"),
                     };
                     if read == 0 {
+                        if ending == HostEnding::ControllerDisplayFailure {
+                            audit
+                                .as_ref()
+                                .unwrap()
+                                .close_interrupted(AuditCloseReason::ConnectionLost)
+                                .await;
+                            return;
+                        }
                         if matches!(ending, HostEnding::Stall) {
                             return;
+                        }
+                        if matches!(ending, HostEnding::ControllerDetach | HostEnding::ControllerInterrupt) {
+                            data_open = false;
+                            continue;
                         }
                         break;
                     }
@@ -8134,15 +8621,27 @@ mod tests {
                         ).await.unwrap();
                     }
                 }
-                result = control_read.read(&mut control_buffer) => {
+                result = control_read.read(&mut control_buffer), if control_open => {
                     let read = match result {
                         Ok(read) => read,
                         Err(_) if matches!(ending, HostEnding::Stall) => return,
                         Err(error) => panic!("scripted terminal control read failed: {error}"),
                     };
                     if read == 0 {
+                        if ending == HostEnding::ControllerDisplayFailure {
+                            audit
+                                .as_ref()
+                                .unwrap()
+                                .close_interrupted(AuditCloseReason::ConnectionLost)
+                                .await;
+                            return;
+                        }
                         if matches!(ending, HostEnding::Stall) {
                             return;
+                        }
+                        if matches!(ending, HostEnding::ControllerDetach | HostEnding::ControllerInterrupt) {
+                            control_open = false;
+                            continue;
                         }
                         break;
                     }
@@ -8167,6 +8666,40 @@ mod tests {
                         *script.resize.lock().unwrap() = Some(resize.size());
                     }
                 }
+                result = &mut audit_frames, if audit.is_some() => {
+                    let audit = audit.as_ref().unwrap();
+                    let Some(frame) = result.unwrap() else {
+                        assert_eq!(ending, HostEnding::ControllerDisplayFailure);
+                        audit.close_interrupted(AuditCloseReason::ConnectionLost).await;
+                        return;
+                    };
+                    let event = drive_drained(driver, audit.handle_frame(&frame)).await.unwrap();
+                    if let FrameEvent::Close(reason) = event {
+                        if ending == HostEnding::ControllerDisplayFailure {
+                            assert_eq!(reason, AuditCloseReason::ConnectionLost);
+                            drive_drained(driver, audit.close_interrupted(reason)).await;
+                        } else {
+                            let expected = if ending == HostEnding::ControllerDetach {
+                                AuditCloseReason::ControllerDetach
+                            } else {
+                                AuditCloseReason::LocalInterrupt
+                            };
+                            assert_eq!(reason, expected);
+                            drive_drained(
+                                driver,
+                                audit.close_and_finalize(
+                                    ManifestEnding::CloseReason(reason),
+                                    false,
+                                    CloseNoticeHandling::AlreadyReceived(reason),
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        return;
+                    }
+                    audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
+                }
                 stream = file_incoming.next() => {
                     pending_file = Some(stream.expect("the file transfer registration ended"));
                 }
@@ -8184,6 +8717,7 @@ mod tests {
                 serve_file_stream(driver, stream, script).await;
             }
         }
+        drop(audit_frames);
 
         // -- completion: exit code, data EOF, TerminalComplete, control
         // close; the controller returns the exit code.
@@ -8212,6 +8746,10 @@ mod tests {
                 .unwrap();
         }
         let _ = control_write.shutdown().await;
+        if ending == HostEnding::AuditFinalizeStreamEnd {
+            drop(audit.take());
+            return;
+        }
         if let Some(audit) = audit.as_ref() {
             drive_drained(
                 driver,
@@ -8533,12 +9071,11 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn in_process_enterprise_controller_runs_the_complete_audited_terminal() {
+    fn run_enterprise_controller_case(ending: HostEnding) {
         let _test_guard = crate::in_process_test_guard();
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(|| {
+            .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -8612,6 +9149,8 @@ mod tests {
                             };
                             let cancellation = tokio_util::sync::CancellationToken::new();
                             let controller_audit_dir = tempdir().unwrap();
+                            let controller_done = Arc::new(tokio::sync::Notify::new());
+                            let controller_done_signal = Arc::clone(&controller_done);
 
                             let controller = async {
                                 let (mut driver, mut streams) = build_endpoint(
@@ -8649,14 +9188,20 @@ mod tests {
                                     TerminalValue::new("xterm").unwrap(),
                                     TerminalValue::new("truecolor").unwrap(),
                                 );
-                                run_terminal(
-                                    prepared,
-                                    hello,
-                                    frontend,
-                                    &mut progress,
-                                    &cancellation,
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(60),
+                                    run_terminal(
+                                        prepared,
+                                        hello,
+                                        frontend,
+                                        &mut progress,
+                                        &cancellation,
+                                    ),
                                 )
                                 .await
+                                .expect("the controller terminal stage must finish");
+                                controller_done_signal.notify_one();
+                                result
                             };
                             let host = serve_scripted_host(
                                 &mut host_driver,
@@ -8671,14 +9216,44 @@ mod tests {
                                 &target,
                                 &mut host_pake,
                                 &host_script,
-                                HostEnding::Complete,
+                                ending,
                                 None,
                             );
                             let interaction = async {
-                                let mut seen = read_output_until(&mut script_output, OUTPUT).await;
-                                script_input.write_all(INPUT).await.unwrap();
-                                script_input.flush().await.unwrap();
-                                seen.extend(read_output_until(&mut script_output, INPUT).await);
+                                if ending == HostEnding::ControllerDisplayFailure {
+                                    drop(script_output);
+                                    controller_done.notified().await;
+                                    drop(script_input);
+                                    return Vec::new();
+                                }
+                                let mut seen = if matches!(
+                                    ending,
+                                    HostEnding::AuditFailure | HostEnding::AuditStreamEnd
+                                ) {
+                                    Vec::new()
+                                } else {
+                                    read_output_until(&mut script_output, OUTPUT).await
+                                };
+                                if matches!(
+                                    ending,
+                                    HostEnding::Complete | HostEnding::CheckpointThenComplete
+                                ) {
+                                    if ending == HostEnding::CheckpointThenComplete {
+                                        tokio::time::sleep(Duration::from_millis(1_500)).await;
+                                    }
+                                    script_input.write_all(INPUT).await.unwrap();
+                                    script_input.flush().await.unwrap();
+                                    seen.extend(read_output_until(&mut script_output, INPUT).await);
+                                } else if ending == HostEnding::AuditFinalizeStreamEnd {
+                                    script_input.write_all(INPUT).await.unwrap();
+                                    script_input.flush().await.unwrap();
+                                    seen.extend(read_output_until(&mut script_output, INPUT).await);
+                                } else if ending == HostEnding::ControllerDetach {
+                                    script_input.write_all(b"\x1d.").await.unwrap();
+                                    script_input.flush().await.unwrap();
+                                } else if ending == HostEnding::ControllerInterrupt {
+                                    cancellation.cancel();
+                                }
                                 drop(script_input);
                                 seen.extend(drain_output_until_closed(&mut script_output).await);
                                 seen
@@ -8689,11 +9264,76 @@ mod tests {
                                 Box::pin(host),
                                 Box::pin(interaction),
                             );
-                            assert_eq!(controller_result.unwrap(), EXIT_CODE);
+                            match ending {
+                                HostEnding::Complete | HostEnding::CheckpointThenComplete => {
+                                    assert_eq!(controller_result.unwrap(), EXIT_CODE);
+                                }
+                                HostEnding::AuditFailure | HostEnding::AuditStreamEnd => {
+                                    assert!(
+                                        matches!(
+                                            &controller_result,
+                                            Err(ControllerError::Audit(AuditError::FailedClosed))
+                                        ),
+                                        "unexpected controller result: {controller_result:?}"
+                                    );
+                                }
+                                HostEnding::ControllerDetach => {
+                                    assert!(matches!(
+                                        controller_result,
+                                        Err(ControllerError::Interrupted)
+                                    ));
+                                }
+                                HostEnding::ControllerInterrupt => {
+                                    assert!(matches!(
+                                        controller_result,
+                                        Err(ControllerError::Interrupted)
+                                    ));
+                                }
+                                HostEnding::ControllerDisplayFailure => {
+                                    assert!(matches!(
+                                        controller_result,
+                                        Err(ControllerError::SessionAndTerminalOutput { .. })
+                                            | Err(ControllerError::Io(_))
+                                    ));
+                                }
+                                HostEnding::AuditFinalizeStreamEnd => {
+                                    assert!(
+                                        matches!(
+                                            &controller_result,
+                                            Err(ControllerError::Audit(_))
+                                        ),
+                                        "unexpected controller result: {controller_result:?}"
+                                    );
+                                }
+                                _ => unreachable!("unsupported enterprise controller case"),
+                            }
                             assert!(restored.get(), "the display must be restored");
-                            assert_eq!(*recorded_input.lock().unwrap(), INPUT);
-                            assert!(seen.windows(OUTPUT.len()).any(|window| window == OUTPUT));
-                            assert!(seen.windows(INPUT.len()).any(|window| window == INPUT));
+                            if matches!(
+                                ending,
+                                HostEnding::Complete
+                                    | HostEnding::CheckpointThenComplete
+                                    | HostEnding::AuditFinalizeStreamEnd
+                            ) {
+                                assert_eq!(*recorded_input.lock().unwrap(), INPUT);
+                            } else {
+                                assert!(recorded_input.lock().unwrap().is_empty());
+                            }
+                            if !matches!(
+                                ending,
+                                HostEnding::AuditFailure
+                                    | HostEnding::AuditStreamEnd
+                                    | HostEnding::ControllerDisplayFailure
+                            ) {
+                                assert!(seen.windows(OUTPUT.len()).any(|window| window == OUTPUT));
+                            }
+                            if matches!(
+                                ending,
+                                HostEnding::Complete
+                                    | HostEnding::CheckpointThenComplete
+                                    | HostEnding::AuditFinalizeStreamEnd
+                            ) {
+                                assert!(seen.windows(INPUT.len()).any(|window| window == INPUT));
+                            }
 
                             relay.stop().await;
                         }),
@@ -8705,6 +9345,46 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_runs_the_complete_audited_terminal() {
+        run_enterprise_controller_case(HostEnding::Complete);
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_checkpoints_while_active() {
+        run_enterprise_controller_case(HostEnding::CheckpointThenComplete);
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_detaches_and_finalizes_both_audits() {
+        run_enterprise_controller_case(HostEnding::ControllerDetach);
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_interrupts_and_finalizes_both_audits() {
+        run_enterprise_controller_case(HostEnding::ControllerInterrupt);
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_closes_after_local_display_failure() {
+        run_enterprise_controller_case(HostEnding::ControllerDisplayFailure);
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_rejects_incomplete_audit_finalization() {
+        run_enterprise_controller_case(HostEnding::AuditFinalizeStreamEnd);
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_fails_closed_with_the_peer_audit() {
+        run_enterprise_controller_case(HostEnding::AuditFailure);
+    }
+
+    #[test]
+    fn in_process_enterprise_controller_fails_closed_when_the_audit_stream_ends() {
+        run_enterprise_controller_case(HostEnding::AuditStreamEnd);
     }
 
     #[test]

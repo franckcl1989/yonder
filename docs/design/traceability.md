@@ -39,7 +39,7 @@
 | R-035 | 本地控制命名空间跨平台一致且非交互字节透明 | terminal frontend | `Ctrl+] u/d/?/./Ctrl+]` | 跨块状态属性测试、PTY/ConPTY 原生 E2E、未知选择器 |
 | R-036 | 仅企业会话强制双端审计，普通会话零审计副作用 | yon audit/session | `/yonder/audit/2.0.0` | 普通回归、企业握手/旧端拒绝、目录缺失/不可写失败关闭 |
 | R-037 | 原始输入不落盘，双端以会话私有 HMAC 承诺一致 | audit observer/crypto | Input shared chain | 内容边界、承诺一致、无 key 离线猜测不可验证测试 |
-| R-038 | 输出/控制/文件事实链、周期检查点、共同清单和双签名 | audit session/wire | Hello..LedgerCommit | wire golden/property/fuzz、乱序/重复/mismatch、完整/中断 E2E |
+| R-038 | 输出/控制/文件事实链、周期检查点、共同清单和双签名；失败通知固定为 `AuditError -> CloseNotice`，同时就绪时审计失败不得被终端 EOF/I/O 覆盖 | audit session/wire + controller/host event pump | Hello..LedgerCommit；结构化失败码先于统一关闭；审计帧优先根因归类 | wire golden/property/fuzz、跨子流晚到、双方向序号/确认、关闭屏障、重复/mismatch、完整/中断 E2E、双端结构化审计失败与终端关闭竞态回归 |
 | R-039 | 持久身份和串行连续账本抵抗本地静默改写/分叉 | audit identity/ledger | identity + ledger + record container | 竞争、崩溃恢复、回滚/fork 检测、签名/链篡改矩阵 |
 | R-040 | 离线 verify 六状态和 vt100 安全 replay | yon audit CLI | `.yonaudit` format 2 | 退出码、截断/逐字节篡改、OSC52/DCS/查询过滤、原生 smoke |
 | R-041 | 0.2.0 产物与历史只建立在 v0.1.1 和本基线上 | release workflow | v0.1.1 -> v0.2.0 | commit provenance、六 target 资产、撤回 release/tag/run 清理审计 |

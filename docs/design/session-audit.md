@@ -74,17 +74,21 @@ Audit/
 
 企业准入事实由双方签名容器头中的 `AuthMode::Enterprise` 表达。成员身份只在 relay 内用于准入判断，验证后立即清除；Enterprise Resolve 不向端点传播该身份，因此共同清单不得包含成员标识、提供商用户 ID 或由其派生的稳定值。
 
-握手固定为双方发送 `AuditHello` 和 `SecretContribution`，验证承诺与持久签名，按角色顺序计算相同 session ID/输入承诺键，安全创建并同步本地 header，交换并验证 `AuditReady`。只有双方 ready 成功，host 才能创建 PTY 并发送 TerminalReady。
+握手固定为双方发送 `AuditHello` 和 `SecretContribution`，验证承诺与持久签名，按角色顺序计算相同 session ID/输入承诺键，安全创建并同步本地 header，交换并验证 `AuditReady`。只有双方 ready 成功，host 才能创建 PTY 并发送 TerminalReady。每个独立 wire 读写继续受绝对 `10s` 上限约束；包含身份/账本打开、排他创建记录、header 持久同步和全部握手消息的整个审计建立阶段使用独立绝对 `30s` 总预算，避免正常安全存储初始化挤占单条对端消息预算。两层截止都必须失败关闭，不能超时后降级为无审计会话。
 
-检查点在距上次检查点 `1s`、新增规范共享数据达到 `1 MiB`、文件操作边界或关闭边界任一条件满足时触发。快照永远描述生成它之前的链头，避免自引用；收到 Ack 且双方四条链的 count/head 完全相同后才成为共同确认前缀。检查点发送不能阻塞每个终端块，但延迟达到硬上限时施加背压，不能静默跳过。
+检查点在距上次检查点 `1s`、新增规范共享数据达到 `1 MiB`、文件操作边界或关闭边界任一条件满足时触发。快照永远描述生成它之前的链头，避免自引用。运行期检查点是发送方对其当时四条共享链的会话密钥签名观察，Ack 是接收方对该检查点摘要及原快照的会话密钥签名回执；由于 terminal、file 与 audit 使用独立 libp2p 子流，接收时不得假定本地链恰好停在同一快照，也不得用跨子流到达顺序制造伪不一致。发送记录必须与发送方本地链位置一致，接收记录由签名、严格递增的方向内序号、Ack 原快照绑定及双文件交叉验证证明。关闭屏障后的最终双边检查点仍要求双方四条链的 count/head 精确相同，随后构造的 `JointManifest` 必须逐字节一致。检查点发送不能阻塞每个终端块，但延迟达到硬上限时施加背压，不能静默跳过。
 
-正常结束顺序固定为：最终 `Checkpoint/CheckpointAck -> JointManifest -> controller ManifestSignature -> host ManifestSignature -> LocalRecordSeal -> LedgerCommit -> record sync_all -> ledger 原子推进`。任一步失败都报告审计失败，不能只返回 shell 退出码。连接异常时不伪造共同清单，只封存本地可验证前缀和最后共同检查点。
+正常结束顺序固定为：`CloseNotice -> 记录共同关闭事实并封闭 input/output 规范化方向 -> 结清在途运行期 Checkpoint/Ack -> 交换快照精确一致的最终 Checkpoint/Ack -> JointManifest -> controller ManifestSignature -> host ManifestSignature -> LocalRecordSeal -> LedgerCommit -> record sync_all -> ledger 原子推进`。关闭事实和最后部分块提交后共享快照才稳定；禁止把跨越关闭边界晚到的运行期观察误当最终检查点。任一步失败都报告审计失败，不能只返回 shell 退出码。连接异常时不伪造共同清单，只封存本地可验证记录；双文件离线验证按发送/接收两个独立方向交叉匹配已签名 Checkpoint 与 Ack，并以第二次有界流式遍历证明所选快照确为双方共享链前缀，不在内存中保留无界链头历史。
 
 `AuditError` 固定码：`1 IdentityMissing`、`2 IdentityInvalid`、`3 IdentityPermissions`、`4 LedgerInvalid`、`5 LedgerConflict`、`6 DirectoryUnavailable`、`7 RecordCreateFailed`、`8 RecordWriteFailed`、`9 RecordSyncFailed`、`10 ProtocolUnsupported`、`11 HandshakeInvalid`、`12 SessionBindingMismatch`、`13 CheckpointMismatch`、`14 PeerSignatureInvalid`、`15 FinalManifestMismatch`、`16 LedgerCommitFailed`、`17 ReplayUnsafe`、`18 ContainerInvalid`。对端自由文本不得进入 CLI。
 
 ## 记录与并发
 
 `AuditObserver` 是终端/文件与审计的唯一窄边界，提供输入发送前、PTY 写入前、输出发送前、显示写入前、resize、文件事件、关闭和最终化方法。需要 append-before-effect 的方法把有界 record batch 交给专用同步 writer 并等待确认后才允许外部效果；写入失败立即停止新效果、终止 PTY/文件、恢复本地终端并保留中断记录。
+
+企业会话的活动期事件泵必须确定性地先处理连接取消/生命周期与审计帧，再处理同时就绪的终端 EOF、终端 I/O 和文件事件。这样，对端已经发送的强制审计失败不会因独立终端子流恰好同时关闭而被随机降格为普通 I/O 断开；该优先级只决定同时就绪事件的根因归类，不允许审计处理长期饿死终端或绕过现有背压与超时。
+
+本地审计失败的尽力通知顺序固定为 `AuditError(code) -> CloseNotice(AuditFailure)`；前者保留结构化失败类别，后者驱动统一关闭。接收任一帧都必须立即失败关闭，不得等待另一帧或因随后出现的终端 EOF 改写根因。
 
 writer 使用容量固定的有界队列，在 Tokio runtime 之外独占记录句柄和哈希状态；不共享 `File`、不无界缓存、不每事件 `fsync`。规范块最大 `16 KiB`，每方向最多一个未检查点部分块；队列容量和峰值内存必须通过压力/分配测量固定。账本锁与记录 writer 不交叉持有，所有等待有绝对截止并可取消，避免磁盘停顿造成死锁。
 

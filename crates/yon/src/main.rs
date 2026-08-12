@@ -943,11 +943,11 @@ mod tests {
     use super::{
         AppError, AuditCommand, Cli, Command, ConfigCommand, ConnectionCodeArgument,
         ENDPOINT_SCHEMA, LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
-        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, hex_digest,
-        map_controller_error, open_diagnostic_log, portable_process_exit, process_result, read_ca,
-        read_ca_document, read_connection_code_from, run, terminal_supports_progress,
-        validate_diagnostic_output, write_remote_exit_warning, write_replay_report,
-        write_verification_report,
+        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, execute_command,
+        hex_digest, map_controller_error, open_diagnostic_log, portable_process_exit,
+        process_result, read_ca, read_ca_document, read_connection_code_from, run,
+        terminal_supports_progress, validate_diagnostic_output, write_remote_exit_warning,
+        write_replay_report, write_verification_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -1587,7 +1587,8 @@ mod tests {
             local_event_count: 6,
             finalized: true,
             truncated_tail: true,
-            last_confirmed_checkpoint: Some((7, [2; 32])),
+            last_confirmed_sent_checkpoint: Some((7, [2; 32])),
+            last_confirmed_received_checkpoint: Some((6, [3; 32])),
             ending: Some(ManifestEnding::ShellExit(0)),
             ended_normally: true,
         };
@@ -1654,6 +1655,192 @@ mod tests {
             write_replay_report(&mut FailingWriter, &replay),
             Err(AppError::AuditOutput(_))
         ));
+    }
+
+    #[test]
+    fn audit_commands_fail_closed_through_the_real_command_dispatch() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let missing = test_directory("missing-audit-record").join("missing.yonaudit");
+
+        assert!(matches!(
+            execute_command(
+                &runtime,
+                Command::Audit {
+                    command: AuditCommand::Verify {
+                        local_file: missing.clone(),
+                        peer_file: None,
+                    },
+                },
+            ),
+            Err(AppError::AuditVerify(_))
+        ));
+        assert!(matches!(
+            execute_command(
+                &runtime,
+                Command::Audit {
+                    command: AuditCommand::Replay {
+                        controller_file: missing,
+                        peer_file: None,
+                    },
+                },
+            ),
+            Err(AppError::AuditReplay(_))
+        ));
+    }
+
+    #[test]
+    fn finalized_bilateral_audit_runs_through_verify_and_replay_commands() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    use yon::audit::observer::{
+                        AuditObserver, CloseNoticeHandling, utc_start_seconds,
+                    };
+                    use yonder_core::OsSecureRandom;
+                    use yonder_core::wire::audit::{
+                        AuditCloseReason, AuditRole, Digest32, ManifestEnding,
+                    };
+
+                    let controller_dir = tempfile::tempdir().unwrap();
+                    let host_dir = tempfile::tempdir().unwrap();
+                    let controller_root = controller_dir.path().join("audit");
+                    let host_root = host_dir.path().join("audit");
+                    let controller_peer = Keypair::generate_ed25519().public().to_peer_id();
+                    let host_peer = Keypair::generate_ed25519().public().to_peer_id();
+                    let digest = Digest32::new([0xA5; 32]);
+                    let (controller_half, host_half) = tokio::io::duplex(256 * 1024);
+                    let mut controller_random = OsSecureRandom;
+                    let mut host_random = OsSecureRandom;
+                    let (controller, host) = tokio::join!(
+                        Box::pin(AuditObserver::establish(
+                            controller_half,
+                            AuditRole::Controller,
+                            controller_peer,
+                            host_peer,
+                            utc_start_seconds(),
+                            digest,
+                            &controller_root,
+                            &mut controller_random,
+                        )),
+                        Box::pin(AuditObserver::establish(
+                            host_half,
+                            AuditRole::Host,
+                            controller_peer,
+                            host_peer,
+                            utc_start_seconds(),
+                            digest,
+                            &host_root,
+                            &mut host_random,
+                        )),
+                    );
+                    let controller = controller.unwrap();
+                    let host = host.unwrap();
+                    controller.record_terminal_hello(digest).await.unwrap();
+                    host.record_terminal_hello(digest).await.unwrap();
+                    host.record_terminal_ready().await.unwrap();
+                    controller.record_terminal_ready().await.unwrap();
+                    host.record_raw_output(b"verified replay output\r\n")
+                        .await
+                        .unwrap();
+                    controller
+                        .record_raw_output(b"verified replay output\r\n")
+                        .await
+                        .unwrap();
+                    controller
+                        .record_display_bytes(b"verified replay output\r\n")
+                        .await
+                        .unwrap();
+                    host.record_terminal_exit(0).await.unwrap();
+                    controller.record_terminal_exit(0).await.unwrap();
+                    controller.record_terminal_complete().await.unwrap();
+                    host.record_terminal_complete().await.unwrap();
+                    let (controller_result, host_result) = tokio::join!(
+                        Box::pin(controller.close_and_finalize(
+                            ManifestEnding::ShellExit(0),
+                            true,
+                            CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                        )),
+                        Box::pin(host.close_and_finalize(
+                            ManifestEnding::ShellExit(0),
+                            true,
+                            CloseNoticeHandling::Receiver,
+                        )),
+                    );
+                    controller_result.unwrap();
+                    host_result.unwrap();
+
+                    let controller_file = fs::read_dir(controller_root.join("records"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let host_file = fs::read_dir(host_root.join("records"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let expected =
+                        yon::audit::verify::VerificationState::ConsistentCompleteUnanchored
+                            .exit_code();
+                    assert_eq!(
+                        execute_command(
+                            &runtime,
+                            Command::Audit {
+                                command: AuditCommand::Verify {
+                                    local_file: controller_file.clone(),
+                                    peer_file: Some(host_file.clone()),
+                                },
+                            },
+                        )
+                        .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        execute_command(
+                            &runtime,
+                            Command::Audit {
+                                command: AuditCommand::Replay {
+                                    controller_file: controller_file.clone(),
+                                    peer_file: Some(host_file.clone()),
+                                },
+                            },
+                        )
+                        .unwrap(),
+                        expected
+                    );
+
+                    let mut tampered = fs::read(&host_file).unwrap();
+                    let mutation = tampered.len() / 2;
+                    tampered[mutation] ^= 0x80;
+                    fs::write(&host_file, tampered).unwrap();
+                    assert_eq!(
+                        execute_command(
+                            &runtime,
+                            Command::Audit {
+                                command: AuditCommand::Replay {
+                                    controller_file,
+                                    peer_file: Some(host_file),
+                                },
+                            },
+                        )
+                        .unwrap(),
+                        yon::audit::verify::VerificationState::Tampered.exit_code()
+                    );
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

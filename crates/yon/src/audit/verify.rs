@@ -34,8 +34,9 @@
 //! - [`VerificationState::ConsistentCompleteUnanchored`]: the same checks
 //!   pass but no trusted identity or ledger anchor exists on this machine.
 //! - [`VerificationState::MatchedInterruptedPrefix`]: the session ended
-//!   without a complete joint manifest; both files certify the same last
-//!   bilaterally confirmed checkpoint.
+//!   without a complete joint manifest; both files cross-confirm the same
+//!   directional checkpoint evidence, and each selected snapshot is a
+//!   verified prefix of both shared-chain records.
 //! - [`VerificationState::IntactUnpaired`]: a single file is self-consistent
 //!   but no peer file was provided.
 //! - [`VerificationState::Mismatch`]: the two files are internally valid but
@@ -118,8 +119,8 @@ pub enum VerificationState {
     /// Both files complete and cryptographically self-consistent, but no
     /// trusted identity or ledger anchor exists on this machine.
     ConsistentCompleteUnanchored,
-    /// The session was interrupted; both files certify the same last
-    /// bilaterally confirmed checkpoint and there is no complete joint
+    /// The session was interrupted; both files cross-confirm compatible
+    /// directional checkpoint prefixes and there is no complete joint
     /// manifest.
     MatchedInterruptedPrefix,
     /// A single file is self-consistent; no peer file was provided, so
@@ -187,9 +188,12 @@ pub struct FileReport {
     /// Whether the file ends in a truncated tail (a partial frame or an
     /// incomplete footer). The verified prefix stays valid.
     pub truncated_tail: bool,
-    /// The last bilaterally confirmed checkpoint: sequence and checkpoint
-    /// payload digest, when one exists.
-    pub last_confirmed_checkpoint: Option<(u64, [u8; DIGEST_LEN])>,
+    /// The last locally sent checkpoint whose peer acknowledgment is in
+    /// this record: sequence and checkpoint payload digest.
+    pub last_confirmed_sent_checkpoint: Option<(u64, [u8; DIGEST_LEN])>,
+    /// The last peer checkpoint for which this endpoint recorded a signed
+    /// acknowledgment: sequence and checkpoint payload digest.
+    pub last_confirmed_received_checkpoint: Option<(u64, [u8; DIGEST_LEN])>,
     /// The manifest ending, when the file is finalized.
     pub ending: Option<ManifestEnding>,
     /// The manifest's normal-completion flag, when the file is finalized.
@@ -449,11 +453,12 @@ struct CheckpointRef {
     snapshot: SharedSnapshot,
 }
 
-/// One bilaterally confirmed checkpoint.
-#[derive(Debug, Clone, Copy)]
+/// One checkpoint confirmed in one sender-to-receiver direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Confirmed {
     sequence: u64,
     digest: [u8; DIGEST_LEN],
+    snapshot: SharedSnapshot,
 }
 
 /// The verified facts of one file after the streaming walk.
@@ -464,8 +469,10 @@ struct VerifiedFile {
     shared: [SharedChainState; SHARED_STREAMS],
     local_head: ChainHead,
     local_count: u64,
-    last_confirmed: Option<Confirmed>,
-    prev_confirmed: Option<Confirmed>,
+    last_confirmed_sent: Option<Confirmed>,
+    prev_confirmed_sent: Option<Confirmed>,
+    last_confirmed_received: Option<Confirmed>,
+    prev_confirmed_received: Option<Confirmed>,
     footer: Option<FooterFacts>,
     truncated_tail: bool,
     manifest_evidence: Option<Vec<u8>>,
@@ -703,9 +710,31 @@ fn verify_walk_pair(
         }
         (_, _) => {
             // Interrupted pair (design sections 20.4 and 22.4): certify only
-            // the last bilaterally confirmed checkpoint.
-            if let Err(reason) = last_common_confirmed(&controller, &host) {
-                return Ok(mismatch_report(&controller, &host, reason));
+            // checkpoints cross-confirmed in each independent direction.
+            let common = match last_common_confirmed(&controller, &host) {
+                Ok(common) => common,
+                Err(reason) => return Ok(mismatch_report(&controller, &host, reason)),
+            };
+            for confirmed in common.into_iter().flatten() {
+                for file in [&controller, &host] {
+                    match snapshot_is_prefix(&file.path, confirmed.snapshot) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Ok(mismatch_report(
+                                &controller,
+                                &host,
+                                "the confirmed checkpoint is not a shared prefix",
+                            ));
+                        }
+                        Err(StreamError::Tampered(reason)) => {
+                            return Ok(tampered_report(&controller, &host, reason));
+                        }
+                        Err(StreamError::Io(error)) => return Err(VerifyError::Io(error)),
+                        Err(StreamError::NotAnAuditContainer) => {
+                            return Err(VerifyError::NotAnAuditContainer);
+                        }
+                    }
+                }
             }
             // A complete file's footer manifest must agree with the
             // interrupted side's manifest evidence, when the evidence exists.
@@ -771,36 +800,94 @@ fn verify_walk_pair(
     }
 }
 
-/// The last checkpoint confirmed by both files, or the fixed reason why the
-/// prefixes cannot match.
+/// The last checkpoint cross-confirmed by both files in each independent
+/// sender-to-receiver direction, or the fixed mismatch reason.
 fn last_common_confirmed(
     controller: &VerifiedFile,
     host: &VerifiedFile,
-) -> Result<(u64, [u8; DIGEST_LEN]), &'static str> {
-    let reason = "the checkpoint prefixes do not match";
-    match (controller.last_confirmed, host.last_confirmed) {
-        (None, None) => Ok((0, [0; DIGEST_LEN])),
-        (Some(_), None) | (None, Some(_)) => Err(reason),
-        (Some(a), Some(b)) if a.sequence == b.sequence => {
-            if a.digest == b.digest {
-                Ok((a.sequence, a.digest))
-            } else {
-                Err(reason)
+) -> Result<[Option<Confirmed>; 2], &'static str> {
+    Ok([
+        common_direction(
+            controller.last_confirmed_sent,
+            controller.prev_confirmed_sent,
+            host.last_confirmed_received,
+            host.prev_confirmed_received,
+        )?,
+        common_direction(
+            host.last_confirmed_sent,
+            host.prev_confirmed_sent,
+            controller.last_confirmed_received,
+            controller.prev_confirmed_received,
+        )?,
+    ])
+}
+
+fn common_direction(
+    sender_last: Option<Confirmed>,
+    sender_previous: Option<Confirmed>,
+    receiver_last: Option<Confirmed>,
+    receiver_previous: Option<Confirmed>,
+) -> Result<Option<Confirmed>, &'static str> {
+    let reason = "the directional checkpoint confirmations do not match";
+    if sender_last.is_none() || receiver_last.is_none() {
+        return Ok(None);
+    }
+    let mut common = None;
+    for sender in [sender_last, sender_previous].into_iter().flatten() {
+        for receiver in [receiver_last, receiver_previous].into_iter().flatten() {
+            if sender.sequence == receiver.sequence
+                && sender.digest == receiver.digest
+                && sender.snapshot == receiver.snapshot
+                && common.is_none_or(|current: Confirmed| sender.sequence > current.sequence)
+            {
+                common = Some(sender);
             }
         }
-        (Some(a), Some(b)) if a.sequence > b.sequence => match controller.prev_confirmed {
-            Some(prev) if prev.sequence == b.sequence && prev.digest == b.digest => {
-                Ok((b.sequence, b.digest))
-            }
-            _ => Err(reason),
-        },
-        (Some(a), Some(_)) => match host.prev_confirmed {
-            Some(prev) if prev.sequence == a.sequence && prev.digest == a.digest => {
-                Ok((a.sequence, a.digest))
-            }
-            _ => Err(reason),
-        },
     }
+    common.ok_or(reason).map(Some)
+}
+
+/// Replays the bounded shared-chain state to the four counts in a confirmed
+/// checkpoint. This second streaming pass avoids retaining an unbounded
+/// history of chain heads while still proving that an asynchronously
+/// received sender observation is a prefix of both endpoint records.
+fn snapshot_is_prefix(path: &Path, target: SharedSnapshot) -> Result<bool, StreamError> {
+    let mut walker = FrameWalker::open(path)?;
+    let header_bytes = walker.skip_header()?;
+    let header = AuditContainerHeader::decode(&header_bytes)
+        .map_err(|_| StreamError::NotAnAuditContainer)?;
+    let hello = *header.audit_hello();
+    let mut verifier = ChainVerifier::new(header, hello);
+    let mut reached = [false; SHARED_STREAMS];
+    for stream in SharedStream::ALL {
+        let expected = target.get(stream);
+        if expected.count() == 0 {
+            if expected.head() != zero_head() {
+                return Ok(false);
+            }
+            reached[stream.index()] = true;
+        }
+    }
+    while let Some((record_type, payload)) = walker.next_frame()? {
+        verifier.process_frame(record_type, payload)?;
+        for stream in SharedStream::ALL {
+            let index = stream.index();
+            if reached[index] {
+                continue;
+            }
+            let expected = target.get(stream);
+            let actual = verifier.shared[index];
+            if actual.count == expected.count() {
+                if actual.head != expected.head() {
+                    return Ok(false);
+                }
+                reached[index] = true;
+            } else if actual.count > expected.count() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(reached.into_iter().all(|value| value))
 }
 
 fn mismatch_report(
@@ -864,8 +951,11 @@ fn file_report(file: &VerifiedFile) -> FileReport {
         local_event_count: file.local_count,
         finalized: footer.is_some(),
         truncated_tail: file.truncated_tail,
-        last_confirmed_checkpoint: file
-            .last_confirmed
+        last_confirmed_sent_checkpoint: file
+            .last_confirmed_sent
+            .map(|confirmed| (confirmed.sequence, confirmed.digest)),
+        last_confirmed_received_checkpoint: file
+            .last_confirmed_received
             .map(|confirmed| (confirmed.sequence, confirmed.digest)),
         ending: manifest.as_ref().map(|manifest| manifest.ending()),
         ended_normally: manifest
@@ -1110,8 +1200,12 @@ fn verify_footer(
         ));
     }
     let confirmed_sequence = verified
-        .last_confirmed
-        .map_or(0, |confirmed| confirmed.sequence);
+        .last_confirmed_sent
+        .into_iter()
+        .chain(verified.last_confirmed_received)
+        .map(|confirmed| confirmed.sequence)
+        .max()
+        .unwrap_or(0);
     if manifest.final_checkpoint_sequence() != confirmed_sequence {
         return Err(tampered(
             "the joint manifest does not match the recorded checkpoints",
@@ -1334,13 +1428,16 @@ struct ChainVerifier {
     last_block: [ChainHead; SHARED_STREAMS],
     input_batch: Option<BatchState>,
     output_batch: Option<BatchState>,
-    last_checkpoint_seq: u64,
+    last_sent_checkpoint_seq: u64,
+    last_received_checkpoint_seq: u64,
     last_received_checkpoint: Option<CheckpointRef>,
     last_sent_checkpoint: Option<CheckpointRef>,
     last_received_ack_seq: u64,
     last_sent_ack_seq: u64,
-    last_confirmed: Option<Confirmed>,
-    prev_confirmed: Option<Confirmed>,
+    last_confirmed_sent: Option<Confirmed>,
+    prev_confirmed_sent: Option<Confirmed>,
+    last_confirmed_received: Option<Confirmed>,
+    prev_confirmed_received: Option<Confirmed>,
     manifest_evidence: Option<Vec<u8>>,
     received_manifest_evidence: Option<Vec<u8>>,
     sent_manifest_signature: Option<ManifestSignature>,
@@ -1361,13 +1458,16 @@ impl ChainVerifier {
             last_block: [zero_head(); SHARED_STREAMS],
             input_batch: None,
             output_batch: None,
-            last_checkpoint_seq: 0,
+            last_sent_checkpoint_seq: 0,
+            last_received_checkpoint_seq: 0,
             last_received_checkpoint: None,
             last_sent_checkpoint: None,
             last_received_ack_seq: 0,
             last_sent_ack_seq: 0,
-            last_confirmed: None,
-            prev_confirmed: None,
+            last_confirmed_sent: None,
+            prev_confirmed_sent: None,
+            last_confirmed_received: None,
+            prev_confirmed_received: None,
             manifest_evidence: None,
             received_manifest_evidence: None,
             sent_manifest_signature: None,
@@ -1384,8 +1484,10 @@ impl ChainVerifier {
             shared: self.shared,
             local_head: self.local_head,
             local_count: self.local_count,
-            last_confirmed: self.last_confirmed,
-            prev_confirmed: self.prev_confirmed,
+            last_confirmed_sent: self.last_confirmed_sent,
+            prev_confirmed_sent: self.prev_confirmed_sent,
+            last_confirmed_received: self.last_confirmed_received,
+            prev_confirmed_received: self.prev_confirmed_received,
             footer: None,
             truncated_tail,
             manifest_evidence: self.manifest_evidence,
@@ -1866,12 +1968,22 @@ impl ChainVerifier {
                 ) {
                     return Err(StreamError::Tampered("the checkpoint signature is invalid"));
                 }
+                let previous_sequence = if kind == EVIDENCE_SENT_CHECKPOINT {
+                    self.last_sent_checkpoint_seq
+                } else {
+                    self.last_received_checkpoint_seq
+                };
+                let expected_sequence = previous_sequence
+                    .checked_add(1)
+                    .ok_or(StreamError::Tampered("the checkpoint is invalid"))?;
                 if checkpoint.session_id() != self.header.session_id()
-                    || checkpoint.sequence() != self.last_checkpoint_seq + 1
+                    || checkpoint.sequence() != expected_sequence
                 {
                     return Err(StreamError::Tampered("the checkpoint is invalid"));
                 }
-                if checkpoint.snapshot() != self.shared_snapshot() {
+                if kind == EVIDENCE_SENT_CHECKPOINT
+                    && checkpoint.snapshot() != self.shared_snapshot()
+                {
                     return Err(StreamError::Tampered(
                         "the checkpoint does not match the shared chains",
                     ));
@@ -1889,7 +2001,11 @@ impl ChainVerifier {
                 {
                     return Err(StreamError::Tampered("the checkpoint is invalid"));
                 }
-                self.last_checkpoint_seq = checkpoint.sequence();
+                if kind == EVIDENCE_SENT_CHECKPOINT {
+                    self.last_sent_checkpoint_seq = checkpoint.sequence();
+                } else {
+                    self.last_received_checkpoint_seq = checkpoint.sequence();
+                }
                 let digest = sha256_32(evidence);
                 let reference = CheckpointRef {
                     sequence: checkpoint.sequence(),
@@ -1905,7 +2021,6 @@ impl ChainVerifier {
                     self.last_sent_checkpoint = Some(reference);
                 } else {
                     self.last_received_checkpoint = Some(reference);
-                    self.confirm(reference.sequence, reference.digest)?;
                 }
             }
             EVIDENCE_SENT_CHECKPOINT_ACK | EVIDENCE_RECEIVED_CHECKPOINT_ACK => {
@@ -1922,9 +2037,14 @@ impl ChainVerifier {
                         "the checkpoint acknowledgment signature is invalid",
                     ));
                 }
+                let checkpoint_sequence = if kind == EVIDENCE_SENT_CHECKPOINT_ACK {
+                    self.last_received_checkpoint_seq
+                } else {
+                    self.last_sent_checkpoint_seq
+                };
                 if ack.session_id() != self.header.session_id()
                     || ack.sequence() == 0
-                    || ack.sequence() > self.last_checkpoint_seq
+                    || ack.sequence() > checkpoint_sequence
                 {
                     return Err(StreamError::Tampered(
                         "the checkpoint acknowledgment is invalid",
@@ -1950,6 +2070,7 @@ impl ChainVerifier {
                             "the checkpoint acknowledgment is invalid",
                         ));
                     }
+                    self.confirm_received(*last)?;
                 } else {
                     if ack.sequence() <= self.last_received_ack_seq {
                         return Err(StreamError::Tampered(
@@ -1970,7 +2091,7 @@ impl ChainVerifier {
                             "the checkpoint acknowledgment is invalid",
                         ));
                     }
-                    self.confirm(ack.sequence(), last.digest)?;
+                    self.confirm_sent(*last)?;
                 }
             }
             EVIDENCE_SENT_MANIFEST | EVIDENCE_RECEIVED_MANIFEST => {
@@ -2013,33 +2134,56 @@ impl ChainVerifier {
         Ok(())
     }
 
-    /// Records one bilaterally confirmed checkpoint. Confirmations arrive in
-    /// strictly increasing sequence order; the last two are kept for the
-    /// pair-level comparison (honest sessions diverge by at most one).
-    fn confirm(&mut self, sequence: u64, digest: [u8; DIGEST_LEN]) -> Result<(), StreamError> {
-        match self.last_confirmed {
-            None => self.last_confirmed = Some(Confirmed { sequence, digest }),
-            Some(current) if current.sequence == sequence => {
-                if current.digest != digest {
-                    return Err(StreamError::Tampered(
-                        "the checkpoint confirmations are inconsistent",
-                    ));
-                }
-            }
-            Some(current) if sequence > current.sequence => {
-                self.prev_confirmed = Some(current);
-                self.last_confirmed = Some(Confirmed { sequence, digest });
-            }
-            Some(_) => {
-                // Out of order: an honest session never confirms out of
-                // order, so the file is not an honest record.
+    fn confirm_sent(&mut self, checkpoint: CheckpointRef) -> Result<(), StreamError> {
+        confirm_direction(
+            &mut self.last_confirmed_sent,
+            &mut self.prev_confirmed_sent,
+            checkpoint,
+        )
+    }
+
+    fn confirm_received(&mut self, checkpoint: CheckpointRef) -> Result<(), StreamError> {
+        confirm_direction(
+            &mut self.last_confirmed_received,
+            &mut self.prev_confirmed_received,
+            checkpoint,
+        )
+    }
+}
+
+/// Advances one independent checkpoint direction. Only the last two are
+/// needed because at most one checkpoint may await acknowledgment on a
+/// direction, so honest peer records can differ by at most one confirmation.
+fn confirm_direction(
+    last: &mut Option<Confirmed>,
+    previous: &mut Option<Confirmed>,
+    checkpoint: CheckpointRef,
+) -> Result<(), StreamError> {
+    let confirmed = Confirmed {
+        sequence: checkpoint.sequence,
+        digest: checkpoint.digest,
+        snapshot: checkpoint.snapshot,
+    };
+    match *last {
+        None => *last = Some(confirmed),
+        Some(current) if current.sequence == confirmed.sequence => {
+            if current.digest != confirmed.digest || current.snapshot != confirmed.snapshot {
                 return Err(StreamError::Tampered(
-                    "the checkpoint confirmations are out of order",
+                    "the checkpoint confirmations are inconsistent",
                 ));
             }
         }
-        Ok(())
+        Some(current) if confirmed.sequence > current.sequence => {
+            *previous = Some(current);
+            *last = Some(confirmed);
+        }
+        Some(_) => {
+            return Err(StreamError::Tampered(
+                "the checkpoint confirmations are out of order",
+            ));
+        }
     }
+    Ok(())
 }
 
 /// The fixed payload length of one shared control event kind.
@@ -2803,7 +2947,10 @@ pub(crate) mod tests {
         })
         .await;
 
-        // A bilaterally confirmed checkpoint.
+        // Independent, bilaterally confirmed checkpoints in both
+        // directions. Their snapshots match, but their sender-local heads,
+        // ledger digests and signatures deliberately make the payload
+        // digests different.
         controller_writer.sync_all().await.unwrap();
         let (checkpoint, evidence) = controller.build_checkpoint(1_000_000_000).unwrap();
         append(&controller_writer, evidence).await;
@@ -2815,6 +2962,20 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         append(&controller_writer, ack_evidence).await;
+
+        host_writer.sync_all().await.unwrap();
+        let (checkpoint, evidence) = host.build_checkpoint(1_000_000_020).unwrap();
+        append(&host_writer, evidence).await;
+        let (ack, controller_evidence) = controller
+            .receive_checkpoint(&checkpoint, 1_000_000_020)
+            .unwrap();
+        append(&controller_writer, controller_evidence).await;
+        controller_writer.sync_all().await.unwrap();
+        let ack_evidence = host
+            .receive_checkpoint_ack(&ack, 1_000_000_030)
+            .unwrap()
+            .unwrap();
+        append(&host_writer, ack_evidence).await;
 
         append(
             &controller_writer,
@@ -3008,6 +3169,23 @@ pub(crate) mod tests {
         );
         assert!(!report.anchor.identity_matched);
         assert_eq!(report.state.exit_code(), 2);
+
+        let report = verify_files(&pair.host_path, Some(&pair.controller_path), &NoAnchor).unwrap();
+        assert_eq!(
+            report.state,
+            VerificationState::ConsistentCompleteUnanchored
+        );
+        assert_eq!(
+            report.controller.as_ref().unwrap().role,
+            WireRole::Controller
+        );
+        assert_eq!(report.host.as_ref().unwrap().role, WireRole::Host);
+
+        let missing_peer = dir.path().join("missing-peer.yonaudit");
+        assert!(matches!(
+            verify_files(&pair.controller_path, Some(&missing_peer), &NoAnchor),
+            Err(VerifyError::Io(_))
+        ));
     }
 
     #[tokio::test]
@@ -3043,7 +3221,7 @@ pub(crate) mod tests {
             .controller
             .as_ref()
             .unwrap()
-            .last_confirmed_checkpoint
+            .last_confirmed_sent_checkpoint
             .unwrap();
         assert_eq!(sequence, 1);
         assert_eq!(report.state.exit_code(), 2);
@@ -3314,6 +3492,36 @@ pub(crate) mod tests {
         let pair = build_full_pair(dir.path(), Endpoint::Memory(18), Endpoint::Memory(118)).await;
         let mut bytes = std::fs::read(&pair.controller_path).unwrap();
         bytes.extend_from_slice(b"garbage");
+        std::fs::write(&pair.controller_path, &bytes).unwrap();
+        let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+    }
+
+    #[tokio::test]
+    async fn known_record_type_with_invalid_length_is_tampered() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(19), Endpoint::Memory(119)).await;
+        let mut bytes = std::fs::read(&pair.controller_path).unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&0_u32.to_be_bytes());
+        frame.push(RecordType::LocalLifecycleEvent.code());
+        bytes.splice(CONTAINER_HEADER_LEN..CONTAINER_HEADER_LEN, frame);
+        std::fs::write(&pair.controller_path, &bytes).unwrap();
+        let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
+        assert_eq!(report.state, VerificationState::Tampered);
+    }
+
+    #[tokio::test]
+    async fn complete_but_invalid_footer_is_tampered() {
+        let dir = tempdir().unwrap();
+        let pair = build_full_pair(dir.path(), Endpoint::Memory(20), Endpoint::Memory(120)).await;
+        let mut walker = FrameWalker::open(&pair.controller_path).unwrap();
+        walker.skip_header().unwrap();
+        while walker.next_frame().unwrap().is_some() {}
+        let footer_start = usize::try_from(walker.footer_start().unwrap()).unwrap();
+        let mut bytes = std::fs::read(&pair.controller_path).unwrap();
+        bytes[footer_start + FOOTER_MAGIC.len()..footer_start + FOOTER_MAGIC.len() + 2]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
         std::fs::write(&pair.controller_path, &bytes).unwrap();
         let report = verify_files(&pair.controller_path, None, &NoAnchor).unwrap();
         assert_eq!(report.state, VerificationState::Tampered);
@@ -3598,52 +3806,58 @@ pub(crate) mod tests {
         let dir = tempdir().unwrap();
         let pair = build_interrupted_pair(dir.path()).await;
         let (mut controller, mut host) = walked_pair(&pair);
-        let confirmed = controller.last_confirmed.unwrap();
+        let confirmed = controller.last_confirmed_sent.unwrap();
+        assert!(snapshot_is_prefix(&controller.path, confirmed.snapshot).unwrap());
+        assert!(snapshot_is_prefix(&host.path, confirmed.snapshot).unwrap());
+        let mut wrong_streams = confirmed.snapshot.streams();
+        wrong_streams[0] =
+            StreamSnapshot::new(wrong_streams[0].count(), ChainHead::new([0xB0; DIGEST_LEN]));
+        assert!(!snapshot_is_prefix(&host.path, SharedSnapshot::new(wrong_streams)).unwrap());
 
-        controller.last_confirmed = None;
-        host.last_confirmed = None;
-        assert_eq!(
-            last_common_confirmed(&controller, &host),
-            Ok((0, [0; DIGEST_LEN]))
-        );
+        controller.last_confirmed_sent = None;
+        host.last_confirmed_received = None;
+        assert_eq!(last_common_confirmed(&controller, &host), Ok([None, None]));
 
-        controller.last_confirmed = Some(confirmed);
-        assert!(last_common_confirmed(&controller, &host).is_err());
-        host.last_confirmed = Some(Confirmed {
+        controller.last_confirmed_sent = Some(confirmed);
+        assert_eq!(last_common_confirmed(&controller, &host), Ok([None, None]));
+        host.last_confirmed_received = Some(Confirmed {
             sequence: confirmed.sequence,
             digest: [0xB1; DIGEST_LEN],
+            snapshot: confirmed.snapshot,
         });
         assert!(last_common_confirmed(&controller, &host).is_err());
 
-        host.last_confirmed = Some(confirmed);
+        host.last_confirmed_received = Some(confirmed);
         assert_eq!(
             last_common_confirmed(&controller, &host),
-            Ok((confirmed.sequence, confirmed.digest))
+            Ok([Some(confirmed), None])
         );
 
-        controller.prev_confirmed = Some(confirmed);
-        controller.last_confirmed = Some(Confirmed {
+        controller.prev_confirmed_sent = Some(confirmed);
+        controller.last_confirmed_sent = Some(Confirmed {
             sequence: confirmed.sequence + 1,
             digest: [0xB2; DIGEST_LEN],
+            snapshot: confirmed.snapshot,
         });
         assert_eq!(
             last_common_confirmed(&controller, &host),
-            Ok((confirmed.sequence, confirmed.digest))
+            Ok([Some(confirmed), None])
         );
-        controller.prev_confirmed = None;
+        controller.prev_confirmed_sent = None;
         assert!(last_common_confirmed(&controller, &host).is_err());
 
-        controller.last_confirmed = Some(confirmed);
-        host.prev_confirmed = Some(confirmed);
-        host.last_confirmed = Some(Confirmed {
+        controller.last_confirmed_sent = Some(confirmed);
+        host.prev_confirmed_received = Some(confirmed);
+        host.last_confirmed_received = Some(Confirmed {
             sequence: confirmed.sequence + 1,
             digest: [0xB3; DIGEST_LEN],
+            snapshot: confirmed.snapshot,
         });
         assert_eq!(
             last_common_confirmed(&controller, &host),
-            Ok((confirmed.sequence, confirmed.digest))
+            Ok([Some(confirmed), None])
         );
-        host.prev_confirmed = None;
+        host.prev_confirmed_received = None;
         assert!(last_common_confirmed(&controller, &host).is_err());
     }
 
@@ -3866,10 +4080,15 @@ pub(crate) mod tests {
         ] {
             assert_tampered(make().process_frame(record_type, &[0; SPLIT_PREFIX_LEN]));
         }
+        assert_tampered(
+            make().process_local(RecordType::LocalKeyAction, &[0; SPLIT_PREFIX_LEN - 1]),
+        );
 
         let mut send = vec![0; SPLIT_PREFIX_LEN + 10];
         send[SPLIT_PREFIX_LEN] = DIRECTION_CTRL_TO_HOST;
         send[8] = 1;
+        assert_tampered(make().process_frame(RecordType::LocalSendOutcome, &send));
+        send[SPLIT_PREFIX_LEN] = DIRECTION_HOST_TO_CTRL;
         assert_tampered(make().process_frame(RecordType::LocalSendOutcome, &send));
 
         let mut pty = vec![0; SPLIT_PREFIX_LEN + 9];
@@ -3881,6 +4100,39 @@ pub(crate) mod tests {
         resize[SPLIT_PREFIX_LEN] = DIRECTION_CTRL_TO_HOST;
         resize[8] = 1;
         assert_tampered(make().process_frame(RecordType::LocalResizeEvent, &resize));
+
+        for record_type in [
+            RecordType::LocalLifecycleEvent,
+            RecordType::LocalKeyAction,
+            RecordType::LocalConnectionState,
+        ] {
+            let mut payload = vec![0; SPLIT_PREFIX_LEN + 1];
+            payload[8] = 1;
+            payload[SPLIT_PREFIX_LEN] = 1;
+            assert_tampered(make().process_frame(record_type, &payload));
+        }
+        let mut audit_error = vec![0; SPLIT_PREFIX_LEN + 2];
+        audit_error[8] = 1;
+        assert_tampered(make().process_frame(RecordType::LocalAuditError, &audit_error));
+        let mut local_file = vec![0; SPLIT_PREFIX_LEN + 12];
+        local_file[SPLIT_PREFIX_LEN + 9..SPLIT_PREFIX_LEN + 11]
+            .copy_from_slice(&1_u16.to_be_bytes());
+        local_file[SPLIT_PREFIX_LEN + 11] = 0xFF;
+        assert_tampered(make().process_frame(RecordType::LocalFileTransferEvent, &local_file));
+        let mut close = vec![0; SPLIT_PREFIX_LEN + 2];
+        close[8] = 1;
+        assert_tampered(make().process_frame(RecordType::LocalCloseEvent, &close));
+        let mut evidence = vec![0; SPLIT_PREFIX_LEN + 5];
+        evidence[8] = 1;
+        assert_tampered(make().process_frame(RecordType::CheckpointEvidence, &evidence));
+        for record_type in [
+            RecordType::SharedInputCommitment,
+            RecordType::SharedOutputBlock,
+            RecordType::SharedControlEvent,
+            RecordType::SharedFileTransferEvent,
+        ] {
+            assert_tampered(make().process_local(record_type, &[0; SPLIT_PREFIX_LEN]));
+        }
 
         let mut verifier = make();
         verifier.input_batch = Some(BatchState {
@@ -3910,13 +4162,28 @@ pub(crate) mod tests {
         let mut verifier = make();
         assert_tampered(verifier.process_evidence(&[]));
         assert_tampered(verifier.process_evidence(&[0xFF, 0, 0, 0, 0]));
+        assert_tampered(
+            verifier.process_evidence(&checkpoint_evidence(EVIDENCE_SENT_CHECKPOINT_ACK, &[0])),
+        );
+        assert_tampered(
+            verifier.process_evidence(&checkpoint_evidence(EVIDENCE_SENT_MANIFEST, &[0])),
+        );
+        assert_tampered(
+            verifier.process_evidence(&checkpoint_evidence(EVIDENCE_SENT_MANIFEST_SIGNATURE, &[0])),
+        );
 
+        let snapshot = SharedSnapshot::new([StreamSnapshot::new(0, zero_head()); SHARED_STREAMS]);
+        let reference = |sequence, digest| CheckpointRef {
+            sequence,
+            digest: [digest; DIGEST_LEN],
+            snapshot,
+        };
         let mut verifier = make();
-        verifier.confirm(1, [1; DIGEST_LEN]).unwrap();
-        verifier.confirm(1, [1; DIGEST_LEN]).unwrap();
-        assert_tampered(verifier.confirm(1, [2; DIGEST_LEN]));
-        verifier.confirm(2, [3; DIGEST_LEN]).unwrap();
-        assert_tampered(verifier.confirm(1, [1; DIGEST_LEN]));
+        verifier.confirm_sent(reference(1, 1)).unwrap();
+        verifier.confirm_sent(reference(1, 1)).unwrap();
+        assert_tampered(verifier.confirm_sent(reference(1, 2)));
+        verifier.confirm_sent(reference(2, 3)).unwrap();
+        assert_tampered(verifier.confirm_sent(reference(1, 1)));
 
         for (kind, len, expected) in [
             (CONTROL_KIND_RESIZE, 4, true),
@@ -4032,7 +4299,7 @@ pub(crate) mod tests {
 
         let sent_state = || {
             let mut verifier = ChainVerifier::new(header, hello);
-            verifier.last_checkpoint_seq = 1;
+            verifier.last_received_checkpoint_seq = 1;
             verifier.last_received_checkpoint = Some(reference);
             verifier
         };
@@ -4087,7 +4354,7 @@ pub(crate) mod tests {
 
         let received_state = || {
             let mut verifier = ChainVerifier::new(header, hello);
-            verifier.last_checkpoint_seq = 1;
+            verifier.last_sent_checkpoint_seq = 1;
             verifier.last_sent_checkpoint = Some(reference);
             verifier
         };
@@ -4239,9 +4506,9 @@ pub(crate) mod tests {
 
         let dir = tempdir().unwrap();
         let pair = build_full_pair(dir.path(), Endpoint::Memory(26), Endpoint::Memory(126)).await;
-        let controller = walk_file(&pair.controller_path).unwrap();
+        let mut controller = walk_file(&pair.controller_path).unwrap();
 
-        for offset in [2, 34, 98, 162, 194, 226] {
+        for offset in [2, 34, 98, 162, 194, 226, MANIFEST_LEN - 1] {
             let mut footer = controller.footer.clone().unwrap();
             footer.manifest_bytes[offset] ^= 1;
             assert!(matches!(
@@ -4277,57 +4544,88 @@ pub(crate) mod tests {
         ));
 
         let original = controller.footer.as_ref().unwrap().seal;
-        let make_seal = |session_id, local_head, local_count, shared, manifest, signature| {
-            LocalRecordSeal::new(
-                session_id,
-                original.role(),
-                local_head,
-                local_count,
-                shared,
-                manifest,
-                *original.sealed_prefix_digest(),
-                signature,
-            )
-        };
+        let make_seal =
+            |session_id, role, local_head, local_count, shared, manifest, prefix, signature| {
+                LocalRecordSeal::new(
+                    session_id,
+                    role,
+                    local_head,
+                    local_count,
+                    shared,
+                    manifest,
+                    prefix,
+                    signature,
+                )
+            };
         let cases = [
             make_seal(
                 SessionId::new([0xD4; DIGEST_LEN]),
+                original.role(),
                 *original.final_local_event_root(),
                 original.local_event_count(),
                 *original.final_shared_roots(),
                 *original.joint_manifest_digest(),
+                *original.sealed_prefix_digest(),
                 *original.signature(),
             ),
             make_seal(
                 *original.session_id(),
+                AuditRole::Host,
+                *original.final_local_event_root(),
+                original.local_event_count(),
+                *original.final_shared_roots(),
+                *original.joint_manifest_digest(),
+                *original.sealed_prefix_digest(),
+                *original.signature(),
+            ),
+            make_seal(
+                *original.session_id(),
+                original.role(),
                 ChainHead::new([0xD5; DIGEST_LEN]),
                 original.local_event_count(),
                 *original.final_shared_roots(),
                 *original.joint_manifest_digest(),
+                *original.sealed_prefix_digest(),
                 *original.signature(),
             ),
             make_seal(
                 *original.session_id(),
+                original.role(),
+                *original.final_local_event_root(),
+                original.local_event_count() + 1,
+                *original.final_shared_roots(),
+                *original.joint_manifest_digest(),
+                *original.sealed_prefix_digest(),
+                *original.signature(),
+            ),
+            make_seal(
+                *original.session_id(),
+                original.role(),
                 *original.final_local_event_root(),
                 original.local_event_count(),
                 [ChainHead::new([0xD6; DIGEST_LEN]); 4],
                 *original.joint_manifest_digest(),
+                *original.sealed_prefix_digest(),
                 *original.signature(),
             ),
             make_seal(
                 *original.session_id(),
+                original.role(),
                 *original.final_local_event_root(),
                 original.local_event_count(),
                 *original.final_shared_roots(),
                 Digest32::new([0xD7; DIGEST_LEN]),
+                *original.sealed_prefix_digest(),
                 *original.signature(),
             ),
             make_seal(
                 *original.session_id(),
+                original.role(),
                 *original.final_local_event_root(),
                 original.local_event_count(),
                 *original.final_shared_roots(),
                 *original.joint_manifest_digest(),
+                *original.sealed_prefix_digest(),
                 Ed25519Signature::new([0xD8; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
             ),
         ];
@@ -4339,6 +4637,37 @@ pub(crate) mod tests {
                 Err(StreamError::Tampered(_))
             ));
         }
+
+        let unsigned = make_seal(
+            *original.session_id(),
+            original.role(),
+            *original.final_local_event_root(),
+            original.local_event_count(),
+            *original.final_shared_roots(),
+            *original.joint_manifest_digest(),
+            Digest32::new([0xDE; DIGEST_LEN]),
+            Ed25519Signature::new([0; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        let seal = make_seal(
+            *original.session_id(),
+            original.role(),
+            *original.final_local_event_root(),
+            original.local_event_count(),
+            *original.final_shared_roots(),
+            *original.joint_manifest_digest(),
+            *unsigned.sealed_prefix_digest(),
+            Ed25519Signature::new(
+                session_signing_key(26)
+                    .sign(unsigned.signing_input().as_slice())
+                    .to_bytes(),
+            ),
+        );
+        let mut footer = controller.footer.clone().unwrap();
+        footer.seal = seal;
+        assert!(matches!(
+            verify_footer(&pair.controller_path, &controller, footer),
+            Err(StreamError::Tampered(_))
+        ));
 
         let original = controller.footer.as_ref().unwrap().commit;
         let make_commit = |session_id, manifest_digest, signature| {
@@ -4377,6 +4706,50 @@ pub(crate) mod tests {
                 Err(StreamError::Tampered(_))
             ));
         }
+
+        let original = controller.footer.as_ref().unwrap().commit;
+        let unsigned = LedgerCommit::new(
+            original.sequence(),
+            *original.previous_root(),
+            *original.session_id(),
+            *original.manifest_digest(),
+            Digest32::new([0xDF; DIGEST_LEN]),
+            *original.peer_identity_fingerprint(),
+            original.result(),
+            Ed25519Signature::new([0; yonder_core::wire::audit::ED25519_SIGNATURE_LEN]),
+        );
+        let commit = LedgerCommit::new(
+            unsigned.sequence(),
+            *unsigned.previous_root(),
+            *unsigned.session_id(),
+            *unsigned.manifest_digest(),
+            *unsigned.sealed_record_digest(),
+            *unsigned.peer_identity_fingerprint(),
+            unsigned.result(),
+            TestIdentity::generate(26)
+                .sign(unsigned.signing_input().as_slice())
+                .unwrap(),
+        );
+        let mut footer = controller.footer.clone().unwrap();
+        footer.commit = commit;
+        assert!(matches!(
+            verify_footer(&pair.controller_path, &controller, footer),
+            Err(StreamError::Tampered(_))
+        ));
+
+        let mut footer = controller.footer.clone().unwrap();
+        footer.final_digest = Digest32::new([0xE0; DIGEST_LEN]);
+        assert!(matches!(
+            verify_footer(&pair.controller_path, &controller, footer),
+            Err(StreamError::Tampered(_))
+        ));
+
+        let footer = controller.footer.clone().unwrap();
+        controller.manifest_evidence = Some(vec![0]);
+        assert!(matches!(
+            verify_footer(&pair.controller_path, &controller, footer),
+            Err(StreamError::Tampered(_))
+        ));
     }
 
     #[tokio::test]

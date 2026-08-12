@@ -41,7 +41,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 use yonder_core::wire::audit::{
-    AuditCloseReason, AuditErrorCode, AuditMessage, AuditRole, BindingDigest, Digest32,
+    AuditCloseReason, AuditErrorCode, AuditMessage, AuditRole, BindingDigest, Checkpoint, Digest32,
     FRAME_HEADER_LEN, IdentityFingerprint, JointManifest, LedgerCommit, LedgerRoot, ManifestEnding,
     ManifestSignature, SecretContribution, SecretContributionMessage, SharedStream,
     decode_frame_header, validate_payload_len,
@@ -49,7 +49,7 @@ use yonder_core::wire::audit::{
 use yonder_core::{OsSecureRandom, SecureRandom};
 use yonder_net::{PeerId, peer_id_bytes};
 
-use crate::audit::identity::{AuditIdentity, AuditRoot, PlatformAuditRoot};
+use crate::audit::identity::{AuditIdentity, AuditIdentityError, AuditRoot, PlatformAuditRoot};
 use crate::audit::ledger;
 use crate::audit::session::{
     AuditError, AuditSession, CONNECTION_STATE_ESTABLISHED, ConnectionSecret,
@@ -68,6 +68,18 @@ pub const AUDIT_CHECKPOINT_POLL: Duration = Duration::from_millis(250);
 /// handshake exchange (the same frozen exchange bound as the terminal
 /// protocol).
 pub const AUDIT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The complete enterprise audit establishment bound. Unlike one wire
+/// exchange, establishment also opens the persistent ledger, creates the
+/// session record and durably syncs its header before `AuditReady`; those
+/// local storage steps must not consume the peer's individual 10-second
+/// message allowance.
+pub const AUDIT_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointPhase {
+    Running,
+    Closing,
+}
 
 /// The fixed connection-binding domain label (design section 13.3).
 const CONNECTION_BINDING_LABEL: &[u8] = b"yonder-audit-connection-binding-v2";
@@ -79,8 +91,12 @@ const FILE_TRANSFER_ID_LABEL: &[u8] = b"yonder-audit-file-transfer-id-v2";
 /// Resolves the platform audit root (design section 10), mapping the
 /// identity errors to the fixed [`AuditError`] categories.
 pub fn platform_audit_root() -> Result<PathBuf, AuditError> {
-    PlatformAuditRoot.audit_root().map_err(|error| match error {
-        crate::audit::identity::AuditIdentityError::InvalidAuditDirectoryEnv => {
+    PlatformAuditRoot.audit_root().map_err(map_audit_root_error)
+}
+
+fn map_audit_root_error(error: AuditIdentityError) -> AuditError {
+    match error {
+        AuditIdentityError::InvalidAuditDirectoryEnv => {
             AuditError::DirectoryUnavailable(io::Error::other(
                 "the audit directory environment variable must be a non-empty absolute path",
             ))
@@ -88,7 +104,7 @@ pub fn platform_audit_root() -> Result<PathBuf, AuditError> {
         _ => {
             AuditError::DirectoryUnavailable(io::Error::other("the audit directory is unavailable"))
         }
-    })
+    }
 }
 
 /// The authenticated connection binding digest (design section 13.3): a
@@ -341,12 +357,6 @@ struct AuditCore {
     /// unanswered checkpoint can never be followed by a sequence mismatch
     /// (design section 20.3).
     awaiting_ack: bool,
-    /// One finalization frame the running phase must not consume: the
-    /// peer's close notice, joint manifest or manifest signature can arrive
-    /// while the confirmation loop still runs (the close is asymmetric when
-    /// one side initiates), so the phase readers park it here and the next
-    /// phase consumes it first. At most one frame is ever parked.
-    pending_frame: Option<Vec<u8>>,
 }
 
 /// The narrow audit observer of one endpoint session (design sections 8 and
@@ -457,7 +467,6 @@ impl AuditObserver {
                 session,
                 writer,
                 awaiting_ack: false,
-                pending_frame: None,
             })),
             read: Mutex::new(Box::new(read)),
             write: Mutex::new(Box::new(write)),
@@ -661,6 +670,7 @@ impl AuditObserver {
                     ) {
                         let _ = core.writer.append_batch(batch).await;
                     }
+                    let _ = self.send_frame(&AuditMessage::AuditError(code)).await;
                     let _ = self
                         .send_frame(&AuditMessage::CloseNotice(AuditCloseReason::AuditFailure))
                         .await;
@@ -716,15 +726,8 @@ impl AuditObserver {
         let message = AuditMessage::decode_frame(frame)?;
         match message {
             AuditMessage::Checkpoint(checkpoint) => {
-                let mut core = self.core.lock().await;
-                let (ack, evidence) = core
-                    .session
-                    .receive_checkpoint(&checkpoint, self.now_ns())?;
-                core.writer.append_batch(evidence).await?;
-                core.writer.sync_all().await?;
-                drop(core);
-                self.send_frame(&AuditMessage::CheckpointAck(ack)).await?;
-                Ok(FrameEvent::None)
+                self.handle_checkpoint(checkpoint, CheckpointPhase::Running)
+                    .await
             }
             AuditMessage::CheckpointAck(ack) => {
                 let mut core = self.core.lock().await;
@@ -744,6 +747,27 @@ impl AuditObserver {
         }
     }
 
+    async fn handle_checkpoint(
+        &self,
+        checkpoint: Checkpoint,
+        phase: CheckpointPhase,
+    ) -> Result<FrameEvent, AuditError> {
+        let mut core = self.core.lock().await;
+        let (ack, evidence) = match phase {
+            CheckpointPhase::Running => core
+                .session
+                .receive_checkpoint(&checkpoint, self.now_ns())?,
+            CheckpointPhase::Closing => core
+                .session
+                .receive_final_checkpoint(&checkpoint, self.now_ns())?,
+        };
+        core.writer.append_batch(evidence).await?;
+        core.writer.sync_all().await?;
+        drop(core);
+        self.send_frame(&AuditMessage::CheckpointAck(ack)).await?;
+        Ok(FrameEvent::None)
+    }
+
     // -----------------------------------------------------------------
     // Close and finalization (design sections 21 and 22)
     // -----------------------------------------------------------------
@@ -761,57 +785,84 @@ impl AuditObserver {
         ended_normally: bool,
         close: CloseNoticeHandling,
     ) -> Result<(), AuditError> {
-        // 0. The close notice, before the final checkpoint exchange (design
-        //    sections 22.2 and 22.3: the reason is conveyed first). Sending
-        //    it first lets the peer enter finalization while our
-        //    confirmation exchange still runs; a sender that waited until
-        //    after the exchange would never see the peer's final checkpoint,
-        //    because the peer sends it only after receiving the notice.
-        if let CloseNoticeHandling::Sender(reason) = close {
-            self.send_frame(&AuditMessage::CloseNotice(reason)).await?;
-        }
-        // 1. The final bilateral checkpoint (design section 20.1: session
-        //    closing trigger). Both sides exchange their final checkpoints
-        //    while still Active, so the snapshots match. A checkpoint still
-        //    awaiting its ack from the running phase is confirmed in the
-        //    exchange below instead of being replaced.
-        {
-            let mut core = self.core.lock().await;
-            if !core.awaiting_ack && core.session.is_active() {
-                let (checkpoint, evidence) = core.session.build_checkpoint(self.now_ns())?;
-                core.awaiting_ack = true;
-                core.writer.append_batch(evidence).await?;
-                core.writer.sync_all().await?;
-                drop(core);
-                self.send_frame(&AuditMessage::Checkpoint(checkpoint))
-                    .await?;
+        // 0. Convey or receive the close reason first. A receiver may find
+        //    running checkpoint traffic ahead of the notice on the ordered
+        //    audit substream; that traffic is settled as observation
+        //    evidence, not mistaken for the final checkpoint.
+        let reason = match close {
+            CloseNoticeHandling::Sender(reason) => {
+                self.send_frame(&AuditMessage::CloseNotice(reason)).await?;
+                reason
             }
-        }
-        // 2. The confirmation exchange: acknowledge the peer's final
-        //    checkpoint and await the ack of ours. The exchange only ends
-        //    once both own ack has arrived and the peer's final checkpoint
-        //    was received and acknowledged, so both sides build the joint
-        //    manifest from the same mutually confirmed checkpoint sequence.
-        //    The close is asymmetric when one side initiates, so the peer's
-        //    frames arrive in different orders: its close notice is parked
-        //    for the close-reason step while the exchange continues, and a
-        //    manifest that races ahead is parked for the next phase.
-        let mut peer_close_notice = None;
-        let mut peer_checkpoint_seen = false;
+            CloseNoticeHandling::AlreadyReceived(reason) => reason,
+            CloseNoticeHandling::Receiver => self.receive_close_reason().await?,
+        };
+
+        // 1. Establish the shared close barrier before constructing the
+        //    final checkpoint. Closing the normalizers commits any final
+        //    partial input/output blocks, after which the shared snapshot is
+        //    stable and exact comparison is meaningful.
+        self.record_shared_close(reason).await?;
+        self.close_directions().await?;
+
+        // 2. Settle any running checkpoint already awaiting an ack, then
+        //    send a fresh final checkpoint from the stable snapshot. A peer
+        //    observation whose snapshot differs is an older running
+        //    checkpoint delayed across substreams; acknowledge it and keep
+        //    waiting for the exact final checkpoint.
+        let mut own_final_sent = false;
+        let mut peer_final_seen = false;
         loop {
+            if !own_final_sent {
+                let checkpoint = {
+                    let mut core = self.core.lock().await;
+                    if core.awaiting_ack {
+                        None
+                    } else {
+                        let (checkpoint, evidence) =
+                            core.session.build_final_checkpoint(self.now_ns())?;
+                        core.awaiting_ack = true;
+                        core.writer.append_batch(evidence).await?;
+                        core.writer.sync_all().await?;
+                        Some(checkpoint)
+                    }
+                };
+                if let Some(checkpoint) = checkpoint {
+                    self.send_frame(&AuditMessage::Checkpoint(checkpoint))
+                        .await?;
+                    own_final_sent = true;
+                }
+            }
+
+            let core = self.core.lock().await;
+            let confirmed = own_final_sent && !core.awaiting_ack && peer_final_seen;
+            drop(core);
+            if confirmed {
+                break;
+            }
+
             let frame = self.read_finalization_frame().await?;
             let Some(frame) = frame else {
                 return Err(AuditError::FailedClosed);
             };
             match AuditMessage::decode_frame(&frame)? {
-                AuditMessage::Checkpoint(_) => {
-                    peer_checkpoint_seen = true;
-                    let event = self.handle_frame(&frame).await?;
+                AuditMessage::Checkpoint(checkpoint) => {
+                    let exact = {
+                        let core = self.core.lock().await;
+                        checkpoint.snapshot() == core.session.shared_snapshot()
+                    };
+                    let phase = if exact {
+                        CheckpointPhase::Closing
+                    } else {
+                        CheckpointPhase::Running
+                    };
+                    let event = self.handle_checkpoint(checkpoint, phase).await?;
                     if !matches!(event, FrameEvent::None) {
                         return Err(AuditError::InvalidState(
                             "unexpected audit frame during finalization",
                         ));
                     }
+                    peer_final_seen |= exact;
                 }
                 AuditMessage::CheckpointAck(_) => {
                     let event = self.handle_frame(&frame).await?;
@@ -821,12 +872,17 @@ impl AuditObserver {
                         ));
                     }
                 }
-                AuditMessage::CloseNotice(_) => {
-                    peer_close_notice = Some(frame);
+                AuditMessage::CloseNotice(peer_reason) => {
+                    if peer_reason != reason {
+                        return Err(AuditError::InvalidState(
+                            "the peer close reason changed during finalization",
+                        ));
+                    }
                 }
                 AuditMessage::JointManifest(_) | AuditMessage::ManifestSignature(_) => {
-                    self.defer_frame(frame).await?;
-                    break;
+                    return Err(AuditError::InvalidState(
+                        "the peer manifest arrived before the final checkpoint",
+                    ));
                 }
                 _ => {
                     return Err(AuditError::InvalidState(
@@ -834,55 +890,13 @@ impl AuditObserver {
                     ));
                 }
             }
-            let core = self.core.lock().await;
-            let confirmed = !core.awaiting_ack && peer_checkpoint_seen;
-            drop(core);
-            if confirmed {
-                break;
-            }
         }
-        // 3. The shared close reason, only after it was conveyed to the
-        //    peer (design section 15.2). The shared chains are independent
-        //    per stream, so the close event may precede the final partial
-        //    blocks of the input and output directions (the session layer
-        //    records the close reason while still Active).
-        match close {
-            CloseNoticeHandling::Sender(reason) => {
-                self.record_shared_close(reason).await?;
-            }
-            CloseNoticeHandling::AlreadyReceived(reason) => {
-                self.record_shared_close(reason).await?;
-            }
-            CloseNoticeHandling::Receiver => {
-                let frame = match peer_close_notice {
-                    Some(frame) => frame,
-                    None => {
-                        let frame = self.read_finalization_frame().await?;
-                        let Some(frame) = frame else {
-                            return Err(AuditError::FailedClosed);
-                        };
-                        frame
-                    }
-                };
-                let reason = match AuditMessage::decode_frame(&frame)? {
-                    AuditMessage::CloseNotice(reason) => reason,
-                    _ => {
-                        return Err(AuditError::InvalidState(
-                            "unexpected audit frame during finalization",
-                        ));
-                    }
-                };
-                self.record_shared_close(reason).await?;
-            }
-        }
-        // 4. Close both byte directions (design section 16.1).
-        self.close_directions().await?;
-        // 5. The joint manifest and the dual session signatures (design
+        // 3. The joint manifest and the dual session signatures (design
         //    sections 21.1 and 21.2).
         let (manifest, own_signature) =
             self.build_and_send_manifest(ending, ended_normally).await?;
         let peer_signature = self.read_peer_manifest_pair(&manifest).await?;
-        // 6. The acyclic footer and the serialized ledger commit (design
+        // 4. The acyclic footer and the serialized ledger commit (design
         //    sections 21.3, 21.4 and 12.3).
         let pending = {
             let mut core = self.core.lock().await;
@@ -890,7 +904,6 @@ impl AuditObserver {
                 session,
                 writer,
                 awaiting_ack: _,
-                pending_frame: _,
             } = &mut *core;
             session
                 .write_footer_prefix(writer, &manifest, own_signature, peer_signature)
@@ -931,17 +944,17 @@ impl AuditObserver {
     /// best-effort. `code` is the peer's structured code when one was
     /// received; the local category of a record failure is used otherwise.
     pub async fn fail_closed(&self, code: Option<AuditErrorCode>, reason: AuditCloseReason) {
+        let code = code.unwrap_or(AuditErrorCode::AuditRecordWriteFailed);
         let mut core = self.core.lock().await;
-        if !core.session.has_failed() {
-            let code = code.unwrap_or(AuditErrorCode::AuditRecordWriteFailed);
-            if let Ok(batch) = core
+        if !core.session.has_failed()
+            && let Ok(batch) = core
                 .session
                 .fail_closed_records(code, reason, self.now_ns())
-            {
-                let _ = core.writer.append_batch(batch).await;
-            }
+        {
+            let _ = core.writer.append_batch(batch).await;
         }
         drop(core);
+        let _ = self.send_frame(&AuditMessage::AuditError(code)).await;
         let _ = self.send_frame(&AuditMessage::CloseNotice(reason)).await;
     }
 
@@ -960,6 +973,35 @@ impl AuditObserver {
             session.record_shared_close_reason(DIRECTION_CTRL_TO_HOST, reason, now)
         })
         .await
+    }
+
+    /// Reads through running checkpoint traffic until the peer's close
+    /// notice arrives. The audit substream is ordered, but the terminal and
+    /// file substreams are independent, so their pumps may enter the close
+    /// path while an earlier checkpoint exchange is still in flight.
+    async fn receive_close_reason(&self) -> Result<AuditCloseReason, AuditError> {
+        loop {
+            let frame = self.read_finalization_frame().await?;
+            let Some(frame) = frame else {
+                return Err(AuditError::FailedClosed);
+            };
+            match AuditMessage::decode_frame(&frame)? {
+                AuditMessage::Checkpoint(checkpoint) => {
+                    self.handle_checkpoint(checkpoint, CheckpointPhase::Running)
+                        .await?;
+                }
+                AuditMessage::CheckpointAck(_) => {
+                    self.handle_frame(&frame).await?;
+                }
+                AuditMessage::CloseNotice(reason) => return Ok(reason),
+                AuditMessage::AuditError(_) => return Err(AuditError::FailedClosed),
+                _ => {
+                    return Err(AuditError::InvalidState(
+                        "unexpected audit frame before the close notice",
+                    ));
+                }
+            }
+        }
     }
 
     /// The local manifest with its session signature (design section 21.2),
@@ -1024,29 +1066,9 @@ impl AuditObserver {
     }
 
     /// One finalization frame read bounded by the frozen exchange timeout,
-    /// consuming a parked frame first (design section 12.3: the phases
-    /// share one frame stream, and the confirmation loop parks frames the
-    /// next phase owns).
+    /// with the fixed exchange timeout.
     async fn read_finalization_frame(&self) -> Result<Option<Vec<u8>>, AuditError> {
-        let parked = self.core.lock().await.pending_frame.take();
-        if let Some(frame) = parked {
-            return Ok(Some(frame));
-        }
         self.read_frame_timeout().await
-    }
-
-    /// Parks one frame the running finalization phase does not own, for the
-    /// next phase to consume. At most one frame is ever parked: every
-    /// phase breaks on the first frame it does not own.
-    async fn defer_frame(&self, frame: Vec<u8>) -> Result<(), AuditError> {
-        let mut core = self.core.lock().await;
-        if core.pending_frame.is_some() {
-            return Err(AuditError::InvalidState(
-                "a finalization frame was already parked",
-            ));
-        }
-        core.pending_frame = Some(frame);
-        Ok(())
     }
 
     /// Consumes frames until one of the wanted kinds arrives, handling the
@@ -1187,7 +1209,7 @@ mod tests {
     use super::*;
     use crate::audit::session::{
         CONNECTION_STATE_LOST, FILE_DIRECTION_DOWNLOAD, FILE_DIRECTION_UPLOAD, FILE_KIND_SUCCESS,
-        KEY_ACTION_DETACH, LIFECYCLE_KIND_ACTIVE_DETACH,
+        KEY_ACTION_DETACH, LIFECYCLE_KIND_ACTIVE_DETACH, MAX_INPUT_SEGMENT,
     };
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1207,6 +1229,26 @@ mod tests {
 
     fn test_root() -> PathBuf {
         tempdir().unwrap().path().join("audit")
+    }
+
+    #[test]
+    fn audit_root_errors_keep_their_fixed_operator_diagnostics() {
+        let invalid = map_audit_root_error(AuditIdentityError::InvalidAuditDirectoryEnv);
+        let unavailable = map_audit_root_error(AuditIdentityError::AuditDirectoryUnavailable);
+
+        match invalid {
+            AuditError::DirectoryUnavailable(error) => assert_eq!(
+                error.to_string(),
+                "the audit directory environment variable must be a non-empty absolute path"
+            ),
+            other => panic!("unexpected mapped error: {other}"),
+        }
+        match unavailable {
+            AuditError::DirectoryUnavailable(error) => {
+                assert_eq!(error.to_string(), "the audit directory is unavailable");
+            }
+            other => panic!("unexpected mapped error: {other}"),
+        }
     }
 
     /// Establishes two observers (controller and host) over one duplex
@@ -1249,6 +1291,141 @@ mod tests {
             Arc::new(controller_result.unwrap()),
             Arc::new(host_result.unwrap()),
         )
+    }
+
+    #[derive(Clone, Copy)]
+    enum UnexpectedHandshakeStage {
+        Hello,
+        Contribution,
+        Ready,
+    }
+
+    async fn establish_with_unexpected_handshake_message(
+        stage: UnexpectedHandshakeStage,
+    ) -> Result<AuditObserver, AuditError> {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = test_peers();
+        let binding = connection_binding_digest(controller, host);
+        let ledger = ledger::Ledger::open(&host_root, &mut OsSecureRandom).unwrap();
+        let identity = ledger.identity().clone();
+        let mut peer_session = AuditSession::new(
+            AuditRole::Host,
+            Box::new(IdentityAdapter(identity)),
+            Box::new(LedgerAdapter::new(ledger)),
+            binding,
+            utc_start_seconds(),
+            &mut OsSecureRandom,
+        )
+        .unwrap();
+        let (mut peer, local) = duplex(256 * 1024);
+        let digest = Digest32::new([0xAB; 32]);
+        let mut random = OsSecureRandom;
+        let establish = Box::pin(AuditObserver::establish(
+            local,
+            AuditRole::Controller,
+            controller,
+            host,
+            utc_start_seconds(),
+            digest,
+            &controller_root,
+            &mut random,
+        ));
+        let scripted_peer = async move {
+            let frame = read_one_frame(&mut peer).await.unwrap().unwrap();
+            let controller_hello = match AuditMessage::decode_frame(&frame).unwrap() {
+                AuditMessage::AuditHello(hello) => hello,
+                _ => panic!("the controller must start with AuditHello"),
+            };
+            if matches!(stage, UnexpectedHandshakeStage::Hello) {
+                write_frame_to(
+                    &mut peer,
+                    &AuditMessage::CloseNotice(AuditCloseReason::AuditFailure),
+                )
+                .await
+                .unwrap();
+                return;
+            }
+            write_frame_to(
+                &mut peer,
+                &AuditMessage::AuditHello(*peer_session.local_hello()),
+            )
+            .await
+            .unwrap();
+
+            let frame = read_one_frame(&mut peer).await.unwrap().unwrap();
+            let controller_contribution = match AuditMessage::decode_frame(&frame).unwrap() {
+                AuditMessage::SecretContribution(contribution) => {
+                    contribution.contribution().clone()
+                }
+                _ => panic!("the controller must send its secret contribution"),
+            };
+            if matches!(stage, UnexpectedHandshakeStage::Contribution) {
+                write_frame_to(
+                    &mut peer,
+                    &AuditMessage::CloseNotice(AuditCloseReason::AuditFailure),
+                )
+                .await
+                .unwrap();
+                return;
+            }
+            write_frame_to(
+                &mut peer,
+                &AuditMessage::SecretContribution(SecretContributionMessage::new(
+                    peer_session.local_contribution().clone(),
+                )),
+            )
+            .await
+            .unwrap();
+            peer_session
+                .receive_peer_hello(&controller_hello, &controller_contribution)
+                .unwrap();
+            peer_session
+                .compute_ready(ConnectionSecret::NotExportable)
+                .unwrap();
+
+            let frame = read_one_frame(&mut peer).await.unwrap().unwrap();
+            assert!(matches!(
+                AuditMessage::decode_frame(&frame).unwrap(),
+                AuditMessage::AuditReady(_)
+            ));
+            assert!(matches!(stage, UnexpectedHandshakeStage::Ready));
+            write_frame_to(
+                &mut peer,
+                &AuditMessage::CloseNotice(AuditCloseReason::AuditFailure),
+            )
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(establish, scripted_peer);
+        result
+    }
+
+    #[test]
+    fn observer_handshake_rejects_wrong_message_at_every_stage() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        for stage in [
+                            UnexpectedHandshakeStage::Hello,
+                            UnexpectedHandshakeStage::Contribution,
+                            UnexpectedHandshakeStage::Ready,
+                        ] {
+                            assert!(matches!(
+                                establish_with_unexpected_handshake_message(stage).await,
+                                Err(AuditError::HandshakeInvalid)
+                            ));
+                        }
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// Records the terminal lifecycle on both sides.
@@ -1579,7 +1756,83 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_mismatch_fails_closed_and_preserves_the_prefix() {
+    fn bilateral_finalization_settles_an_inflight_running_checkpoint() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let controller_root = test_root();
+                        let host_root = test_root();
+                        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+                        record_lifecycle(&controller, &host, Digest32::new([0xAB; 32])).await;
+
+                        let chunk = vec![0xC3; 16 * 1024];
+                        for _ in 0..64 {
+                            controller.record_input(&chunk).await.unwrap();
+                            host.record_input(&chunk).await.unwrap();
+                        }
+                        controller.send_due_checkpoint().await.unwrap();
+
+                        host.record_terminal_exit(0).await.unwrap();
+                        controller.record_terminal_exit(0).await.unwrap();
+                        controller.record_terminal_complete().await.unwrap();
+                        host.record_terminal_complete().await.unwrap();
+
+                        let controller_close = controller.clone();
+                        let host_close = host.clone();
+                        let (controller_result, host_result) = tokio::join!(
+                            Box::pin(controller_close.close_and_finalize(
+                                ManifestEnding::ShellExit(0),
+                                true,
+                                CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit,),
+                            )),
+                            Box::pin(host_close.close_and_finalize(
+                                ManifestEnding::ShellExit(0),
+                                true,
+                                CloseNoticeHandling::Receiver,
+                            )),
+                        );
+                        controller_result.unwrap();
+                        host_result.unwrap();
+
+                        let controller_record = std::fs::read_dir(
+                            controller_root.join(crate::audit::identity::RECORDS_DIR_NAME),
+                        )
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                        let host_record = std::fs::read_dir(
+                            host_root.join(crate::audit::identity::RECORDS_DIR_NAME),
+                        )
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                        let controller_bytes = std::fs::read(controller_record).unwrap();
+                        let host_bytes = std::fs::read(host_record).unwrap();
+                        let mut controller_reader =
+                            ContainerReader::new(&controller_bytes).unwrap();
+                        let mut host_reader = ContainerReader::new(&host_bytes).unwrap();
+                        while controller_reader.next_frame().unwrap().is_some() {}
+                        while host_reader.next_frame().unwrap().is_some() {}
+                        assert!(controller_reader.footer().is_ok());
+                        assert!(host_reader.footer().is_ok());
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn final_checkpoint_mismatch_fails_closed_and_preserves_the_prefix() {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
@@ -1604,10 +1857,28 @@ mod tests {
                     host.record_input(&chunk).await.unwrap();
                     assert!(controller.checkpoint_due().await);
                     controller.send_due_checkpoint().await.unwrap();
-                    // The host's checkpoint verification is a mismatch; the session
-                    // fails closed.
+                    // The running receipt is valid even though the host has
+                    // already observed a different cross-stream position.
                     let controller_checkpoint = host.wait_for_frame().await.unwrap().unwrap();
-                    let error = host.handle_frame(&controller_checkpoint).await.unwrap_err();
+                    let checkpoint =
+                        match AuditMessage::decode_frame(&controller_checkpoint).unwrap() {
+                            AuditMessage::Checkpoint(checkpoint) => checkpoint,
+                            _ => panic!("expected checkpoint"),
+                        };
+                    assert_eq!(
+                        host.handle_frame(&controller_checkpoint).await.unwrap(),
+                        FrameEvent::None
+                    );
+                    assert!(!host.has_failed().await);
+
+                    // The same unequal snapshot is invalid once evaluated at
+                    // the closing barrier, where both shared prefixes must be
+                    // exact.
+                    host.close_directions().await.unwrap();
+                    let error = host
+                        .handle_checkpoint(checkpoint, CheckpointPhase::Closing)
+                        .await
+                        .unwrap_err();
                     assert!(matches!(error, AuditError::CheckpointMismatch));
                     assert!(host.has_failed().await);
                     // No further recording is possible.
@@ -1782,19 +2053,6 @@ mod tests {
                     ));
 
                     controller
-                        .defer_frame(close.as_slice().to_vec())
-                        .await
-                        .unwrap();
-                    assert!(matches!(
-                        controller.defer_frame(close.as_slice().to_vec()).await,
-                        Err(AuditError::InvalidState(_))
-                    ));
-                    assert_eq!(
-                        controller.read_finalization_frame().await.unwrap(),
-                        Some(close.as_slice().to_vec())
-                    );
-
-                    controller
                         .close_interrupted(AuditCloseReason::ConnectionLost)
                         .await;
                     controller
@@ -1806,6 +2064,16 @@ mod tests {
                     )
                     .await;
                     assert!(host.has_failed().await);
+                    let error = controller.wait_for_frame().await.unwrap().unwrap();
+                    assert!(matches!(
+                        AuditMessage::decode_frame(&error).unwrap(),
+                        AuditMessage::AuditError(AuditErrorCode::AuditCheckpointMismatch)
+                    ));
+                    let close = controller.wait_for_frame().await.unwrap().unwrap();
+                    assert!(matches!(
+                        AuditMessage::decode_frame(&close).unwrap(),
+                        AuditMessage::CloseNotice(AuditCloseReason::AuditFailure)
+                    ));
                     host.fail_closed(None, AuditCloseReason::AuditFailure).await;
                 });
             })
@@ -1829,20 +2097,82 @@ mod tests {
         let frame = host.wait_for_frame().await.unwrap().unwrap();
         assert!(matches!(
             AuditMessage::decode_frame(&frame).unwrap(),
+            AuditMessage::AuditError(AuditErrorCode::AuditRecordWriteFailed)
+        ));
+        let frame = host.wait_for_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            AuditMessage::decode_frame(&frame).unwrap(),
             AuditMessage::CloseNotice(AuditCloseReason::AuditFailure)
         ));
     }
 
     #[tokio::test]
-    async fn unexpected_finalization_message_is_rejected_before_manifest_processing() {
+    async fn oversized_record_fails_closed_with_structured_peer_notification() {
         let controller_root = test_root();
         let host_root = test_root();
-        let (controller, _host) = establish_pair(&controller_root, &host_root).await;
-        let unexpected = AuditMessage::AuditError(AuditErrorCode::AuditRecordWriteFailed)
-            .encode()
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+
+        let oversized = vec![0xA5; MAX_INPUT_SEGMENT + 1];
+        assert!(matches!(
+            controller.record_input(&oversized).await,
+            Err(AuditError::SegmentTooLarge)
+        ));
+        assert!(controller.has_failed().await);
+        assert!(matches!(
+            controller.record_input(b"after failure").await,
+            Err(AuditError::FailedClosed)
+        ));
+
+        let error = host.wait_for_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            AuditMessage::decode_frame(&error).unwrap(),
+            AuditMessage::AuditError(AuditErrorCode::AuditRecordWriteFailed)
+        ));
+        let close = host.wait_for_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            AuditMessage::decode_frame(&close).unwrap(),
+            AuditMessage::CloseNotice(AuditCloseReason::AuditFailure)
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_and_finalization_readers_reject_unexpected_wire_states() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        let hello = {
+            let core = host.core.lock().await;
+            *core.session.local_hello()
+        };
+        host.send_frame(&AuditMessage::AuditHello(hello))
+            .await
             .unwrap();
-        controller
-            .defer_frame(unexpected.as_slice().to_vec())
+        assert!(matches!(
+            controller.receive_close_reason().await,
+            Err(AuditError::InvalidState(_))
+        ));
+
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        host.send_frame(&AuditMessage::AuditError(
+            AuditErrorCode::AuditRecordWriteFailed,
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            controller.receive_close_reason().await,
+            Err(AuditError::FailedClosed)
+        ));
+
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        let hello = {
+            let core = host.core.lock().await;
+            *core.session.local_hello()
+        };
+        host.send_frame(&AuditMessage::AuditHello(hello))
             .await
             .unwrap();
         assert!(matches!(
@@ -1850,6 +2180,252 @@ mod tests {
                 .read_until_kind(&[FinalizationKind::JointManifest])
                 .await,
             Err(AuditError::InvalidState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unexpected_finalization_message_is_rejected_before_manifest_processing() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        host.send_frame(&AuditMessage::AuditError(
+            AuditErrorCode::AuditRecordWriteFailed,
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            controller
+                .read_until_kind(&[FinalizationKind::JointManifest])
+                .await,
+            Err(AuditError::InvalidState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_confirmation_phase_rejects_eof_and_unexpected_messages() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        host.write.lock().await.shutdown().await.unwrap();
+        assert!(matches!(
+            controller
+                .close_and_finalize(
+                    ManifestEnding::ShellExit(0),
+                    true,
+                    CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                )
+                .await,
+            Err(AuditError::FailedClosed)
+        ));
+
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        host.send_frame(&AuditMessage::AuditError(
+            AuditErrorCode::AuditRecordWriteFailed,
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            controller
+                .close_and_finalize(
+                    ManifestEnding::ShellExit(0),
+                    true,
+                    CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                )
+                .await,
+            Err(AuditError::InvalidState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalization_reader_consumes_checkpoint_and_redundant_close_before_manifest() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        let checkpoint = {
+            let mut core = host.core.lock().await;
+            let (checkpoint, evidence) = core.session.build_checkpoint(host.now_ns()).unwrap();
+            core.writer.append_batch(evidence).await.unwrap();
+            checkpoint
+        };
+        host.send_frame(&AuditMessage::Checkpoint(checkpoint))
+            .await
+            .unwrap();
+        host.send_frame(&AuditMessage::CloseNotice(
+            AuditCloseReason::NormalShellExit,
+        ))
+        .await
+        .unwrap();
+        host.close_directions().await.unwrap();
+        let (manifest, _) = host
+            .build_and_send_manifest(ManifestEnding::ShellExit(0), true)
+            .await
+            .unwrap();
+
+        let frame = controller
+            .read_until_kind(&[FinalizationKind::JointManifest])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            AuditMessage::decode_frame(&frame).unwrap(),
+            AuditMessage::JointManifest(manifest)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_receiver_settles_running_checkpoint_and_ack_before_the_notice() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+
+        let checkpoint = {
+            let mut core = host.core.lock().await;
+            let (checkpoint, evidence) = core.session.build_checkpoint(host.now_ns()).unwrap();
+            core.writer.append_batch(evidence).await.unwrap();
+            checkpoint
+        };
+        host.send_frame(&AuditMessage::Checkpoint(checkpoint))
+            .await
+            .unwrap();
+        host.send_frame(&AuditMessage::CloseNotice(
+            AuditCloseReason::NormalShellExit,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            controller.receive_close_reason().await.unwrap(),
+            AuditCloseReason::NormalShellExit
+        );
+
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        let checkpoint = {
+            let mut core = controller.core.lock().await;
+            let (checkpoint, evidence) =
+                core.session.build_checkpoint(controller.now_ns()).unwrap();
+            core.awaiting_ack = true;
+            core.writer.append_batch(evidence).await.unwrap();
+            checkpoint
+        };
+        controller
+            .send_frame(&AuditMessage::Checkpoint(checkpoint))
+            .await
+            .unwrap();
+        let frame = host.wait_for_frame().await.unwrap().unwrap();
+        assert_eq!(host.handle_frame(&frame).await.unwrap(), FrameEvent::None);
+        host.send_frame(&AuditMessage::CloseNotice(
+            AuditCloseReason::ControllerDetach,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            controller.receive_close_reason().await.unwrap(),
+            AuditCloseReason::ControllerDetach
+        );
+    }
+
+    #[tokio::test]
+    async fn final_checkpoint_phase_rejects_changed_close_and_early_manifest() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        host.send_frame(&AuditMessage::CloseNotice(AuditCloseReason::ConnectionLost))
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .close_and_finalize(
+                    ManifestEnding::ShellExit(0),
+                    true,
+                    CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                )
+                .await,
+            Err(AuditError::InvalidState(_))
+        ));
+
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        host.close_directions().await.unwrap();
+        let manifest = {
+            let mut core = host.core.lock().await;
+            let (manifest, _, evidence) = core
+                .session
+                .build_manifest(ManifestEnding::ShellExit(0), true, host.now_ns())
+                .unwrap();
+            core.writer.append_batch(evidence).await.unwrap();
+            manifest
+        };
+        host.send_frame(&AuditMessage::JointManifest(manifest))
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .close_and_finalize(
+                    ManifestEnding::ShellExit(0),
+                    true,
+                    CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                )
+                .await,
+            Err(AuditError::InvalidState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn peer_manifest_reader_rejects_eof_at_both_pair_boundaries() {
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        drop(host);
+        assert!(matches!(
+            controller
+                .read_until_kind(&[FinalizationKind::JointManifest])
+                .await,
+            Ok(None)
+        ));
+
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        controller.close_directions().await.unwrap();
+        let own = {
+            let mut core = controller.core.lock().await;
+            let (manifest, _, evidence) = core
+                .session
+                .build_manifest(ManifestEnding::ShellExit(0), true, controller.now_ns())
+                .unwrap();
+            core.writer.append_batch(evidence).await.unwrap();
+            manifest
+        };
+        drop(host);
+        assert!(matches!(
+            controller.read_peer_manifest_pair(&own).await,
+            Err(AuditError::FailedClosed)
+        ));
+
+        let controller_root = test_root();
+        let host_root = test_root();
+        let (controller, host) = establish_pair(&controller_root, &host_root).await;
+        controller.close_directions().await.unwrap();
+        let own = {
+            let mut core = controller.core.lock().await;
+            let (manifest, _, evidence) = core
+                .session
+                .build_manifest(ManifestEnding::ShellExit(0), true, controller.now_ns())
+                .unwrap();
+            core.writer.append_batch(evidence).await.unwrap();
+            manifest
+        };
+        host.send_frame(&AuditMessage::JointManifest(own.clone()))
+            .await
+            .unwrap();
+        drop(host);
+        assert!(matches!(
+            controller.read_peer_manifest_pair(&own).await,
+            Err(AuditError::FailedClosed)
         ));
     }
 

@@ -710,6 +710,15 @@ mod tests {
             message,
             &signature
         ));
+        // The compressed Edwards y-coordinate 2 has no corresponding point
+        // and must be rejected before signature verification.
+        let mut non_canonical = [0; 32];
+        non_canonical[0] = 2;
+        assert!(!verify_ed25519_signature(
+            &Ed25519PublicKey::new(non_canonical),
+            message,
+            &signature
+        ));
         // Debug output never prints key material.
         assert_eq!(format!("{identity:?}"), "AuditIdentity([REDACTED])");
         // Seeds from the approved random source are wiped on drop; a failing
@@ -857,6 +866,10 @@ mod tests {
             macos_audit_root(None),
             Err(AuditIdentityError::AuditDirectoryUnavailable)
         ));
+        assert!(matches!(
+            macos_audit_root(Some(OsString::new())),
+            Err(AuditIdentityError::AuditDirectoryUnavailable)
+        ));
 
         let local = absolute_test_path("local/appdata");
         let local_path = PathBuf::from(&local);
@@ -874,6 +887,34 @@ mod tests {
         assert!(matches!(
             windows_audit_root(Some(OsString::from("relative/appdata"))),
             Err(AuditIdentityError::InvalidAuditDirectoryEnv)
+        ));
+    }
+
+    #[test]
+    fn storage_policy_errors_keep_their_operation_category() {
+        assert!(matches!(
+            map_policy_create(SecretFileError::Insecure),
+            AuditIdentityError::AuditIdentityPermissions
+        ));
+        assert!(matches!(
+            map_policy_create(SecretFileError::Platform(io::Error::other("create"))),
+            AuditIdentityError::CreateDirectoryFailed(_)
+        ));
+        assert!(matches!(
+            map_policy_read(SecretFileError::Insecure),
+            AuditIdentityError::AuditIdentityPermissions
+        ));
+        assert!(matches!(
+            map_policy_read(SecretFileError::Platform(io::Error::other("read"))),
+            AuditIdentityError::ReadFailed(_)
+        ));
+        assert!(matches!(
+            map_policy_write(SecretFileError::Insecure),
+            AuditIdentityError::AuditIdentityPermissions
+        ));
+        assert!(matches!(
+            map_policy_write(SecretFileError::Platform(io::Error::other("write"))),
+            AuditIdentityError::WriteFailed(_)
         ));
     }
 

@@ -1068,6 +1068,13 @@ mod tests {
         assert_eq!(ledger.head().sequence(), 1);
         assert_eq!(ledger.head().root(), ledger_root_of(&first));
 
+        // A stale commit cannot be applied at the next chain position.
+        let session = ledger.begin_commit().unwrap();
+        assert!(matches!(
+            session.advance(&first),
+            Err(AuditLedgerError::AuditLedgerConflict)
+        ));
+
         // A second session chains from the new head.
         let session = ledger.begin_commit().unwrap();
         let second = session.commit(&test_commit_input([2; 32])).unwrap();
@@ -1081,6 +1088,29 @@ mod tests {
         let ledger = Ledger::open(&root, &mut OsSecureRandom).unwrap();
         assert_eq!(ledger.head().sequence(), 2);
         assert_eq!(ledger.head().root(), ledger_root_of(&second));
+    }
+
+    #[test]
+    fn owned_commit_session_signs_advances_and_rejects_stale_commits() {
+        let root = test_root();
+        let ledger = Ledger::open(&root, &mut OsSecureRandom).unwrap();
+        let session = ledger.begin_owned_commit().unwrap();
+        let commit = session.commit(&test_commit_input([0x41; 32])).unwrap();
+        assert!(
+            session
+                .ledger
+                .identity()
+                .verify(commit.signing_input().as_slice(), commit.signature())
+        );
+        let ledger = session.advance(&commit).unwrap();
+        assert_eq!(ledger.head().sequence(), 1);
+        assert_eq!(ledger.head().root(), ledger_root_of(&commit));
+
+        let stale = ledger.begin_owned_commit().unwrap();
+        assert!(matches!(
+            stale.advance(&commit),
+            Err(AuditLedgerError::AuditLedgerConflict)
+        ));
     }
 
     #[test]
@@ -1246,6 +1276,12 @@ mod tests {
         drop(session);
         let records = root.join(identity::RECORDS_DIR_NAME);
 
+        // Non-record extensions, non-files and files shorter than a header
+        // are never recovery candidates.
+        write_private_record(&records.join("ignored.txt"), b"not an audit record");
+        fs::create_dir(records.join("directory.controller.yonaudit")).unwrap();
+        write_private_record(&records.join("short.controller.yonaudit"), &[]);
+
         // A truncated record with no footer is not a candidate.
         let truncated = AuditContainerHeader::new(
             AuditRole::Controller,
@@ -1320,16 +1356,25 @@ mod tests {
         // Checksum mismatch.
         let mut bytes = fs::read(&path).unwrap();
         bytes[10] ^= 0xFF;
-        fs::write(&path, &bytes).unwrap();
+        fs::write(&path, bytes).unwrap();
         assert!(matches!(
             Ledger::open(&root, &mut OsSecureRandom),
             Err(AuditLedgerError::AuditLedgerInvalid)
         ));
 
         // Wrong magic.
-        let mut bytes = fs::read(&path).unwrap();
+        let mut bytes = encode_ledger_state(&ledger.head());
         bytes[0] = b'X';
-        fs::write(&path, &bytes).unwrap();
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            Ledger::open(&root, &mut OsSecureRandom),
+            Err(AuditLedgerError::AuditLedgerInvalid)
+        ));
+
+        // Unsupported version.
+        let mut bytes = encode_ledger_state(&ledger.head());
+        bytes[8..10].copy_from_slice(&(LEDGER_STATE_VERSION + 1).to_be_bytes());
+        fs::write(&path, bytes).unwrap();
         assert!(matches!(
             Ledger::open(&root, &mut OsSecureRandom),
             Err(AuditLedgerError::AuditLedgerInvalid)
@@ -1341,6 +1386,50 @@ mod tests {
             Ledger::open(&root, &mut OsSecureRandom),
             Err(AuditLedgerError::AuditLedgerInvalid)
         ));
+    }
+
+    #[test]
+    fn record_digest_verification_covers_boundaries_and_failures() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("digest-input");
+        let bytes = vec![0xA5; RECOVERY_CHUNK + 17];
+        fs::write(&path, &bytes).unwrap();
+
+        let seal_end = RECOVERY_CHUNK;
+        let ledger_end = bytes.len();
+        let expected_sealed = Digest32::new(Sha256::digest(&bytes[..seal_end]).into());
+        let expected_final = Digest32::new(Sha256::digest(&bytes).into());
+        let mut file = File::open(&path).unwrap();
+        assert!(
+            verify_record_digests(
+                &mut file,
+                seal_end,
+                ledger_end,
+                &expected_sealed,
+                &expected_final
+            )
+            .unwrap()
+        );
+
+        let wrong = Digest32::new([0x11; 32]);
+        assert!(
+            !verify_record_digests(&mut file, seal_end, ledger_end, &wrong, &expected_final)
+                .unwrap()
+        );
+        assert!(
+            !verify_record_digests(&mut file, seal_end, ledger_end, &expected_sealed, &wrong)
+                .unwrap()
+        );
+        assert!(
+            !verify_record_digests(
+                &mut file,
+                seal_end,
+                ledger_end + 1,
+                &expected_sealed,
+                &expected_final
+            )
+            .unwrap()
+        );
     }
 
     #[test]

@@ -1957,7 +1957,7 @@ mod tests {
     use crate::audit::observer::AuditObserver;
     use crate::file_semantics::CHUNK_SIZE;
     use yonder_core::OsSecureRandom;
-    use yonder_core::wire::audit::{AuditRole, Digest32};
+    use yonder_core::wire::audit::{AuditCloseReason, AuditRole, Digest32};
     use yonder_net::Keypair;
 
     // ------------------------------------------------------------------
@@ -2333,6 +2333,27 @@ mod tests {
     #[tokio::test]
     async fn audited_transfer_end_records_every_terminal_outcome() {
         let (controller, host, _controller_dir, _host_dir) = establish_audit_pair().await;
+        record_transfer_end(
+            Some(controller.as_ref()),
+            FILE_DIRECTION_UPLOAD,
+            &TransferAuditFacts::default(),
+            TransferOutcome::Cancelled,
+        )
+        .await;
+        let incomplete = TransferAuditFacts {
+            started: true,
+            remote_path: Some("remote/path".to_owned()),
+            ..TransferAuditFacts::default()
+        };
+        record_transfer_end(
+            Some(controller.as_ref()),
+            FILE_DIRECTION_UPLOAD,
+            &incomplete,
+            TransferOutcome::Cancelled,
+        )
+        .await;
+        assert!(!controller.has_failed().await);
+
         let facts = TransferAuditFacts {
             started: true,
             remote_path: Some("remote/path".to_owned()),
@@ -2358,6 +2379,112 @@ mod tests {
             assert!(!controller.has_failed().await);
             assert!(!host.has_failed().await);
         }
+    }
+
+    #[tokio::test]
+    async fn every_transfer_role_aborts_before_file_effects_when_audit_has_failed() {
+        let config = test_config();
+        let base = BaseDirectory::capture().unwrap();
+        let cancel = AtomicBool::new(false);
+        let (audit, peer_audit, _audit_dir, _peer_audit_dir) = establish_audit_pair().await;
+        audit
+            .fail_closed(None, AuditCloseReason::AuditFailure)
+            .await;
+        assert!(audit.has_failed().await);
+
+        let upload_dir = tempdir().unwrap();
+        let upload_destination = path_string(&upload_dir.path().join("host-target.bin"));
+        let upload_open = FileTransferMessage::UploadOpen {
+            destination: &upload_destination,
+            file_name: "source.bin",
+            declared_size: 1,
+        };
+        let (mut host_upload, _controller_upload) = duplex(64 * 1024);
+        assert_eq!(
+            handle_upload_from_open(
+                &mut host_upload,
+                &config,
+                &base,
+                &cancel,
+                &upload_open,
+                Some(audit.as_ref()),
+            )
+            .await,
+            TransferOutcome::Cancelled
+        );
+        assert!(!upload_dir.path().join("host-target.bin").exists());
+
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("source.bin");
+        write_pattern_file(&source_path, 1);
+        let source_name = path_string(&source_path);
+        let download_open = FileTransferMessage::DownloadOpen {
+            source: &source_name,
+        };
+        let (mut host_download, _controller_download) = duplex(64 * 1024);
+        assert_eq!(
+            handle_download_from_open(
+                &mut host_download,
+                &config,
+                &base,
+                &cancel,
+                &download_open,
+                Some(audit.as_ref()),
+            )
+            .await,
+            TransferOutcome::Cancelled
+        );
+
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let (mut controller_upload, _host_upload) = duplex(64 * 1024);
+        assert_eq!(
+            run_upload_audited(
+                &mut controller_upload,
+                &config,
+                &mut source,
+                "remote.bin",
+                "source.bin",
+                &cancel,
+                Some(audit.as_ref()),
+            )
+            .await,
+            TransferOutcome::Cancelled
+        );
+        assert_eq!(source.bytes_read(), 0);
+
+        let target_dir = tempdir().unwrap();
+        let target_path = path_string(&target_dir.path().join("download.bin"));
+        let (mut controller_download, host_download) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            host_download,
+            TransferDirection::Download,
+            TransferSide::Host,
+        );
+        let (outcome, ()) = tokio::join!(
+            run_download_audited(
+                &mut controller_download,
+                &config,
+                &base,
+                "remote/source.bin",
+                Some(&target_path),
+                &cancel,
+                Some(audit.as_ref()),
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::DownloadOffer {
+                    file_name: "source.bin",
+                    declared_size: 1,
+                })
+                .await;
+            },
+        );
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        assert!(!target_dir.path().join("download.bin").exists());
+        drop(peer_audit);
     }
 
     #[tokio::test]
@@ -4913,6 +5040,16 @@ mod tests {
             .await
             .expect_err("the injected write failure must surface");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+        let source = "x".repeat(yonder_core::wire::file_transfer::MAX_PATH_LEN + 1);
+        let (mut stream, _peer) = duplex(64 * 1024);
+        let error = write_frame_raw(
+            &mut stream,
+            &FileTransferMessage::DownloadOpen { source: &source },
+        )
+        .await
+        .expect_err("an oversized control field must fail before writing");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
