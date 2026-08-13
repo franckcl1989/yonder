@@ -133,7 +133,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
     use tokio::sync::{Notify, mpsc};
@@ -4145,11 +4145,9 @@ mod tests {
                 runtime.block_on(async {
                     let local = tokio::task::LocalSet::new();
                     let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-                    let stage = Arc::new(Mutex::new("starting"));
+                    let stage = Arc::new(Mutex::new(("starting", Instant::now())));
                     let scenario_stage = Arc::clone(&stage);
-                    let result = tokio::time::timeout(
-                        ENTERPRISE_HOST_CASE_TIMEOUT,
-                        local.run_until(async move {
+                    let scenario = local.run_until(async move {
                             const EXIT_CODE: u32 = 7;
                             const OUTPUT: &[u8] = b"scripted-host-output";
                             const INPUT: &[u8] = b"scripted-controller-input";
@@ -4209,7 +4207,7 @@ mod tests {
                             let mut pake = OpaquePake;
                             let (advertised, code) =
                                 create_advertisement(locator, &target, &mut pake).unwrap();
-                            *scenario_stage.lock().unwrap() = "host-advertised";
+                            *scenario_stage.lock().unwrap() = ("host-advertised", Instant::now());
 
                             let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
                             let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
@@ -4239,7 +4237,7 @@ mod tests {
                             let controller_stage = Arc::clone(&scenario_stage);
                             let controller = tokio::task::spawn_local(async move {
                                 let mark = |next| {
-                                    *controller_stage.lock().unwrap() = next;
+                                    *controller_stage.lock().unwrap() = (next, Instant::now());
                                 };
                                 let mut controller =
                                     ScriptedController::connect(&relay_address).await;
@@ -4831,7 +4829,7 @@ mod tests {
                             controller
                                 .await
                                 .expect("the scripted controller must finish");
-                            *scenario_stage.lock().unwrap() = "controller-joined";
+                            *scenario_stage.lock().unwrap() = ("controller-joined", Instant::now());
                             if matches!(
                                 ending,
                                 EnterpriseControllerEnding::Complete
@@ -4869,15 +4867,20 @@ mod tests {
                             }
 
                             relay.stop().await;
-                            *scenario_stage.lock().unwrap() = "relay-stopped";
-                        }),
-                    )
-                    .await;
-                    if result.is_err() {
-                        panic!(
-                            "the in-process happy path must finish (last stage: {})",
-                            *stage.lock().unwrap()
-                        );
+                            *scenario_stage.lock().unwrap() = ("relay-stopped", Instant::now());
+                        });
+                    tokio::pin!(scenario);
+                    loop {
+                        tokio::select! {
+                            () = &mut scenario => break,
+                            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                                let (name, changed_at) = *stage.lock().unwrap();
+                                assert!(
+                                    changed_at.elapsed() < ENTERPRISE_HOST_CASE_TIMEOUT,
+                                    "the in-process happy path made no progress for {ENTERPRISE_HOST_CASE_TIMEOUT:?} (last stage: {name})"
+                                );
+                            }
+                        }
                     }
                 });
             })
@@ -6894,6 +6897,25 @@ async fn file_substream_coordinator<S>(
     let mut busy_reply: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
     loop {
         tokio::select! {
+            // A completed serving future must release its role before an
+            // already-ready next substream is classified. Without this
+            // priority, `select!` can randomly retain a completed active or
+            // busy slot and reject/drop a truly sequential transfer.
+            biased;
+            _ = async {
+                if let Some(future) = active.as_mut() {
+                    future.await;
+                }
+            }, if active.is_some() => {
+                active = None;
+            }
+            _ = async {
+                if let Some(future) = busy_reply.as_mut() {
+                    future.await;
+                }
+            }, if busy_reply.is_some() => {
+                busy_reply = None;
+            }
             stream = pending.recv() => {
                 match stream {
                     None => {
@@ -6932,20 +6954,6 @@ async fn file_substream_coordinator<S>(
                         // dropped.
                     }
                 }
-            }
-            _ = async {
-                if let Some(future) = active.as_mut() {
-                    future.await;
-                }
-            }, if active.is_some() => {
-                active = None;
-            }
-            _ = async {
-                if let Some(future) = busy_reply.as_mut() {
-                    future.await;
-                }
-            }, if busy_reply.is_some() => {
-                busy_reply = None;
             }
         }
     }
