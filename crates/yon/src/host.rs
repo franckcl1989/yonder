@@ -2738,11 +2738,9 @@ mod tests {
             let second_destination = &second_destination;
             async move {
                 first_done.notified().await;
-                // Let the coordinator observe the completed serve future and
-                // free the active slot before the next substream arrives.
-                for _ in 0..16 {
-                    tokio::task::yield_now().await;
-                }
+                // Deliver the next substream immediately after the first
+                // peer observes EOF. The coordinator must reap a completed
+                // active future before classifying this stream as busy.
                 let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
                 sender.try_send(host_second).unwrap();
                 send_wire_frame(
@@ -4566,6 +4564,7 @@ mod tests {
                                     ),
                                 )
                                 .await;
+                                mark("download-open-sent");
                                 let offer = drive_test_node(
                                     &mut controller.node,
                                     read_wire_frame(&mut file),
