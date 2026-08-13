@@ -523,6 +523,23 @@ pub async fn handle_upload_from_open(
     open: &FileTransferMessage<'_>,
     audit: Option<&AuditObserver>,
 ) -> TransferOutcome {
+    handle_upload_from_open_with_settlement(stream, config, base, cancel, open, audit, None).await
+}
+
+/// The session-coordinator variant of [`handle_upload_from_open`]. Once the
+/// upload leaves its wire state machine, `wire_settled` is published before
+/// the local audit end record is appended. This lets the bounded coordinator
+/// distinguish a truly concurrent substream from the next sequential
+/// transfer without weakening audit ordering or adding a protocol frame.
+pub(crate) async fn handle_upload_from_open_with_settlement(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    open: &FileTransferMessage<'_>,
+    audit: Option<&AuditObserver>,
+    wire_settled: Option<&AtomicBool>,
+) -> TransferOutcome {
     let started = Instant::now();
     tracing::debug!(
         direction = ?TransferDirection::Upload,
@@ -584,6 +601,9 @@ pub async fn handle_upload_from_open(
         &mut facts,
     )
     .await;
+    if let Some(wire_settled) = wire_settled {
+        wire_settled.store(true, Ordering::Release);
+    }
     record_transfer_end(audit, FILE_DIRECTION_UPLOAD, &facts, outcome).await;
     tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
     outcome
@@ -606,6 +626,21 @@ pub async fn handle_download_from_open(
     cancel: &AtomicBool,
     open: &FileTransferMessage<'_>,
     audit: Option<&AuditObserver>,
+) -> TransferOutcome {
+    handle_download_from_open_with_settlement(stream, config, base, cancel, open, audit, None).await
+}
+
+/// The session-coordinator variant of [`handle_download_from_open`]. See
+/// [`handle_upload_from_open_with_settlement`] for the bounded sequential
+/// hand-off invariant.
+pub(crate) async fn handle_download_from_open_with_settlement(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    open: &FileTransferMessage<'_>,
+    audit: Option<&AuditObserver>,
+    wire_settled: Option<&AtomicBool>,
 ) -> TransferOutcome {
     let started = Instant::now();
     tracing::debug!(
@@ -642,6 +677,9 @@ pub async fn handle_download_from_open(
         &mut facts,
     )
     .await;
+    if let Some(wire_settled) = wire_settled {
+        wire_settled.store(true, Ordering::Release);
+    }
     record_transfer_end(audit, FILE_DIRECTION_DOWNLOAD, &facts, outcome).await;
     tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
     outcome
@@ -2502,6 +2540,7 @@ mod tests {
         let (controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
             establish_audit_pair().await;
         let (mut controller_stream, mut host_stream) = duplex(64 * 1024);
+        let upload_wire_settled = AtomicBool::new(false);
         let (controller_outcome, host_outcome) = tokio::join!(
             run_upload_audited(
                 &mut controller_stream,
@@ -2535,13 +2574,14 @@ mod tests {
                     file_name: &file_name,
                     declared_size,
                 };
-                handle_upload_from_open(
+                handle_upload_from_open_with_settlement(
                     &mut host_stream,
                     &config,
                     &base,
                     &cancel,
                     &open,
                     Some(host_audit.as_ref()),
+                    Some(&upload_wire_settled),
                 )
                 .await
             },
@@ -2551,6 +2591,10 @@ mod tests {
             TransferOutcome::Committed { bytes: 4097 }
         );
         assert_eq!(host_outcome, controller_outcome);
+        assert!(
+            upload_wire_settled.load(Ordering::Acquire),
+            "the coordinator must observe the upload wire terminal state"
+        );
         assert_eq!(
             fs::read(&upload_destination).unwrap(),
             fs::read(&upload_source_path).unwrap()
@@ -2567,6 +2611,7 @@ mod tests {
         let (controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
             establish_audit_pair().await;
         let (mut controller_stream, mut host_stream) = duplex(64 * 1024);
+        let download_wire_settled = AtomicBool::new(false);
         let (controller_outcome, host_outcome) = tokio::join!(
             run_download_audited(
                 &mut controller_stream,
@@ -2591,13 +2636,14 @@ mod tests {
                     panic!("expected download open");
                 };
                 let open = FileTransferMessage::DownloadOpen { source: &source };
-                handle_download_from_open(
+                handle_download_from_open_with_settlement(
                     &mut host_stream,
                     &config,
                     &base,
                     &cancel,
                     &open,
                     Some(host_audit.as_ref()),
+                    Some(&download_wire_settled),
                 )
                 .await
             },
@@ -2607,6 +2653,10 @@ mod tests {
             TransferOutcome::Committed { bytes: 8193 }
         );
         assert_eq!(host_outcome, controller_outcome);
+        assert!(
+            download_wire_settled.load(Ordering::Acquire),
+            "the coordinator must observe the download wire terminal state"
+        );
         assert_eq!(
             fs::read(&download_target).unwrap(),
             fs::read(&download_source_path).unwrap()
@@ -4827,6 +4877,7 @@ mod tests {
             TransferSide::Controller,
         );
         let cancel = AtomicBool::new(false);
+        let wire_settled = AtomicBool::new(false);
         let destination = path_string(&final_path);
         let open = FileTransferMessage::UploadOpen {
             destination: &destination,
@@ -4834,7 +4885,15 @@ mod tests {
             declared_size: bytes.len() as u64,
         };
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload_from_open(&mut host_half, &config, &base, &cancel, &open, None),
+            handle_upload_from_open_with_settlement(
+                &mut host_half,
+                &config,
+                &base,
+                &cancel,
+                &open,
+                None,
+                Some(&wire_settled),
+            ),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -4847,6 +4906,7 @@ mod tests {
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::DestinationExists);
         assert_eq!(host_outcome, expected);
+        assert!(wire_settled.load(Ordering::Acquire));
         assert_eq!(
             error_message,
             OwnedMessage::Error {
@@ -4876,15 +4936,25 @@ mod tests {
             .send(&FileTransferMessage::DownloadOpen { source: "consumed" })
             .unwrap();
         let cancel = AtomicBool::new(false);
+        let wire_settled = AtomicBool::new(false);
         let open = FileTransferMessage::DownloadOpen {
             source: &source_string,
         };
         let (host_outcome, error_message) = tokio::join!(
-            handle_download_from_open(&mut host_half, &config, &base, &cancel, &open, None),
+            handle_download_from_open_with_settlement(
+                &mut host_half,
+                &config,
+                &base,
+                &cancel,
+                &open,
+                None,
+                Some(&wire_settled),
+            ),
             async { peer.read_control().await },
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::SourceNotFound);
         assert_eq!(host_outcome, expected);
+        assert!(wire_settled.load(Ordering::Acquire));
         assert_eq!(
             error_message,
             OwnedMessage::Error {

@@ -34,7 +34,7 @@
 | R-030 | 企业回调只开放两个 HTTPS GET 路径且无敏感日志 | yon-relay callback | 固定 path/state/code | TLS loopback、404/400/405、no-store、泄露负断言 |
 | R-031 | 企业 secret 和审计文件跨平台强制保护 | `SecretFilePolicy` + audit store | Unix 0700/0600；Windows protected DACL | Unix mode/owner/symlink、Windows owner/ACE 正反原生测试 |
 | R-032 | controller 提示/选择 provider、先显示 URL、浏览器打开失败可继续 | yon enterprise UI | Providers/Select/Authenticate | 单/双 provider、非 TTY、open 失败、心跳与零污染测试 |
-| R-033 | 活动交互会话原生单文件上传/下载 | yon file actor | `/yonder/file-transfer/2.0.0` | 上传/下载 E2E、错误/取消不结束终端、新旧互操作 |
+| R-033 | 活动交互会话原生单文件上传/下载 | yon file actor | `/yonder/file-transfer/2.0.0` | 上传/下载 E2E、错误/取消不结束终端、终态后有界顺序交接、真实并发 Busy、新旧互操作 |
 | R-034 | 文件流式 64 KiB、SHA-256、安全临时文件和 no-replace | `FileTransferBackend` | Open/Data/Finish/Committed | 多块/空文件、竞态、symlink、源变化、磁盘/权限故障 |
 | R-035 | 本地控制命名空间跨平台一致且非交互字节透明 | terminal frontend | `Ctrl+] u/d/?/./Ctrl+]` | 跨块状态属性测试、PTY/ConPTY 原生 E2E、未知选择器 |
 | R-036 | 仅企业会话强制双端审计，普通会话零审计副作用 | yon audit/session | `/yonder/audit/2.0.0` | 普通回归、企业握手/旧端拒绝、目录缺失/不可写失败关闭 |

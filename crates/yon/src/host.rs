@@ -18,7 +18,10 @@ use crate::terminal::{
     PortablePtyBackend, PtyEventKind, TerminalBackend, TerminalError, TerminalInput,
     TerminalSession,
 };
-use crate::transfer::{TransferConfig, handle_download_from_open, handle_upload_from_open};
+use crate::transfer::{
+    TransferConfig, handle_download_from_open_with_settlement,
+    handle_upload_from_open_with_settlement,
+};
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::future::Future;
@@ -98,9 +101,10 @@ pub enum HostStage {
 mod tests {
     use super::{
         EXCHANGE_TIMEOUT, FILE_SUBSTREAM_QUEUE, FileOpenError, FileOpenFrame, HostConfig,
-        HostError, HostStage, OpaquePake, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair, binding_event,
-        classify_file_open_io, complete_terminal_exit_io, copy_controller_input,
-        copy_terminal_output, create_advertisement, file_substream_coordinator, host_error_event,
+        HostError, HostStage, IncomingFileDisposition, OpaquePake, PRE_AUTH_QUIESCENCE_TIMEOUT,
+        PendingPair, binding_event, classify_file_open_io, complete_terminal_exit_io,
+        copy_controller_input, copy_terminal_output, create_advertisement,
+        file_substream_coordinator, file_substream_disposition, host_error_event,
         read_auth_hello_io, read_file_open_frame, read_terminal_hello_io,
         report_connection_code_to, report_replacement_notice_to, retryable_relay_error, run_host,
         run_host_with, run_host_with_progress, send_auth_retry_io, send_busy_reply,
@@ -2683,9 +2687,16 @@ mod tests {
         let directory = tempdir().unwrap();
         let base = Some(BaseDirectory::capture().unwrap());
         let cancel = Arc::new(AtomicBool::new(false));
+        let (_controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
+            establish_audit_pair().await;
         let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
-        let coordinator =
-            file_substream_coordinator(receiver, base.as_ref(), cancel, &config, None);
+        let coordinator = file_substream_coordinator(
+            receiver,
+            base.as_ref(),
+            cancel,
+            &config,
+            Some(host_audit.as_ref()),
+        );
 
         let first_bytes = patterned_bytes(64 * 1024, 5);
         let second_bytes = patterned_bytes(64 * 1024, 7);
@@ -2723,13 +2734,16 @@ mod tests {
                 )
                 .await;
                 expect_wire_control(&mut peer_first, &FileTransferMessage::Committed).await;
+                // `Committed` is the wire terminal point. Let the next
+                // operation start before this substream reaches EOF, while
+                // the host is still appending its local audit end record.
+                first_done.notify_one();
                 let mut trailing = [0_u8; 1];
                 assert_eq!(
                     peer_first.read(&mut trailing).await.unwrap(),
                     0,
                     "the first substream must be closed by the host"
                 );
-                first_done.notify_one();
             }
         };
         let second = {
@@ -2739,8 +2753,8 @@ mod tests {
             async move {
                 first_done.notified().await;
                 // Deliver the next substream immediately after the first
-                // peer observes EOF. The coordinator must reap a completed
-                // active future before classifying this stream as busy.
+                // peer observes its terminal frame. The coordinator must
+                // defer it until the prior local audit append completes.
                 let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
                 sender.try_send(host_second).unwrap();
                 send_wire_frame(
@@ -2773,6 +2787,34 @@ mod tests {
         .expect("coordinator slot reuse deadlocked");
         assert_eq!(fs::read(&first_path).unwrap(), first_bytes);
         assert_eq!(fs::read(&second_path).unwrap(), second_bytes);
+    }
+
+    #[test]
+    fn coordinator_defers_only_a_wire_settled_active_handoff() {
+        assert_eq!(
+            file_substream_disposition(false, false, false),
+            IncomingFileDisposition::Active
+        );
+        assert_eq!(
+            file_substream_disposition(true, false, false),
+            IncomingFileDisposition::Busy
+        );
+        assert_eq!(
+            file_substream_disposition(true, true, false),
+            IncomingFileDisposition::Deferred
+        );
+        assert_eq!(
+            file_substream_disposition(true, false, true),
+            IncomingFileDisposition::Drop
+        );
+        assert_eq!(
+            file_substream_disposition(false, false, true),
+            IncomingFileDisposition::Deferred
+        );
+        assert_eq!(
+            file_substream_disposition(true, true, true),
+            IncomingFileDisposition::Deferred
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6666,6 +6708,40 @@ enum FileSubstreamRole {
     Busy,
 }
 
+#[derive(Clone, Copy)]
+struct FileSubstreamDispatch<'a> {
+    role: FileSubstreamRole,
+    wire_settled: Option<&'a AtomicBool>,
+}
+
+/// The bounded coordinator decision for one newly opened file substream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingFileDisposition {
+    Active,
+    Busy,
+    /// The prior transfer has left its wire state machine or an earlier Busy
+    /// response is still closing. One explicit local slot retains this
+    /// substream until both serving roles are free.
+    Deferred,
+    Drop,
+}
+
+fn file_substream_disposition(
+    active: bool,
+    active_wire_settled: bool,
+    busy_reply: bool,
+) -> IncomingFileDisposition {
+    if !active && !busy_reply {
+        IncomingFileDisposition::Active
+    } else if active && active_wire_settled || !active && busy_reply {
+        IncomingFileDisposition::Deferred
+    } else if active && !busy_reply {
+        IncomingFileDisposition::Busy
+    } else {
+        IncomingFileDisposition::Drop
+    }
+}
+
 /// The bounded, zero-side-effect result of the first-frame read of a file
 /// substream (design 9.3: an EOF before any byte is a capability probe).
 #[derive(Debug, PartialEq, Eq)]
@@ -6802,11 +6878,33 @@ fn classify_file_open_io(error: std::io::Error) -> FileOpenError {
 /// failure only terminates the current substream and the remote terminal
 /// stays Active (design 17.2).
 async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+    stream: S,
     base: Option<&BaseDirectory>,
     cancel: Arc<AtomicBool>,
     config: &TransferConfig,
     role: FileSubstreamRole,
+    audit: Option<&AuditObserver>,
+) {
+    serve_one_file_substream_with_settlement(
+        stream,
+        base,
+        cancel,
+        config,
+        FileSubstreamDispatch {
+            role,
+            wire_settled: None,
+        },
+        audit,
+    )
+    .await;
+}
+
+async fn serve_one_file_substream_with_settlement<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    base: Option<&BaseDirectory>,
+    cancel: Arc<AtomicBool>,
+    config: &TransferConfig,
+    dispatch: FileSubstreamDispatch<'_>,
     audit: Option<&AuditObserver>,
 ) {
     match read_file_open_frame(&mut stream, config.control_timeout).await {
@@ -6819,7 +6917,7 @@ async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
             destination,
             file_name,
             declared_size,
-        }) if role == FileSubstreamRole::Active => {
+        }) if dispatch.role == FileSubstreamRole::Active => {
             let Some(base) = base else {
                 // The session base directory is unavailable; the request
                 // cannot be resolved and the substream closes without
@@ -6831,9 +6929,18 @@ async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
                 file_name: &file_name,
                 declared_size,
             };
-            handle_upload_from_open(&mut stream, config, base, &cancel, &open, audit).await;
+            handle_upload_from_open_with_settlement(
+                &mut stream,
+                config,
+                base,
+                &cancel,
+                &open,
+                audit,
+                dispatch.wire_settled,
+            )
+            .await;
         }
-        Ok(FileOpenFrame::Download { source }) if role == FileSubstreamRole::Active => {
+        Ok(FileOpenFrame::Download { source }) if dispatch.role == FileSubstreamRole::Active => {
             let Some(base) = base else {
                 // The session base directory is unavailable; the request
                 // cannot be resolved and the substream closes without
@@ -6841,7 +6948,16 @@ async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
                 return;
             };
             let open = FileTransferMessage::DownloadOpen { source: &source };
-            handle_download_from_open(&mut stream, config, base, &cancel, &open, audit).await;
+            handle_download_from_open_with_settlement(
+                &mut stream,
+                config,
+                base,
+                &cancel,
+                &open,
+                audit,
+                dispatch.wire_settled,
+            )
+            .await;
         }
         Ok(_) => {
             // Another file operation is active: answer the opening frame
@@ -6893,9 +7009,33 @@ async fn file_substream_coordinator<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let active_wire_settled = AtomicBool::new(false);
     let mut active: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
     let mut busy_reply: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
+    let mut deferred: Option<S> = None;
+    let mut pending_closed = false;
     loop {
+        if active.is_none()
+            && busy_reply.is_none()
+            && let Some(stream) = deferred.take()
+        {
+            active_wire_settled.store(false, Ordering::Relaxed);
+            active = Some(Box::pin(serve_one_file_substream_with_settlement(
+                stream,
+                base,
+                cancel.clone(),
+                config,
+                FileSubstreamDispatch {
+                    role: FileSubstreamRole::Active,
+                    wire_settled: Some(&active_wire_settled),
+                },
+                audit,
+            )));
+            continue;
+        }
+        if pending_closed && active.is_none() && busy_reply.is_none() {
+            return;
+        }
         tokio::select! {
             // A completed serving future must release its role before an
             // already-ready next substream is classified. Without this
@@ -6916,42 +7056,51 @@ async fn file_substream_coordinator<S>(
             }, if busy_reply.is_some() => {
                 busy_reply = None;
             }
-            stream = pending.recv() => {
+            stream = pending.recv(), if !pending_closed && deferred.is_none() => {
                 match stream {
                     None => {
                         // The queue is closed (the bridge dropped the
-                        // sender at session teardown): finish any in-flight
-                        // work, then end.
-                        if active.is_none() && busy_reply.is_none() {
-                            return;
-                        }
+                        // sender at session teardown). Disable this always-
+                        // ready branch, finish in-flight work, then end.
+                        pending_closed = true;
                     }
                     Some(stream) => {
-                        if active.is_none() && busy_reply.is_none() {
-                            active = Some(Box::pin(serve_one_file_substream(
-                                stream,
-                                base,
-                                cancel.clone(),
-                                config,
-                                FileSubstreamRole::Active,
-                                audit,
-                            )
-                        ));
-                        } else if busy_reply.is_none() {
-                            // A transfer is active: answer this opening
-                            // with `Error(Busy)` (design 15.3).
-                            busy_reply = Some(Box::pin(serve_one_file_substream(
-                                stream,
-                                base,
-                                cancel.clone(),
-                                config,
-                                FileSubstreamRole::Busy,
-                                audit,
-                            )
-                        ));
+                        match file_substream_disposition(
+                            active.is_some(),
+                            active_wire_settled.load(Ordering::Acquire),
+                            busy_reply.is_some(),
+                        ) {
+                            IncomingFileDisposition::Active => {
+                                active_wire_settled.store(false, Ordering::Relaxed);
+                                active = Some(Box::pin(serve_one_file_substream_with_settlement(
+                                    stream,
+                                    base,
+                                    cancel.clone(),
+                                    config,
+                                    FileSubstreamDispatch {
+                                        role: FileSubstreamRole::Active,
+                                        wire_settled: Some(&active_wire_settled),
+                                    },
+                                    audit,
+                                )));
+                            }
+                            IncomingFileDisposition::Busy => {
+                                // A transfer is active: answer this opening
+                                // with `Error(Busy)` (design 15.3).
+                                busy_reply = Some(Box::pin(serve_one_file_substream(
+                                    stream,
+                                    base,
+                                    cancel.clone(),
+                                    config,
+                                    FileSubstreamRole::Busy,
+                                    audit,
+                                )));
+                            }
+                            IncomingFileDisposition::Deferred => {
+                                deferred = Some(stream);
+                            }
+                            IncomingFileDisposition::Drop => {}
                         }
-                        // Else both slots are occupied; the substream is
-                        // dropped.
                     }
                 }
             }

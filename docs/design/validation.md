@@ -1,6 +1,6 @@
 # 实现验证记录
 
-更新日期：2026-08-12。当前开发环境为 Windows x86_64；Linux 原生验证使用 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
+更新日期：2026-08-13。当前开发环境为 Windows x86_64；Linux 原生验证使用 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
 
 ## 0.2.0 当前证据
 
@@ -40,6 +40,14 @@
 正式候选前仍必须完成：五目标独立覆盖率、其余五个发布目标的原生构建与静态链接检查及 MSRV、四个 fuzz target 各 `30min`；Rocky Linux 真机的文件传输、双端审计和长时间资源稳定性；macOS Intel/Apple Silicon 及 Windows ARM64 的原生终端、文件和审计路径；最终六平台单文件归档、SBOM、许可证清单、checksum 和 provenance。
 
 - 手动 CI 运行 `31598541805` 对提交 `633eb572d384911b69aa4f5d9e8bdb7a959d71aa` 证明 ASan 与 TSan 均通过，确认 sanitizer 专用 `1 GiB` 有界 RSS 预算修复了插桩开销误触发，同时不改变 release 的 endpoint `96 MiB` / relay `64 MiB` 产品上限。该运行的五目标覆盖率、六目标 MSRV、Miri、供应链与 fuzz smoke 全部通过；普通全量测试则暴露了两处测试端 endpoint 驱动缺口。Ubuntu 的 enterprise controller 夹具在发送首屏输出、回显、关闭子流和等待脚本时没有持续轮询 scripted host swarm，因而可能在看似可立即完成的小 I/O 上互等；Windows 的 enterprise host 夹具在打开定位查询子流和重试等待时也没有持续轮询 scripted controller endpoint。两条路径现均统一复用现有 `drive_drained` / `drive_test_node` 驱动抽象，Windows 复杂 host 场景另增加细粒度阶段记录，并把仅包围完整 relay、认证、终端、双向文件传输和双端审计串联流程的夹具聚合上限从 `120s` 调整为 `300s`；每个产品协议步骤仍保留自身的短绝对期限，产品网络与 I/O 超时未改变。修复后的 Windows 本机 `yon --lib` 完整并发套件为 `653 passed / 0 failed / 2 ignored`、耗时 `399.17s`，Ubuntu 对应原失败场景连续多轮约 `9-12s` 完成，Clippy 零警告；最终提交仍须重新执行完整 CI 和候选门禁。
+
+- 手动 CI 运行 `31658622446` 对提交 `d467d85f5ff0642bfb6e8ac1910439ecbb010a24` 完成 `23/24` 项：五个独立 coverage、六目标 MSRV、Miri、ASan/TSan、供应链、四个 fuzz smoke、Linux/macOS 普通测试均通过，唯一失败是 Windows 普通测试中的完整 enterprise host 场景在 `download-stream-opened` 阶段触发测试聚合看门。该结果与同提交 Windows coverage 已完整通过相互约束，排除了稳定的产品下载协议失败；测试夹具随后增加阶段诊断并把只包围整条多协议串联场景的聚合上限调整为 `300s`，每个产品认证、终端、文件和审计步骤的绝对期限均未放宽。
+
+- 手动 CI 运行 `31661113996` 对提交 `687a29692e909213584bab0683aca5a3bf85fb1a` 完成 `22/24` 项：三平台普通测试、Linux/macOS 四个 coverage、六目标 MSRV、Miri、TSan、供应链和四个 fuzz smoke 均通过。ASan 没有产生内存安全、泄漏或越界报告，唯一失败仍是 controller 完整 enterprise 测试外层遗留的 `60s` 测试专用看门；该看门已统一到 `300s` 聚合预算，产品期限不变。Windows coverage 的唯一失败是 `end_to_end` 同一测试进程并行运行多个真实 relay、host、controller、TCP/UDP listener 和 PTY/ConPTY 场景时，插桩开销与端口竞争使三进程终端会话在产品期限内未被调度完成；当前测试二进制用标准库互斥量只串行化这些外部进程场景，场景内部的网络、终端与协议并发完全保留。修正后的聚焦真实三进程回归在 Windows 以 `16.64s` 完成，目标测试 Clippy 零警告；最终结论仍以提交 `0ffaf2d1af0722169f089fb31b37334cf3a31876` 的完整 CI 和候选门禁为准。
+
+- 手动 CI 运行 `31663992005` 对提交 `0ffaf2d1af0722169f089fb31b37334cf3a31876` 完成 `23/24` 项：Windows 普通测试及其余全部平台、覆盖率、MSRV、Miri、sanitizer、供应链和 fuzz smoke 均通过，唯一失败为 Windows coverage 的完整 enterprise host 成功场景连续 `300s` 没有越过 `download-open-sent`。手动 CI 运行 `31666312553` 对提交 `ef7b828ead2d3392659d5322b2f9cdaa06fc01ca` 完成 `22/24` 项；Windows 普通测试的成功场景与 Windows coverage 的不完整审计终结场景均停在同一个 `download-open-sent`，其余 `22` 项通过。两种构建、两个不同结尾场景在同一精确阶段复现，证明问题不是总测试时长或单一 coverage 调度噪声，而是成功上传返回终态后立即打开下载时的产品交接边界。
+
+- 文件协议的 `Committed`/`Error`/关闭是对端可观察的线协议终态，但 host 过去要等本地审计结束记录追加完成后才释放活动槽；controller 在终态后合法立即打开下一条文件子流时，host 因而可能把顺序操作误判为并发 `Busy`。当前协调器在传输离开线状态机、进入本地审计收尾前发布单 owner 交接状态，将恰好一条已到达的下一子流保存在容量 `1` 的显式本地槽中，审计完成后再启动；真实并发仍返回 `Busy`，第三条仍受既有有界入口约束。该修复没有新增依赖、协议帧、堆分配、产品超时或队列容量，同时在入口通道关闭时禁用其永久就绪分支，避免活动收尾期间空转。Windows 本机精确协调器回归在真实审计写入下于第一笔 `Committed` 后、EOF 前提交第二笔并以 `3 passed / 0 failed` 完成；双向传输审计回归 `1 passed / 0 failed`，上传目标已存在与下载源不存在的两种 `Error` 终态也分别验证交接状态；九个完整 enterprise host 场景在同一测试进程串行执行为 `9 passed / 0 failed`、耗时 `140.02s`，包括上述两个 CI 原失败场景；`yon --lib` 全量单线程原生复验为 `654 passed / 0 failed / 2 ignored`、耗时 `1668.47s`，两项 ignored 均为既有独立候选门禁。最终提交仍须重新执行完整 CI 和候选门禁。
 
 ## v0.1.1 发布基线历史证据
 
