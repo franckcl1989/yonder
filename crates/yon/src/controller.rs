@@ -8438,7 +8438,7 @@ mod tests {
         let hello = drive_drained(driver, read_terminal_hello(&mut control)).await;
         assert_eq!(hello.size(), TerminalSize::new(80, 24).unwrap());
         if ending == HostEnding::StallHandshake {
-            tokio::time::sleep(Duration::from_secs(12)).await;
+            drive_drained(driver, tokio::time::sleep(Duration::from_secs(12))).await;
             return;
         }
         let mut audit = match audit_incoming {
@@ -8487,11 +8487,14 @@ mod tests {
                 .await
                 .unwrap();
         }
-        data_write
-            .write_all(script.output.as_slice())
-            .await
-            .unwrap();
-        data_write.flush().await.unwrap();
+        drive_drained(driver, async {
+            data_write
+                .write_all(script.output.as_slice())
+                .await
+                .unwrap();
+            data_write.flush().await.unwrap();
+        })
+        .await;
         if let Some(audit) = audit.as_ref() {
             drive_drained(
                 driver,
@@ -8539,8 +8542,8 @@ mod tests {
         }
         match ending {
             HostEnding::CloseDataSilently => {
-                let _ = data_write.shutdown().await;
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                let _ = drive_drained(driver, data_write.shutdown()).await;
+                drive_drained(driver, tokio::time::sleep(Duration::from_secs(6))).await;
                 return;
             }
             // The stall keeps the session Active while the scenario drives
@@ -8584,11 +8587,14 @@ mod tests {
                     };
                     if read == 0 {
                         if ending == HostEnding::ControllerDisplayFailure {
-                            audit
-                                .as_ref()
-                                .unwrap()
-                                .close_interrupted(AuditCloseReason::ConnectionLost)
-                                .await;
+                            drive_drained(
+                                driver,
+                                audit
+                                    .as_ref()
+                                    .unwrap()
+                                    .close_interrupted(AuditCloseReason::ConnectionLost),
+                            )
+                            .await;
                             return;
                         }
                         if matches!(ending, HostEnding::Stall) {
@@ -8608,8 +8614,10 @@ mod tests {
                     }
                     // The scripted host echoes the typed bytes back without
                     // a PTY.
-                    data_write.write_all(&data_buffer[..read]).await.unwrap();
-                    data_write.flush().await.unwrap();
+                    drive_drained(driver, async {
+                        data_write.write_all(&data_buffer[..read]).await.unwrap();
+                        data_write.flush().await.unwrap();
+                    }).await;
                     if let Some(audit) = audit.as_ref() {
                         drive_drained(
                             driver,
@@ -8629,11 +8637,14 @@ mod tests {
                     };
                     if read == 0 {
                         if ending == HostEnding::ControllerDisplayFailure {
-                            audit
-                                .as_ref()
-                                .unwrap()
-                                .close_interrupted(AuditCloseReason::ConnectionLost)
-                                .await;
+                            drive_drained(
+                                driver,
+                                audit
+                                    .as_ref()
+                                    .unwrap()
+                                    .close_interrupted(AuditCloseReason::ConnectionLost),
+                            )
+                            .await;
                             return;
                         }
                         if matches!(ending, HostEnding::Stall) {
@@ -8670,7 +8681,11 @@ mod tests {
                     let audit = audit.as_ref().unwrap();
                     let Some(frame) = result.unwrap() else {
                         assert_eq!(ending, HostEnding::ControllerDisplayFailure);
-                        audit.close_interrupted(AuditCloseReason::ConnectionLost).await;
+                        drive_drained(
+                            driver,
+                            audit.close_interrupted(AuditCloseReason::ConnectionLost),
+                        )
+                        .await;
                         return;
                     };
                     let event = drive_drained(driver, audit.handle_frame(&frame)).await.unwrap();
@@ -8710,8 +8725,11 @@ mod tests {
             if dump_fired && !dump_sent {
                 dump_sent = true;
                 let bytes = dump.as_ref().expect("a fired dump holds bytes");
-                data_write.write_all(bytes).await.unwrap();
-                data_write.flush().await.unwrap();
+                drive_drained(driver, async {
+                    data_write.write_all(bytes).await.unwrap();
+                    data_write.flush().await.unwrap();
+                })
+                .await;
             }
             if let Some((_peer, stream)) = pending_file.take() {
                 serve_file_stream(driver, stream, script).await;
@@ -8734,7 +8752,7 @@ mod tests {
             control_write.flush().await.unwrap();
         })
         .await;
-        let _ = data_write.shutdown().await;
+        let _ = drive_drained(driver, data_write.shutdown()).await;
         let mut complete = [0_u8; 1];
         drive_drained(driver, control_read.read_exact(&mut complete))
             .await
@@ -8745,7 +8763,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let _ = control_write.shutdown().await;
+        let _ = drive_drained(driver, control_write.shutdown()).await;
         if ending == HostEnding::AuditFinalizeStreamEnd {
             drop(audit.take());
             return;

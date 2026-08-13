@@ -3281,15 +3281,21 @@ mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
             loop {
                 let open = self.streams.open(self.relay_peer, RESOLVE_PROTOCOL);
-                tokio::pin!(open);
-                let stream = match tokio::time::timeout_at(deadline, &mut open).await {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(_)) => {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
-                    }
-                    Err(_) => panic!("locator resolve substream never opened"),
-                };
+                let stream =
+                    match tokio::time::timeout_at(deadline, drive_test_node(&mut self.node, open))
+                        .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(_)) => {
+                            drive_test_node(
+                                &mut self.node,
+                                tokio::time::sleep(Duration::from_millis(200)),
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(_) => panic!("locator resolve substream never opened"),
+                    };
                 let mut stream = stream.into_tokio();
                 let mut response = Vec::new();
                 drive_test_node(&mut self.node, async {
@@ -3342,7 +3348,11 @@ mod tests {
                     tokio::time::Instant::now() < deadline,
                     "the controller could not reach the host through the relay"
                 );
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                drive_test_node(
+                    &mut self.node,
+                    tokio::time::sleep(Duration::from_millis(250)),
+                )
+                .await;
             }
         }
 
@@ -3562,6 +3572,13 @@ mod tests {
         AuditStreamEnd,
         AuditFinalizeStreamEnd,
     }
+
+    // This is the aggregate harness bound, not a product timeout. The case
+    // deliberately composes relay setup, OPAQUE, terminal startup, two file
+    // transfers and bilateral audit finalization, each of which retains its
+    // own shorter protocol deadline. Instrumented and contended CI runners
+    // need enough aggregate room to exercise that complete sequence.
+    const ENTERPRISE_HOST_CASE_TIMEOUT: Duration = Duration::from_secs(300);
 
     async fn drive_test_node<F: Future>(node: &mut EndpointNode, future: F) -> F::Output {
         tokio::pin!(future);
@@ -4133,7 +4150,7 @@ mod tests {
                     let stage = Arc::new(Mutex::new("starting"));
                     let scenario_stage = Arc::clone(&stage);
                     let result = tokio::time::timeout(
-                        Duration::from_secs(120),
+                        ENTERPRISE_HOST_CASE_TIMEOUT,
                         local.run_until(async move {
                             const EXIT_CODE: u32 = 7;
                             const OUTPUT: &[u8] = b"scripted-host-output";
@@ -4531,12 +4548,14 @@ mod tests {
                                 )
                                 .await
                                 .unwrap();
+                                mark("upload-audit-recorded");
                                 drop(file);
 
                                 let mut file = controller
                                     .open(host_peer, FILE_TRANSFER_PROTOCOL)
                                     .await
                                     .into_tokio();
+                                mark("download-stream-opened");
                                 drive_test_node(
                                     &mut controller.node,
                                     send_wire_frame(

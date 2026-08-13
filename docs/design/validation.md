@@ -39,6 +39,8 @@
 
 正式候选前仍必须完成：五目标独立覆盖率、其余五个发布目标的原生构建与静态链接检查及 MSRV、四个 fuzz target 各 `30min`；Rocky Linux 真机的文件传输、双端审计和长时间资源稳定性；macOS Intel/Apple Silicon 及 Windows ARM64 的原生终端、文件和审计路径；最终六平台单文件归档、SBOM、许可证清单、checksum 和 provenance。
 
+- 手动 CI 运行 `31598541805` 对提交 `633eb572d384911b69aa4f5d9e8bdb7a959d71aa` 证明 ASan 与 TSan 均通过，确认 sanitizer 专用 `1 GiB` 有界 RSS 预算修复了插桩开销误触发，同时不改变 release 的 endpoint `96 MiB` / relay `64 MiB` 产品上限。该运行的五目标覆盖率、六目标 MSRV、Miri、供应链与 fuzz smoke 全部通过；普通全量测试则暴露了两处测试端 endpoint 驱动缺口。Ubuntu 的 enterprise controller 夹具在发送首屏输出、回显、关闭子流和等待脚本时没有持续轮询 scripted host swarm，因而可能在看似可立即完成的小 I/O 上互等；Windows 的 enterprise host 夹具在打开定位查询子流和重试等待时也没有持续轮询 scripted controller endpoint。两条路径现均统一复用现有 `drive_drained` / `drive_test_node` 驱动抽象，Windows 复杂 host 场景另增加细粒度阶段记录，并把仅包围完整 relay、认证、终端、双向文件传输和双端审计串联流程的夹具聚合上限从 `120s` 调整为 `300s`；每个产品协议步骤仍保留自身的短绝对期限，产品网络与 I/O 超时未改变。修复后的 Windows 本机 `yon --lib` 完整并发套件为 `653 passed / 0 failed / 2 ignored`、耗时 `399.17s`，Ubuntu 对应原失败场景连续多轮约 `9-12s` 完成，Clippy 零警告；最终提交仍须重新执行完整 CI 和候选门禁。
+
 ## v0.1.1 发布基线历史证据
 
 以下结果对应 v0.1.1 及其形成过程中的提交。它们证明既有远程终端基线并为 0.2.0 回归提供比较数据，但凡文本中出现“当前源码”“当前工作树”均应按该条记录时的历史提交理解，不能外推到 0.2.0。
