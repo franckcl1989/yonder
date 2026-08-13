@@ -1134,6 +1134,14 @@ async fn run_terminal(
             audit.as_ref(),
         );
         let mut audit_frames = Box::pin(wait_for_audit_frame(audit.as_ref()));
+        // The checkpoint send and the received-frame processing are pinned
+        // branches of the inner select rather than inline awaits: while
+        // either runs (ledger fsync, substream write) the pump must keep
+        // polling the other branches, otherwise a substream delivered by
+        // the swarm in that window is silently dropped by the stream
+        // adapter's zero-capacity rendezvous channel.
+        let mut audit_send: Option<AuditPumpStep<'_, ()>> = None;
+        let mut audit_process: Option<AuditPumpStep<'_, FrameEvent>> = None;
         tokio::pin!(remote_exit);
         tokio::pin!(terminal_resizes);
         loop {
@@ -1149,9 +1157,25 @@ async fn run_terminal(
                         () = cancellation.cancelled() => TerminalPumpEvent::Cancelled,
                         event = driver.next() => TerminalPumpEvent::Driver(event),
                         result = tokio::time::timeout(AUDIT_CHECKPOINT_POLL, &mut audit_frames),
-                            if audit.is_some() => {
+                            if audit.is_some() && audit_send.is_none() && audit_process.is_none() => {
                             TerminalPumpEvent::Audit(result)
                         }
+                        result = async {
+                            let outcome = audit_send
+                                .as_mut()
+                                .expect("the send branch is gated on the slot")
+                                .await;
+                            audit_send = None;
+                            outcome
+                        }, if audit_send.is_some() => TerminalPumpEvent::AuditSend(result),
+                        result = async {
+                            let outcome = audit_process
+                                .as_mut()
+                                .expect("the process branch is gated on the slot")
+                                .await;
+                            audit_process = None;
+                            outcome
+                        }, if audit_process.is_some() => TerminalPumpEvent::AuditProcess(result),
                         result = process_local_input_chunk(
                             &mut input,
                             &mut data_write,
@@ -1339,80 +1363,22 @@ async fn run_terminal(
                                 .as_ref()
                                 .expect("the audit branch is enabled only for enterprise sessions");
                             match result {
-                                // The periodic poll: send a due checkpoint
-                                // (design sections 20.1 and 27.4). The
-                                // substream send is driven with the swarm so
-                                // a full muxer queue cannot stall the pump.
+                                // The periodic poll: a due checkpoint is
+                                // handed to the pinned send branch (design
+                                // sections 20.1 and 27.4); the substream
+                                // write never suspends the pump.
                                 Err(_elapsed) => {
-                                    match drive_bound(
-                                        driver,
-                                        binding,
-                                        audit.send_due_checkpoint(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(())) => None,
-                                        Ok(Err(error)) => break Err(error.into()),
-                                        Err(endpoint) => break Err(endpoint.into()),
-                                    }
+                                    audit_send = Some(Box::pin(audit.send_due_checkpoint()));
                                 }
                                 Ok(Ok(Some(frame))) => {
-                                    let handled = match drive_bound(
-                                        driver,
-                                        binding,
-                                        audit.handle_frame(&frame),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(event)) => event,
-                                        Ok(Err(error)) => break Err(error.into()),
-                                        Err(endpoint) => break Err(endpoint.into()),
-                                    };
-                                    match handled {
-                                        FrameEvent::None => {}
-                                        // The controller never initiates a
-                                        // close from the peer's notice; the
-                                        // host only conveys its own audit
-                                        // failure, so the session fails
-                                        // closed (design section 18.7).
-                                        FrameEvent::Close(_) => {
-                                            drive_bound(
-                                                driver,
-                                                binding,
-                                                audit.fail_closed(
-                                                    None,
-                                                    AuditCloseReason::AuditFailure,
-                                                ),
-                                            )
-                                            .await
-                                            .ok();
-                                            break Err(ControllerError::Audit(
-                                                AuditError::FailedClosed,
-                                            ));
-                                        }
-                                        FrameEvent::PeerAuditError(code) => {
-                                            drive_bound(
-                                                driver,
-                                                binding,
-                                                audit.fail_closed(
-                                                    Some(code),
-                                                    AuditCloseReason::AuditFailure,
-                                                ),
-                                            )
-                                            .await
-                                            .ok();
-                                            break Err(ControllerError::Audit(
-                                                AuditError::FailedClosed,
-                                            ));
-                                        }
-                                    };
-                                    // The completed read is re-armed so the
-                                    // substream keeps being drained; without
-                                    // this the peer's checkpoints and close
-                                    // notice would sit unread and the peer's
-                                    // writes would stall on the muxer window.
-                                    audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
-                                    None
+                                    // The received frame is handed to the
+                                    // pinned process branch; the substream
+                                    // stays unread while it runs, so the
+                                    // ordered frame sequence can never be
+                                    // handled out of order.
+                                    audit_process = Some(Box::pin(async move {
+                                        audit.handle_frame(&frame).await
+                                    }));
                                 }
                                 // The audit substream ended: the connection
                                 // is gone, the session fails closed.
@@ -1420,6 +1386,56 @@ async fn run_terminal(
                                     break Err(ControllerError::Audit(AuditError::FailedClosed));
                                 }
                                 Ok(Err(error)) => break Err(error.into()),
+                            }
+                            None
+                        }
+                        TerminalPumpEvent::AuditSend(result) => {
+                            match result {
+                                Ok(()) => None,
+                                Err(error) => break Err(error.into()),
+                            }
+                        }
+                        TerminalPumpEvent::AuditProcess(result) => {
+                            let audit = audit
+                                .as_ref()
+                                .expect("the audit branch is enabled only for enterprise sessions");
+                            match result {
+                                Ok(FrameEvent::None) => {
+                                    // The completed frame is re-armed only
+                                    // now: the substream stays unread while
+                                    // the previous frame is being processed.
+                                    audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
+                                    None
+                                }
+                                Ok(FrameEvent::Close(_)) => {
+                                    // The controller never initiates a
+                                    // close from the peer's notice; the
+                                    // host only conveys its own audit
+                                    // failure, so the session fails
+                                    // closed (design section 18.7).
+                                    drive_bound(
+                                        driver,
+                                        binding,
+                                        audit.fail_closed(None, AuditCloseReason::AuditFailure),
+                                    )
+                                    .await
+                                    .ok();
+                                    break Err(ControllerError::Audit(AuditError::FailedClosed));
+                                }
+                                Ok(FrameEvent::PeerAuditError(code)) => {
+                                    drive_bound(
+                                        driver,
+                                        binding,
+                                        audit.fail_closed(
+                                            Some(code),
+                                            AuditCloseReason::AuditFailure,
+                                        ),
+                                    )
+                                    .await
+                                    .ok();
+                                    break Err(ControllerError::Audit(AuditError::FailedClosed));
+                                }
+                                Err(error) => break Err(error.into()),
                             }
                         }
                     };
@@ -1503,6 +1519,11 @@ async fn run_terminal(
     finish_terminal(session, frontend.restore_raw_mode(raw_mode))
 }
 
+/// The pinned audit-pump step carried by the terminal pump: a checkpoint
+/// send or a received-frame processing future that must never suspend the
+/// inner-select branches of the pump.
+type AuditPumpStep<'a, T> = Pin<Box<dyn Future<Output = Result<T, AuditError>> + 'a>>;
+
 enum TerminalPumpEvent {
     Cancelled,
     Driver(EndpointEvent),
@@ -1512,6 +1533,8 @@ enum TerminalPumpEvent {
     Resize(Result<Infallible, ControllerError>),
     Transfer(TransferOutcome),
     Audit(Result<Result<Option<Vec<u8>>, AuditError>, tokio::time::error::Elapsed>),
+    AuditSend(Result<(), AuditError>),
+    AuditProcess(Result<FrameEvent, AuditError>),
 }
 
 async fn wait_for_audit_frame(

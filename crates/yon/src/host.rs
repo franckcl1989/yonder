@@ -6111,6 +6111,22 @@ async fn reject_extra_auth(
     }
 }
 
+/// The in-flight half of an extra-authentication Retry used by
+/// `bridge_terminal`: the write and its timeout, without driving the swarm
+/// (the bridge's own driver branch keeps the swarm polled, and the pinned
+/// branch must not borrow the driver).
+async fn auth_retry_reply(stream: ApplicationStream) {
+    match tokio::time::timeout(EXCHANGE_TIMEOUT, send_auth_retry(stream)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "extra authentication Retry response failed");
+        }
+        Err(_) => {
+            tracing::debug!("extra authentication Retry response timed out");
+        }
+    }
+}
+
 async fn read_auth_hello(stream: &mut ApplicationStream) -> Result<AuthClientHello, HostError> {
     let mut stream = stream.compat();
     read_auth_hello_io(&mut stream, EXCHANGE_TIMEOUT).await
@@ -6470,6 +6486,11 @@ async fn wait_for_audit_frame(
     }
 }
 
+/// The pinned audit-pump step carried by `bridge_terminal`: a checkpoint
+/// send or a received-frame processing future that must never suspend the
+/// inbound-registration branches of the bridge select.
+type AuditPumpStep<'a, T> = Pin<Box<dyn Future<Output = Result<T, AuditError>> + 'a>>;
+
 #[allow(clippy::too_many_arguments)]
 async fn bridge_terminal<S: TerminalSession>(
     driver: &mut EndpointDriver,
@@ -6508,6 +6529,17 @@ async fn bridge_terminal<S: TerminalSession>(
             audit,
         );
         let mut audit_frames = Box::pin(wait_for_audit_frame(audit));
+        // The checkpoint send and the received-frame processing are pinned
+        // branches rather than inline awaits: while either runs (ledger
+        // fsync, substream write) the inbound registrations below must keep
+        // being polled, otherwise a substream delivered by the swarm in
+        // that window is silently dropped by the stream adapter's
+        // zero-capacity rendezvous channel.
+        let mut audit_send: Option<AuditPumpStep<'_, ()>> = None;
+        let mut audit_process: Option<AuditPumpStep<'_, FrameEvent>> = None;
+        // The extra-auth Retry reply runs as a pinned branch for the same
+        // reason: its write must not suspend the receive loop.
+        let mut auth_retry: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
         tokio::pin!(controller_input);
         tokio::pin!(terminal_output);
         loop {
@@ -6521,7 +6553,26 @@ async fn bridge_terminal<S: TerminalSession>(
             },
             stream = incoming.auth.next() => {
                 let (peer, stream) = stream.ok_or(HostError::ProtocolRegistrationEnded)?;
-                reject_extra_auth(driver, binding, peer, stream).await?;
+                if !driver.has_unique_connection(&peer) {
+                    // The peer is not the unique authenticated controller
+                    // (or has no connection left): no retry is owed (the
+                    // same check as `reject_extra_auth`).
+                    drop(stream);
+                } else if auth_retry.is_none() {
+                    auth_retry = Some(Box::pin(auth_retry_reply(stream)));
+                } else {
+                    // A rejection is already in flight: closing the new
+                    // substream is the same denial of service without state.
+                    drop(stream);
+                }
+            }
+            () = async {
+                auth_retry
+                    .as_mut()
+                    .expect("the retry branch is gated on the slot")
+                    .await;
+            }, if auth_retry.is_some() => {
+                auth_retry = None;
             }
             stream = incoming.data.next() => {
                 drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
@@ -6545,101 +6596,24 @@ async fn bridge_terminal<S: TerminalSession>(
                 }
             }
             result = tokio::time::timeout(AUDIT_CHECKPOINT_POLL, &mut audit_frames),
-                if audit.is_some() => {
+                if audit.is_some() && audit_send.is_none() && audit_process.is_none() => {
                 let audit = audit
                     .expect("the audit branch is enabled only for enterprise sessions");
                 match result {
-                    // The periodic poll: send a due checkpoint (design
-                    // sections 20.1 and 27.4). The substream send is driven
-                    // with the swarm so a full muxer queue cannot stall the
-                    // pump.
+                    // The periodic poll: a due checkpoint is handed to the
+                    // pinned send branch (design sections 20.1 and 27.4);
+                    // the substream write never suspends the receive loop.
                     Err(_elapsed) => {
-                        match drive_bound(driver, binding, audit.send_due_checkpoint()).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                cancel.store(true, Ordering::Relaxed);
-                                break Err(HostError::Audit(error));
-                            }
-                            Err(endpoint) => {
-                                cancel.store(true, Ordering::Relaxed);
-                                break Err(endpoint.into());
-                            }
-                        }
+                        audit_send = Some(Box::pin(audit.send_due_checkpoint()));
                     }
                     Ok(Ok(Some(frame))) => {
-                        let handled = match drive_bound(driver, binding, audit.handle_frame(&frame))
-                            .await
-                        {
-                            Ok(Ok(event)) => event,
-                            Ok(Err(error)) => {
-                                cancel.store(true, Ordering::Relaxed);
-                                break Err(HostError::Audit(error));
-                            }
-                            Err(endpoint) => {
-                                cancel.store(true, Ordering::Relaxed);
-                                break Err(endpoint.into());
-                            }
-                        };
-                        match handled {
-                            FrameEvent::None => {}
-                            FrameEvent::Close(reason) => {
-                                cancel.store(true, Ordering::Relaxed);
-                                match reason {
-                                    // The controller's own audit failed:
-                                    // fail closed locally (design 18.7).
-                                    AuditCloseReason::AuditFailure => {
-                                        drive_bound(
-                                            driver,
-                                            binding,
-                                            audit.fail_closed(None, reason),
-                                        )
-                                        .await
-                                        .ok();
-                                        break Err(HostError::Audit(AuditError::FailedClosed));
-                                    }
-                                    // The controller closed the session
-                                    // (detach or local interrupt): finalize
-                                    // with the received reason (design
-                                    // sections 22.2 and 22.3). The driver is
-                                    // polled throughout so the peer's
-                                    // finalization frames arrive.
-                                    reason => {
-                                        let finalized = drive_bound(
-                                            driver,
-                                            binding,
-                                            audit.close_and_finalize(
-                                                ManifestEnding::CloseReason(reason),
-                                                false,
-                                                CloseNoticeHandling::AlreadyReceived(reason),
-                                            ),
-                                        )
-                                        .await;
-                                        match finalized {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(error)) => {
-                                                break Err(HostError::Audit(error));
-                                            }
-                                            Err(endpoint) => {
-                                                break Err(endpoint.into());
-                                            }
-                                        }
-                                        break Err(HostError::ConnectionLost);
-                                    }
-                                }
-                            }
-                            FrameEvent::PeerAuditError(code) => {
-                                cancel.store(true, Ordering::Relaxed);
-                                drive_bound(
-                                    driver,
-                                    binding,
-                                    audit.fail_closed(Some(code), AuditCloseReason::AuditFailure),
-                                )
-                                .await
-                                .ok();
-                                break Err(HostError::Audit(AuditError::FailedClosed));
-                            }
-                        }
-                        audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
+                        // The received frame is handed to the pinned process
+                        // branch; the substream stays unread while it runs,
+                        // so the ordered frame sequence (final checkpoint,
+                        // then manifest) can never be handled out of order.
+                        audit_process = Some(Box::pin(async move {
+                            audit.handle_frame(&frame).await
+                        }));
                     }
                     // The audit substream ended: the connection is gone.
                     Ok(Ok(None)) => {
@@ -6647,6 +6621,101 @@ async fn bridge_terminal<S: TerminalSession>(
                         break Err(HostError::Audit(AuditError::FailedClosed));
                     }
                     Ok(Err(error)) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        break Err(HostError::Audit(error));
+                    }
+                }
+            }
+            result = async {
+                audit_send
+                    .as_mut()
+                    .expect("the send branch is gated on the slot")
+                    .await
+            }, if audit_send.is_some() => {
+                audit_send = None;
+                match result {
+                    Ok(()) => {}
+                    Err(error) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        break Err(HostError::Audit(error));
+                    }
+                }
+            }
+            result = async {
+                audit_process
+                    .as_mut()
+                    .expect("the process branch is gated on the slot")
+                    .await
+            }, if audit_process.is_some() => {
+                audit_process = None;
+                let audit = audit
+                    .expect("the audit branch is enabled only for enterprise sessions");
+                match result {
+                    Ok(FrameEvent::None) => {
+                        // The completed frame is re-armed only now: the
+                        // substream stays unread while the previous frame
+                        // is being processed, so the ordered frame
+                        // sequence (final checkpoint, then manifest) can
+                        // never be handled out of order.
+                        audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
+                    }
+                    Ok(FrameEvent::Close(reason)) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        match reason {
+                            // The controller's own audit failed:
+                            // fail closed locally (design 18.7).
+                            AuditCloseReason::AuditFailure => {
+                                drive_bound(
+                                    driver,
+                                    binding,
+                                    audit.fail_closed(None, reason),
+                                )
+                                .await
+                                .ok();
+                                break Err(HostError::Audit(AuditError::FailedClosed));
+                            }
+                            // The controller closed the session
+                            // (detach or local interrupt): finalize
+                            // with the received reason (design
+                            // sections 22.2 and 22.3). The driver is
+                            // polled throughout so the peer's
+                            // finalization frames arrive.
+                            reason => {
+                                let finalized = drive_bound(
+                                    driver,
+                                    binding,
+                                    audit.close_and_finalize(
+                                        ManifestEnding::CloseReason(reason),
+                                        false,
+                                        CloseNoticeHandling::AlreadyReceived(reason),
+                                    ),
+                                )
+                                .await;
+                                match finalized {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        break Err(HostError::Audit(error));
+                                    }
+                                    Err(endpoint) => {
+                                        break Err(endpoint.into());
+                                    }
+                                }
+                                break Err(HostError::ConnectionLost);
+                            }
+                        }
+                    }
+                    Ok(FrameEvent::PeerAuditError(code)) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        drive_bound(
+                            driver,
+                            binding,
+                            audit.fail_closed(Some(code), AuditCloseReason::AuditFailure),
+                        )
+                        .await
+                        .ok();
+                        break Err(HostError::Audit(AuditError::FailedClosed));
+                    }
+                    Err(error) => {
                         cancel.store(true, Ordering::Relaxed);
                         break Err(HostError::Audit(error));
                     }
