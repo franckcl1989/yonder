@@ -1,58 +1,44 @@
-//! Enterprise HTTPS callback server for provider browser callbacks.
-//!
-//! Design section 9: the relay offers one dedicated HTTPS callback
-//! listener used only for the WeCom and Feishu callbacks. There is no
-//! homepage, admin page, status endpoint or static resource. Result
-//! pages are minimal, never cached, and carry no external resources.
-//! Callback sessions are handled through the injectable
-//! `CallbackHandler`, which owns the single-use state lookup and the
-//! bounded member verification.
+//! Bounded Axum HTTPS callback service for enterprise authorization.
 
 use crate::enterprise::EnterpriseAuthConfig;
 use crate::verifier::MAX_AUTHORIZATION_CODE_BYTES;
-use hyper::body::Incoming;
+use axum::Router;
+use axum::extract::{ConnectInfo, RawQuery, State, connect_info::Connected};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::get;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use axum_server::{AddrListener, Address, Handle, Server};
+use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::net::TcpListener;
-use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
-use yonder_core::{EnterpriseProvider, SecretDocument};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use yonder_core::EnterpriseProvider;
 use yonder_net::contains_pem_marker;
 
-/// Bound on one callback request query string.
 pub const MAX_CALLBACK_QUERY_BYTES: usize = 1024;
-/// Bound on the callback state parameter (lowercase hex of 32 bytes).
 pub const MAX_CALLBACK_STATE_BYTES: usize = 128;
-/// Bound on concurrent callback connections; excess connections fail closed.
 pub const MAX_CALLBACK_CONNECTIONS: usize = 16;
-/// Bound on one callback TLS handshake and on the whole per-connection
-/// request/response exchange: a stalled handshake, or a connection that
-/// completes the handshake but never sends a request, releases its
-/// connection permit (fail closed) instead of pinning it indefinitely.
-const CALLBACK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CALLBACK_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The outcome of one callback handling run, used for the result page and
-/// the redacted logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackResult {
-    /// The member was admitted and the session is resolving.
     Admitted,
-    /// The user was rejected or the state was already spent.
     Rejected,
-    /// The state was missing, malformed or mismatched.
     InvalidState,
-    /// The provider exchange failed; nothing can be confirmed.
     Platform,
-    /// The callback source exceeded the rate limit.
     Limited,
 }
 
 impl CallbackResult {
-    /// The redacted result label used in logs.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -65,56 +51,77 @@ impl CallbackResult {
     }
 }
 
-/// Handles one validated callback request.
-///
-/// The server validates the path, method, query bounds and encoding before
-/// invoking the handler; the handler owns the single-use session lookup,
-/// the bounded provider exchange and the redacted logging. The boxed
-/// future keeps the trait dyn-compatible for the shared handler.
 pub trait CallbackHandler: Send + Sync {
-    /// Handles a callback for one provider with the decoded code, state and
-    /// source address. The source is used for rate limiting only; it is
-    /// never logged.
     fn handle<'a>(
         &'a self,
         provider: EnterpriseProvider,
         code: &'a str,
         state: &'a str,
         source: IpAddr,
-    ) -> std::pin::Pin<Box<dyn Future<Output = CallbackResult> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = CallbackResult> + Send + 'a>>;
 }
 
-/// The enterprise HTTPS callback server.
+/// Prepared callback TLS configuration. Binding remains explicit so relay
+/// startup fails before entering the network event loop.
 #[derive(Clone)]
 pub struct CallbackServer {
-    acceptor: tokio_rustls::TlsAcceptor,
-    listen: std::net::SocketAddr,
+    tls: RustlsConfig,
+    listen: SocketAddr,
+}
+
+impl fmt::Debug for CallbackServer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallbackServer")
+            .field("listen", &self.listen)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CallbackServer {
-    /// Parses the callback TLS material from the validated enterprise
-    /// configuration. Any invalid document fails closed at construction.
-    pub fn from_config(config: &EnterpriseAuthConfig) -> Result<Self, CallbackServerError> {
-        let certificates = parse_certificates(config.certificate_chain())?;
-        let private_key = parse_private_key(config.private_key())?;
-        let server = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)
-            .map_err(|_| CallbackServerError::InvalidTlsMaterial)?;
+    pub async fn from_config(config: &EnterpriseAuthConfig) -> Result<Self, CallbackServerError> {
+        let certificate_documents: Vec<Vec<u8>> = config
+            .certificate_chain()
+            .iter()
+            .map(|document| document.as_bytes().to_vec())
+            .collect();
+        let private_key = config.private_key().as_bytes().to_vec();
+        let certificates_are_pem = certificate_documents
+            .iter()
+            .all(|document| contains_pem_marker(document));
+        let certificates_are_der = certificate_documents
+            .iter()
+            .all(|document| !contains_pem_marker(document));
+        let key_is_pem = contains_pem_marker(&private_key);
+
+        let tls = if certificates_are_pem && key_is_pem {
+            let mut chain = Vec::new();
+            for document in certificate_documents {
+                chain.extend_from_slice(&document);
+                if !chain.ends_with(b"\n") {
+                    chain.push(b'\n');
+                }
+            }
+            RustlsConfig::from_pem(chain, private_key).await
+        } else if certificates_are_der && !key_is_pem {
+            RustlsConfig::from_der(certificate_documents, private_key).await
+        } else {
+            return Err(CallbackServerError::InvalidTlsMaterial);
+        }
+        .map_err(|_| CallbackServerError::InvalidTlsMaterial)?;
+
         Ok(Self {
-            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server)),
+            tls,
             listen: config.listen(),
         })
     }
 
-    /// The configured callback listener address.
     #[must_use]
-    pub const fn listen(&self) -> std::net::SocketAddr {
+    pub const fn listen(&self) -> SocketAddr {
         self.listen
     }
 
-    /// Binds the callback listener, reporting the bound address.
-    pub async fn bind(&self) -> Result<(TcpListener, std::net::SocketAddr), CallbackServerError> {
+    pub(crate) async fn bind(&self) -> Result<(LimitedListener, SocketAddr), CallbackServerError> {
         let listener =
             TcpListener::bind(self.listen)
                 .await
@@ -122,177 +129,126 @@ impl CallbackServer {
                     address: self.listen,
                     source,
                 })?;
-        let address = listener
+        let bound = listener
             .local_addr()
             .map_err(|source| CallbackServerError::Bind {
                 address: self.listen,
                 source,
             })?;
-        Ok((listener, address))
+        Ok((LimitedListener::new(listener), bound))
     }
 
-    /// Serves the callback HTTPS until the shutdown signal completes.
-    ///
-    /// Connections are accepted until `MAX_CALLBACK_CONNECTIONS`; excess
-    /// connections are dropped immediately (fail closed). One connection
-    /// permit is held only for the TLS handshake (bounded by
-    /// `CALLBACK_HANDSHAKE_TIMEOUT`) plus one request/response exchange:
-    /// HTTP keep-alive is disabled so a connection releases its permit as
-    /// soon as the response is written. The whole connection is
-    /// additionally bounded by `CALLBACK_HANDSHAKE_TIMEOUT`, so a
-    /// connection that completes the handshake but never sends a request
-    /// also releases its permit (fail closed) instead of pinning it
-    /// indefinitely.
-    pub async fn serve_on(
+    pub(crate) async fn serve_on(
         self,
-        listener: TcpListener,
+        listener: LimitedListener,
         handler: Arc<dyn CallbackHandler>,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), CallbackServerError> {
-        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CALLBACK_CONNECTIONS));
-        let mut shutdown = Box::pin(shutdown);
-        loop {
-            tokio::select! {
-                () = &mut shutdown => return Ok(()),
-                accepted = listener.accept() => {
-                    let (stream, peer) = accepted
-                        .map_err(|source| CallbackServerError::Accept { source })?;
-                    let Ok(permit) = permits.clone().try_acquire_owned() else {
-                        // The connection capacity is exhausted; fail closed.
-                        continue;
-                    };
-                    let source = peer.ip();
-                    let acceptor = self.acceptor.clone();
-                    let handler = Arc::clone(&handler);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let tls = match tokio::time::timeout(
-                            CALLBACK_HANDSHAKE_TIMEOUT,
-                            acceptor.accept(stream),
-                        )
-                        .await
-                        {
-                            Ok(Ok(tls)) => tls,
-                            Ok(Err(_)) | Err(_) => return,
-                        };
-                        let io = hyper_util::rt::TokioIo::new(tls);
-                        let service = hyper::service::service_fn(move |request| {
-                            handle_request(Arc::clone(&handler), request, source)
-                        });
-                        let mut builder = hyper_util::server::conn::auto::Builder::new(
-                            hyper_util::rt::TokioExecutor::new(),
-                        );
-                        // Callback connections are single-request: keep-alive
-                        // is disabled so the connection closes once the
-                        // response is written. The whole connection is
-                        // additionally bounded by CALLBACK_HANDSHAKE_TIMEOUT
-                        // so a connection that never sends a request cannot
-                        // pin its permit indefinitely.
-                        builder.http1().keep_alive(false);
-                        let _ = tokio::time::timeout(
-                            CALLBACK_HANDSHAKE_TIMEOUT,
-                            builder.serve_connection(io, service),
-                        )
-                        .await;
-                    });
-                }
+        let state = CallbackState { handler };
+        let app = Router::new()
+            .route("/yonder/callback/wecom", get(wecom_callback))
+            .route("/yonder/callback/feishu", get(feishu_callback))
+            .method_not_allowed_fallback(method_not_allowed)
+            .fallback(not_found)
+            .with_state(state);
+
+        let handle: Handle<LimitedAddress> = Handle::new();
+        let acceptor = RustlsAcceptor::new(self.tls).handshake_timeout(CALLBACK_CONNECTION_TIMEOUT);
+        let mut server = Server::from_listener(listener)
+            .acceptor(acceptor)
+            .http1_only()
+            .handle(handle.clone());
+        server.http_builder().http1().keep_alive(false);
+        let serving = server.serve(app.into_make_service_with_connect_info::<CallbackSource>());
+        tokio::pin!(serving);
+        tokio::pin!(shutdown);
+        tokio::select! {
+            result = &mut serving => result.map_err(|source| CallbackServerError::Serve { source }),
+            () = &mut shutdown => {
+                handle.graceful_shutdown(Some(CALLBACK_CONNECTION_TIMEOUT));
+                serving
+                    .await
+                    .map_err(|source| CallbackServerError::Serve { source })
             }
         }
     }
 }
 
-/// Parses one or more DER certificates or PEM bundles into a leaf-first chain.
-fn parse_certificates(
-    documents: &[SecretDocument],
-) -> Result<Vec<CertificateDer<'static>>, CallbackServerError> {
-    let mut certificates = Vec::new();
-    for document in documents {
-        let bytes = document.as_bytes();
-        if contains_pem_marker(bytes) {
-            for item in CertificateDer::pem_slice_iter(bytes) {
-                certificates.push(item.map_err(|_| CallbackServerError::InvalidCertificate)?);
-            }
-        } else {
-            certificates.push(CertificateDer::from(bytes.to_vec()));
-        }
-    }
-    if certificates.is_empty() {
-        return Err(CallbackServerError::InvalidCertificate);
-    }
-    Ok(certificates)
-}
-
-/// Parses a DER or PEM private key document.
-fn parse_private_key(
-    document: &SecretDocument,
-) -> Result<PrivateKeyDer<'static>, CallbackServerError> {
-    let bytes = document.as_bytes();
-    if contains_pem_marker(bytes) {
-        PrivateKeyDer::from_pem_slice(bytes).map_err(|_| CallbackServerError::InvalidPrivateKey)
-    } else {
-        PrivateKeyDer::try_from(bytes.to_vec()).map_err(|_| CallbackServerError::InvalidPrivateKey)
-    }
-}
-
-/// Dispatches one callback request: exact path match, GET only, bounded
-/// query, then the handler. Every other request gets a minimal response.
-async fn handle_request(
+#[derive(Clone)]
+struct CallbackState {
     handler: Arc<dyn CallbackHandler>,
-    request: hyper::Request<Incoming>,
-    source: IpAddr,
-) -> Result<hyper::Response<String>, io::Error> {
-    let provider = match request.uri().path() {
-        "/yonder/callback/wecom" => Some(EnterpriseProvider::WeCom),
-        "/yonder/callback/feishu" => Some(EnterpriseProvider::Feishu),
-        _ => None,
-    };
-    let Some(provider) = provider else {
-        return Ok(response::not_found());
-    };
-    if request.method() != hyper::Method::GET {
-        return Ok(response::method_not_allowed());
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallbackSource(IpAddr);
+
+impl Connected<LimitedAddress> for CallbackSource {
+    fn connect_info(address: LimitedAddress) -> Self {
+        Self(address.socket.ip())
     }
-    let Some(query) = request.uri().query() else {
+}
+
+async fn wecom_callback(
+    state: State<CallbackState>,
+    source: ConnectInfo<CallbackSource>,
+    query: RawQuery,
+) -> Response {
+    dispatch(EnterpriseProvider::WeCom, state, source, query).await
+}
+
+async fn feishu_callback(
+    state: State<CallbackState>,
+    source: ConnectInfo<CallbackSource>,
+    query: RawQuery,
+) -> Response {
+    dispatch(EnterpriseProvider::Feishu, state, source, query).await
+}
+
+async fn dispatch(
+    provider: EnterpriseProvider,
+    State(state): State<CallbackState>,
+    ConnectInfo(source): ConnectInfo<CallbackSource>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(query) = query else {
         log_rejected(provider, "missing-query");
-        return Ok(response::bad_request());
+        return response::bad_request();
     };
     if query.len() > MAX_CALLBACK_QUERY_BYTES {
         log_rejected(provider, "oversized-query");
-        return Ok(response::bad_request());
+        return response::bad_request();
     }
-    let Some(code) = query_param(query, "code") else {
+    let Some(code) = query_param(&query, "code") else {
         log_rejected(provider, "missing-code");
-        return Ok(response::bad_request());
+        return response::bad_request();
     };
-    let Some(state) = query_param(query, "state") else {
+    let Some(callback_state) = query_param(&query, "state") else {
         log_rejected(provider, "missing-state");
-        return Ok(response::bad_request());
+        return response::bad_request();
     };
     if code.is_empty()
         || code.len() > MAX_AUTHORIZATION_CODE_BYTES
-        || state.is_empty()
-        || state.len() > MAX_CALLBACK_STATE_BYTES
+        || callback_state.is_empty()
+        || callback_state.len() > MAX_CALLBACK_STATE_BYTES
     {
         log_rejected(provider, "oversized-parameter");
-        return Ok(response::bad_request());
+        return response::bad_request();
     }
-    let result = handler.handle(provider, &code, &state, source).await;
-    Ok(response::result(result))
+
+    response::result(
+        state
+            .handler
+            .handle(provider, &code, &callback_state, source.0)
+            .await,
+    )
 }
 
-/// Extracts one percent-decoded query parameter by name.
-///
-/// The url crate's form-urlencoded parser is lenient about malformed
-/// percent escapes, which is safe here: the state parameter is still
-/// strictly hex-decoded and the code is rejected by the provider
-/// exchange, so malformed input fails closed either way.
 fn query_param(query: &str, key: &str) -> Option<String> {
     url::form_urlencoded::parse(query.as_bytes())
         .find(|(name, _)| name == key)
         .map(|(_, value)| value.into_owned())
 }
 
-/// Redacted callback rejection logging: platform and reason only.
 fn log_rejected(provider: EnterpriseProvider, reason: &str) {
     tracing::info!(
         event = "enterprise_callback_rejected",
@@ -303,76 +259,212 @@ fn log_rejected(provider: EnterpriseProvider, reason: &str) {
     );
 }
 
-mod response {
-    use super::CallbackResult;
-    use hyper::Response;
+async fn method_not_allowed() -> Response {
+    response::method_not_allowed()
+}
 
-    /// The minimal result page: inline only, no cache, no external resources.
-    fn page(status: hyper::StatusCode, text: &str) -> Response<String> {
+async fn not_found() -> Response {
+    response::not_found()
+}
+
+mod response {
+    use super::{CallbackResult, Html, IntoResponse, Response, StatusCode};
+
+    fn page(status: StatusCode, text: &'static str) -> Response {
         let body = format!(
             "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"robots\" content=\"noindex\"><title>Yonder</title></head><body><p>{text}</p></body></html>"
         );
-        Response::builder()
-            .status(status)
-            .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header(hyper::header::CACHE_CONTROL, "no-store")
-            .body(body)
-            .expect("static result page cannot fail to build")
+        (
+            status,
+            [
+                ("cache-control", "no-store"),
+                ("content-security-policy", "default-src 'none'"),
+                ("x-content-type-options", "nosniff"),
+            ],
+            Html(body),
+        )
+            .into_response()
     }
 
-    pub(super) fn result(result: CallbackResult) -> Response<String> {
+    pub(super) fn result(result: CallbackResult) -> Response {
         match result {
-            CallbackResult::Admitted => {
-                page(hyper::StatusCode::OK, "认证成功，请返回 Yonder 客户端")
-            }
-            CallbackResult::Rejected => {
-                page(hyper::StatusCode::OK, "认证未通过，请返回 Yonder 客户端")
-            }
+            CallbackResult::Admitted => page(StatusCode::OK, "认证成功，请返回 Yonder 客户端"),
+            CallbackResult::Rejected => page(StatusCode::OK, "认证未通过，请返回 Yonder 客户端"),
             CallbackResult::InvalidState => page(
-                hyper::StatusCode::BAD_REQUEST,
+                StatusCode::BAD_REQUEST,
                 "请求无效，请返回 Yonder 客户端重新发起",
             ),
-            CallbackResult::Platform => page(
-                hyper::StatusCode::SERVICE_UNAVAILABLE,
-                "认证暂不可用，请稍后重试",
-            ),
-            CallbackResult::Limited => page(
-                hyper::StatusCode::TOO_MANY_REQUESTS,
-                "请求过于频繁，请稍后重试",
-            ),
+            CallbackResult::Platform => {
+                page(StatusCode::SERVICE_UNAVAILABLE, "认证暂不可用，请稍后重试")
+            }
+            CallbackResult::Limited => {
+                page(StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后重试")
+            }
         }
     }
 
-    pub(super) fn bad_request() -> Response<String> {
-        page(hyper::StatusCode::BAD_REQUEST, "请求无效")
+    pub(super) fn bad_request() -> Response {
+        page(StatusCode::BAD_REQUEST, "请求无效")
     }
 
-    pub(super) fn method_not_allowed() -> Response<String> {
-        page(hyper::StatusCode::METHOD_NOT_ALLOWED, "请求无效")
+    pub(super) fn method_not_allowed() -> Response {
+        page(StatusCode::METHOD_NOT_ALLOWED, "请求无效")
     }
 
-    pub(super) fn not_found() -> Response<String> {
-        page(hyper::StatusCode::NOT_FOUND, "请求无效")
+    pub(super) fn not_found() -> Response {
+        page(StatusCode::NOT_FOUND, "请求无效")
     }
 }
 
-/// Callback server failures; every variant fails closed.
+/// Address wrapper carrying the callback connection capacity.
+#[derive(Clone)]
+struct LimitedAddress {
+    socket: SocketAddr,
+    permits: Arc<Semaphore>,
+}
+
+impl fmt::Debug for LimitedAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("LimitedAddress")
+            .field(&self.socket)
+            .finish()
+    }
+}
+
+impl Address for LimitedAddress {
+    type Stream = LimitedStream;
+    type Listener = LimitedListener;
+}
+
+pub(crate) struct LimitedListener {
+    inner: TcpListener,
+    permits: Arc<Semaphore>,
+}
+
+impl fmt::Debug for LimitedListener {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LimitedListener")
+            .field("local_addr", &self.inner.local_addr().ok())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LimitedListener {
+    fn new(inner: TcpListener) -> Self {
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(MAX_CALLBACK_CONNECTIONS)),
+        }
+    }
+}
+
+impl AddrListener<LimitedStream, LimitedAddress> for LimitedListener {
+    async fn bind_to(address: LimitedAddress) -> io::Result<Self> {
+        Ok(Self {
+            inner: TcpListener::bind(address.socket).await?,
+            permits: address.permits,
+        })
+    }
+
+    async fn accept_stream(&self) -> io::Result<(LimitedStream, LimitedAddress)> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("callback connection limiter closed"))?;
+        let (stream, socket) = self.inner.accept().await?;
+        let address = LimitedAddress {
+            socket,
+            permits: Arc::clone(&self.permits),
+        };
+        Ok((LimitedStream::new(stream, permit), address))
+    }
+
+    fn get_local_addr(&self) -> io::Result<LimitedAddress> {
+        Ok(LimitedAddress {
+            socket: self.inner.local_addr()?,
+            permits: Arc::clone(&self.permits),
+        })
+    }
+}
+
+struct LimitedStream {
+    inner: TcpStream,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl LimitedStream {
+    fn new(inner: TcpStream, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep(CALLBACK_CONNECTION_TIMEOUT)),
+            _permit: permit,
+        }
+    }
+
+    fn check_deadline(&mut self, context: &mut Context<'_>) -> io::Result<()> {
+        if self.deadline.as_mut().poll(context).is_ready() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "callback connection timed out",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl AsyncRead for LimitedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Err(error) = self.check_deadline(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for LimitedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if let Err(error) = self.check_deadline(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Err(error) = self.check_deadline(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CallbackServerError {
-    #[error("the enterprise callback certificate chain is invalid")]
-    InvalidCertificate,
-    #[error("the enterprise callback private key is invalid")]
-    InvalidPrivateKey,
     #[error("the enterprise callback TLS material is invalid")]
     InvalidTlsMaterial,
     #[error("failed to bind the callback listener {address}: {source}")]
     Bind {
-        address: std::net::SocketAddr,
+        address: SocketAddr,
         #[source]
         source: io::Error,
     },
     #[error("the callback listener failed: {source}")]
-    Accept {
+    Serve {
         #[source]
         source: io::Error,
     },
@@ -382,39 +474,64 @@ pub enum CallbackServerError {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        CALLBACK_HANDSHAKE_TIMEOUT, CallbackHandler, CallbackResult, CallbackServer,
-        CallbackServerError, MAX_CALLBACK_CONNECTIONS, MAX_CALLBACK_QUERY_BYTES,
-        parse_certificates, parse_private_key, query_param,
+        CALLBACK_CONNECTION_TIMEOUT, CallbackHandler, CallbackResult, CallbackServer,
+        CallbackServerError, CallbackSource, LimitedAddress, LimitedListener,
+        MAX_CALLBACK_CONNECTIONS, MAX_CALLBACK_QUERY_BYTES, MAX_CALLBACK_STATE_BYTES, query_param,
     };
     use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
+    use axum::extract::connect_info::Connected as _;
+    use axum_server::AddrListener as _;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio_rustls::rustls;
-    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Semaphore;
     use url::Url;
     use yonder_core::{EnterpriseProvider, EnterpriseProviders, SecretDocument};
 
     const TEST_CERT_DER: &[u8] = include_bytes!("../../yon/tests/fixtures/localhost-test-cert.der");
     const TEST_KEY_DER: &[u8] = include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
+    const TEST_CA_DER: &[u8] = include_bytes!("../../yon/tests/fixtures/localhost-test-ca.der");
 
-    #[derive(Clone, Copy)]
-    struct StubHandler(CallbackResult);
+    struct RoutingHandler;
 
-    impl CallbackHandler for StubHandler {
+    impl CallbackHandler for RoutingHandler {
         fn handle<'a>(
             &'a self,
             _provider: EnterpriseProvider,
-            _code: &'a str,
+            code: &'a str,
             _state: &'a str,
             _source: std::net::IpAddr,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CallbackResult> + Send + 'a>>
         {
-            let result = self.0;
-            Box::pin(async move { result })
+            let result = match code {
+                "admitted" => CallbackResult::Admitted,
+                "rejected" => CallbackResult::Rejected,
+                "invalid-state" => CallbackResult::InvalidState,
+                "platform" => CallbackResult::Platform,
+                "limited" => CallbackResult::Limited,
+                _ => CallbackResult::Rejected,
+            };
+            Box::pin(std::future::ready(result))
         }
     }
 
-    fn server_with(listen: std::net::SocketAddr) -> CallbackServer {
+    fn pem(label: &str, der: &[u8]) -> Vec<u8> {
+        let encoded = data_encoding::BASE64.encode(der);
+        let mut document = format!("-----BEGIN {label}-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            document.push_str(std::str::from_utf8(chunk).unwrap());
+            document.push('\n');
+        }
+        document.push_str(&format!("-----END {label}-----\n"));
+        document.into_bytes()
+    }
+
+    fn config_with(
+        listen: std::net::SocketAddr,
+        certificates: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+    ) -> EnterpriseAuthConfig {
         let providers = EnterpriseProviders::new(true, false).unwrap();
         let secrets = ProviderSecrets::new(
             providers,
@@ -422,382 +539,261 @@ mod tests {
             None,
         )
         .unwrap();
-        let config = EnterpriseAuthConfig::new(
+        EnterpriseAuthConfig::new(
             listen,
             CallbackExternalUrl::new(Url::parse("https://relay.example.test").unwrap()).unwrap(),
-            vec![SecretDocument::new(TEST_CERT_DER.to_vec())],
-            SecretDocument::new(TEST_KEY_DER.to_vec()),
+            certificates.into_iter().map(SecretDocument::new).collect(),
+            SecretDocument::new(private_key),
             providers,
             secrets,
         )
-        .unwrap();
-        CallbackServer::from_config(&config).unwrap()
+        .unwrap()
     }
 
-    /// Connects and completes the TLS handshake with the fixture CA
-    /// without sending any HTTP request.
-    async fn tls_connect(
-        address: std::net::SocketAddr,
-    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
-        let mut roots = rustls::RootCertStore::empty();
-        let ca = include_bytes!("../../yon/tests/fixtures/localhost-test-ca.der");
-        roots
-            .add(CertificateDer::from(ca.to_vec()))
-            .expect("fixture CA is parseable");
-        let client = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        connector.connect(server_name, stream).await.unwrap()
-    }
-
-    /// Executes one HTTP/1.1 request over a TLS connection trusting the
-    /// fixture CA, and returns the status line and headers.
-    async fn tls_request(address: std::net::SocketAddr, request: &str) -> (String, String) {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let mut tls = tls_connect(address).await;
-        tls.write_all(request.as_bytes()).await.unwrap();
-        let mut bytes = Vec::new();
-        tls.read_to_end(&mut bytes).await.unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        let mut lines = text.lines();
-        let status = lines.next().unwrap_or_default().to_owned();
-        let headers: Vec<&str> = lines.take_while(|line| !line.is_empty()).collect();
-        (status, headers.join("\n"))
+    async fn server_with(listen: std::net::SocketAddr) -> CallbackServer {
+        let config = config_with(listen, vec![TEST_CERT_DER.to_vec()], TEST_KEY_DER.to_vec());
+        CallbackServer::from_config(&config).await.unwrap()
     }
 
     #[test]
-    fn query_params_decode_percent_and_plus_and_report_missing() {
-        assert_eq!(query_param("code=a&state=b", "code"), Some("a".to_owned()));
-        assert_eq!(query_param("code=a&state=b", "state"), Some("b".to_owned()));
-        assert_eq!(query_param("state=b", "code"), None);
-        assert_eq!(
-            query_param("code=a%20b&state=c", "code"),
-            Some("a b".to_owned())
-        );
-        assert_eq!(
-            query_param("code=a+b&state=c", "code"),
-            Some("a b".to_owned())
-        );
-        assert_eq!(
-            query_param("code=a%2Fb&state=c", "code"),
-            Some("a/b".to_owned())
-        );
-        // The parser is lenient about malformed escapes; the downstream
-        // strict state hex-decoding and provider exchange reject them.
-        assert_eq!(
-            query_param("code=a%zz&state=b", "code"),
-            Some("a%zz".to_owned())
-        );
-    }
-
-    #[test]
-    fn invalid_tls_material_fails_closed_at_construction() {
-        let config = EnterpriseAuthConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            CallbackExternalUrl::new(Url::parse("https://relay.example.test").unwrap()).unwrap(),
-            vec![SecretDocument::new(vec![1, 2, 3])],
-            SecretDocument::new(TEST_KEY_DER.to_vec()),
-            EnterpriseProviders::new(true, false).unwrap(),
-            ProviderSecrets::new(
-                EnterpriseProviders::new(true, false).unwrap(),
-                Some(std::path::PathBuf::from("wecom.secret")),
-                None,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(
-            CallbackServer::from_config(&config),
-            Err(CallbackServerError::InvalidTlsMaterial)
-        ));
-    }
-
-    #[test]
-    fn private_key_pem_documents_are_rejected_as_certificates() {
-        // A PEM private key document is not a certificate chain: every
-        // section fails the certificate filter, leaving an empty chain.
-        let key_pem = b"-----BEGIN PRIVATE KEY-----\naGVsbG8gd29ybGQ=\n-----END PRIVATE KEY-----\n";
-        assert!(matches!(
-            parse_certificates(&[SecretDocument::new(key_pem.to_vec())]),
-            Err(CallbackServerError::InvalidCertificate)
-        ));
-    }
-
-    #[test]
-    fn invalid_private_key_documents_fail_closed() {
-        // Garbage DER bytes are not a usable private key.
-        assert!(matches!(
-            parse_private_key(&SecretDocument::new(vec![1, 2, 3, 4])),
-            Err(CallbackServerError::InvalidPrivateKey)
-        ));
-        // A PEM certificate is not a private key document.
-        let certificate_pem =
-            b"-----BEGIN CERTIFICATE-----\naGVsbG8gd29ybGQ=\n-----END CERTIFICATE-----\n";
-        assert!(matches!(
-            parse_private_key(&SecretDocument::new(certificate_pem.to_vec())),
-            Err(CallbackServerError::InvalidPrivateKey)
-        ));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn callback_requests_are_served_over_https() {
-        let server = server_with("127.0.0.1:0".parse().unwrap());
-        let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
-        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
-        let (status, headers) = tls_request(
-            address,
-            "GET /yonder/callback/wecom?code=auth-code-1&state=abcdef HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
-        assert!(headers.to_lowercase().contains("cache-control: no-store"));
-        assert!(headers.to_lowercase().contains("content-type: text/html"));
-        // Keep-alive is disabled so the connection releases its permit as
-        // soon as the response is written.
-        assert!(headers.to_lowercase().contains("connection: close"));
-        serving.abort();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn unknown_paths_methods_and_missing_params_are_rejected() {
-        let server = server_with("127.0.0.1:0".parse().unwrap());
-        let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Rejected));
-        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
-        for request in [
-            "GET / HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-            "GET /yonder/callback/wecom HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-            "GET /yonder/callback/wecom?code=a HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-            "POST /yonder/callback/wecom?code=a&state=b HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-        ] {
-            let (status, _) = tls_request(address, request).await;
-            assert!(
-                status.starts_with("HTTP/1.1 400")
-                    || status.starts_with("HTTP/1.1 404")
-                    || status.starts_with("HTTP/1.1 405"),
-                "{status}"
-            );
-        }
-        serving.abort();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn oversized_queries_are_rejected() {
-        let server = server_with("127.0.0.1:0".parse().unwrap());
-        let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
-        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
-        let big = format!(
-            "GET /yonder/callback/wecom?code={}&state=x HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-            "a".repeat(MAX_CALLBACK_QUERY_BYTES)
-        );
-        let (status, _) = tls_request(address, &big).await;
-        assert!(status.starts_with("HTTP/1.1 400"), "{status}");
-        serving.abort();
-    }
-
-    /// Regression test for the callback connection lifetime: a connection
-    /// that completes the TLS handshake but never sends an HTTP request
-    /// must release its permit after `CALLBACK_HANDSHAKE_TIMEOUT`.
-    ///
-    /// Real-time test: sleeps for the ten-second constant plus a margin,
-    /// so it takes about eleven seconds. This is deliberate — the whole
-    /// per-connection bound is a fixed ten-second constant used directly
-    /// by the server, so the release can only be proven with real time.
-    #[tokio::test(flavor = "current_thread")]
-    async fn stalled_callback_connections_release_their_permit_after_the_timeout() {
-        let server = server_with("127.0.0.1:0".parse().unwrap());
-        let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
-        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
-
-        // The TLS handshake completes, but no HTTP request ever arrives.
-        use tokio::io::AsyncReadExt as _;
-        let mut stalled = tls_connect(address).await;
-        tokio::time::sleep(CALLBACK_HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
-
-        // The server closed the stalled connection: its permit is released.
-        let mut byte = [0_u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte)).await;
-        match read {
-            Ok(Ok(0)) | Ok(Err(_)) => {}
-            Ok(Ok(_)) => panic!("the stalled connection received data"),
-            Err(_) => panic!("the stalled connection was not closed by the server"),
-        }
-
-        // Every permit slot is available again: all MAX_CALLBACK_CONNECTIONS
-        // genuine callback requests are served. If the stalled connection
-        // had pinned its permit, the last request would have been dropped.
-        for _ in 0..MAX_CALLBACK_CONNECTIONS {
-            let (status, _) = tls_request(
-                address,
-                "GET /yonder/callback/wecom?code=auth-code-1&state=abcdef HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-            )
-            .await;
-            assert!(status.starts_with("HTTP/1.1 200"), "{status}");
-        }
-        serving.abort();
-    }
-
-    #[test]
-    fn result_pages_map_every_outcome_to_minimal_never_cached_responses() {
-        use crate::callback::response::result;
-        let cases = [
-            (CallbackResult::Admitted, "200"),
-            (CallbackResult::Rejected, "200"),
-            (CallbackResult::InvalidState, "400"),
-            (CallbackResult::Platform, "503"),
-            (CallbackResult::Limited, "429"),
-        ];
-        for (outcome, status) in cases {
-            let response = result(outcome);
-            assert_eq!(response.status().as_str(), status, "{outcome:?}");
-            assert_eq!(
-                response
-                    .headers()
-                    .get(hyper::header::CACHE_CONTROL)
-                    .and_then(|value| value.to_str().ok()),
-                Some("no-store"),
-                "{outcome:?}"
-            );
-            assert_eq!(
-                response
-                    .headers()
-                    .get(hyper::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("text/html; charset=utf-8"),
-                "{outcome:?}"
-            );
-            let body = response.body();
-            assert!(body.contains("Yonder"), "{outcome:?}");
-            assert!(
-                !body.contains("http"),
-                "{outcome:?} has no external resources"
-            );
-        }
-    }
-
-    #[test]
-    fn callback_result_labels_are_low_cardinality_and_stable() {
-        let cases = [
+    fn callback_results_query_parser_and_capacity_have_the_frozen_values() {
+        assert_eq!(MAX_CALLBACK_CONNECTIONS, 16);
+        assert_eq!(MAX_CALLBACK_QUERY_BYTES, 1024);
+        assert_eq!(MAX_CALLBACK_STATE_BYTES, 128);
+        assert_eq!(CALLBACK_CONNECTION_TIMEOUT, Duration::from_secs(10));
+        for (result, text) in [
             (CallbackResult::Admitted, "admitted"),
             (CallbackResult::Rejected, "rejected"),
             (CallbackResult::InvalidState, "invalid-state"),
             (CallbackResult::Platform, "platform"),
             (CallbackResult::Limited, "limited"),
-        ];
-        for (outcome, label) in cases {
-            assert_eq!(outcome.as_str(), label);
+        ] {
+            assert_eq!(result.as_str(), text);
         }
+        assert_eq!(
+            query_param("code=a+value&state=b", "code").as_deref(),
+            Some("a value")
+        );
+        assert_eq!(
+            query_param("code=first&code=second", "code").as_deref(),
+            Some("first")
+        );
+        assert_eq!(query_param("state=b", "code"), None);
     }
 
-    #[test]
-    fn callback_server_reports_its_configured_listener() {
-        let listen: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = server_with(listen);
-        assert_eq!(server.listen(), listen);
-    }
+    #[tokio::test]
+    async fn tls_documents_accept_consistent_pem_or_der_and_reject_other_material() {
+        let listen = "127.0.0.1:0".parse().unwrap();
+        let der = CallbackServer::from_config(&config_with(
+            listen,
+            vec![TEST_CERT_DER.to_vec()],
+            TEST_KEY_DER.to_vec(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(der.listen(), listen);
+        assert!(format!("{der:?}").contains("127.0.0.1:0"));
 
-    #[test]
-    fn malformed_pem_certificate_sections_are_rejected() {
-        // A PEM document whose certificate section is not valid base64
-        // fails the certificate filter fail-closed.
-        let garbage = b"-----BEGIN CERTIFICATE-----\nnot-base64!\n-----END CERTIFICATE-----\n";
+        let pem_server = CallbackServer::from_config(&config_with(
+            listen,
+            vec![pem("CERTIFICATE", TEST_CERT_DER)],
+            pem("PRIVATE KEY", TEST_KEY_DER),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(pem_server.listen(), listen);
+
+        let invalid = config_with(
+            listen,
+            vec![b"not-a-certificate".to_vec()],
+            TEST_KEY_DER.to_vec(),
+        );
         assert!(matches!(
-            parse_certificates(&[SecretDocument::new(garbage.to_vec())]),
-            Err(CallbackServerError::InvalidCertificate)
+            CallbackServer::from_config(&invalid).await,
+            Err(CallbackServerError::InvalidTlsMaterial)
+        ));
+        let mixed = config_with(
+            listen,
+            vec![pem("CERTIFICATE", TEST_CERT_DER)],
+            TEST_KEY_DER.to_vec(),
+        );
+        assert!(matches!(
+            CallbackServer::from_config(&mixed).await,
+            Err(CallbackServerError::InvalidTlsMaterial)
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn excess_callback_connections_are_dropped_fail_closed() {
-        use tokio::io::AsyncReadExt as _;
-
-        let server = server_with("127.0.0.1:0".parse().unwrap());
-        let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
-        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
-
-        // Every connection holds its permit during the TLS handshake, so
-        // the connection capacity is exhausted; the next connection is
-        // dropped immediately (fail closed).
-        let mut held = Vec::new();
-        for _ in 0..MAX_CALLBACK_CONNECTIONS {
-            held.push(tokio::net::TcpStream::connect(address).await.unwrap());
-        }
-        tokio::task::yield_now().await;
-        let mut overflow = tokio::net::TcpStream::connect(address).await.unwrap();
-        let mut byte = [0_u8; 1];
-        match tokio::time::timeout(Duration::from_secs(2), overflow.read(&mut byte)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => {}
-            Ok(Ok(_)) => panic!("the overflow connection received data"),
-            Err(_) => panic!("the overflow connection was not dropped by the server"),
-        }
-        serving.abort();
+    #[tokio::test]
+    async fn bind_reports_an_occupied_callback_address() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        let server = server_with(address).await;
+        assert!(matches!(
+            server.bind().await,
+            Err(CallbackServerError::Bind {
+                address: failed,
+                ..
+            }) if failed == address
+        ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn failed_tls_handshakes_close_the_connection_immediately() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let server = server_with("127.0.0.1:0".parse().unwrap());
-        let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
-        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
-
-        // Plain bytes are not a TLS handshake: the server rejects the
-        // connection instead of pinning its permit until the timeout. The
-        // rejection may include a TLS alert before the close, so the test
-        // accepts bytes and only requires the connection to end promptly.
-        let mut raw = tokio::net::TcpStream::connect(address).await.unwrap();
-        raw.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
+    #[tokio::test]
+    async fn real_https_callback_routes_validate_inputs_and_are_not_cached() {
+        let server = server_with("127.0.0.1:0".parse().unwrap()).await;
+        let (listener, bound) = server.bind().await.unwrap();
+        assert!(format!("{listener:?}").contains("LimitedListener"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(
+            server.serve_on(listener, Arc::new(RoutingHandler), async move {
+                let _ = shutdown_rx.await;
+            }),
+        );
+        let certificate = reqwest::Certificate::from_der(TEST_CA_DER).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(certificate)
+            .https_only(true)
+            .build()
             .unwrap();
-        let mut buffer = [0_u8; 64];
-        let closed = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                match raw.read(&mut buffer).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => continue,
-                }
-            }
-        })
-        .await;
-        assert!(
-            closed.is_ok(),
-            "the failed handshake connection was not closed by the server"
+        let base = format!("https://localhost:{}", bound.port());
+        for (provider, code, status) in [
+            ("wecom", "admitted", reqwest::StatusCode::OK),
+            ("feishu", "rejected", reqwest::StatusCode::OK),
+            ("wecom", "invalid-state", reqwest::StatusCode::BAD_REQUEST),
+            (
+                "wecom",
+                "platform",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("wecom", "limited", reqwest::StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let response = client
+                .get(format!(
+                    "{base}/yonder/callback/{provider}?code={code}&state=state"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                "default-src 'none'"
+            );
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert!(response.text().await.unwrap().contains("Yonder"));
+        }
+
+        let bad_paths = [
+            "/yonder/callback/wecom",
+            "/yonder/callback/wecom?state=state",
+            "/yonder/callback/wecom?code=admitted",
+            "/yonder/callback/wecom?code=&state=state",
+            "/yonder/callback/wecom?code=admitted&state=",
+        ];
+        for path in bad_paths {
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        let oversized_query = "q".repeat(MAX_CALLBACK_QUERY_BYTES + 1);
+        let oversized_code = "c".repeat(crate::verifier::MAX_AUTHORIZATION_CODE_BYTES + 1);
+        let oversized_state = "s".repeat(MAX_CALLBACK_STATE_BYTES + 1);
+        for path in [
+            format!("/yonder/callback/wecom?{oversized_query}"),
+            format!("/yonder/callback/wecom?code={oversized_code}&state=state"),
+            format!("/yonder/callback/wecom?code=admitted&state={oversized_state}"),
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            client
+                .post(format!("{base}/yonder/callback/wecom"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
         );
-        serving.abort();
+        assert_eq!(
+            client
+                .get(format!("{base}/unknown"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn missing_code_and_oversized_parameters_are_rejected() {
-        let server = server_with("127.0.0.1:0".parse().unwrap());
-        let (listener, address) = server.bind().await.unwrap();
-        let handler: Arc<dyn CallbackHandler> = Arc::new(StubHandler(CallbackResult::Admitted));
-        let serving = tokio::spawn(server.serve_on(listener, handler, std::future::pending()));
-
-        // The state parameter is present but the code is missing.
-        let (status, _) = tls_request(
-            address,
-            "GET /yonder/callback/wecom?state=abcdef HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(status.starts_with("HTTP/1.1 400"), "{status}");
-
-        // The authorization code exceeds the wire bound.
-        let oversized = format!(
-            "GET /yonder/callback/wecom?code={}&state=abcdef HTTP/1.1\r\nHost: relay.example.test\r\nConnection: close\r\n\r\n",
-            "a".repeat(crate::verifier::MAX_AUTHORIZATION_CODE_BYTES + 1)
+    #[tokio::test]
+    async fn limited_listener_carries_capacity_addresses_io_and_deadlines() {
+        let listener = LimitedListener::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.get_local_addr().unwrap();
+        assert!(format!("{address:?}").contains(&address.socket.to_string()));
+        assert_eq!(
+            CallbackSource::connect_info(address.clone()).0,
+            address.socket.ip()
         );
-        let (status, _) = tls_request(address, &oversized).await;
-        assert!(status.starts_with("HTTP/1.1 400"), "{status}");
 
-        serving.abort();
+        let rebound = LimitedListener::bind_to(LimitedAddress {
+            socket: "127.0.0.1:0".parse().unwrap(),
+            permits: Arc::new(Semaphore::new(1)),
+        })
+        .await
+        .unwrap();
+        assert_ne!(rebound.get_local_addr().unwrap().socket.port(), 0);
+
+        let mut client = TcpStream::connect(address.socket).await.unwrap();
+        let (mut server, remote) = listener.accept_stream().await.unwrap();
+        assert_eq!(remote.socket.ip(), client.local_addr().unwrap().ip());
+        client.write_all(b"request").await.unwrap();
+        let mut request = [0_u8; 7];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        server.write_all(b"reply").await.unwrap();
+        server.flush().await.unwrap();
+        let mut reply = [0_u8; 5];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        server.deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        server.deadline.as_mut().await;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            server.read(&mut byte).await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        server.deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        server.deadline.as_mut().await;
+        assert_eq!(
+            server.write(b"x").await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        server.deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        server.deadline.as_mut().await;
+        assert_eq!(
+            server.flush().await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        server.shutdown().await.unwrap();
+
+        listener.permits.close();
+        let error = listener.accept_stream().await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 }

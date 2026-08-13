@@ -1,4 +1,4 @@
-//! Local control input state machine (0.1.3 design §6.1–§6.4, §7.4–§7.6, §16.1).
+//! Local control input state machine for the 0.2.0 file-transfer UX.
 //!
 //! Interprets the local control namespace on controller terminal input: the
 //! `Ctrl+]` prefix and its selectors in pass-through, the modal file-transfer

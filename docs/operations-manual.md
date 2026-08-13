@@ -1,6 +1,6 @@
-# Yonder 0.1.3 运维与使用手册
+# Yonder 0.2.0 运维与使用手册
 
-本文档面向需要部署、维护和使用 Yonder 的系统管理员、网络管理员与终端用户。文中的命令、配置字段和行为均对应 Yonder `0.1.3`。
+本文档面向需要部署、维护和使用 Yonder 的系统管理员、网络管理员与终端用户。文中的命令、配置字段和行为均对应 Yonder `0.2.0`。
 
 ## 目录
 
@@ -47,9 +47,7 @@ relay 不掌握连接码中的认证秘密，也不能读取终端内容。relay
 
 ### 1.2 当前功能边界
 
-Yonder `0.1.1` 提供一次性远程交互终端、终端尺寸同步、ANSI 字节传输、Ctrl+C、远端退出码传播和 TCP/QUIC/WS/WSS 自适应连接。它不提供 SSH/SFTP 兼容、文件同步、端口转发、常驻多会话账户体系或官方公共 relay。
-
-`0.1.3` 增加活动交互终端会话内的原生单文件上传与下载（`Ctrl+] u` 上传、`Ctrl+] d` 下载，详见 9.6 节）：两端只需同一个 `yon` 二进制，不依赖 `rz`/`sz`、ZMODEM、SFTP/SCP 或 Shell 命令；文件同步、目录传输、断点续传和多文件操作仍不属于本版本范围。
+Yonder `0.2.0` 提供一次性远程交互终端、终端尺寸同步、ANSI 字节传输、Ctrl+C、远端退出码传播、TCP/QUIC/WS/WSS 自适应连接、活动会话内的单文件上传/下载，以及可选的企业微信/飞书成员准入和强制双端可验证审计。它不提供 SSH/SFTP 兼容、目录同步、端口转发、常驻多会话账户体系、RBAC、中心化审计平台或官方公共 relay。
 
 ## 2. 平台与发布文件
 
@@ -66,9 +64,9 @@ Yonder `0.1.1` 提供一次性远程交互终端、终端尺寸同步、ANSI 字
 
 每个归档恰好包含一个规范名称的可执行文件。Linux 产物是完全静态 ELF；Windows 产物静态链接 CRT，不依赖第三方 DLL；macOS 产物只依赖 Apple 系统 `libSystem`/framework。macOS 不允许普通第三方程序把系统库静态嵌入 Mach-O，因此 macOS 的“单文件分发”不等于字面意义上的全静态链接。
 
-`0.1.1` 发布流程提供 SHA-256 和 GitHub 构建来源证明，但当前不包含 Windows Authenticode 签名或 Apple notarization。Windows SmartScreen、macOS Gatekeeper 或企业终端防护可能因此要求管理员批准。应先验证 SHA-256 与 provenance，再通过组织的软件分发、MDM 或应用白名单流程授权；不要为了运行 Yonder 全局关闭系统安全机制。
+`0.2.0` 发布流程提供 SHA-256、CycloneDX SBOM、第三方许可证清单和 GitHub 构建来源证明，但当前不包含 Windows Authenticode 签名或 Apple notarization。Windows SmartScreen、macOS Gatekeeper 或企业终端防护可能因此要求管理员批准。应先验证 SHA-256 与 provenance，再通过组织的软件分发、MDM 或应用白名单流程授权；不要为了运行 Yonder 全局关闭系统安全机制。
 
-`0.1.1` 的生产支持基线如下。低于基线的系统可能仍能启动，但不属于发布验收范围：
+`0.2.0` 的生产支持基线如下。低于基线的系统可能仍能启动，但不属于发布验收范围：
 
 | 平台 | 最低生产基线 | 说明 |
 | --- | --- | --- |
@@ -76,7 +74,7 @@ Yonder `0.1.1` 提供一次性远程交互终端、终端尺寸同步、ANSI 字
 | Windows x86_64/arm64 | Windows 10 `1809` 或 Windows Server 2019 | 交互终端依赖 ConPTY；不支持 Windows Nano Server，也不依赖 WSL。 |
 | macOS Intel/Apple Silicon | macOS 12 | 只依赖 Apple 系统库；不同架构必须使用对应归档。 |
 
-Windows PowerShell `5.1` 是 relay identity 与 WSS 私钥 ACL 校验所用的系统组件；它随上述受支持的常规 Windows 客户端和 Server/Core 安装提供。精简掉 Windows PowerShell 的自定义镜像不属于 `0.1.1` 支持范围。Linux 与 macOS 不调用 PowerShell。
+Windows PowerShell `5.1` 是 relay identity、WSS/企业回调私钥与 endpoint 企业审计目录 ACL 校验所用的系统组件；它随上述受支持的常规 Windows 客户端和 Server/Core 安装提供。精简掉 Windows PowerShell 的自定义镜像不属于 `0.2.0` 支持范围。Linux 与 macOS 不调用 PowerShell。
 
 ### 2.1 校验下载文件
 
@@ -204,7 +202,7 @@ Windows 首次运行 `yon` 时可能出现 Defender Firewall 网络访问提示�
 - IPv6 listener 示例为 `/ip6/::/tcp/4001` 和 `/ip6/::/udp/4001/quic-v1`。
 - DNS 变更生效前应保留旧地址，并在 endpoint 的 `relays` 列表中短期同时配置新旧入口。所有入口必须属于同一个 relay PeerId。
 
-同一 PeerId 下的多个地址仅表示**同一个 relay 进程的多个传输入口**，不是独立高可用节点。relay 的定位注册表只在本进程内存中；不要把同一 identity 同时复制给多个进程，不要在这些进程前使用 DNS 轮询或无会话一致性的四层负载均衡，否则 host 注册与 controller 查询可能落到不同内存注册表。`0.1.1` 不提供多 relay 一致性或活动会话迁移；生产可用性应通过单实例进程监督、稳定存储 identity、快速重启和多传输入口保障。
+同一 PeerId 下的多个地址仅表示**同一个 relay 进程的多个传输入口**，不是独立高可用节点。relay 的定位注册表只在本进程内存中；不要把同一 identity 同时复制给多个进程，不要在这些进程前使用 DNS 轮询或无会话一致性的四层负载均衡，否则 host 注册与 controller 查询可能落到不同内存注册表。`0.2.0` 不提供多 relay 一致性或活动会话迁移；生产可用性应通过单实例进程监督、稳定存储 identity、快速重启和多传输入口保障。
 
 ## 4. 配置加载规则
 
@@ -483,12 +481,12 @@ source_limiter_capacity >=
 | `circuit.capacity` | `YON_RELAY_CIRCUIT__CAPACITY` |
 | `circuit.duration_seconds` | `YON_RELAY_CIRCUIT__DURATION_SECONDS` |
 | `circuit.bytes` | `YON_RELAY_CIRCUIT__BYTES` |
-| `enterprise_auth.secret_wecom` | `YON_RELAY_ENTERPRISE_AUTH__SECRET_WECOM` |
-| `enterprise_auth.secret_feishu` | `YON_RELAY_ENTERPRISE_AUTH__SECRET_FEISHU` |
-| `enterprise_auth.certificate` | `YON_RELAY_ENTERPRISE_AUTH__CERTIFICATE` |
-| `enterprise_auth.private_key` | `YON_RELAY_ENTERPRISE_AUTH__PRIVATE_KEY` |
 | `enterprise_auth.callback_listen` | `YON_RELAY_ENTERPRISE_AUTH__CALLBACK_LISTEN` |
 | `enterprise_auth.callback_external_url` | `YON_RELAY_ENTERPRISE_AUTH__CALLBACK_EXTERNAL_URL` |
+| `enterprise_auth.certificate` | `YON_RELAY_ENTERPRISE_AUTH__CERTIFICATE` |
+| `enterprise_auth.private_key` | `YON_RELAY_ENTERPRISE_AUTH__PRIVATE_KEY` |
+| `enterprise_auth.secret_wecom` | `YON_RELAY_ENTERPRISE_AUTH__SECRET_WECOM` |
+| `enterprise_auth.secret_feishu` | `YON_RELAY_ENTERPRISE_AUTH__SECRET_FEISHU` |
 
 列表环境变量用逗号分隔：
 
@@ -497,57 +495,73 @@ export YON_RELAY_LISTEN='/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1'
 export YON_RELAY_EXTERNAL='/dns4/relay.example.com/tcp/4001,/dns4/relay.example.com/udp/4001/quic-v1'
 ```
 
-`wss_certificate` 也是列表字段：环境变量中的证书链路径按叶证书到中间证书顺序用逗号分隔。兼容键 `wss_certificate_der`、`wss_private_key_der` 及其 `_DER` 环境变量在 `0.1.1` 仍可读取；高优先级新键可覆盖低优先级旧键，同一配置层同时设置同组新旧键会失败。
+`wss_certificate` 也是列表字段：环境变量中的证书链路径按叶证书到中间证书顺序用逗号分隔。兼容键 `wss_certificate_der`、`wss_private_key_der` 及其 `_DER` 环境变量在 `0.2.0` 仍可读取；高优先级新键可覆盖低优先级旧键，同一配置层同时设置同组新旧键会失败。
 
-### 5.6 企业认证模式
+### 5.6 企业成员准入模式
 
-`0.1.2` 起 relay 可以要求发起连接的用户先证明自己仍是配置企业的有效内部成员。**配置存在即模式切换，没有 `enabled` 开关**：TOML 中存在 `[enterprise_auth]` 段即进入企业模式，进程生命周期内不可切换；一个 relay 要么是普通模式、要么是企业模式，不会混用。
+relay 配置中不存在 `[enterprise_auth]` 时运行普通模式；存在该节时运行企业模式。模式在进程启动时固定，不能热切换。企业模式只提供 Enterprise Resolve，普通 Resolve 不会同时开放；OAuth 失败、超时或平台不可用时不会降级到普通准入。
 
-企业模式只提供 Enterprise Resolve 协议，不提供普通 Resolve；认证失败不会降级。兼容性：旧 host 仍可注册到企业 relay；旧 connect 无法使用企业 relay；`0.1.2` 及以后的 connect 自动识别普通或企业 relay。
-
-#### 5.6.1 配置示例
+企业模式至少启用企业微信或飞书中的一个提供商。下面是同时启用两者的完整示例：
 
 ```toml
+identity = "/var/lib/yonder/relay.key"
+listen = [
+  "/ip4/0.0.0.0/tcp/4001",
+  "/ip4/0.0.0.0/udp/4001/quic-v1",
+]
+external = [
+  "/dns4/relay.example.com/tcp/4001",
+  "/dns4/relay.example.com/udp/4001/quic-v1",
+]
+
 [enterprise_auth]
-secret_wecom = "/etc/yonder/wecom.secret"
-secret_feishu = "/etc/yonder/feishu.secret"
-certificate = ["/etc/yonder/callback-cert.pem"]
-private_key = "/etc/yonder/callback-key.pem"
 callback_listen = "0.0.0.0:8443"
-callback_external_url = "https://auth.relay.example.com"
+callback_external_url = "https://relay.example.com:8443"
+certificate = [
+  "/etc/yonder/oauth/callback-leaf.pem",
+  "/etc/yonder/oauth/callback-intermediate.pem",
+]
+private_key = "/etc/yonder/oauth/callback-key.pem"
+secret_wecom = "/etc/yonder/oauth/wecom.secret.toml"
+secret_feishu = "/etc/yonder/oauth/feishu.secret.toml"
 ```
 
-- `secret_wecom` / `secret_feishu`：各平台企业自建应用的敏感凭据文件路径；两个平台可同时配置，也可以只配置一个；至少一个平台才能进入企业模式。
-- `certificate`（链，叶到中间，DER 或 PEM）与 `private_key`（DER 或 PEM）：回调 HTTPS 的 TLS 材料，由企业签发的公网可信证书组成。兼容键 `certificate_der`、`private_key_der` 与新键的关系与 `wss_*` 相同。
-- `callback_listen`：回调 HTTPS 监听地址。
-- `callback_external_url`：浏览器与 OAuth 平台都能访问的裸 HTTPS origin（带点域名或 IP，无路径/查询/片段），用作 OAuth `redirect_uri` 基址。
+`callback_external_url` 必须是客户端浏览器和企业平台都能访问的裸 HTTPS origin，不能包含 path、query、fragment 或 userinfo。Yonder 自动追加固定回调路径：
 
-#### 5.6.2 Secret 文件
+| 提供商 | 在平台后台登记的回调 URL |
+| --- | --- |
+| 企业微信 | `https://relay.example.com:8443/yonder/callback/wecom` |
+| 飞书 | `https://relay.example.com:8443/yonder/callback/feishu` |
 
-凭据文件是独立敏感文件，不允许写进配置正文：启动时读取一次，运行期间不热更新。格式为 TOML，大小上限 `16 KiB`：
+`callback_listen` 是 relay 自带 HTTPS 回调服务的明确 socket 地址。若直接监听 `8443`，应在安全组和主机防火墙开放该 TCP 端口；若外部端口经 DNAT 映射，`callback_external_url` 写浏览器实际访问的端口。0.2.0 的回调服务自身终止 TLS，不把明文 HTTP 暴露给反向代理。WSS transport 证书与 OAuth 回调证书是两个独立配置域，可以使用同一 CA，但不能用一组配置字段替代另一组。
+
+回调证书支持 DER 或 PEM，链顺序为叶证书在前、随后是 intermediate；私钥支持既有 TLS 解析器接受的 PKCS#1、PKCS#8 或 SEC1。证书 SAN 必须覆盖 `callback_external_url` 的精确 DNS 名或 IP。公开使用通常应部署浏览器和企业平台信任的 CA 证书；自签证书只有在组织已把对应 CA 安全安装到用户浏览器信任库，并且企业平台允许该回调 URL 时才可用。endpoint 的 `wss_ca` 不会影响浏览器对 OAuth 回调证书的信任。
+
+企业微信秘密文件：
 
 ```toml
-# wecom.secret —— 企业微信自建应用
-corp_id = "ww1234567890abcdef"
+corp_id = "ww0000000000000000"
 agent_id = 1000002
-app_secret = "企业微信应用的 secret"
+app_secret = "replace-with-application-secret"
 ```
+
+飞书秘密文件：
 
 ```toml
-# feishu.secret —— 飞书企业自建应用
-app_id = "cli_abc123"
-app_secret = "飞书应用的 secret"
+app_id = "cli_xxxxxxxxxxxxxxxx"
+app_secret = "replace-with-application-secret"
 ```
 
-Secret 文件必须遵循与其他 relay 秘密文件相同的平台权限策略（Unix `0600` 与可信父目录；Windows 受保护 DACL）。任一启用平台的文件缺失、不可读、越权或格式非法都会让 relay 拒绝启动（失败关闭）。凭据在进程内按需零化销毁。
+秘密文件最大 `16 KiB`，只允许上述字段，启动时读取一次且不热更新。Unix 上使用最终 relay 服务账户创建，权限必须为 `0600`，父目录不得允许 group/other 写入；Windows 上必须由最终服务账户持有并使用受保护 DACL。配置、证书、私钥或任一已启用提供商的秘密无效时，relay 在开放服务前失败关闭。
 
-#### 5.6.3 认证要求与回调
+```console
+install -d -o yonder -g yonder -m 0700 /etc/yonder/oauth
+chown yonder:yonder /etc/yonder/oauth/*.toml /etc/yonder/oauth/callback-key.pem
+chmod 0600 /etc/yonder/oauth/*.toml /etc/yonder/oauth/callback-key.pem
+yon-relay config check
+```
 
-认证要求：当前用户属于配置企业、且仍为有效内部成员。拒绝：外部用户、其他企业用户、离职、停用与无法确认状态的用户。企业微信需要自建应用在其可见范围内，应用 secret 用于换取应用 token；飞书需要自建应用具备 `authen:user.id:read` 与通讯录只读权限（`employee_status` 在职校验）。
-
-回调 HTTPS 只服务两个路径：`/yonder/callback/wecom` 与 `/yonder/callback/feishu`；不提供首页、管理页、状态查询或静态资源，未知路径与畸形请求返回最小错误页。结果页极简、`no-store` 不缓存、无外部资源。认证成功后用户身份立即销毁。
-
-日志只记录请求 ID、平台、阶段与脱敏结果；不记录用户身份、Token、OAuth state、locator 或 PeerId。
+企业 controller 输入连接码后会收到可用提供商列表；只有一个提供商时直接选择，有多个时提示选择。授权 URL 会先完整显示并 flush，再尽力打开本机默认浏览器；自动打开失败时可手工访问已显示 URL。用户完成授权后，relay 只判断其是否为配置企业中的有效在职内部成员，不向 host 传播成员 ID，也不把身份写入日志。事务最长 `10min`，浏览器回调、OAuth state、code、token 和成员身份均为单次、内存态数据，完成、取消、断连、超时或 relay 重启后销毁。
 
 ## 6. 配置 endpoint
 
@@ -593,7 +607,7 @@ $env:YON_WSS_CA = 'C:\ProgramData\Yonder\relay-ca.pem'
 export YON_WSS_CA='/etc/yonder/old-relay.pem,/etc/yonder/new-relay.pem'
 ```
 
-兼容键 `wss_ca_der`/`YON_WSS_CA_DER` 在 `0.1.1` 仍可读取。推荐新部署使用无格式后缀的新键；高优先级新键可覆盖低优先级旧键，同一配置层不能同时设置两者。
+兼容键 `wss_ca_der`/`YON_WSS_CA_DER` 在 `0.2.0` 仍可读取。推荐新部署使用无格式后缀的新键；高优先级新键可覆盖低优先级旧键，同一配置层不能同时设置两者。
 
 ## 7. WSS 证书部署
 
@@ -846,7 +860,7 @@ sudo launchctl print system/com.yonder.relay
 
 ### 8.3 Windows 进程托管
 
-`yon-relay` `0.1.1` 是 console 程序，不实现 Windows SCM 的 `ServiceMain`，因此不能直接用 `sc.exe create` 注册后期待正常启动。生产环境必须使用组织已有、经过验证的进程监督或编排系统，以专用低权限服务账户运行 console 程序：
+`yon-relay` `0.2.0` 是 console 程序，不实现 Windows SCM 的 `ServiceMain`，因此不能直接用 `sc.exe create` 注册后期待正常启动。生产环境必须使用组织已有、经过验证的进程监督或编排系统，以专用低权限服务账户运行 console 程序：
 
 ```powershell
 & 'C:\Program Files\Yonder\yon-relay.exe' --log-level info serve
@@ -920,14 +934,12 @@ printf 'ABCD-EFGH-JKMP-QRST\necho hello\nexit\n' | yon connect
 
 Windows ConPTY 无法在保留尾部输出的同时可靠地把管道关闭映射为 shell EOF，因此 Windows 非交互脚本必须显式发送 `exit`。Unix 会把输入半关闭传递为 PTY EOF，但显式 `exit` 仍是更清晰的跨平台做法。
 
-文件传输只在主控端标准输入为交互式终端时可用：管道或脚本输入下 `Ctrl+]` 不具有本地控制前缀语义，`u`、`d`、`?` 不触发任何本地操作，所有输入字节继续原样转发，也没有脚本化文件传输入口（详见 9.6.6 节）。
-
 ### 9.4 终端行为
 
 - 本地终端尺寸变化会同步到远端 PTY。
 - ANSI 控制字节原样传输。
 - 交互模式下 Ctrl+C 作为字节发送给远端前台程序。
-- 按 `Ctrl+]` 后再按 `.` 会在本地主控端断开会话；连续按两次 `Ctrl+]` 会向远端发送一个原样的 `Ctrl+]`。该转义只作用于交互终端，管道输入完全原样转发。`0.1.3` 新增 `Ctrl+] u`（上传文件）、`Ctrl+] d`（下载文件）、`Ctrl+] ?`（显示本地控制帮助），详见 9.6 节。
+- 按 `Ctrl+]` 后再按 `.` 会在本地主控端断开会话；连续按两次 `Ctrl+]` 会向远端发送一个原样的 `Ctrl+]`。该转义只作用于交互终端，管道输入完全原样转发。
 - 远端 shell 的 `0..=255` 退出码传播给本地主控进程。
 - 超出可移植范围的远端退出码会记录警告，并在本地返回 `1`。
 - 会话结束、连接中断或本地终端恢复失败时，必要警告和结构化错误会在远端最后一段输出后另起一行显示，不会黏在远端提示符或被 tracing 过滤掉。
@@ -963,88 +975,92 @@ yon-relay --log-level info serve
 - `yon connect` 向终端输出远端画面时，使用 `warn`、`info`、`debug` 或 `trace` 必须指定 `--log-file` 或重定向 stderr；未分离时会在连接前直接拒绝并显示示例命令。优先使用 `--log-file`，这样进度仍留在终端，而详细诊断追加写入文件。
 - 调试时可以临时使用 `debug`；`trace` 只应在受控窗口启用，避免产生大量网络事件日志。日志可能包含地址、PeerId 和时序元数据，按敏感运维材料保存。
 
-### 9.6 文件传输（0.1.3）
+### 9.6 会话内单文件传输
 
-`0.1.3` 起，在已经建立的交互式远程终端会话中，主控端可以用本地控制快捷键上传或下载一个普通文件。两端只需要同一个 `yon` 二进制，不依赖 `rz`、`sz`、ZMODEM、SFTP、SCP、Shell 命令或任何额外软件，也不需要被控端现场人员执行任何额外操作。文件字节不经过远端 PTY/ConPTY 与 Shell，在两端之间走独立应用子流；relay 不存储、不理解文件内容。完成、取消或普通失败后都返回同一个远程终端会话，不退出终端、不另开连接、不重新认证。
+文件传输只在已经进入 Active 状态的交互终端中可用，不提供独立的上传/下载命令，也不是 SFTP。主控端使用本地转义前缀发起操作：
 
-#### 9.6.1 快捷键
+| 按键 | 动作 |
+| --- | --- |
+| `Ctrl+]`，然后按 `u` | 上传一个本地文件到被控端 |
+| `Ctrl+]`，然后按 `d` | 下载一个被控端文件到本地 |
+| `Ctrl+]`，然后按 `?` | 显示本地控制帮助 |
+| `Ctrl+]`，然后按 `.` | 结束整个终端会话 |
+| 连续按两次 `Ctrl+]` | 向远端原样发送一个 `Ctrl+]` |
 
-`Ctrl+]` 是本地控制前缀，选择器固定为单个小写 ASCII 字符。`0.1.3` 的完整快捷键集合：
+上传会依次询问 `local source:` 和 `remote destination [remote session start directory]:`。下载会依次询问 `remote source:` 和 `local destination [local connect start directory]:`。目标字段留空时使用对应端的会话起始目录和源文件名；目标指向已经存在的目录时，也会在目录下追加源文件名。
 
-| 操作 | 快捷键 | 语义 |
-| --- | --- | --- |
-| 结束当前会话 | `Ctrl+]` 后按 `.` | 保持既有语义 |
-| 发送字面 `Ctrl+]` | `Ctrl+]` 后再按 `Ctrl+]` | 保持既有语义 |
-| 上传一个文件 | `Ctrl+]` 后按 `u` | 主控端文件传到被控端 |
-| 下载一个文件 | `Ctrl+]` 后按 `d` | 被控端文件传到主控端 |
-| 显示本地控制帮助 | `Ctrl+]` 后按 `?` | 显示当前版本定义的全部本地快捷键 |
+路径规则如下：
 
-`Ctrl+] ?` 以完整状态行输出全部快捷键后立即返回终端，不进入分页器、不启动外部程序、不修改远端终端状态。大写 `U`、`D` 不是快捷键，按未识别选择器处理；普通模式下未识别选择器保持既有透明转发，路径提示或传输期间则响铃并忽略。
+- 主控端相对路径始终相对于执行 `yon connect` 时捕获的本地工作目录；远端相对路径始终相对于启动 `yon host` 并创建 shell 时捕获的被控端工作目录。会话中执行 `cd` 不会改变文件传输的路径基准。
+- 路径按字面处理，不执行 `~`、环境变量、通配符或 shell 展开。需要使用绝对路径时，应输入目标操作系统可以识别的绝对路径。
+- 路径必须是 UTF-8，最长 `4096` 字节，并且不能包含 NUL 或控制字符。Windows 设备名、驱动器相对形式和其他不能安全解析的特殊路径会被拒绝。
+- 源必须是普通文件。目录、管道、socket、设备和其他特殊文件不能传输；符号链接只有在最终解析到普通文件时才能作为源读取。
+- 目标不得已经存在，父目录必须已经存在且必须是目录。Yonder 不自动创建父目录，也不覆盖、截断或删除已有目标。
 
-#### 9.6.2 上传流程
+一次会话最多运行一个文件操作。路径提示期间，Yonder 继续读取远端输出但暂缓显示，缓冲区硬上限为 `256 KiB`；达到上限时只取消尚未开始的文件操作并立即按原顺序显示已缓冲输出，终端会话继续。传输运行期间终端输出继续显示，但普通终端输入暂停；按 `Ctrl+C` 只取消当前传输，不会把该按键发给远端 shell，也不会结束终端。
 
-按 `Ctrl+] u` 后，主控端临时进入本地路径提示：
+数据以固定 `64 KiB` 分块流式传输，不把整个文件载入内存。控制步骤和数据无进展等待上限均为 `30s`。接收端先在目标同目录创建私有临时文件，流式计算并核对 SHA-256、大小和源文件变化，最后以不覆盖语义提交；失败、取消、摘要不匹配或连接中断时清理临时文件。普通文件传输错误会显示在当前终端中，但不会自动结束终端会话。
+
+### 9.7 企业会话审计与安全回放
+
+审计只在企业模式启用，并且是终端建立的强制前置条件。任一端无法创建安全审计目录、持久身份、记录文件或双端审计子流时，企业会话在 PTY 创建前失败关闭；普通模式不解析审计目录、不创建审计文件，也不打开审计子流。
+
+每个 endpoint 在本地保存自己的记录：
+
+| 平台 | 默认审计根目录 |
+| --- | --- |
+| Linux | `$XDG_STATE_HOME/yonder/audit`；未设置时为 `~/.local/state/yonder/audit` |
+| macOS | `~/Library/Application Support/Yonder/Audit` |
+| Windows | `%LOCALAPPDATA%\Yonder\Audit` |
+
+目录结构为：
 
 ```text
-[yonder upload]
-local source:
-remote destination [remote session start directory]:
+audit/
+|-- identity.ed25519
+|-- ledger.state
+|-- ledger.lock
+`-- records/
+    `-- <session-id>.<controller|host>.yonaudit
 ```
 
-- `local source:` 必填。本地相对路径相对于主控端启动 `yon connect` 时的会话起始目录。
-- `remote destination [remote session start directory]:` 留空时，目标为远端会话起始目录下的源文件基本名；填写相对路径时相对于被控端启动 Shell 时的会话起始目录；远端绝对路径由被控端操作系统解释。
-- 远端目标是已存在目录时，最终文件名使用本地源文件基本名；目标不存在时把填写内容视为完整目标文件路径。
-- 最终目标已经存在时拒绝上传，目标父目录不存在时拒绝上传；Yonder 不自动创建父目录。
-- 提示阶段按 `Ctrl+C` 取消本次上传并返回终端。
+`identity.ed25519` 是该 endpoint 的持久 Ed25519 审计身份，`ledger.state` 是本地连续性锚，`ledger.lock` 防止同一审计身份被多个进程并发分叉。Unix 目录必须为 `0700`、文件必须为 `0600`；Windows 使用仅允许当前用户、SYSTEM 和 Administrators 的受保护 DACL。符号链接、reparse point、宽松权限、所有者异常或历史目录中身份文件缺失都会使企业会话拒绝启动，不能通过删除单个文件静默重建身份。
 
-#### 9.6.3 下载流程
+审计记录包括双端共同确认的会话、终端输入承诺、终端输出摘要、文件传输事实、关闭与最终清单，以及主控端实际显示的输出。原始键盘字节不落盘，只保存会话私钥保护的 HMAC 承诺；文件内容不落盘，另一端不接收本端绝对路径；企业成员或提供商的稳定身份也不进入 endpoint 审计文件。relay 始终看不到终端和文件明文。
 
-按 `Ctrl+] d` 后，主控端临时进入本地路径提示：
+验证一个本地文件：
 
-```text
-[yonder download]
-remote source:
-local destination [local connect start directory]:
+```console
+yon audit verify /path/to/session.controller.yonaudit
 ```
 
-- `remote source:` 必填。远端相对路径相对于被控端会话起始目录；远端绝对路径由被控端操作系统解释。
-- `local destination [local connect start directory]:` 留空时，目标为本地会话起始目录下的远端源文件基本名；本地相对路径相对于主控端会话起始目录。
-- 本地目标是已存在目录时，最终文件名使用远端源文件基本名；目标不存在时把填写内容视为完整目标文件路径。
-- 最终目标已经存在时拒绝下载，目标父目录不存在时拒绝下载；Yonder 不自动创建父目录。
-- 提示阶段按 `Ctrl+C` 取消本次下载并返回终端。
+把两个 endpoint 的同一会话记录通过受控渠道汇集后执行双边验证：
 
-两个会话起始目录（主控端启动 `yon connect` 时的工作目录、被控端启动 Shell 时的工作目录）在会话生命周期内固定不变，不随 Shell 内 `cd` 或进程级目录变化而改变；Yonder 不跟踪、猜测或解析 Shell 当前目录。路径按字面解释：不做 Shell 展开、不解释通配符、不展开 `~` 或环境变量，路径中的空格是普通字符，不需要 Shell 引号。路径使用 UTF-8，编码后最长 `4096` 字节；Unix 上无法转换为 UTF-8 的原生路径不属于支持范围。
+```console
+yon audit verify session.controller.yonaudit session.host.yonaudit
+```
 
-#### 9.6.4 语义与限制
+验证状态和进程退出码固定如下：
 
-- 一次文件操作只传输一个文件，且必须是普通文件；空文件可以。路径经过符号链接或等价重解析后最终指向普通文件的，传输其内容但不传输链接关系；目录、管道、socket、字符设备、块设备、Windows 设备对象等特殊文件一律拒绝。
-- 同一活动终端会话同一时刻最多一个文件操作，不排队、不并行。已有操作进行时再按 `Ctrl+] u` 或 `Ctrl+] d`，显示固定提示 `file transfer already active`，保持当前操作不变。
-- 目标文件绝不覆盖：最终目标在提交前必须不存在，普通文件、目录、符号链接、reparse point 或其他任何已存在对象都会导致拒绝；不提供覆盖确认、强制覆盖、自动改名、自动追加或自动创建父目录。
-- 接收方先在目标同目录创建不可预测名称的私有临时文件并流式写入，完整接收并验证字节数与 SHA-256 后，才以不替换已有目标的 no-replace 方式提交；提交成功前最终路径不会出现任何半成品。失败、取消、断线或进程退出时尽力删除临时文件。传输期间源文件发生变化时操作失败，接收方不提交。
-- 文件字节只进入独立文件子流，不进入 terminal-data、terminal-control、PTY/ConPTY、Shell 或本地终端显示；relay 只承载既有端到端连接中的应用子流，看不到文件内容、路径、文件名和摘要。
-- 文件操作使用当前操作系统身份和权限：被控端使用运行 `yon host` 的身份，主控端使用运行 `yon connect` 的本地用户身份；不提权、不切换用户、不绕过 ACL。Shell 内通过 `sudo`、`su` 等取得的临时身份不会传递给文件传输。文件传输继承当前活动会话的认证、连接、权限和生命周期，不重新认证，也不建立额外授权模型。
-- 目标文件由接收端当前进程、目录、umask 和操作系统默认规则创建；不保留所有者、权限、ACL、扩展属性、时间戳等任何元数据。
-- 日志与诊断只记录本地请求 ID、方向、协议阶段、结果类别、总字节数和耗时；不记录路径、文件名、文件内容、SHA-256、临时文件名或认证秘密。
-- `0.1.3` 不增加任何文件传输配置项：没有功能开关、默认上传/下载目录、最大文件大小、覆盖策略、快捷键、并发或超时配置。文件大小上限由文件系统和操作系统能力、可用空间、当前用户权限及协议 `u64` 边界决定，不设额外产品级上限。
+| 状态 | 退出码 | 含义 |
+| --- | ---: | --- |
+| `VERIFIED_COMPLETE` | `0` | 双端完整一致，且本地身份/账本连续性可验证 |
+| `CONSISTENT_COMPLETE_UNANCHORED` | `2` | 双端完整一致，但当前位置无法建立本地持久锚 |
+| `MATCHED_INTERRUPTED_PREFIX` | `2` | 双端中断前缀一致，未形成完整结束清单 |
+| `INTACT_UNPAIRED` | `2` | 单文件自身完整，但未提供对端文件，不能证明双边一致 |
+| `MISMATCH` | `3` | 两个文件的身份、共同链、计数、检查点或清单不一致 |
+| `TAMPERED` | `4` | 容器、哈希链、签名、封印或账本证据无效 |
+| I/O 或格式错误 | `1` | 文件无法读取或不是可解析的审计容器 |
 
-明确非目标（`0.1.3` 版本边界）：一次传输多个文件、目录或递归传输、断点续传、自动压缩或归档、文件删除/移动/重命名/权限管理、Shell 通配符或 `~` 展开、脚本化文件传输 CLI、`rz/sz`/ZMODEM/SFTP/SCP/rsync 兼容。
+离线回放必须使用主控端记录作为第一个参数：
 
-#### 9.6.5 传输期间的终端行为
+```console
+yon audit replay session.controller.yonaudit session.host.yonaudit
+```
 
-- 路径提示期间主控端暂停把远端终端输出写到本地显示，但继续读取并暂存在有界延迟缓冲（每会话最多 `256 KiB`）；提示完成或取消后先恢复终端，再按原顺序写出延迟输出。缓冲达到上限时取消尚未开始的文件操作、恢复终端并立即写出，不会关闭远端终端。
-- 传输期间普通本地键盘输入暂停，状态提示明确写明“传输期间终端输入暂停，Ctrl+C 取消”；暂停的输入不发送、不排队、不在传输结束后重放。
-- 传输开始只输出一条状态行，成功、取消或失败时只输出一条完成摘要，不做易受远端控制序列破坏的动态进度条或光标重绘；远端终端输出在传输期间继续实时显示。
-- `Ctrl+C` 直接取消当前文件操作（提示阶段取消操作，传输阶段取消传输并清理），不向远端 PTY 发送 `Ctrl+C`；`Ctrl+] .` 取消文件操作并按既有语义结束整个会话。
-- 普通文件错误（路径错误、权限不足、目标存在、空间不足、摘要错误、源文件变化、用户取消）只结束本次文件操作，不结束远端 Shell、不污染活动终端；只有连接丢失、会话关闭或协议安全状态无法维持时，终端才按既有规则结束。
-- 连接中断时当前文件操作立即失败，未提交目标不得出现，临时文件尽力删除；`0.1.3` 不恢复、不续传，终端会话按既有中断规则结束。
+回放前会先验证记录，并用 `vt100` 状态机重建主控端实际显示画面。程序不会把记录中的原始控制字节直接写回当前终端；标题修改、剪贴板、设备控制字符串、响铃、远端 resize 请求和未处理控制会被过滤或抑制。完整匹配记录和完整但未锚定记录可以回放；完整的单边主控记录会明确警告后回放；中断、错配、篡改以及把 host 记录作为回放源都会被拒绝。回放期间按 `Ctrl+C` 可安全停止。
 
-#### 9.6.6 旧版本与跨平台
-
-- `0.1.3` 主控端连接不支持文件协议的旧被控端时，触发文件快捷键会显示固定错误 `file transfer is not supported by the remote peer`，终端会话继续正常工作，不执行任何降级，路径也不会发送到远端 Shell；旧主控端连接 `0.1.3` 被控端时，被控端不会主动开启文件流，终端行为保持旧版本语义。`0.1.3` 与旧版本双向兼容，host 与 controller 可以任意顺序滚动升级；只有两端都升级到 `0.1.3` 时文件传输才可用。
-- 普通 relay 与企业 relay 都不理解 file-transfer 消息、不需要新配置、不缓存或保存文件，只承载既有端到端连接中的应用子流。
-- 六个正式发布目标（Linux x86_64/arm64、Windows x86_64/arm64、macOS Intel/Apple Silicon）提供相同的快捷键、单文件语义、相对路径基准、默认目标目录、目标不存在要求、临时写入、no-replace 提交、SHA-256 验证、取消、断线清理、错误分类和版本兼容行为；平台差异只允许存在于路径解析、普通文件判断、临时文件创建、no-replace 提交、flush 和控制台 raw/cooked 模式切换。
-- 跨系统互传（如 Linux 主控 ↔ Windows 被控）同样支持；默认文件名由接收端按本机规则重新校验（UTF-8 非空、单一名称组件、无路径分隔符/根/盘符/UNC/设备前缀、非保留名称），跨系统时发送端合法的文件名可能无法作为接收端默认文件名，可重新发起操作并显式提供接收端合法的完整目标路径。
-- 文件传输只在主控端标准输入为交互式终端时可用；管道或脚本输入下 `Ctrl+]` 不具有本地前缀语义，`u`、`d`、`?` 不触发任何本地操作，所有输入字节原样转发，不提供脚本化文件传输入口。
+移动或归档记录后，验证器可能无法读取原 endpoint 的 `identity.ed25519` 与账本历史，从而得到 `CONSISTENT_COMPLETE_UNANCHORED`；这仍证明两份文件的双边密码学一致性，但不再证明它们位于原本地连续账本中。`0.2.0` 不自动轮转或删除审计记录，运维方必须把两端记录的保留、加密归档、访问审计、容量告警和销毁策略纳入组织制度。
 
 ## 10. 生命周期、重启与升级
 
@@ -1083,9 +1099,9 @@ relay 注册表只存在内存中。重启会丢失临时映射，但不会丢�
 
 ### 10.4 升级 endpoint
 
-`yon` 是单文件程序，没有本地持久身份。退出当前 host/connect 后替换二进制即可。不要在 Active 终端会话中直接覆盖正在运行的文件；先结束会话，再升级并重新生成连接码。
+`yon` 是单文件程序；普通模式没有本地持久身份，企业模式会在平台状态目录保留审计身份、账本和记录，升级时必须原样保留这些材料。退出当前 host/connect 后替换二进制即可。不要在 Active 终端会话中直接覆盖正在运行的文件；先结束会话，再升级并重新生成连接码。
 
-`0.1.1` 与 `0.1.0` 的终端关闭流程可双向兼容，因此 host 和 controller 可以任意顺序滚动升级；完整的终端尾部消费确认只在两端都升级到 `0.1.1` 后生效。生产环境仍应尽快把两端统一到同一版本，不要把混合版本作为长期运行形态。
+普通模式的基础终端协议仍可与 `0.1.1` endpoint 协商，但文件传输只在两端均为 `0.2.0` 时可用。企业 relay 只发布 Enterprise Resolve，且企业会话强制要求双方支持 v2 审计，因此主控端、被控端和 relay 必须作为同一变更窗口升级到 `0.2.0`；不支持企业解析或审计的旧 endpoint 会失败关闭，不会降级到普通准入。任何模式都不应把混合版本作为长期运行形态，回滚企业 relay 时必须同步回滚两端并重新建立会话。
 
 ## 11. 安全运维要求
 
@@ -1098,6 +1114,9 @@ relay 注册表只存在内存中。重启会丢失临时映射，但不会丢�
 | WSS certificate/CA | relay 和/或 endpoint | 公钥材料；保持完整性，避免误配 |
 | 连接码 | host 与获授权用户 | 短期认证秘密；不要记录或复用 |
 | 终端内容 | 两个 endpoint 内存 | relay 只能转发密文，端点仍需按主机安全基线保护 |
+| 企业平台 secret | 仅 relay | 私密应用凭据；独立私有文件、最小读取权限、按平台制度轮换 |
+| callback private key | 仅 relay | HTTPS 私钥；独立私有文件、最小读取权限、按证书制度轮换 |
+| audit identity/ledger/records | 各 endpoint | 私有持久审计材料；禁止跨机器共用身份，受控备份和保留 |
 
 ### 11.2 relay 信任边界
 
@@ -1110,7 +1129,7 @@ relay 按不可信基础设施设计。即使 relay 被入侵，攻击者也不�
 
 因此 relay 日志、网络流量和操作权限仍应纳入组织安全监控。不要把“不可信 relay”误解为“relay 无需加固”。
 
-`0.1.1` 的 relay 不提供租户账户、接入 allowlist、令牌鉴权或计费。只要能访问监听端口的任意 libp2p PeerId 都可以尝试申请 reservation；内置总容量、每 PeerId/来源限制和查询限速只保证资源有界，不把公网 listener 变成私有准入系统。互联网公开部署必须结合网络层访问控制、容量监控和组织的抗 DDoS 能力；若 relay 只供固定网络使用，应在云安全组/防火墙限制来源。不要把连接码的端到端认证误当作 relay 使用权认证。
+普通模式不提供租户账户、接入 allowlist、令牌鉴权或计费。企业模式要求主控端通过企业微信或飞书完成一次短期成员准入后才允许 Enterprise Resolve，但这不是通用 IAM、RBAC、设备信任或计费系统，也不会限制被控端申请 reservation。只要能访问监听端口的任意 libp2p PeerId 仍可以尝试建立连接或申请 reservation；内置总容量、每 PeerId/来源限制和查询限速只保证资源有界，企业准入也不把公网 listener 变成抗 DDoS 边界。互联网公开部署必须结合网络层访问控制、容量监控和组织的抗 DDoS 能力；若 relay 只供固定网络使用，应在云安全组/防火墙限制来源。不要把连接码的端到端认证或企业成员准入误当作 relay 的完整使用权认证。
 
 ### 11.3 endpoint 主机安全
 
@@ -1149,7 +1168,7 @@ ss -lntup | grep -E ':(4001|4002|443)\b'
 
 ### 12.2 建议监控项
 
-Yonder `0.1.1` 主要通过结构化诊断日志和操作系统指标观测。relay 会输出低基数的 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped` 事件，并每 `60s` 输出一次 `relay_activity_summary` 聚合计数。建议采集：
+Yonder `0.2.0` 主要通过结构化诊断日志和操作系统指标观测。relay 会输出低基数的 `relay_starting`、`relay_ready`、`relay_shutdown_requested`、`relay_stopped` 事件，并每 `60s` 输出一次 `relay_activity_summary` 聚合计数。建议采集：
 
 - 进程存活、重启次数和退出码。
 - CPU、RSS、文件描述符数量和网络吞吐。
@@ -1158,6 +1177,8 @@ Yonder `0.1.1` 主要通过结构化诊断日志和操作系统指标观测。re
 - WSS 握手失败、证书到期时间和 DNS 变更。
 - relay PeerId 是否意外变化。
 - endpoint 建立直连还是使用 relay fallback 的诊断信息。
+- 企业 callback HTTPS 可达性、证书到期时间、待处理 OAuth 事务数量及失败/超时聚合。
+- 各 endpoint 审计目录容量、记录增长速度、账本连续性和最近一次双边校验结果。
 
 不要对 QUIC UDP 端口只做 TCP 探测；应使用真实 `yon host + yon connect` 会话作为端到端健康检查。
 
@@ -1170,6 +1191,8 @@ Yonder `0.1.1` 主要通过结构化诊断日志和操作系统指标观测。re
 3. 配置、证书和私钥路径权限正确。
 4. 新主机的公网 TCP/UDP 防火墙与 NAT 映射正确。
 5. 两个 endpoint 能使用现有 `yon.toml` 建立真实终端会话。
+6. 企业模式能恢复 callback TLS、平台 secret 和 provider 配置，并完成一次真实成员授权。
+7. endpoint 审计身份与记录能从受控备份恢复，恢复后 `yon audit verify` 仍能建立身份和账本连续性。
 
 注册表和连接码映射不需要备份，也无法通过文件恢复。
 
@@ -1269,6 +1292,35 @@ relay 和 CLI 不会向查询者进一步区分这些内部状态。向被控端
 - 如果远端程序修改了终端模式，先在普通本地 PTY 中复现。
 - 使用 `yon --log-level debug --log-file yon-connect-debug.log connect` 收集诊断；不要让详细诊断与远端画面共享终端。
 
+### 13.9 企业成员准入失败
+
+- 确认 relay 启动日志明确处于企业模式，并且 endpoint 实际连接的是该 relay PeerId；企业模式不会回退到普通 Resolve。
+- 使用 `yon-relay config check` 检查 callback listener、外部 HTTPS origin、证书链、私钥和 provider secret 文件。
+- 确认平台控制台登记的 redirect URI 与 Yonder 固定 callback 路径和外部 origin 完全一致，不能额外增加路径、query 或 fragment。
+- 确认浏览器、平台服务器和主控端都能访问 callback HTTPS 地址；使用 IP 时同时核对平台是否接受 IP redirect URI，以及证书是否包含对应 `IP SAN`。
+- 企业微信和飞书只要配置并成功完成其中一个即可准入；平台拒绝、超时或一次性事务已消费时应重新发起，而不是复用旧授权 URL。
+- 检查 relay 系统时间。OAuth 事务有界且短期有效，明显的时间漂移会造成授权过期或 TLS 失败。
+- 调试日志可能包含 provider 名称、PeerId 和时序元数据，但不得包含 provider secret、授权 code 或 endpoint 审计内容；按敏感日志处理。
+
+### 13.10 文件传输失败
+
+- 先确认两端均为 `0.2.0`；旧 endpoint 不支持文件子流时会显示不支持，但终端仍应可用。
+- 确认源是普通文件、目标不存在、父目录存在，并分别检查主控与被控用户的读写权限和可用空间。
+- 相对路径以会话启动目录为准，不以远端 shell 当前 `pwd` 为准；排障时优先临时输入绝对路径。
+- 路径不执行 shell 展开。`~/file`、`$HOME/file`、`*.log` 和 `%USERPROFILE%\file` 都是字面路径，不会自动展开。
+- 传输期间超过 `30s` 没有控制响应或数据进展会安全失败。检查链路丢包、relay 带宽、磁盘阻塞和安全软件扫描延迟。
+- 失败后目标文件不得出现；若出现同名文件，应先确认它是否由其他进程并发创建。Yonder 不会覆盖该文件，也不会把临时文件当成功结果。
+- 使用 `--log-file` 收集诊断，禁止让 debug 日志与远端终端画面共享输出通道。
+
+### 13.11 审计验证或回放失败
+
+- 先确认记录来自企业会话。普通模式按设计不创建 `.yonaudit` 文件。
+- 双边验证必须配对同一个 session ID 的 controller/host 文件；传反顺序可以识别角色，但不能用两个不同会话凑成一对。
+- `INTACT_UNPAIRED` 只证明单文件内部完整，不能证明对端同意；生产取证应尽可能取得两端记录。
+- 归档位置得到 `CONSISTENT_COMPLETE_UNANCHORED` 时，回到原 endpoint 的审计根目录验证，或同时提供受控恢复的身份与账本历史。不要为了得到绿色状态修改记录或伪造目录结构。
+- `MISMATCH` 和 `TAMPERED` 必须按安全事件保留原文件、哈希、来源和采集链路，禁止继续回放或覆盖文件。
+- 回放只接受 controller 文件。看到过滤计数表示安全回放器抑制了可能影响本地终端的控制，不代表原记录被修改。
+
 ## 14. 上线验收清单
 
 ### 14.1 relay
@@ -1284,6 +1336,8 @@ relay 和 CLI 不会向查询者进一步区分这些内部状态。向被控端
 - [ ] 文件描述符、CPU、内存和带宽容量已评估。
 - [ ] 日志进入受控系统，未把身份或连接码写入日志。
 - [ ] 重启、升级和身份恢复演练已完成。
+- [ ] 企业模式下 callback HTTPS 从浏览器和平台侧均可达，redirect URI、证书和 provider secret 已完成真实成功/拒绝/超时验证。
+- [ ] 已记录企业模式不限制 host reservation、不是 RBAC/IAM 且仍需网络层抗滥用控制。
 
 ### 14.2 endpoint
 
@@ -1295,6 +1349,9 @@ relay 和 CLI 不会向查询者进一步区分这些内部状态。向被控端
 - [ ] 诊断文件中的最终 Direct/Relayed 路径和 transport 与测试网络预期一致。
 - [ ] 连接码通过受控渠道传递。
 - [ ] 会话结束后 host 进程和远端 shell 均已退出。
+- [ ] 单文件上传、下载、取消、目标已存在、断线清理和大文件流式传输均已验证。
+- [ ] 企业模式下两个 endpoint 的审计根目录权限正确，身份已纳入受控备份，记录容量和保留策略已启用。
+- [ ] 已汇集一次真实会话的双端记录并得到 `VERIFIED_COMPLETE`，安全回放未把控制序列直接写入本地终端。
 
 ### 14.3 端到端 smoke
 
@@ -1321,6 +1378,15 @@ exit
 
 确认远端用户、权限和工作目录符合预期，本地主控进程返回成功，连接码不能再次使用。
 
+`0.2.0` 验收还必须在 Active 会话内上传和下载至少一个包含二进制字节的非空文件，逐字节比较源与目标；分别验证 `Ctrl+C` 取消、同名目标拒绝和失败后无临时文件残留。企业模式还必须汇集本次会话的 controller/host 审计文件并执行：
+
+```console
+yon audit verify session.controller.yonaudit session.host.yonaudit
+yon audit replay session.controller.yonaudit session.host.yonaudit
+```
+
+第一条必须返回 `VERIFIED_COMPLETE` 和退出码 `0`；第二条必须安全显示主控端实际看到的终端画面，并报告被抑制的危险控制。
+
 ## 15. 命令速查
 
 ```text
@@ -1328,6 +1394,8 @@ yon [--log-level <off|error|warn|info|debug|trace>] [--log-file <PATH>] host
 yon [--log-level <off|error|warn|info|debug|trace>] [--log-file <PATH>] connect [CODE]
 yon config check
 yon config sources
+yon audit verify <LOCAL_FILE> [PEER_FILE]
+yon audit replay <CONTROLLER_FILE> [PEER_FILE]
 
 yon-relay [--log-level <off|error|warn|info|debug|trace>]
   identity init --output <PATH>
@@ -1344,6 +1412,9 @@ yon-relay [--log-level <off|error|warn|info|debug|trace>] serve
 yon --help
 yon connect --help
 yon config --help
+yon audit --help
+yon audit verify --help
+yon audit replay --help
 yon-relay --help
 yon-relay identity init --help
 yon-relay identity show --help

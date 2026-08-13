@@ -2,6 +2,7 @@ use backon::{BackoffBuilder as _, ExponentialBuilder};
 use std::future::Future;
 use std::time::Duration;
 use thiserror::Error;
+use yonder_core::wire::{ENTERPRISE_RESOLVE_PROTOCOL, RESOLVE_PROTOCOL};
 use yonder_net::behaviour::EndpointBehaviourEvent;
 use yonder_net::swarm::SwarmEvent;
 use yonder_net::{
@@ -9,7 +10,7 @@ use yonder_net::{
     ConnectionId, ConnectionSelection, ConnectionSelectionResult, DirectUpgradePolicy,
     EndpointNode, EndpointRelayAddress, EndpointRelaySet, Keypair, Libp2pApplicationStreams,
     ListenerId, Multiaddr, NetworkBuildError, NetworkNodeError, PeerId, SelectedPath,
-    TRANSPORT_TIMEOUT, WssTransportConfig, multiaddr, ping, relay,
+    TRANSPORT_TIMEOUT, WssTransportConfig, identify, multiaddr, ping, relay,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,6 +88,17 @@ pub enum EndpointEvent {
     ReservationReady(ReservationListenerId),
     ReservationClosed(ReservationListenerId),
     DialFailed(ConnectionId),
+    RelayAccessIdentified {
+        peer: PeerId,
+        mode: RelayAccessMode,
+    },
+}
+
+/// The access policy advertised by a configured relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAccessMode {
+    Standard,
+    Enterprise,
 }
 
 /// Terminal outcome of libp2p's bounded DCUtR attempt for one peer.
@@ -123,6 +135,11 @@ pub struct ConnectionBinding {
 }
 
 impl ConnectionBinding {
+    #[cfg(test)]
+    pub(crate) const fn for_test(peer: PeerId, connection: ConnectionId) -> Self {
+        Self { peer, connection }
+    }
+
     #[must_use]
     pub const fn peer(self) -> PeerId {
         self.peer
@@ -234,6 +251,7 @@ pub struct EndpointDriver {
     reservation: Option<ReservationSlot>,
     pending_relay_dials: PendingRelayDials,
     direct_upgrades: DirectUpgradeTracker,
+    relay_access: Option<(PeerId, RelayAccessMode)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +269,7 @@ impl EndpointDriver {
             reservation: None,
             pending_relay_dials: PendingRelayDials::new(),
             direct_upgrades: DirectUpgradeTracker::new(),
+            relay_access: None,
         }
     }
 
@@ -262,6 +281,13 @@ impl EndpointDriver {
     #[must_use]
     pub fn connection_count(&self, peer: &PeerId) -> usize {
         self.connections.count(peer)
+    }
+
+    #[must_use]
+    pub fn relay_access_mode(&self, peer: &PeerId) -> Option<RelayAccessMode> {
+        self.relay_access
+            .filter(|(identified, _)| identified == peer)
+            .map(|(_, mode)| mode)
     }
 
     #[must_use]
@@ -445,6 +471,12 @@ impl EndpointDriver {
                     self.connections.closed(&peer_id, &connection_id);
                     if self.connections.count(&peer_id) == 0 {
                         self.direct_upgrades.remove(&peer_id);
+                        if self
+                            .relay_access
+                            .is_some_and(|(identified, _)| identified == peer_id)
+                        {
+                            self.relay_access = None;
+                        }
                     }
                     return EndpointEvent::Closed {
                         peer: peer_id,
@@ -471,6 +503,32 @@ impl EndpointDriver {
                         peer: event.remote_peer_id,
                         outcome,
                     };
+                }
+                SwarmEvent::Behaviour(EndpointBehaviourEvent::Identify(
+                    identify::Event::Received { peer_id, info, .. },
+                )) => {
+                    let enterprise = info
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.as_ref() == ENTERPRISE_RESOLVE_PROTOCOL);
+                    let standard = info
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.as_ref() == RESOLVE_PROTOCOL);
+                    let mode = if enterprise {
+                        Some(RelayAccessMode::Enterprise)
+                    } else if standard {
+                        Some(RelayAccessMode::Standard)
+                    } else {
+                        None
+                    };
+                    if let Some(mode) = mode {
+                        self.relay_access = Some((peer_id, mode));
+                        return EndpointEvent::RelayAccessIdentified {
+                            peer: peer_id,
+                            mode,
+                        };
+                    }
                 }
                 SwarmEvent::Behaviour(EndpointBehaviourEvent::Relay(
                     relay::client::Event::ReservationReqAccepted { .. },
@@ -1636,6 +1694,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_entire_fast_failed_relay_batch_can_schedule_another_attempt() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let connection = ConnectionId::new_unchecked(10);
         let mut driver = endpoint_driver();
@@ -1681,6 +1740,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reservation_lease_survives_temporary_extras_but_not_selected_connection_loss() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let identity = Keypair::generate_ed25519();
         let mut driver = EndpointDriver::new(
             EndpointNode::new(identity, WssTransportConfig::client(None)).unwrap(),
@@ -1747,6 +1807,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bound_io_rejects_additional_or_lost_physical_connections() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let identity = Keypair::generate_ed25519();
         let local_peer = identity.public().to_peer_id();
         let mut driver = EndpointDriver::new(
@@ -1815,6 +1876,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn driver_guards_and_absolute_deadlines_cover_failure_paths() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relay = relay_connection(relay_peer, 40);
@@ -1891,6 +1953,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_drain_classifies_lost_extra_and_unselected_connections() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let missing = ConnectionBinding {
             peer,
@@ -1963,6 +2026,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_dial_and_stream_failures_are_structured_without_waiting() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relays = relay_set(relay_peer);
@@ -2008,6 +2072,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn listener_close_and_drive_consume_real_swarm_events() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relay = relay_connection(relay_peer, 70);
@@ -2100,6 +2165,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn selection_event_helpers_cover_accept_reject_ping_close_and_ignore() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let other = Keypair::generate_ed25519().public().to_peer_id();
@@ -2215,6 +2281,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn selected_relay_address_is_canonical_and_bound_to_the_winner() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let loser = ConnectionId::new_unchecked(110);
         let winner = ConnectionId::new_unchecked(111);
@@ -2270,6 +2337,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn established_roster_overflow_and_drain_event_are_bounded() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         for connection in 200..208 {
@@ -2318,6 +2386,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bound_event_and_output_helpers_recheck_the_exact_roster() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let connection = ConnectionId::new_unchecked(120);

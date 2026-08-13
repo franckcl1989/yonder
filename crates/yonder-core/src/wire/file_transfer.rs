@@ -17,7 +17,7 @@ use super::WireBytes;
 use crate::error::{ProtocolError, ProtocolField};
 
 /// The negotiated application protocol ID for native file transfer.
-pub const FILE_TRANSFER_PROTOCOL: &str = "/yonder/file-transfer/1.0.0";
+pub const FILE_TRANSFER_PROTOCOL: &str = "/yonder/file-transfer/2.0.0";
 
 /// Maximum encoded protocol path length in UTF-8 bytes.
 pub const MAX_PATH_LEN: usize = 4096;
@@ -45,7 +45,7 @@ pub const DOWNLOAD_OPEN_MAX_LEN: usize = 2 + MAX_PATH_LEN;
 /// `DownloadOffer`: `u16` file name length, file name, `u64` declared size.
 pub const DOWNLOAD_OFFER_MAX_LEN: usize = 2 + MAX_FILE_NAME_LEN + 8;
 
-/// Fixed 1.0.0 message tags.
+/// Fixed 2.0.0 message tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransferTag {
@@ -83,7 +83,7 @@ impl TransferTag {
     }
 }
 
-/// Fixed 1.0.0 structured error codes. Values `0` and undefined values are
+/// Fixed 2.0.0 structured error codes. Values `0` and undefined values are
 /// protocol errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -720,7 +720,7 @@ pub enum WireStateError {
 }
 
 /// Tracks the wire-level state of one transfer for one side, enforcing the
-/// fixed 1.0.0 direction and ordering rules before any file I/O happens.
+/// fixed 2.0.0 direction and ordering rules before any file I/O happens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireSession {
     direction: TransferDirection,

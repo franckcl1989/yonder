@@ -1,5 +1,5 @@
 //! Controller-side path prompt and delayed remote-output buffer for the
-//! 0.1.3 native file transfer flow.
+//! 0.2.0 native file transfer flow.
 //!
 //! Implements the frozen design sections §6.2/§6.3 (input routing), §7.2 and
 //! §7.3 (upload and download prompts), §7.4 (prompt-time terminal handling),

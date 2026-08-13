@@ -7,7 +7,7 @@ use opaque_ke::{
     ServerLogin, ServerLoginParameters, ServerRegistration, ServerSetup,
 };
 use rand::rngs::OsRng;
-use sha2::Sha512;
+use sha2_legacy::Sha512;
 use thiserror::Error;
 use yonder_core::{Pake, PakeSecret, PeerIdBytes};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};

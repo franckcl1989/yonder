@@ -22,6 +22,8 @@ jq -e '
       end;
   def versions_of($name):
     [.packages[] | select(.name == $name) | (.version | stable_semver)];
+  def has_package($name; $version):
+    any(.packages[]; .name == $name and .version == $version);
   def package_id($name; $version):
     [.packages[] | select(.name == $name and .version == $version) | .id] as $ids
     | if ($ids | length) == 1 then $ids[0]
@@ -38,7 +40,26 @@ jq -e '
   (versions_of("curve25519-dalek")) as $curve
   | (versions_of("quinn-proto")) as $quinn
   | ($curve | length) > 0
-  and all($curve[]; . >= [4, 1, 3] and . < [5, 0, 0])
+  and all($curve[]; (. >= [4, 1, 3] and . < [5, 0, 0]) or . == [5, 0, 0])
+  and (
+    if has_package("opaque-ke"; "4.0.1") then
+      depends_on("opaque-ke"; "4.0.1"; "curve25519-dalek"; "4.1.3")
+      and depends_on("voprf"; "0.5.0"; "curve25519-dalek"; "4.1.3")
+    else
+      true
+    end
+  )
+  and (
+    if has_package("ed25519-dalek"; "3.0.0") then
+      depends_on("ed25519-dalek"; "3.0.0"; "curve25519-dalek"; "5.0.0")
+      and (
+        parents_of("curve25519-dalek"; "5.0.0")
+        == [package_id("ed25519-dalek"; "3.0.0")]
+      )
+    else
+      all($curve[]; . < [5, 0, 0])
+    end
+  )
   and ($quinn | length) > 0
   and all($quinn[]; . >= [0, 11, 13] and . < [0, 12, 0])
   and depends_on("libp2p"; "0.56.0"; "libp2p-dns"; "0.44.0")

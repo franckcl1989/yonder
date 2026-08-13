@@ -1,23 +1,34 @@
+use crate::audit::observer::{
+    AUDIT_CHECKPOINT_POLL, AUDIT_ESTABLISH_TIMEOUT, AuditObserver, CloseNoticeHandling, FrameEvent,
+};
+use crate::audit::session::{
+    AuditError, DIRECTION_CTRL_TO_HOST, KEY_ACTION_DETACH, KEY_ACTION_DOWNLOAD, KEY_ACTION_HELP,
+    KEY_ACTION_INTERRUPT, KEY_ACTION_UPLOAD, LIFECYCLE_KIND_ACTIVE_DETACH,
+    LIFECYCLE_KIND_LOCAL_INTERRUPT,
+};
 use crate::file_semantics::{BaseDirectory, SourceFile};
 use crate::local_control::{LocalAction, LocalControlInput, LocalInputChunk, ProcessedInput};
 use crate::network::{
-    ConnectionBinding, EndpointDriver, EndpointError, EndpointEvent, connect_relay,
-    connect_relay_with_policy, connect_target, connect_target_via_relay, drive_bound,
+    ConnectionBinding, EndpointDriver, EndpointError, EndpointEvent, RelayAccessMode,
+    connect_relay, connect_relay_with_policy, connect_target, connect_target_via_relay,
+    drive_bound,
 };
 use crate::pake::{OpaquePake, OpaquePakeError};
 use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
 use crate::protocol::{
-    EnterpriseResolveUi, RelayProtocolError, ResolveDeadline, resolve_peer_auto,
+    EnterpriseResolveUi, RelayProtocolError, ResolveDeadline, ResolvedTarget, resolve_peer_auto,
 };
 use crate::terminal::TerminalChunk;
-use crate::transfer::{TransferConfig, TransferOutcome, run_download, run_upload};
+use crate::transfer::{TransferConfig, TransferOutcome, run_download_audited, run_upload_audited};
 use crate::transfer_prompt::{
     AppendOutcome, DELAYED_OUTPUT_CAP, DelayedOutputBuffer, PROMPT_PATH_LIMIT, PathPrompt,
     PromptResult,
 };
 use backon::{BackoffBuilder as _, ConstantBuilder};
+use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::io::IsTerminal as _;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -26,6 +37,9 @@ use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _,
 };
 use yonder_core::EnterpriseProvider;
+use yonder_core::wire::audit::{
+    AUDIT_PROTOCOL, AuditCloseReason, AuditRole, Digest32, ManifestEnding,
+};
 use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, PROCEED_LEN, PakeContext,
     RETRY_LEN,
@@ -45,15 +59,21 @@ use yonder_net::{
     PeerId, WssTransportConfig, generate_identity, peer_id_bytes,
 };
 
+/// The erased audit substream I/O; the opaque `into_tokio` type cannot be
+/// named, so the handshake boxes it (one bounded allocation per session).
+trait AuditStreamIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> AuditStreamIo for T {}
+
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_LIMIT: usize = 20;
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const REMOTE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 const UTF8_SEQUENCE_CAPACITY: usize = 4;
+#[cfg(test)]
 const UTF8_OUTPUT_BATCH_CAPACITY: usize = 4 * 1024;
 const UTF8_REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
 
-// Fixed controller-local texts of the 0.1.3 file-transfer UI. The prompt
+// Fixed controller-local texts of the 0.2.0 file-transfer UI. The prompt
 // labels, the "already active" line (design §15.3) and the paused-input
 // phrase (design §7.5) are frozen; the remaining texts are fixed
 // implementation strings (the design requires fixed errors, §7.1/§9.3).
@@ -68,7 +88,7 @@ const FILE_TRANSFER_UNAVAILABLE: &str = "file transfer is unavailable in this se
 const FILE_TRANSFER_UNSUPPORTED: &str = "file transfer is not supported by the remote peer";
 const FILE_TRANSFER_PROBE_FAILED: &str = "file transfer capability check failed";
 const FILE_TRANSFER_OPEN_FAILED: &str = "the file transfer substream could not be opened";
-const TRANSFER_STATUS_PAUSED: &str = "传输期间终端输入暂停，Ctrl+C 取消";
+const TRANSFER_STATUS_PAUSED: &str = "terminal input paused during transfer; Ctrl+C cancels";
 const LOCAL_CONTROL_HELP: &str = "Ctrl+] .      end the session\r\n\
     Ctrl+] Ctrl+] send a literal Ctrl+]\r\n\
     Ctrl+] u      upload a file\r\n\
@@ -117,11 +137,118 @@ struct RemoteTerminalOutput {
     pending_len: usize,
 }
 
+impl RemoteTerminalOutput {
+    const fn new(mode: RemoteTerminalOutputMode) -> Self {
+        Self {
+            mode,
+            pending: [0; UTF8_SEQUENCE_CAPACITY],
+            pending_len: 0,
+        }
+    }
+
+    /// The platform output adapter (design section 18.4): transforms one
+    /// raw chunk into the display bytes that will be handed to the display
+    /// write path. Pure — no I/O — so the caller can record the display
+    /// bytes through the audit observer before the write effect. The
+    /// pending UTF-8 state carries across chunks.
+    fn prepare(&mut self, bytes: &[u8]) -> Vec<u8> {
+        match self.mode {
+            RemoteTerminalOutputMode::Bytes => bytes.to_vec(),
+            RemoteTerminalOutputMode::WindowsConsoleUtf8 => {
+                self.prepare_windows_console_utf8(bytes)
+            }
+        }
+    }
+
+    fn prepare_windows_console_utf8(&mut self, mut bytes: &[u8]) -> Vec<u8> {
+        let mut display = Vec::with_capacity(bytes.len());
+        while self.pending_len != 0 {
+            let Some((&next, remaining)) = bytes.split_first() else {
+                return display;
+            };
+            let candidate_len = self.pending_len + 1;
+            self.pending[self.pending_len] = next;
+            match std::str::from_utf8(&self.pending[..candidate_len]) {
+                Ok(_) => {
+                    display.extend_from_slice(&self.pending[..candidate_len]);
+                    self.pending_len = 0;
+                    bytes = remaining;
+                }
+                Err(error) if error.error_len().is_none() => {
+                    self.pending_len = candidate_len;
+                    bytes = remaining;
+                }
+                Err(_) => {
+                    display.extend_from_slice(UTF8_REPLACEMENT);
+                    self.pending_len = 0;
+                }
+            }
+        }
+
+        while !bytes.is_empty() {
+            match std::str::from_utf8(bytes) {
+                Ok(_) => {
+                    display.extend_from_slice(bytes);
+                    return display;
+                }
+                Err(error) => {
+                    let valid_len = error.valid_up_to();
+                    if valid_len != 0 {
+                        display.extend_from_slice(&bytes[..valid_len]);
+                        bytes = &bytes[valid_len..];
+                    }
+                    if let Some(invalid_len) = error.error_len() {
+                        display.extend_from_slice(UTF8_REPLACEMENT);
+                        bytes = &bytes[invalid_len..];
+                    } else {
+                        debug_assert!(bytes.len() < UTF8_SEQUENCE_CAPACITY);
+                        self.pending[..bytes.len()].copy_from_slice(bytes);
+                        self.pending_len = bytes.len();
+                        return display;
+                    }
+                }
+            }
+        }
+        display
+    }
+
+    /// Writes one prepared display chunk to the display write path.
+    async fn write(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+        display: &[u8],
+    ) -> Result<(), std::io::Error> {
+        output.write_all(display).await
+    }
+
+    /// Flushes the trailing incomplete UTF-8 sequence (Windows console
+    /// mode) and returns the bytes that were written, so the audit
+    /// observer can record the display tail (design section 18.4).
+    async fn finish(
+        &mut self,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<Vec<u8>, std::io::Error> {
+        let mut tail = Vec::new();
+        if self.mode == RemoteTerminalOutputMode::WindowsConsoleUtf8 && self.pending_len != 0 {
+            output.write_all(UTF8_REPLACEMENT).await?;
+            tail.extend_from_slice(UTF8_REPLACEMENT);
+            self.pending_len = 0;
+        }
+        output.flush().await?;
+        Ok(tail)
+    }
+}
+
+/// The bounded display write batch of the removed streaming adapter,
+/// retained for the byte-exact regression tests of the Windows console
+/// transformation.
+#[cfg(test)]
 struct Utf8OutputBatch {
     bytes: [u8; UTF8_OUTPUT_BATCH_CAPACITY],
     len: usize,
 }
 
+#[cfg(test)]
 impl Utf8OutputBatch {
     const fn new() -> Self {
         Self {
@@ -157,96 +284,6 @@ impl Utf8OutputBatch {
             self.len = 0;
         }
         Ok(())
-    }
-}
-
-impl RemoteTerminalOutput {
-    const fn new(mode: RemoteTerminalOutputMode) -> Self {
-        Self {
-            mode,
-            pending: [0; UTF8_SEQUENCE_CAPACITY],
-            pending_len: 0,
-        }
-    }
-
-    async fn write(
-        &mut self,
-        output: &mut (impl tokio::io::AsyncWrite + Unpin),
-        bytes: &[u8],
-    ) -> Result<(), std::io::Error> {
-        match self.mode {
-            RemoteTerminalOutputMode::Bytes => output.write_all(bytes).await,
-            RemoteTerminalOutputMode::WindowsConsoleUtf8 => {
-                self.write_windows_console_utf8(output, bytes).await
-            }
-        }
-    }
-
-    async fn write_windows_console_utf8(
-        &mut self,
-        output: &mut (impl tokio::io::AsyncWrite + Unpin),
-        mut bytes: &[u8],
-    ) -> Result<(), std::io::Error> {
-        let mut batch = Utf8OutputBatch::new();
-        while self.pending_len != 0 {
-            let Some((&next, remaining)) = bytes.split_first() else {
-                return batch.flush(output).await;
-            };
-            let candidate_len = self.pending_len + 1;
-            self.pending[self.pending_len] = next;
-            match std::str::from_utf8(&self.pending[..candidate_len]) {
-                Ok(_) => {
-                    batch.append(output, &self.pending[..candidate_len]).await?;
-                    self.pending_len = 0;
-                    bytes = remaining;
-                }
-                Err(error) if error.error_len().is_none() => {
-                    self.pending_len = candidate_len;
-                    bytes = remaining;
-                }
-                Err(_) => {
-                    batch.append(output, UTF8_REPLACEMENT).await?;
-                    self.pending_len = 0;
-                }
-            }
-        }
-
-        while !bytes.is_empty() {
-            match std::str::from_utf8(bytes) {
-                Ok(_) => {
-                    batch.append(output, bytes).await?;
-                    return batch.flush(output).await;
-                }
-                Err(error) => {
-                    let valid_len = error.valid_up_to();
-                    if valid_len != 0 {
-                        batch.append(output, &bytes[..valid_len]).await?;
-                        bytes = &bytes[valid_len..];
-                    }
-                    if let Some(invalid_len) = error.error_len() {
-                        batch.append(output, UTF8_REPLACEMENT).await?;
-                        bytes = &bytes[invalid_len..];
-                    } else {
-                        debug_assert!(bytes.len() < UTF8_SEQUENCE_CAPACITY);
-                        self.pending[..bytes.len()].copy_from_slice(bytes);
-                        self.pending_len = bytes.len();
-                        return batch.flush(output).await;
-                    }
-                }
-            }
-        }
-        batch.flush(output).await
-    }
-
-    async fn finish(
-        &mut self,
-        output: &mut (impl tokio::io::AsyncWrite + Unpin),
-    ) -> Result<(), std::io::Error> {
-        if self.mode == RemoteTerminalOutputMode::WindowsConsoleUtf8 && self.pending_len != 0 {
-            output.write_all(UTF8_REPLACEMENT).await?;
-            self.pending_len = 0;
-        }
-        output.flush().await
     }
 }
 
@@ -449,6 +486,8 @@ pub enum ControllerError {
     TerminalSetup(#[source] std::io::Error),
     #[error("the controller connection was lost")]
     ConnectionLost,
+    #[error("the relay access policy changed while rebuilding the connection")]
+    RelayAccessChanged,
     #[error("failed to install the local interrupt handler")]
     Signal(#[source] std::io::Error),
     #[error("the controller was interrupted locally")]
@@ -471,6 +510,8 @@ pub enum ControllerError {
         session: Box<ControllerError>,
         restore: std::io::Error,
     },
+    #[error(transparent)]
+    Audit(#[from] AuditError),
 }
 
 /// User-visible milestones emitted while a controller session is being prepared.
@@ -590,7 +631,7 @@ async fn prepare_controller_session(
     .await?;
     #[cfg(yonder_e2e_rebuild)]
     let initial_peer_id = driver.peer_id();
-    let target = wait_with_progress(
+    let resolved = wait_with_progress(
         progress,
         ControllerStage::ResolvingHost,
         resolve_peer_auto(
@@ -607,7 +648,7 @@ async fn prepare_controller_session(
         driver,
         streams,
         relay.address(),
-        target,
+        resolved,
         &code,
         DirectUpgradePolicy::Enabled,
         progress,
@@ -630,7 +671,7 @@ async fn prepare_controller_session(
                 ),
             )
             .await?;
-            let target = wait_with_progress(
+            let fallback_resolved = wait_with_progress(
                 progress,
                 ControllerStage::ResolvingHost,
                 resolve_peer_auto(
@@ -643,11 +684,14 @@ async fn prepare_controller_session(
                 ),
             )
             .await?;
+            if fallback_resolved.access() != resolved.access() {
+                return Err(ControllerError::RelayAccessChanged);
+            }
             let prepared = Box::pin(prepare_controller(
                 fallback_driver,
                 fallback_streams,
                 fallback_relay.address(),
-                target,
+                fallback_resolved,
                 &code,
                 DirectUpgradePolicy::Disabled,
                 progress,
@@ -678,22 +722,26 @@ struct PreparedController {
     binding: ConnectionBinding,
     control: ApplicationStream,
     data: ApplicationStream,
+    audit: Option<ApplicationStream>,
+    /// Test and embedding seam for isolating audit artifacts. Production
+    /// sessions leave this unset and use the platform audit directory.
+    audit_root_override: Option<PathBuf>,
 }
 
 async fn prepare_controller(
     mut driver: EndpointDriver,
     mut streams: Libp2pApplicationStreams,
     relay: &EndpointRelayAddress,
-    target: PeerId,
+    target: ResolvedTarget,
     code: &ConnectionCode,
     direct_upgrade: DirectUpgradePolicy,
     progress: &mut impl OperationProgress<ControllerStage>,
 ) -> Result<PreparedController, ControllerError> {
     let selected = wait_with_progress(progress, ControllerStage::EstablishingPath, async {
         match direct_upgrade {
-            DirectUpgradePolicy::Enabled => connect_target(&mut driver, relay, target).await,
+            DirectUpgradePolicy::Enabled => connect_target(&mut driver, relay, target.peer()).await,
             DirectUpgradePolicy::Disabled => {
-                connect_target_via_relay(&mut driver, relay, target).await
+                connect_target_via_relay(&mut driver, relay, target.peer()).await
             }
         }
     })
@@ -712,34 +760,62 @@ async fn prepare_controller(
     )
     .await?;
 
-    let (control, data) = wait_with_progress(progress, ControllerStage::StartingTerminal, async {
-        let terminal_stream_deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
-        let control = open_until(
-            &mut driver,
-            &mut streams,
-            binding,
-            TERMINAL_CONTROL_PROTOCOL,
-            terminal_stream_deadline,
-        )
+    let (control, data, audit) =
+        wait_with_progress(progress, ControllerStage::StartingTerminal, async {
+            let terminal_stream_deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+            let control = open_until(
+                &mut driver,
+                &mut streams,
+                binding,
+                TERMINAL_CONTROL_PROTOCOL,
+                terminal_stream_deadline,
+            )
+            .await?;
+            let data = open_until(
+                &mut driver,
+                &mut streams,
+                binding,
+                TERMINAL_DATA_PROTOCOL,
+                terminal_stream_deadline,
+            )
+            .await?;
+            let audit = match target.access() {
+                RelayAccessMode::Standard => None,
+                RelayAccessMode::Enterprise => {
+                    match open_until(
+                        &mut driver,
+                        &mut streams,
+                        binding,
+                        AUDIT_PROTOCOL,
+                        terminal_stream_deadline,
+                    )
+                    .await
+                    {
+                        Ok(stream) => Some(stream),
+                        Err(ControllerError::Endpoint(EndpointError::Application(
+                            ApplicationStreamError::UnsupportedProtocol,
+                        ))) => return Err(audit_open_error()),
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            Ok::<_, ControllerError>((control, data, audit))
+        })
         .await?;
-        let data = open_until(
-            &mut driver,
-            &mut streams,
-            binding,
-            TERMINAL_DATA_PROTOCOL,
-            terminal_stream_deadline,
-        )
-        .await?;
-        Ok::<_, ControllerError>((control, data))
-    })
-    .await?;
     Ok(PreparedController {
         driver,
         streams,
         binding,
         control,
         data,
+        audit,
+        audit_root_override: None,
     })
+}
+
+/// The fixed peer-unsupported audit error of design section 14.
+fn audit_open_error() -> ControllerError {
+    ControllerError::Audit(AuditError::peer_unsupported())
 }
 
 fn controller_fallback_required(error: &ControllerError) -> bool {
@@ -979,8 +1055,11 @@ async fn run_terminal(
         binding,
         control,
         data,
+        audit: audit_stream,
+        audit_root_override,
     } = prepared;
     let driver = &mut driver;
+    let self_peer = driver.peer_id();
     let (mut data_read, mut data_write) = tokio::io::split(data.into_tokio());
     let (mut control_read, mut control_write) = tokio::io::split(control.into_tokio());
     let handshake = async {
@@ -990,19 +1069,19 @@ async fn run_terminal(
             result = drive_bound(
                 driver,
                 binding,
-                exchange_terminal_ready_timed(
+                establish_audit_and_terminal(
+                    audit_stream,
                     &mut data_read,
                     &mut control_write,
                     &hello,
-                    EXCHANGE_TIMEOUT,
+                    binding,
+                    self_peer,
+                    audit_root_override.as_deref(),
                 ),
-            ) => {
-                result??;
-                Ok(())
-            }
+            ) => result?,
         }
     };
-    let (raw_mode, ()) = wait_with_progress(
+    let (raw_mode, audit) = wait_with_progress(
         progress,
         ControllerStage::StartingTerminal,
         enter_raw_mode_before(&frontend, handshake),
@@ -1036,15 +1115,33 @@ async fn run_terminal(
         frontend.output_is_terminal() || std::io::stderr().is_terminal(),
     );
     let mut remote = RemoteCompletion::new();
+    // Whether the `Ctrl+] .` detach ended the pump (the shutdown signal
+    // produces the same Interrupted error; the close reason differs).
+    let mut detached = false;
     let session = {
         // The remote-exit reader and the resize poller keep state across
         // pump iterations and are pinned once; the local-input and
         // remote-output steps are re-armed per iteration (their state lives
         // in `session_ui`), so the modal flows can borrow the same streams
-        // between events.
+        // between events. The audit frame reader is a select branch that is
+        // re-armed after every frame (design section 20).
         let remote_exit = read_remote_exit(&mut control_read);
-        let terminal_resizes =
-            copy_terminal_resizes(&frontend, &mut control_write, hello.size(), interactive);
+        let terminal_resizes = copy_terminal_resizes(
+            &frontend,
+            &mut control_write,
+            hello.size(),
+            interactive,
+            audit.as_ref(),
+        );
+        let mut audit_frames = Box::pin(wait_for_audit_frame(audit.as_ref()));
+        // The checkpoint send and the received-frame processing are pinned
+        // branches of the inner select rather than inline awaits: while
+        // either runs (ledger fsync, substream write) the pump must keep
+        // polling the other branches, otherwise a substream delivered by
+        // the swarm in that window is silently dropped by the stream
+        // adapter's zero-capacity rendezvous channel.
+        let mut audit_send: Option<AuditPumpStep<'_, ()>> = None;
+        let mut audit_process: Option<AuditPumpStep<'_, FrameEvent>> = None;
         tokio::pin!(remote_exit);
         tokio::pin!(terminal_resizes);
         loop {
@@ -1056,13 +1153,35 @@ async fn run_terminal(
                 }
                 event = async {
                     tokio::select! {
+                        biased;
                         () = cancellation.cancelled() => TerminalPumpEvent::Cancelled,
                         event = driver.next() => TerminalPumpEvent::Driver(event),
+                        result = tokio::time::timeout(AUDIT_CHECKPOINT_POLL, &mut audit_frames),
+                            if audit.is_some() && audit_send.is_none() && audit_process.is_none() => {
+                            TerminalPumpEvent::Audit(result)
+                        }
+                        result = async {
+                            let outcome = audit_send
+                                .as_mut()
+                                .expect("the send branch is gated on the slot")
+                                .await;
+                            audit_send = None;
+                            outcome
+                        }, if audit_send.is_some() => TerminalPumpEvent::AuditSend(result),
+                        result = async {
+                            let outcome = audit_process
+                                .as_mut()
+                                .expect("the process branch is gated on the slot")
+                                .await;
+                            audit_process = None;
+                            outcome
+                        }, if audit_process.is_some() => TerminalPumpEvent::AuditProcess(result),
                         result = process_local_input_chunk(
                             &mut input,
                             &mut data_write,
                             &mut session_ui.control,
                             &mut session_ui.pending_input,
+                            audit.as_ref(),
                         ), if !session_ui.local_ended => TerminalPumpEvent::LocalInput(result),
                         result = copy_remote_output(
                             &mut data_read,
@@ -1071,6 +1190,7 @@ async fn run_terminal(
                             &mut session_ui.delayed,
                             &mut session_ui.delayed_overflow,
                             &session_ui.flow,
+                            audit.as_ref(),
                         ), if remote.output_open() => {
                             TerminalPumpEvent::RemoteOutput(result)
                         }
@@ -1119,6 +1239,7 @@ async fn run_terminal(
                                     &mut terminal_output,
                                     &mut session_ui,
                                     &transfer_cancel,
+                                    audit.as_ref(),
                                 )
                                 .await
                                 {
@@ -1158,6 +1279,7 @@ async fn run_terminal(
                                             &base,
                                             &transfer_cancel,
                                             &mut transfer,
+                                            audit.as_ref(),
                                         )
                                         .await
                                         {
@@ -1165,7 +1287,10 @@ async fn run_terminal(
                                             Err(error) => break Err(error),
                                         }
                                     }
-                                    Err(error) => break Err(error),
+                                    Err(error) => {
+                                        detached = matches!(error, ControllerError::Interrupted);
+                                        break Err(error);
+                                    }
                                 }
                             }
                             Ok(LocalInputSignal::Eof) => {
@@ -1174,6 +1299,7 @@ async fn run_terminal(
                                     &mut output,
                                     &mut terminal_output,
                                     &mut session_ui,
+                                    audit.as_ref(),
                                 )
                                 .await
                                 {
@@ -1194,13 +1320,31 @@ async fn run_terminal(
                                 Ok(code) => code,
                                 Err(error) => break Err(error),
                             };
+                            // Design section 15.2: the shared TerminalExit
+                            // event, matching the host's record.
+                            if let Some(audit) = audit.as_ref()
+                                && let Err(error) = audit.record_terminal_exit(code as u8).await
+                            {
+                                break Err(error.into());
+                            }
                             remote.observe_exit(code, tokio::time::Instant::now())
                         }
-                        TerminalPumpEvent::Resize(result) => match result {
-                            Ok(never) => match never {},
-                            Err(error) => break Err(error),
-                        },
+                        TerminalPumpEvent::Resize(result) => {
+                            match result {
+                                Ok(never) => match never {},
+                                Err(error) => break Err(error),
+                            }
+                        }
                         TerminalPumpEvent::Transfer(outcome) => {
+                            // A transfer outcome is only shown after its
+                            // audit events were recorded (design section
+                            // 18.6); a recording failure already failed the
+                            // session closed inside the transfer.
+                            if let Some(audit) = audit.as_ref()
+                                && audit.has_failed().await
+                            {
+                                break Err(ControllerError::Audit(AuditError::FailedClosed));
+                            }
                             match handle_transfer_event(
                                 outcome,
                                 &mut output,
@@ -1214,6 +1358,86 @@ async fn run_terminal(
                                 Err(error) => break Err(error),
                             }
                         }
+                        TerminalPumpEvent::Audit(result) => {
+                            let audit = audit
+                                .as_ref()
+                                .expect("the audit branch is enabled only for enterprise sessions");
+                            match result {
+                                // The periodic poll: a due checkpoint is
+                                // handed to the pinned send branch (design
+                                // sections 20.1 and 27.4); the substream
+                                // write never suspends the pump.
+                                Err(_elapsed) => {
+                                    audit_send = Some(Box::pin(audit.send_due_checkpoint()));
+                                }
+                                Ok(Ok(Some(frame))) => {
+                                    // The received frame is handed to the
+                                    // pinned process branch; the substream
+                                    // stays unread while it runs, so the
+                                    // ordered frame sequence can never be
+                                    // handled out of order.
+                                    audit_process = Some(Box::pin(async move {
+                                        audit.handle_frame(&frame).await
+                                    }));
+                                }
+                                // The audit substream ended: the connection
+                                // is gone, the session fails closed.
+                                Ok(Ok(None)) => {
+                                    break Err(ControllerError::Audit(AuditError::FailedClosed));
+                                }
+                                Ok(Err(error)) => break Err(error.into()),
+                            }
+                            None
+                        }
+                        TerminalPumpEvent::AuditSend(result) => {
+                            match result {
+                                Ok(()) => None,
+                                Err(error) => break Err(error.into()),
+                            }
+                        }
+                        TerminalPumpEvent::AuditProcess(result) => {
+                            let audit = audit
+                                .as_ref()
+                                .expect("the audit branch is enabled only for enterprise sessions");
+                            match result {
+                                Ok(FrameEvent::None) => {
+                                    // The completed frame is re-armed only
+                                    // now: the substream stays unread while
+                                    // the previous frame is being processed.
+                                    audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
+                                    None
+                                }
+                                Ok(FrameEvent::Close(_)) => {
+                                    // The controller never initiates a
+                                    // close from the peer's notice; the
+                                    // host only conveys its own audit
+                                    // failure, so the session fails
+                                    // closed (design section 18.7).
+                                    drive_bound(
+                                        driver,
+                                        binding,
+                                        audit.fail_closed(None, AuditCloseReason::AuditFailure),
+                                    )
+                                    .await
+                                    .ok();
+                                    break Err(ControllerError::Audit(AuditError::FailedClosed));
+                                }
+                                Ok(FrameEvent::PeerAuditError(code)) => {
+                                    drive_bound(
+                                        driver,
+                                        binding,
+                                        audit.fail_closed(
+                                            Some(code),
+                                            AuditCloseReason::AuditFailure,
+                                        ),
+                                    )
+                                    .await
+                                    .ok();
+                                    break Err(ControllerError::Audit(AuditError::FailedClosed));
+                                }
+                                Err(error) => break Err(error.into()),
+                            }
+                        }
                     };
                     // §7.4.5: a delayed-buffer overflow cancels the
                     // not-yet-started operation and flushes the buffer
@@ -1223,6 +1447,7 @@ async fn run_terminal(
                             &mut session_ui,
                             &mut output,
                             &mut terminal_output,
+                            audit.as_ref(),
                         )
                         .await
                         {
@@ -1238,6 +1463,7 @@ async fn run_terminal(
                             &mut session_ui,
                             &mut output,
                             &mut terminal_output,
+                            audit.as_ref(),
                         )
                         .await
                         {
@@ -1253,11 +1479,21 @@ async fn run_terminal(
     let output_deadline = remote
         .deadline()
         .unwrap_or_else(|| tokio::time::Instant::now() + REMOTE_COMPLETION_TIMEOUT);
-    let output_finish =
-        tokio::time::timeout_at(output_deadline, terminal_output.finish(&mut output))
+    let output_finish = tokio::time::timeout_at(output_deadline, async {
+        let tail = terminal_output
+            .finish(&mut output)
             .await
-            .map_err(|_| ControllerError::RemoteCompletionTimeout)
-            .and_then(|result| result.map_err(ControllerError::TerminalOutput));
+            .map_err(ControllerError::TerminalOutput)?;
+        // The display tail written by the finish (design section 18.4).
+        if !tail.is_empty()
+            && let Some(audit) = audit.as_ref()
+        {
+            audit.record_display_bytes(&tail).await?;
+        }
+        Ok::<(), ControllerError>(())
+    })
+    .await
+    .map_err(|_| ControllerError::RemoteCompletionTimeout)?;
     let session = finish_terminal_output(session, output_finish);
     let session = match session {
         Ok(code) => complete_terminal_control(
@@ -1266,11 +1502,14 @@ async fn run_terminal(
             &mut control_read,
             &mut control_write,
             cancellation,
+            audit.as_ref(),
         )
         .await
         .map(|()| code),
         Err(error) => Err(error),
     };
+    // The audit close and finalization (design sections 21 and 22).
+    let session = audit_close_controller(driver, binding, session, audit.as_ref(), detached).await;
     let display_restore = if session.is_err() {
         frontend.restore_display()
     } else {
@@ -1280,6 +1519,11 @@ async fn run_terminal(
     finish_terminal(session, frontend.restore_raw_mode(raw_mode))
 }
 
+/// The pinned audit-pump step carried by the terminal pump: a checkpoint
+/// send or a received-frame processing future that must never suspend the
+/// inner-select branches of the pump.
+type AuditPumpStep<'a, T> = Pin<Box<dyn Future<Output = Result<T, AuditError>> + 'a>>;
+
 enum TerminalPumpEvent {
     Cancelled,
     Driver(EndpointEvent),
@@ -1288,6 +1532,18 @@ enum TerminalPumpEvent {
     RemoteExit(Result<u32, ControllerError>),
     Resize(Result<Infallible, ControllerError>),
     Transfer(TransferOutcome),
+    Audit(Result<Result<Option<Vec<u8>>, AuditError>, tokio::time::error::Elapsed>),
+    AuditSend(Result<(), AuditError>),
+    AuditProcess(Result<FrameEvent, AuditError>),
+}
+
+async fn wait_for_audit_frame(
+    audit: Option<&AuditObserver>,
+) -> Result<Option<Vec<u8>>, AuditError> {
+    match audit {
+        Some(audit) => audit.wait_for_frame().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1390,6 +1646,7 @@ async fn process_local_input_chunk(
     data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
     control: &mut LocalControlInput,
     pending_input: &mut Option<ProcessedInput>,
+    audit: Option<&AuditObserver>,
 ) -> Result<LocalInputSignal, ControllerError> {
     let reserve = if control.enabled() && control.pending_prefix() {
         1
@@ -1405,10 +1662,34 @@ async fn process_local_input_chunk(
     );
     let processed = control.process(chunk);
     if !processed.remote_bytes.is_empty() {
-        data_write
-            .write_all(processed.remote_bytes.as_slice())
-            .await?;
-        data_write.flush().await?;
+        // Design sections 18.1: the input commitment is appended before the
+        // bytes are sent, and the send outcome after the send.
+        if let Some(audit) = audit {
+            audit
+                .record_input(processed.remote_bytes.as_slice())
+                .await?;
+        }
+        let length = processed.remote_bytes.as_slice().len() as u64;
+        let send = async {
+            data_write
+                .write_all(processed.remote_bytes.as_slice())
+                .await?;
+            data_write.flush().await
+        }
+        .await;
+        if let Err(error) = send {
+            if let Some(audit) = audit {
+                let _ = audit
+                    .record_send_outcome(DIRECTION_CTRL_TO_HOST, false, length)
+                    .await;
+            }
+            return Err(error.into());
+        }
+        if let Some(audit) = audit {
+            audit
+                .record_send_outcome(DIRECTION_CTRL_TO_HOST, true, length)
+                .await?;
+        }
     }
     *pending_input = Some(processed);
     tokio::task::yield_now().await;
@@ -1424,21 +1705,42 @@ async fn finish_local_input_eof(
     output: &mut (impl tokio::io::AsyncWrite + Unpin),
     terminal_output: &mut RemoteTerminalOutput,
     session_ui: &mut TransferUi,
+    audit: Option<&AuditObserver>,
 ) -> Result<(), ControllerError> {
     session_ui.local_ended = true;
     let finished = session_ui.control.finish();
     if !finished.remote_bytes.is_empty() {
-        data_write
-            .write_all(finished.remote_bytes.as_slice())
-            .await?;
-        data_write.flush().await?;
+        if let Some(audit) = audit {
+            audit.record_input(finished.remote_bytes.as_slice()).await?;
+        }
+        let length = finished.remote_bytes.as_slice().len() as u64;
+        let send = async {
+            data_write
+                .write_all(finished.remote_bytes.as_slice())
+                .await?;
+            data_write.flush().await
+        }
+        .await;
+        if let Err(error) = send {
+            if let Some(audit) = audit {
+                let _ = audit
+                    .record_send_outcome(DIRECTION_CTRL_TO_HOST, false, length)
+                    .await;
+            }
+            return Err(error.into());
+        }
+        if let Some(audit) = audit {
+            audit
+                .record_send_outcome(DIRECTION_CTRL_TO_HOST, true, length)
+                .await?;
+        }
     }
     if finished.action == LocalAction::Bell {
         write_local_ui(output, session_ui.ui_to_display, b"\x07").await?;
     }
     if session_ui.flow.is_some() {
         end_transfer_modal(session_ui, output).await?;
-        flush_delayed_output(session_ui, output, terminal_output).await?;
+        flush_delayed_output(session_ui, output, terminal_output, audit).await?;
     }
     data_write.shutdown().await?;
     Ok(())
@@ -1451,6 +1753,7 @@ async fn copy_remote_output(
     delayed: &mut DelayedOutputBuffer,
     delayed_overflow: &mut bool,
     prompt_active: &Option<PathPromptFlow>,
+    audit: Option<&AuditObserver>,
 ) -> Result<(), ControllerError> {
     loop {
         let mut chunk = TerminalChunk::new();
@@ -1461,16 +1764,45 @@ async fn copy_remote_output(
         chunk
             .set_len(length)
             .map_err(|_| ControllerError::ConnectionLost)?;
+        // Design section 18.3: the raw network output is recorded before
+        // any display handling; the shared output chain always compares the
+        // raw terminal bytes.
+        if let Some(audit) = audit {
+            audit.record_raw_output(chunk.as_slice()).await?;
+        }
         if prompt_active.is_some() {
             // §7.4: while a path prompt is active the display is paused but
             // the remote output keeps being read into the bounded delayed
-            // buffer, so the remote PTY never blocks.
+            // buffer, so the remote PTY never blocks. The display record is
+            // appended when the delayed bytes are flushed.
             if delayed.append(chunk.as_slice()) == AppendOutcome::Overflow {
                 *delayed_overflow = true;
             }
         } else {
-            terminal_output.write(output, chunk.as_slice()).await?;
-            output.flush().await?;
+            // Design section 18.4: the display bytes (after the platform
+            // output adapter) are recorded before the display write.
+            let display = terminal_output.prepare(chunk.as_slice());
+            if let Some(audit) = audit {
+                audit.record_display_bytes(&display).await?;
+            }
+            if let Err(error) = async {
+                terminal_output.write(output, &display).await?;
+                output.flush().await
+            }
+            .await
+            {
+                if let Some(audit) = audit {
+                    let _ = audit
+                        .record_display_write_outcome(false, display.len() as u64)
+                        .await;
+                }
+                return Err(error.into());
+            }
+            if let Some(audit) = audit {
+                audit
+                    .record_display_write_outcome(true, display.len() as u64)
+                    .await?;
+            }
         }
         tokio::task::yield_now().await;
     }
@@ -1490,7 +1822,13 @@ async fn complete_terminal_control(
     control_read: &mut (impl tokio::io::AsyncRead + Unpin),
     control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
     cancellation: &tokio_util::sync::CancellationToken,
+    audit: Option<&AuditObserver>,
 ) -> Result<(), ControllerError> {
+    // Design section 15.2: the shared TerminalComplete event is recorded
+    // before it is conveyed.
+    if let Some(audit) = audit {
+        audit.record_terminal_complete().await?;
+    }
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(ControllerError::Interrupted),
@@ -1544,6 +1882,7 @@ async fn copy_terminal_resizes(
     control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
     mut last_size: TerminalSize,
     enabled: bool,
+    audit: Option<&AuditObserver>,
 ) -> Result<Infallible, ControllerError> {
     if !enabled {
         return std::future::pending().await;
@@ -1556,6 +1895,13 @@ async fn copy_terminal_resizes(
             continue;
         };
         if let Some((size, resize)) = changed {
+            // Design section 18.5: the resize is recorded before it is
+            // sent, with the sender's direction.
+            if let Some(audit) = audit {
+                audit
+                    .record_resize(DIRECTION_CTRL_TO_HOST, size.columns(), size.rows())
+                    .await?;
+            }
             control_write.write_all(&resize).await?;
             control_write.flush().await?;
             last_size = size;
@@ -1798,7 +2144,7 @@ impl PathPromptFlow {
     }
 }
 
-/// Session-local controller state of the 0.1.3 file-transfer interaction
+/// Session-local controller state of the 0.2.0 file-transfer interaction
 /// (design §6–§9, §15, §16).
 struct TransferUi {
     /// The local control input machine (disabled for non-interactive
@@ -1898,13 +2244,37 @@ async fn flush_delayed_output(
     session_ui: &mut TransferUi,
     output: &mut (impl tokio::io::AsyncWrite + Unpin),
     terminal_output: &mut RemoteTerminalOutput,
+    audit: Option<&AuditObserver>,
 ) -> Result<(), ControllerError> {
     if session_ui.delayed.is_empty() {
         return Ok(());
     }
     let bytes = session_ui.delayed.take_all();
-    terminal_output.write(output, &bytes).await?;
-    output.flush().await?;
+    // Design section 18.4: the delayed bytes were already recorded as raw
+    // network output; the display record is appended before the display
+    // write.
+    let display = terminal_output.prepare(&bytes);
+    if let Some(audit) = audit {
+        audit.record_display_bytes(&display).await?;
+    }
+    let displayed = async {
+        terminal_output.write(output, &display).await?;
+        output.flush().await
+    }
+    .await;
+    if let Err(error) = displayed {
+        if let Some(audit) = audit {
+            let _ = audit
+                .record_display_write_outcome(false, display.len() as u64)
+                .await;
+        }
+        return Err(error.into());
+    }
+    if let Some(audit) = audit {
+        audit
+            .record_display_write_outcome(true, display.len() as u64)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1929,9 +2299,10 @@ async fn abort_prompt_for_overflow(
     session_ui: &mut TransferUi,
     output: &mut (impl tokio::io::AsyncWrite + Unpin),
     terminal_output: &mut RemoteTerminalOutput,
+    audit: Option<&AuditObserver>,
 ) -> Result<(), ControllerError> {
     end_transfer_modal(session_ui, output).await?;
-    flush_delayed_output(session_ui, output, terminal_output).await
+    flush_delayed_output(session_ui, output, terminal_output, audit).await
 }
 
 /// Handles one processed local input chunk: the active prompt consumes its
@@ -1943,6 +2314,7 @@ async fn handle_processed_input(
     terminal_output: &mut RemoteTerminalOutput,
     session_ui: &mut TransferUi,
     cancel: &AtomicBool,
+    audit: Option<&AuditObserver>,
 ) -> Result<LocalInputHandling, ControllerError> {
     let mut run_transfer = None;
     if let Some(flow) = session_ui.flow.as_mut() {
@@ -1968,7 +2340,7 @@ async fn handle_processed_input(
                 session_ui.flow = None;
                 // §7.4.4: the delayed remote output is flushed in order
                 // once the prompt has ended.
-                flush_delayed_output(session_ui, output, terminal_output).await?;
+                flush_delayed_output(session_ui, output, terminal_output, audit).await?;
                 run_transfer = Some((
                     session_ui
                         .direction
@@ -1982,7 +2354,7 @@ async fn handle_processed_input(
                 // §16.1: no file substream is opened and nothing is sent to
                 // the remote PTY.
                 end_transfer_modal(session_ui, output).await?;
-                flush_delayed_output(session_ui, output, terminal_output).await?;
+                flush_delayed_output(session_ui, output, terminal_output, audit).await?;
             }
         }
     }
@@ -1992,10 +2364,17 @@ async fn handle_processed_input(
         LocalAction::Detach => {
             // §6.2/§16.3: end the whole session; an active operation is
             // cancelled by dropping it (its substream closes, the peer
-            // cleans up best-effort).
+            // cleans up best-effort). The local key action is recorded
+            // before the session ends (design section 15.3).
+            if let Some(audit) = audit {
+                audit.record_key_action(KEY_ACTION_DETACH).await?;
+            }
             return Err(ControllerError::Interrupted);
         }
         LocalAction::ShowHelp => {
+            if let Some(audit) = audit {
+                audit.record_key_action(KEY_ACTION_HELP).await?;
+            }
             if session_ui.ui_terminal {
                 write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
                 write_local_ui(
@@ -2042,12 +2421,15 @@ async fn handle_processed_input(
             write_local_ui(output, session_ui.ui_to_display, b"\x07").await?;
         }
         LocalAction::CancelOp => {
+            if let Some(audit) = audit {
+                audit.record_key_action(KEY_ACTION_INTERRUPT).await?;
+            }
             if session_ui.flow.is_some() {
                 // §16.1: Ctrl+C cancels the path prompt; the terminal is
                 // restored and the delayed remote output is written out.
                 write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
                 end_transfer_modal(session_ui, output).await?;
-                flush_delayed_output(session_ui, output, terminal_output).await?;
+                flush_delayed_output(session_ui, output, terminal_output, audit).await?;
             } else {
                 // §16.2: Ctrl+C cancels the running transfer; the flag is
                 // observed by the transfer between bounded blocks.
@@ -2056,7 +2438,17 @@ async fn handle_processed_input(
         }
         LocalAction::StartUpload | LocalAction::StartDownload => {
             // Pass-through only: the machine never starts an operation
-            // while modal; the pump loop runs the modal entry.
+            // while modal; the pump loop runs the modal entry. The local
+            // key action is recorded before the modal starts (design
+            // section 15.3).
+            if let Some(audit) = audit {
+                let action = if processed.action == LocalAction::StartUpload {
+                    KEY_ACTION_UPLOAD
+                } else {
+                    KEY_ACTION_DOWNLOAD
+                };
+                audit.record_key_action(action).await?;
+            }
             let direction = if processed.action == LocalAction::StartUpload {
                 TransferDirection::Upload
             } else {
@@ -2201,6 +2593,7 @@ async fn begin_transfer<'a>(
     base: &'a Option<BaseDirectory>,
     cancel: &'a AtomicBool,
     transfer: &mut Option<Pin<Box<dyn Future<Output = TransferOutcome> + 'a>>>,
+    audit: Option<&'a AuditObserver>,
 ) -> Result<(), ControllerError> {
     let Some(base) = base.as_ref() else {
         // The base directory became unavailable after the session started:
@@ -2279,17 +2672,15 @@ async fn begin_transfer<'a>(
         write_local_ui(output, session_ui.ui_to_display, b"\r\n").await?;
         write_local_ui(output, session_ui.ui_to_display, status.as_bytes()).await?;
         *transfer = Some(Box::pin(async move {
-            let mut random = OsSecureRandom;
             let mut stream = stream.into_tokio();
-            run_upload(
+            run_upload_audited(
                 &mut stream,
                 &TransferConfig::defaults(),
-                &mut random,
-                base,
                 &mut source,
                 &destination,
                 &file_name,
                 cancel,
+                audit,
             )
             .await
         }));
@@ -2303,16 +2694,15 @@ async fn begin_transfer<'a>(
         write_local_ui(output, session_ui.ui_to_display, status.as_bytes()).await?;
         *transfer = Some(Box::pin(async move {
             let local_target = second.as_deref();
-            let mut random = OsSecureRandom;
             let mut stream = stream.into_tokio();
-            run_download(
+            run_download_audited(
                 &mut stream,
                 &TransferConfig::defaults(),
-                &mut random,
                 base,
                 &first,
                 local_target,
                 cancel,
+                audit,
             )
             .await
         }));
@@ -2481,6 +2871,7 @@ async fn await_remote_completion<T>(
     }
 }
 
+#[cfg(test)]
 async fn exchange_terminal_ready(
     data: &mut (impl tokio::io::AsyncRead + Unpin),
     control: &mut (impl tokio::io::AsyncWrite + Unpin),
@@ -2495,6 +2886,7 @@ async fn exchange_terminal_ready(
         .map_err(ControllerError::from)
 }
 
+#[cfg(test)]
 async fn exchange_terminal_ready_timed(
     data: &mut (impl tokio::io::AsyncRead + Unpin),
     control: &mut (impl tokio::io::AsyncWrite + Unpin),
@@ -2504,6 +2896,168 @@ async fn exchange_terminal_ready_timed(
     tokio::time::timeout(timeout, exchange_terminal_ready(data, control, hello))
         .await
         .map_err(|_| ControllerError::Timeout)?
+}
+
+/// The Terminal Active gate (design sections 13.2 and 14): the terminal
+/// hello is conveyed first, an enterprise session completes its mandatory
+/// audit handshake, and then `TerminalReady` is awaited. Standard sessions
+/// pass `None` and never resolve audit storage or construct an observer.
+#[allow(clippy::too_many_arguments)]
+async fn establish_audit_and_terminal(
+    audit_stream: Option<ApplicationStream>,
+    data_read: &mut (impl tokio::io::AsyncRead + Unpin),
+    control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    hello: &TerminalHello,
+    binding: ConnectionBinding,
+    self_peer: PeerId,
+    audit_root_override: Option<&Path>,
+) -> Result<Option<AuditObserver>, ControllerError> {
+    control_write.write_all(hello.encode().as_slice()).await?;
+    control_write.flush().await?;
+    let digest = Digest32::new(Sha256::digest(hello.encode().as_slice()).into());
+    let audit = if let Some(audit_stream) = audit_stream {
+        let audit_root = match audit_root_override {
+            Some(root) => root.to_path_buf(),
+            None => crate::audit::observer::platform_audit_root()?,
+        };
+        // The opaque tokio stream is boxed before the handshake so the
+        // handshake future never holds the stream's inline buffers.
+        let audit_stream: Box<dyn AuditStreamIo> = Box::new(audit_stream.into_tokio());
+        let audit = tokio::time::timeout(
+            AUDIT_ESTABLISH_TIMEOUT,
+            AuditObserver::establish(
+                audit_stream,
+                AuditRole::Controller,
+                self_peer,
+                binding.peer(),
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &audit_root,
+                &mut OsSecureRandom,
+            ),
+        )
+        .await
+        .map_err(|_| ControllerError::Timeout)?
+        .map_err(ControllerError::from)?;
+        audit.record_terminal_hello(digest).await?;
+        Some(audit)
+    } else {
+        None
+    };
+    let mut ready = [0_u8; 1];
+    tokio::time::timeout(EXCHANGE_TIMEOUT, data_read.read_exact(&mut ready))
+        .await
+        .map_err(|_| ControllerError::Timeout)??;
+    TerminalReady::decode(&ready).map_err(ControllerError::from)?;
+    if let Some(audit) = audit.as_ref() {
+        audit.record_terminal_ready().await?;
+    }
+    Ok(audit)
+}
+
+/// The controller-side audit close (design sections 21 and 22). On a
+/// normal exit the finalization runs to completion; on an interrupted
+/// session the close reason is conveyed and the finalization is attempted;
+/// on connection loss the local tail is completed without a manifest; on
+/// an audit failure the observer already failed closed. A finalization
+/// failure is never hidden behind the remote exit code (design
+/// section 22.1).
+///
+/// The finalization exchange reads and writes the audit substream, so the
+/// endpoint driver is polled throughout (`drive_bound`); the connection
+/// would otherwise never deliver the peer's finalization frames.
+async fn audit_close_controller(
+    driver: &mut EndpointDriver,
+    binding: ConnectionBinding,
+    session: Result<u32, ControllerError>,
+    audit: Option<&AuditObserver>,
+    detached: bool,
+) -> Result<u32, ControllerError> {
+    let Some(audit) = audit else {
+        return session;
+    };
+    match session {
+        Ok(code) => {
+            let finalized = drive_bound(
+                driver,
+                binding,
+                audit.close_and_finalize(
+                    ManifestEnding::ShellExit(code as u8),
+                    true,
+                    CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                ),
+            )
+            .await;
+            match finalized {
+                Ok(Ok(())) => Ok(code),
+                Ok(Err(error)) => {
+                    audit
+                        .fail_closed(None, AuditCloseReason::AuditFailure)
+                        .await;
+                    Err(ControllerError::Audit(error))
+                }
+                Err(endpoint) => {
+                    audit
+                        .fail_closed(None, AuditCloseReason::AuditFailure)
+                        .await;
+                    Err(endpoint.into())
+                }
+            }
+        }
+        Err(error) => match error {
+            ControllerError::Interrupted => {
+                let reason = if detached {
+                    AuditCloseReason::ControllerDetach
+                } else {
+                    AuditCloseReason::LocalInterrupt
+                };
+                let lifecycle = if detached {
+                    LIFECYCLE_KIND_ACTIVE_DETACH
+                } else {
+                    LIFECYCLE_KIND_LOCAL_INTERRUPT
+                };
+                let _ = audit.record_lifecycle(lifecycle).await;
+                match drive_bound(
+                    driver,
+                    binding,
+                    audit.close_and_finalize(
+                        ManifestEnding::CloseReason(reason),
+                        false,
+                        CloseNoticeHandling::Sender(reason),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Err(error),
+                    Ok(Err(audit_error)) => {
+                        audit
+                            .fail_closed(None, AuditCloseReason::AuditFailure)
+                            .await;
+                        Err(ControllerError::Audit(audit_error))
+                    }
+                    Err(endpoint) => {
+                        audit
+                            .fail_closed(None, AuditCloseReason::AuditFailure)
+                            .await;
+                        Err(endpoint.into())
+                    }
+                }
+            }
+            ControllerError::Audit(_) => {
+                // The observer already failed closed and conveyed the
+                // notice; keep the original error.
+                Err(error)
+            }
+            _ => {
+                // Connection loss or any other failure: the local tail is
+                // completed without a manifest (design section 22.4).
+                audit
+                    .close_interrupted(AuditCloseReason::ConnectionLost)
+                    .await;
+                Err(error)
+            }
+        },
+    }
 }
 
 fn decode_terminal_exit(message: &[u8]) -> Result<u32, ControllerError> {
@@ -2749,41 +3303,49 @@ mod tests {
         ActiveTerminalConnectionEvent, CapabilityCache, ControllerConfig, ControllerError,
         ControllerStage, CrosstermFrontend, DELAYED_OUTPUT_CAP, DisplayModeGuard, EndpointError,
         EndpointEvent, EnterpriseControllerUi, FILE_TRANSFER_ALREADY_ACTIVE,
-        FILE_TRANSFER_UNAVAILABLE, LOCAL_CONTROL_HELP, LocalInputHandling, LocalInputSignal,
-        PROMPT_BANNER_DOWNLOAD, PROMPT_BANNER_UPLOAD, PROMPT_DOWNLOAD_SOURCE, PROMPT_UPLOAD_SOURCE,
-        PathPromptFlow, PromptProgress, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion,
-        RemoteTerminalOutput, RemoteTerminalOutputMode, TerminalFrontend, TransferNotReady,
-        TransferUi, UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch, abort_prompt_for_overflow,
+        FILE_TRANSFER_UNAVAILABLE, FILE_TRANSFER_UNSUPPORTED, LOCAL_CONTROL_HELP,
+        LocalInputHandling, LocalInputSignal, PROMPT_BANNER_DOWNLOAD, PROMPT_BANNER_UPLOAD,
+        PROMPT_DOWNLOAD_SOURCE, PROMPT_UPLOAD_SOURCE, PathPromptFlow, PromptProgress,
+        REMOTE_COMPLETION_TIMEOUT, RemoteCompletion, RemoteTerminalOutput,
+        RemoteTerminalOutputMode, TerminalFrontend, TransferNotReady, TransferUi,
+        UTF8_OUTPUT_BATCH_CAPACITY, Utf8OutputBatch, abort_prompt_for_overflow,
         active_terminal_connection_event, await_remote_completion, await_until,
-        changed_terminal_size, complete_after_output_eof, complete_terminal_control_io,
-        controller_fallback_required, copy_remote_output, copy_terminal_resizes,
-        decode_terminal_exit, default_terminal_value, direct_fallback_required, end_transfer_modal,
-        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
-        fail_transfer_startup, fallback_transport, file_transfer_ready, finish_local_input_eof,
-        finish_terminal, finish_terminal_output, flush_delayed_output, handle_processed_input,
+        begin_file_transfer_modal, begin_transfer, changed_terminal_size,
+        complete_after_output_eof, complete_terminal_control_io, controller_fallback_required,
+        copy_remote_output, copy_terminal_resizes, decode_terminal_exit, default_terminal_value,
+        direct_fallback_required, end_transfer_modal, enter_raw_mode_before,
+        exchange_terminal_ready, exchange_terminal_ready_timed, fail_transfer_startup,
+        fallback_transport, file_transfer_ready, finish_local_input_eof, finish_terminal,
+        finish_terminal_output, flush_delayed_output, handle_processed_input,
         handle_transfer_event, local_terminal_hello, local_terminal_hello_with,
-        native_display_restore_commands, next_retry_delay, platform_open,
+        native_display_restore_commands, next_retry_delay, platform_open, prepare_controller,
         prepare_controller_session, probe_file_transfer_capability, process_local_input_chunk,
         read_auth_response, read_local_input, read_remote_exit, restore_native_display,
-        run_controller, run_controller_session, run_controller_with_progress,
+        run_controller, run_controller_session, run_controller_with_progress, run_terminal,
         run_until_interrupted, terminal_environment, terminal_environment_from,
-        transfer_summary_line, wait_for_remote_completion_deadline, write_local_ui,
-        write_native_display_restore,
+        transfer_summary_line, wait_for_audit_frame, wait_for_remote_completion_deadline,
+        write_local_ui, write_native_display_restore,
     };
+    use crate::audit::observer::{AuditObserver, CloseNoticeHandling, FrameEvent};
+    use crate::audit::session::{
+        AuditError, KEY_ACTION_DOWNLOAD, KEY_ACTION_HELP, KEY_ACTION_INTERRUPT, KEY_ACTION_UPLOAD,
+        OUTCOME_FAILED, OUTCOME_OK,
+    };
+    use crate::audit::verify::{StreamAction, stream_frames};
     use crate::file_semantics::BaseDirectory;
     use crate::local_control::{LocalAction, LocalControlInput, LocalInputChunk, ModalPhase};
     use crate::network::{
-        EndpointDriver, RelayConnection, build_endpoint, connect_configured_relay,
-        wait_for_reservation,
+        ConnectionBinding, EndpointDriver, RelayAccessMode, RelayConnection, build_endpoint,
+        connect_configured_relay, wait_for_reservation,
     };
     use crate::pake::{OpaquePake, OpaqueRegistration};
     use crate::progress::NoopProgress;
     use crate::progress::OperationProgress;
     use crate::protocol::EnterpriseResolveUi as _;
-    use crate::protocol::allocate_locator;
+    use crate::protocol::{ResolveDeadline, ResolvedTarget, allocate_locator, resolve_peer};
     use crate::transfer::TransferOutcome;
-    use crate::transfer_prompt::AppendOutcome;
-    use sha2::{Digest, Sha256};
+    use crate::transfer_prompt::{AppendOutcome, DelayedOutputBuffer};
+    use sha2::{Digest as _, Sha256};
     use std::cell::Cell;
     use std::fs;
     use std::future::Future;
@@ -2801,6 +3363,10 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
     use tokio::sync::oneshot;
     use yon_relay::{RelayServeConfig, RelayServiceError, run_relay_until};
+    use yonder_core::wire::audit::{
+        AUDIT_PROTOCOL, AuditCloseReason, AuditErrorCode, AuditRole, Digest32, ManifestEnding,
+    };
+    use yonder_core::wire::audit_container::RecordType;
     use yonder_core::wire::auth::AuthServerResponse;
     use yonder_core::wire::auth::{
         AuthClientFinish, AuthClientHello, Authenticated, CLIENT_HELLO_LEN, KE3_LEN, PakeContext,
@@ -2824,11 +3390,16 @@ mod tests {
     use yonder_core::{OsSecureRandom, Pake, PeerIdBytes, SecureRandom};
     use yonder_net::{
         ApplicationStream, ApplicationStreamError, ApplicationStreams, ConnectedPoint,
-        ConnectionId, EndpointRelayAddress, EndpointRelaySet, IncomingApplicationStreams, Keypair,
-        Libp2pApplicationStreams, NetworkBuildError, PeerId, WssTransportConfig, peer_id_bytes,
+        ConnectionId, DirectUpgradePolicy, EndpointRelayAddress, EndpointRelaySet,
+        IncomingApplicationStreams, Keypair, Libp2pApplicationStreams, NetworkBuildError, PeerId,
+        WssTransportConfig, peer_id_bytes,
     };
 
-    const CONTROLLER_SESSION_HEAP_LIMIT: usize = 128 * 1024;
+    // The fixed session state with the 0.2.0 audit observer: the
+    // handshake futures carry the session state machine (the two 16 KiB
+    // canonical normalizers) and the observer is alive across the pump.
+    // The bound is still fixed-size — never proportional to input.
+    const CONTROLLER_SESSION_HEAP_LIMIT: usize = 2 * 1024 * 1024;
 
     fn invalid_wss_controller_config() -> ControllerConfig {
         let relay_identity = Keypair::generate_ed25519();
@@ -2886,14 +3457,30 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn invalid_wss_ca_is_rejected_before_controller_network_activity() {
-        assert!(matches!(
-            run_controller(invalid_wss_controller_config()).await,
-            Err(ControllerError::Endpoint(EndpointError::Build(
-                NetworkBuildError::WssTls(_)
-            )))
-        ));
+    #[test]
+    fn invalid_wss_ca_is_rejected_before_controller_network_activity() {
+        // The controller future (with the 0.2.0 audit observer state)
+        // exceeds the default test-thread stack, so the scenario runs on a
+        // dedicated thread with a large stack.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    assert!(matches!(
+                        run_controller(invalid_wss_controller_config()).await,
+                        Err(ControllerError::Endpoint(EndpointError::Build(
+                            NetworkBuildError::WssTls(_)
+                        )))
+                    ));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -3133,6 +3720,7 @@ mod tests {
             &mut controller,
             TerminalSize::new(80, 24).unwrap(),
             true,
+            None,
         );
         let receive = async {
             let mut resize = [0_u8; 5];
@@ -3487,12 +4075,21 @@ mod tests {
         ));
     }
 
+    async fn write_prepared(
+        terminal_output: &mut RemoteTerminalOutput,
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+        raw: &[u8],
+    ) {
+        let display = terminal_output.prepare(raw);
+        terminal_output.write(output, &display).await.unwrap();
+    }
+
     async fn render_remote_output(mode: RemoteTerminalOutputMode, chunks: &[&[u8]]) -> Vec<u8> {
         let (mut output, mut captured) = tokio::io::duplex(128);
         let writer = async {
             let mut terminal_output = RemoteTerminalOutput::new(mode);
             for chunk in chunks {
-                terminal_output.write(&mut output, chunk).await.unwrap();
+                write_prepared(&mut terminal_output, &mut output, chunk).await;
                 output.flush().await.unwrap();
             }
             terminal_output.finish(&mut output).await.unwrap();
@@ -3608,7 +4205,8 @@ mod tests {
         let mut output = CountingWriter::default();
         let mut terminal_output =
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
-        terminal_output.write(&mut output, &invalid).await.unwrap();
+        let display = terminal_output.prepare(&invalid);
+        terminal_output.write(&mut output, &display).await.unwrap();
         terminal_output.finish(&mut output).await.unwrap();
         assert_eq!(output.bytes, String::from_utf8_lossy(&invalid).as_bytes());
         assert!(output.writes <= 16, "write count: {}", output.writes);
@@ -3643,15 +4241,17 @@ mod tests {
     async fn remote_output_adapter_propagates_write_and_flush_failures() {
         let mut output = CountingWriter::failing_first_write();
         let mut bytes = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
-        assert_injected_io(bytes.write(&mut output, b"bytes").await.unwrap_err());
+        let display = bytes.prepare(b"bytes");
+        assert_injected_io(bytes.write(&mut output, &display).await.unwrap_err());
 
         let mut output = CountingWriter::failing_first_write();
         let mut terminal_output =
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
         let oversized = vec![b'a'; UTF8_OUTPUT_BATCH_CAPACITY + 1];
+        let display = terminal_output.prepare(&oversized);
         assert_injected_io(
             terminal_output
-                .write(&mut output, &oversized)
+                .write(&mut output, &display)
                 .await
                 .unwrap_err(),
         );
@@ -3661,9 +4261,10 @@ mod tests {
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
         let mut valid_then_invalid = vec![b'a'; UTF8_OUTPUT_BATCH_CAPACITY + 1];
         valid_then_invalid.push(0xff);
+        let display = terminal_output.prepare(&valid_then_invalid);
         assert_injected_io(
             terminal_output
-                .write(&mut output, &valid_then_invalid)
+                .write(&mut output, &display)
                 .await
                 .unwrap_err(),
         );
@@ -3672,9 +4273,10 @@ mod tests {
         let mut terminal_output =
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
         let invalid = vec![0xff; UTF8_OUTPUT_BATCH_CAPACITY];
+        let display = terminal_output.prepare(&invalid);
         assert_injected_io(
             terminal_output
-                .write(&mut output, &invalid)
+                .write(&mut output, &display)
                 .await
                 .unwrap_err(),
         );
@@ -3682,7 +4284,8 @@ mod tests {
         let mut output = CountingWriter::failing_first_write();
         let mut terminal_output =
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
-        terminal_output.write(&mut output, b"\xf0").await.unwrap();
+        let display = terminal_output.prepare(b"\xf0");
+        terminal_output.write(&mut output, &display).await.unwrap();
         assert_injected_io(terminal_output.finish(&mut output).await.unwrap_err());
 
         let mut output = CountingWriter::failing_flush();
@@ -3694,24 +4297,21 @@ mod tests {
     async fn remote_output_adapter_handles_every_streaming_utf8_boundary() {
         let mut output = CountingWriter::default();
         let mut bytes = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
-        bytes.write(&mut output, b"\xff").await.unwrap();
+        write_prepared(&mut bytes, &mut output, b"\xff").await;
         bytes.finish(&mut output).await.unwrap();
         assert_eq!(output.bytes, b"\xff");
 
         let mut output = CountingWriter::default();
         let mut terminal_output =
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
-        terminal_output.write(&mut output, b"valid").await.unwrap();
-        terminal_output.write(&mut output, b"\xe4").await.unwrap();
-        terminal_output.write(&mut output, b"").await.unwrap();
-        terminal_output.write(&mut output, b"\xb8").await.unwrap();
-        terminal_output.write(&mut output, b"\xad").await.unwrap();
-        terminal_output.write(&mut output, b"\xe4").await.unwrap();
-        terminal_output.write(&mut output, b"A").await.unwrap();
-        terminal_output
-            .write(&mut output, b"ok\xff\xf0\x90")
-            .await
-            .unwrap();
+        write_prepared(&mut terminal_output, &mut output, b"valid").await;
+        write_prepared(&mut terminal_output, &mut output, b"\xe4").await;
+        write_prepared(&mut terminal_output, &mut output, b"").await;
+        write_prepared(&mut terminal_output, &mut output, b"\xb8").await;
+        write_prepared(&mut terminal_output, &mut output, b"\xad").await;
+        write_prepared(&mut terminal_output, &mut output, b"\xe4").await;
+        write_prepared(&mut terminal_output, &mut output, b"A").await;
+        write_prepared(&mut terminal_output, &mut output, b"ok\xff\xf0\x90").await;
         terminal_output.finish(&mut output).await.unwrap();
 
         assert_eq!(
@@ -3783,6 +4383,7 @@ mod tests {
                     &mut controller_write,
                     &mut session_ui.control,
                     &mut session_ui.pending_input,
+                    None,
                 )
                 .await
                 {
@@ -3804,6 +4405,7 @@ mod tests {
             &mut session_ui.delayed,
             &mut session_ui.delayed_overflow,
             &session_ui.flow,
+            None,
         );
         let peer_exchange = async {
             peer_write.write_all(&remote_payload).await.unwrap();
@@ -3846,6 +4448,111 @@ mod tests {
 
         assert_eq!(completed, local_payload);
         assert_eq!(local_output, remote_payload);
+    }
+
+    async fn establish_audit_pair() -> (
+        Arc<AuditObserver>,
+        Arc<AuditObserver>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let controller = Keypair::generate_ed25519().public().to_peer_id();
+        let host = Keypair::generate_ed25519().public().to_peer_id();
+        let (host_half, controller_half) = tokio::io::duplex(256 * 1024);
+        let digest = Digest32::new([0xCE; 32]);
+        let controller_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let controller_root = controller_dir.path().join("audit");
+        let host_root = host_dir.path().join("audit");
+        let mut controller_random = OsSecureRandom;
+        let mut host_random = OsSecureRandom;
+        let (controller_result, host_result) = tokio::join!(
+            Box::pin(AuditObserver::establish(
+                controller_half,
+                AuditRole::Controller,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &controller_root,
+                &mut controller_random,
+            )),
+            Box::pin(AuditObserver::establish(
+                host_half,
+                AuditRole::Host,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &host_root,
+                &mut host_random,
+            )),
+        );
+        (
+            Arc::new(controller_result.unwrap()),
+            Arc::new(host_result.unwrap()),
+            controller_dir,
+            host_dir,
+        )
+    }
+
+    #[test]
+    fn audit_failure_stops_further_remote_output_from_reaching_the_display() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (controller_audit, _host_audit, _controller_dir, _host_dir) =
+                        establish_audit_pair().await;
+                    let pump_audit = Arc::clone(&controller_audit);
+                    let (host_half, controller_half) = tokio::io::duplex(64 * 1024);
+                    let (mut controller_read, _controller_write) =
+                        tokio::io::split(controller_half);
+                    let (_peer_read, mut peer_write) = tokio::io::split(host_half);
+                    let (mut output_write, mut output_read) = tokio::io::duplex(64 * 1024);
+
+                    let pump = tokio::task::spawn(async move {
+                        copy_remote_output(
+                            &mut controller_read,
+                            &mut output_write,
+                            &mut RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes),
+                            &mut DelayedOutputBuffer::new(DELAYED_OUTPUT_CAP),
+                            &mut false,
+                            &None,
+                            Some(&pump_audit),
+                        )
+                        .await
+                    });
+
+                    let first = b"remote-output-first";
+                    peer_write.write_all(first).await.unwrap();
+                    let mut shown = vec![0_u8; first.len()];
+                    output_read.read_exact(&mut shown).await.unwrap();
+                    assert_eq!(shown, first);
+
+                    controller_audit
+                        .fail_closed(None, AuditCloseReason::AuditFailure)
+                        .await;
+                    assert!(controller_audit.has_failed().await);
+
+                    peer_write.write_all(b"remote-output-second").await.unwrap();
+                    let result = tokio::time::timeout(Duration::from_secs(10), pump)
+                        .await
+                        .expect("the output pump must stop after audit failure")
+                        .expect("the output pump must not panic");
+                    assert!(matches!(result, Err(ControllerError::Audit(_))));
+                    let mut trailing = Vec::new();
+                    output_read.read_to_end(&mut trailing).await.unwrap();
+                    assert!(trailing.is_empty());
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     fn local_chunk(bytes: &[u8]) -> LocalInputChunk {
@@ -3926,6 +4633,7 @@ mod tests {
             &mut controller_write,
             &mut machine,
             &mut pending_input,
+            None,
         )
         .await
         .unwrap();
@@ -3970,7 +4678,7 @@ mod tests {
         assert_native_input_adapter_uses_byte_escape_semantics();
     }
 
-    // ---- 0.1.3 native file transfer: capability, prompts, transfers ----
+    // ---- 0.2.0 native file transfer: capability, prompts, transfers ----
 
     struct TrackedProbeStream(Rc<Cell<bool>>);
 
@@ -4040,6 +4748,124 @@ mod tests {
         assert_eq!(
             file_transfer_ready(&no_base, None),
             Err(TransferNotReady::Unavailable)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_transfer_modal_preflight_preserves_ui_and_substream_boundaries() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let (mut driver, mut streams) = build_endpoint(
+            Keypair::generate_ed25519(),
+            WssTransportConfig::client(None),
+        )
+        .unwrap();
+        let binding =
+            ConnectionBinding::for_test(driver.peer_id(), ConnectionId::new_unchecked(0xF11E));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let base = Some(BaseDirectory::capture().unwrap());
+
+        let mut unavailable = TransferUi::new(true, true, true);
+        let _ = unavailable.control.process(local_chunk(b"\x1du"));
+        let mut output = CountingWriter::default();
+        begin_file_transfer_modal(
+            TransferDirection::Upload,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut unavailable,
+            &None,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output
+                .bytes
+                .windows(FILE_TRANSFER_UNAVAILABLE.len())
+                .any(|window| window == FILE_TRANSFER_UNAVAILABLE.as_bytes())
+        );
+        assert_eq!(unavailable.control.modal_phase(), None);
+
+        let mut unsupported = TransferUi::new(true, true, true);
+        let _ = unsupported.control.process(local_chunk(b"\x1dd"));
+        unsupported.capability = CapabilityCache::Unsupported;
+        output.bytes.clear();
+        begin_file_transfer_modal(
+            TransferDirection::Download,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut unsupported,
+            &base,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output
+                .bytes
+                .windows(FILE_TRANSFER_UNSUPPORTED.len())
+                .any(|window| window == FILE_TRANSFER_UNSUPPORTED.as_bytes())
+        );
+        assert_eq!(unsupported.control.modal_phase(), None);
+
+        let mut supported = TransferUi::new(true, true, true);
+        let _ = supported.control.process(local_chunk(b"\x1du"));
+        supported.capability = CapabilityCache::Supported;
+        output.bytes.clear();
+        begin_file_transfer_modal(
+            TransferDirection::Upload,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut supported,
+            &base,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(supported.direction, Some(TransferDirection::Upload));
+        assert!(supported.flow.is_some());
+        assert!(
+            output
+                .bytes
+                .windows(PROMPT_BANNER_UPLOAD.len())
+                .any(|window| window == PROMPT_BANNER_UPLOAD.as_bytes())
+        );
+
+        let mut disappeared = TransferUi::new(true, true, true);
+        let _ = disappeared.control.process(local_chunk(b"\x1du"));
+        output.bytes.clear();
+        let missing_base = None;
+        let cancel = AtomicBool::new(false);
+        let mut transfer: Option<Pin<Box<dyn Future<Output = TransferOutcome>>>> = None;
+        begin_transfer(
+            TransferDirection::Upload,
+            "source.bin".to_owned(),
+            None,
+            &mut driver,
+            &mut streams,
+            binding,
+            &mut output,
+            &mut disappeared,
+            &cancellation,
+            &missing_base,
+            &cancel,
+            &mut transfer,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(transfer.is_none());
+        assert_eq!(disappeared.control.modal_phase(), None);
+        assert!(
+            output
+                .bytes
+                .windows(FILE_TRANSFER_UNAVAILABLE.len())
+                .any(|window| window == FILE_TRANSFER_UNAVAILABLE.as_bytes())
         );
     }
 
@@ -4215,6 +5041,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -4239,7 +5066,7 @@ mod tests {
         session_ui.delayed_overflow = true;
         let mut output = CountingWriter::default();
         let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
-        abort_prompt_for_overflow(&mut session_ui, &mut output, &mut terminal_output)
+        abort_prompt_for_overflow(&mut session_ui, &mut output, &mut terminal_output, None)
             .await
             .unwrap();
         assert!(session_ui.flow.is_none());
@@ -4329,6 +5156,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -4356,6 +5184,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -4379,6 +5208,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -4404,6 +5234,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Interrupted)
@@ -4423,6 +5254,7 @@ mod tests {
             &mut controller_write,
             &mut session_ui.control,
             &mut session_ui.pending_input,
+            None,
         )
         .await
         .unwrap();
@@ -4441,6 +5273,7 @@ mod tests {
                 &mut controller_write,
                 &mut session_ui.control,
                 &mut session_ui.pending_input,
+                None,
             )
             .await
             .unwrap(),
@@ -4461,6 +5294,7 @@ mod tests {
             &mut controller_write,
             &mut session_ui.control,
             &mut session_ui.pending_input,
+            None,
         )
         .await
         .unwrap();
@@ -4493,6 +5327,7 @@ mod tests {
             &mut output,
             &mut terminal_output,
             &mut session_ui,
+            None,
         )
         .await
         .unwrap();
@@ -4500,6 +5335,85 @@ mod tests {
         let mut received = Vec::new();
         peer_read.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"\x1d");
+    }
+
+    #[test]
+    fn audited_local_input_flush_failures_record_failed_send_outcomes() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (controller_audit, host_audit, controller_dir, host_dir) =
+                            establish_audit_pair().await;
+
+                        let mut session_ui = TransferUi::new(true, true, true);
+                        let mut input = &b"input"[..];
+                        let mut data_write = CountingWriter::failing_flush();
+                        assert!(matches!(
+                            process_local_input_chunk(
+                                &mut input,
+                                &mut data_write,
+                                &mut session_ui.control,
+                                &mut session_ui.pending_input,
+                                Some(&controller_audit),
+                            )
+                            .await,
+                            Err(ControllerError::Io(_))
+                        ));
+
+                        let mut session_ui = TransferUi::new(true, true, true);
+                        let _ = session_ui.control.process(local_chunk(b"\x1d"));
+                        let mut data_write = CountingWriter::failing_flush();
+                        let mut output = CountingWriter::default();
+                        let mut terminal_output =
+                            RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+                        assert!(matches!(
+                            finish_local_input_eof(
+                                &mut data_write,
+                                &mut output,
+                                &mut terminal_output,
+                                &mut session_ui,
+                                Some(&controller_audit),
+                            )
+                            .await,
+                            Err(ControllerError::Io(_))
+                        ));
+
+                        controller_audit
+                            .close_interrupted(AuditCloseReason::ConnectionLost)
+                            .await;
+                        drop(controller_audit);
+                        drop(host_audit);
+
+                        let record =
+                            fs::read_dir(controller_dir.path().join("audit").join("records"))
+                                .unwrap()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .path();
+                        let mut failures = 0_u8;
+                        stream_frames(&record, &mut |record_type, payload| {
+                            let local = payload.get(40..).unwrap_or_default();
+                            if record_type == RecordType::LocalSendOutcome
+                                && local.get(1) == Some(&OUTCOME_FAILED)
+                            {
+                                failures += 1;
+                            }
+                            Ok(StreamAction::Continue)
+                        })
+                        .unwrap();
+                        assert_eq!(failures, 2, "both flush failures must be recorded");
+                        drop(host_dir);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4517,6 +5431,7 @@ mod tests {
             &mut output,
             &mut terminal_output,
             &mut session_ui,
+            None,
         )
         .await
         .unwrap();
@@ -5038,32 +5953,68 @@ mod tests {
         assert!(!platform_open("not a url://["));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn run_controller_with_progress_rejects_invalid_wss_before_network_activity() {
-        let mut progress = NoopProgress;
-        assert!(matches!(
-            run_controller_with_progress(invalid_wss_controller_config(), &mut progress).await,
-            Err(ControllerError::Endpoint(EndpointError::Build(
-                NetworkBuildError::WssTls(_)
-            )))
-        ));
+    #[test]
+    fn run_controller_with_progress_rejects_invalid_wss_before_network_activity() {
+        // The controller future (with the 0.2.0 audit observer state)
+        // exceeds the default test-thread stack, so the scenario runs on a
+        // dedicated thread with a large stack.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut progress = NoopProgress;
+                    assert!(matches!(
+                        run_controller_with_progress(
+                            invalid_wss_controller_config(),
+                            &mut progress
+                        )
+                        .await,
+                        Err(ControllerError::Endpoint(EndpointError::Build(
+                            NetworkBuildError::WssTls(_)
+                        )))
+                    ));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_cancelled_token_stops_the_session_before_any_network_activity() {
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        cancellation.cancel();
-        let mut progress = NoopProgress;
-        assert!(matches!(
-            run_controller_session(
-                invalid_wss_controller_config(),
-                CrosstermFrontend,
-                &mut progress,
-                cancellation,
-            )
-            .await,
-            Err(ControllerError::Interrupted)
-        ));
+    #[test]
+    fn pre_cancelled_token_stops_the_session_before_any_network_activity() {
+        // The controller session future (with the 0.2.0 audit observer
+        // state) exceeds the default test-thread stack, so the scenario
+        // runs on a dedicated thread with a large stack.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    cancellation.cancel();
+                    let mut progress = NoopProgress;
+                    assert!(matches!(
+                        run_controller_session(
+                            invalid_wss_controller_config(),
+                            CrosstermFrontend,
+                            &mut progress,
+                            cancellation,
+                        )
+                        .await,
+                        Err(ControllerError::Interrupted)
+                    ));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5132,6 +6083,7 @@ mod tests {
                 &mut tokio::io::sink(),
                 TerminalSize::new(80, 24).unwrap(),
                 true,
+                None,
             ),
         )
         .await;
@@ -5158,9 +6110,11 @@ mod tests {
     async fn local_input_pump_logs_the_chunk_length_at_debug_level() {
         // Enable a debug-level subscriber so the pump's length tracing
         // evaluates its field expressions instead of being filtered out.
-        let _ = tracing_subscriber::fmt()
+        let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
-            .try_init();
+            .with_writer(std::io::sink)
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
         let mut session_ui = TransferUi::new(true, true, true);
         let mut input = [b'a'; 7].as_slice();
         let (mut controller_write, _peer) = tokio::io::duplex(16);
@@ -5169,6 +6123,7 @@ mod tests {
             &mut controller_write,
             &mut session_ui.control,
             &mut session_ui.pending_input,
+            None,
         )
         .await
         .unwrap();
@@ -5235,6 +6190,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5266,6 +6222,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5291,6 +6248,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5326,6 +6284,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5343,6 +6302,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5377,6 +6337,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5404,6 +6365,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5433,6 +6395,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5461,6 +6424,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -5520,6 +6484,7 @@ mod tests {
             &mut output,
             &mut terminal_output,
             &mut session_ui,
+            None,
         )
         .await
         .unwrap();
@@ -5572,6 +6537,7 @@ mod tests {
                 &mut session_ui.delayed,
                 &mut session_ui.delayed_overflow,
                 &session_ui.flow,
+                None,
             ),
             async {
                 host.write_all(&payload).await.unwrap();
@@ -5592,28 +6558,22 @@ mod tests {
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
 
         // An incomplete prefix parks in the adapter without writing...
-        terminal_output.write(&mut output, b"\xe4").await.unwrap();
+        write_prepared(&mut terminal_output, &mut output, b"\xe4").await;
         assert!(output.bytes.is_empty());
 
         // ...and completes into a valid sequence once the continuation
         // bytes arrive in a later call.
-        terminal_output
-            .write(&mut output, b"\xb8\xad")
-            .await
-            .unwrap();
+        write_prepared(&mut terminal_output, &mut output, b"\xb8\xad").await;
         assert_eq!(output.bytes, "\u{4e2d}".as_bytes());
 
         // A fresh prefix completed by an invalid byte is replaced; the
         // byte itself is replaced again, matching lossy UTF-8 conversion.
-        terminal_output.write(&mut output, b"\xe4").await.unwrap();
-        terminal_output.write(&mut output, b"\xff").await.unwrap();
+        write_prepared(&mut terminal_output, &mut output, b"\xe4").await;
+        write_prepared(&mut terminal_output, &mut output, b"\xff").await;
         assert_eq!(output.bytes, "\u{4e2d}\u{fffd}\u{fffd}".as_bytes());
 
         // An incomplete prefix at the end is replaced by finish().
-        terminal_output
-            .write(&mut output, b"\xf0\x90")
-            .await
-            .unwrap();
+        write_prepared(&mut terminal_output, &mut output, b"\xf0\x90").await;
         terminal_output.finish(&mut output).await.unwrap();
         assert_eq!(output.bytes, "\u{4e2d}\u{fffd}\u{fffd}\u{fffd}".as_bytes());
     }
@@ -5710,6 +6670,7 @@ mod tests {
                 &mut controller_write,
                 &mut session_ui.control,
                 &mut session_ui.pending_input,
+                None,
             )
             .await
             .unwrap(),
@@ -5741,6 +6702,7 @@ mod tests {
             &mut output,
             &mut terminal_output,
             &mut session_ui,
+            None,
         )
         .await
         .unwrap();
@@ -5843,6 +6805,7 @@ mod tests {
             &mut controller,
             TerminalSize::new(80, 24).unwrap(),
             true,
+            None,
         );
         tokio::pin!(pump);
         let receive = async {
@@ -5937,14 +6900,14 @@ mod tests {
         assert_eq!(session_ui.delayed.append(b"def"), AppendOutcome::Ok);
         let mut output = CountingWriter::default();
         let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
-        flush_delayed_output(&mut session_ui, &mut output, &mut terminal_output)
+        flush_delayed_output(&mut session_ui, &mut output, &mut terminal_output, None)
             .await
             .unwrap();
         assert_eq!(output.bytes, b"abcdef");
         assert!(session_ui.delayed.is_empty());
 
         // An empty delayed buffer writes nothing.
-        flush_delayed_output(&mut session_ui, &mut output, &mut terminal_output)
+        flush_delayed_output(&mut session_ui, &mut output, &mut terminal_output, None)
             .await
             .unwrap();
         assert_eq!(output.bytes, b"abcdef");
@@ -5955,9 +6918,192 @@ mod tests {
         let mut output = FailingFlush;
         let mut terminal_output = RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
         assert!(matches!(
-            flush_delayed_output(&mut session_ui, &mut output, &mut terminal_output).await,
+            flush_delayed_output(&mut session_ui, &mut output, &mut terminal_output, None).await,
             Err(ControllerError::Io(_))
         ));
+    }
+
+    #[test]
+    fn audited_delayed_display_records_flush_success_and_failure() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (controller_audit, host_audit, controller_dir, host_dir) =
+                            establish_audit_pair().await;
+
+                        let mut session_ui = TransferUi::new(true, true, true);
+                        assert_eq!(session_ui.delayed.append(b"visible"), AppendOutcome::Ok);
+                        let mut output = CountingWriter::default();
+                        let mut terminal_output =
+                            RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+                        flush_delayed_output(
+                            &mut session_ui,
+                            &mut output,
+                            &mut terminal_output,
+                            Some(&controller_audit),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert_eq!(session_ui.delayed.append(b"failure"), AppendOutcome::Ok);
+                        let mut output = CountingWriter::failing_flush();
+                        assert!(matches!(
+                            flush_delayed_output(
+                                &mut session_ui,
+                                &mut output,
+                                &mut terminal_output,
+                                Some(&controller_audit),
+                            )
+                            .await,
+                            Err(ControllerError::Io(_))
+                        ));
+
+                        controller_audit
+                            .close_interrupted(AuditCloseReason::ConnectionLost)
+                            .await;
+                        drop(controller_audit);
+                        drop(host_audit);
+
+                        let record =
+                            fs::read_dir(controller_dir.path().join("audit").join("records"))
+                                .unwrap()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .path();
+                        let mut outcomes = Vec::new();
+                        stream_frames(&record, &mut |record_type, payload| {
+                            if record_type == RecordType::LocalDisplayWriteOutcome
+                                && let Some(outcome) = payload.get(40)
+                            {
+                                outcomes.push(*outcome);
+                            }
+                            Ok(StreamAction::Continue)
+                        })
+                        .unwrap();
+                        assert_eq!(outcomes, [OUTCOME_OK, OUTCOME_FAILED]);
+                        drop(host_dir);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn enterprise_local_shortcuts_are_all_persisted_in_the_audit_record() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (controller_audit, host_audit, controller_dir, host_dir) =
+                            establish_audit_pair().await;
+                        let mut output = CountingWriter::default();
+                        let mut terminal_output =
+                            RemoteTerminalOutput::new(RemoteTerminalOutputMode::Bytes);
+                        let cancel = AtomicBool::new(false);
+
+                        let mut help_ui = TransferUi::new(true, true, true);
+                        let help = help_ui.control.process(local_chunk(b"\x1d?"));
+                        assert_eq!(help.action, LocalAction::ShowHelp);
+                        assert_eq!(
+                            handle_processed_input(
+                                help,
+                                &mut output,
+                                &mut terminal_output,
+                                &mut help_ui,
+                                &cancel,
+                                Some(&controller_audit),
+                            )
+                            .await
+                            .unwrap(),
+                            LocalInputHandling::Done
+                        );
+
+                        let mut interrupt_ui = TransferUi::new(true, true, true);
+                        let _ = interrupt_ui.control.process(local_chunk(b"\x1du"));
+                        interrupt_ui.control.enter_transfer().unwrap();
+                        let interrupt = interrupt_ui.control.process(local_chunk(b"\x03"));
+                        assert_eq!(interrupt.action, LocalAction::CancelOp);
+                        handle_processed_input(
+                            interrupt,
+                            &mut output,
+                            &mut terminal_output,
+                            &mut interrupt_ui,
+                            &cancel,
+                            Some(&controller_audit),
+                        )
+                        .await
+                        .unwrap();
+
+                        for (selector, direction) in [
+                            (b"\x1du".as_slice(), TransferDirection::Upload),
+                            (b"\x1dd".as_slice(), TransferDirection::Download),
+                        ] {
+                            let mut session_ui = TransferUi::new(true, true, true);
+                            let processed = session_ui.control.process(local_chunk(selector));
+                            assert_eq!(
+                                handle_processed_input(
+                                    processed,
+                                    &mut output,
+                                    &mut terminal_output,
+                                    &mut session_ui,
+                                    &cancel,
+                                    Some(&controller_audit),
+                                )
+                                .await
+                                .unwrap(),
+                                LocalInputHandling::StartModal(direction)
+                            );
+                        }
+
+                        controller_audit
+                            .close_interrupted(AuditCloseReason::ConnectionLost)
+                            .await;
+                        drop(controller_audit);
+                        drop(host_audit);
+
+                        let record =
+                            fs::read_dir(controller_dir.path().join("audit").join("records"))
+                                .unwrap()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .path();
+                        let mut actions = Vec::new();
+                        stream_frames(&record, &mut |record_type, payload| {
+                            if record_type == RecordType::LocalKeyAction
+                                && let Some(action) = payload.get(40)
+                            {
+                                actions.push(*action);
+                            }
+                            Ok(StreamAction::Continue)
+                        })
+                        .unwrap();
+                        assert_eq!(
+                            actions,
+                            [
+                                KEY_ACTION_HELP,
+                                KEY_ACTION_INTERRUPT,
+                                KEY_ACTION_UPLOAD,
+                                KEY_ACTION_DOWNLOAD,
+                            ]
+                        );
+                        drop(host_dir);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5997,6 +7143,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6011,6 +7158,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6031,6 +7179,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6063,6 +7212,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6084,6 +7234,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6106,6 +7257,7 @@ mod tests {
             &mut terminal_output,
             &mut no_terminal,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6251,36 +7403,61 @@ mod tests {
         assert_eq!(picked, EnterpriseProvider::WeCom);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn controller_config_const_constructor_builds_a_stoppable_session() {
-        // §16.3: the const constructor initializes every field; a config
-        // built from it starts a session that stops on a pre-cancelled
-        // token before any network activity.
-        let identity = Keypair::generate_ed25519();
-        let relay: EndpointRelayAddress = format!(
-            "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
-            identity.public().to_peer_id()
-        )
-        .parse()
-        .unwrap();
-        let config = ControllerConfig::new(
-            identity,
-            EndpointRelaySet::new(vec![relay]).unwrap(),
-            WssTransportConfig::client(Some(vec![1])),
-            ConnectionCode::new(Locator::new(0).unwrap(), PakeSecret::from_u64(0).unwrap()),
-            TerminalHello::new(
-                TerminalSize::new(80, 24).unwrap(),
-                TerminalValue::new("xterm").unwrap(),
-                TerminalValue::new("truecolor").unwrap(),
-            ),
-        );
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        cancellation.cancel();
-        let mut progress = NoopProgress;
-        assert!(matches!(
-            run_controller_session(config, CrosstermFrontend, &mut progress, cancellation).await,
-            Err(ControllerError::Interrupted)
-        ));
+    // The controller session future is large enough that its inline state
+    // overflows the default test stack; the session runs on a 64 MiB stack
+    // thread like the other in-process harnesses.
+    #[test]
+    fn controller_config_const_constructor_builds_a_stoppable_session() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    // §16.3: the const constructor initializes every field; a config
+                    // built from it starts a session that stops on a pre-cancelled
+                    // token before any network activity.
+                    let identity = Keypair::generate_ed25519();
+                    let relay: EndpointRelayAddress = format!(
+                        "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
+                        identity.public().to_peer_id()
+                    )
+                    .parse()
+                    .unwrap();
+                    let config = ControllerConfig::new(
+                        identity,
+                        EndpointRelaySet::new(vec![relay]).unwrap(),
+                        WssTransportConfig::client(Some(vec![1])),
+                        ConnectionCode::new(
+                            Locator::new(0).unwrap(),
+                            PakeSecret::from_u64(0).unwrap(),
+                        ),
+                        TerminalHello::new(
+                            TerminalSize::new(80, 24).unwrap(),
+                            TerminalValue::new("xterm").unwrap(),
+                            TerminalValue::new("truecolor").unwrap(),
+                        ),
+                    );
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    cancellation.cancel();
+                    let mut progress = NoopProgress;
+                    assert!(matches!(
+                        run_controller_session(
+                            config,
+                            CrosstermFrontend,
+                            &mut progress,
+                            cancellation
+                        )
+                        .await,
+                        Err(ControllerError::Interrupted)
+                    ));
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6363,6 +7540,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6379,6 +7557,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6398,6 +7577,7 @@ mod tests {
             &mut terminal_output,
             &mut session_ui,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -6414,6 +7594,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6440,6 +7621,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6463,6 +7645,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6499,6 +7682,7 @@ mod tests {
                         &mut terminal_output,
                         &mut session_ui,
                         &cancel,
+                        None,
                     )
                     .await,
                     Err(ControllerError::Io(_))
@@ -6528,6 +7712,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6557,6 +7742,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6588,6 +7774,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6611,6 +7798,7 @@ mod tests {
                 &mut terminal_output,
                 &mut session_ui,
                 &cancel,
+                None,
             )
             .await,
             Err(ControllerError::Io(_))
@@ -6627,8 +7815,8 @@ mod tests {
         let mut output = CountingWriter::default();
         let mut terminal_output =
             RemoteTerminalOutput::new(RemoteTerminalOutputMode::WindowsConsoleUtf8);
-        terminal_output.write(&mut output, b"\xe4").await.unwrap();
-        terminal_output.write(&mut output, b"\x80").await.unwrap();
+        write_prepared(&mut terminal_output, &mut output, b"\xe4").await;
+        write_prepared(&mut terminal_output, &mut output, b"\x80").await;
         assert!(output.bytes.is_empty());
         terminal_output.finish(&mut output).await.unwrap();
         assert_eq!(output.bytes, "\u{fffd}".as_bytes());
@@ -6683,33 +7871,12 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn available_tcp_port() -> u16 {
-        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    /// Waits until the relay's TCP listener accepts connections.
-    async fn wait_for_tcp_listener(port: u16) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(_) => return,
-                Err(_) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "the relay listener did not open on port {port}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
+        crate::available_test_tcp_port()
     }
 
     /// A real relay service running inside the test runtime on a pinned port.
     struct InProcessRelay {
-        task: tokio::task::JoinHandle<Result<(), RelayServiceError>>,
+        task: Option<tokio::task::JoinHandle<Result<(), RelayServiceError>>>,
         shutdown: Option<oneshot::Sender<()>>,
     }
 
@@ -6732,7 +7899,7 @@ mod tests {
                 Ok(())
             }));
             Self {
-                task,
+                task: Some(task),
                 shutdown: Some(shutdown_tx),
             }
         }
@@ -6741,7 +7908,20 @@ mod tests {
             if let Some(shutdown) = self.shutdown.take() {
                 let _ = shutdown.send(());
             }
-            let _ = self.task.await;
+            if let Some(task) = self.task.take() {
+                let _ = task.await;
+            }
+        }
+    }
+
+    impl Drop for InProcessRelay {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
         }
     }
 
@@ -6889,13 +8069,35 @@ mod tests {
     enum HostEnding {
         /// On data EOF: TerminalExit, data close, TerminalComplete, control close.
         Complete,
+        /// Keep the Active session alive through a periodic checkpoint,
+        /// then complete the same full terminal flow.
+        CheckpointThenComplete,
         /// Close data right after Ready and never send TerminalExit.
         CloseDataSilently,
         /// Read the terminal hello but never send TerminalReady.
         StallHandshake,
         /// Keep everything open after Ready.
         Stall,
+        /// Finalize after the controller's local detach escape.
+        ControllerDetach,
+        /// Finalize after the controller's cancellation token fires.
+        ControllerInterrupt,
+        /// Close the controller's local display before the first host output.
+        ControllerDisplayFailure,
+        /// Fail the mandatory enterprise audit after TerminalReady.
+        AuditFailure,
+        /// Drop the mandatory enterprise audit stream without a close notice.
+        AuditStreamEnd,
+        /// Drop the audit stream after terminal completion but before finalization.
+        AuditFinalizeStreamEnd,
     }
+
+    // This is the aggregate harness bound, not a product timeout. The case
+    // composes relay setup, OPAQUE, terminal startup, active checkpoints and
+    // bilateral audit finalization; every product protocol step retains its
+    // own shorter absolute deadline. Instrumented CI needs the same aggregate
+    // budget as the corresponding enterprise host harness.
+    const ENTERPRISE_CONTROLLER_CASE_TIMEOUT: Duration = Duration::from_secs(300);
 
     /// Reads the controller's rendered output until `needle` appears.
     /// Returns the bytes read in this call (the caller accumulates).
@@ -7090,9 +8292,11 @@ mod tests {
         script: &HostScript,
     ) {
         assert_eq!(source, script.download_source);
+        let file_name = script.download_file_name.clone();
+        let declared_size = script.download_bytes.len() as u64;
         let offer = FileTransferMessage::DownloadOffer {
-            file_name: &script.download_file_name,
-            declared_size: script.download_bytes.len() as u64,
+            file_name: &file_name,
+            declared_size,
         };
         write_file_frame(driver, stream, &offer).await;
         let Some(frame) = read_file_frame(driver, stream).await else {
@@ -7199,6 +8403,8 @@ mod tests {
         data_incoming: &mut IncomingApplicationStreams,
         control_incoming: &mut IncomingApplicationStreams,
         file_incoming: &mut IncomingApplicationStreams,
+        audit_incoming: Option<&mut IncomingApplicationStreams>,
+        audit_root: Option<&Path>,
         locator: Locator,
         registration: &OpaqueRegistration,
         target: &PeerIdBytes,
@@ -7262,9 +8468,39 @@ mod tests {
         let hello = drive_drained(driver, read_terminal_hello(&mut control)).await;
         assert_eq!(hello.size(), TerminalSize::new(80, 24).unwrap());
         if ending == HostEnding::StallHandshake {
-            tokio::time::sleep(Duration::from_secs(12)).await;
+            drive_drained(driver, tokio::time::sleep(Duration::from_secs(12))).await;
             return;
         }
+        let mut audit = match audit_incoming {
+            Some(incoming) => {
+                let (audit_peer, audit_stream) = drive_drained(driver, incoming.next())
+                    .await
+                    .expect("the audit protocol registration ended");
+                assert_eq!(audit_peer, controller);
+                let digest = Digest32::new(Sha256::digest(hello.encode().as_slice()).into());
+                let host_peer = driver.peer_id();
+                let observer = drive_drained(
+                    driver,
+                    AuditObserver::establish(
+                        audit_stream.into_tokio(),
+                        AuditRole::Host,
+                        controller,
+                        host_peer,
+                        crate::audit::observer::utc_start_seconds(),
+                        digest,
+                        audit_root.expect("enterprise host audit needs an isolated root"),
+                        &mut OsSecureRandom,
+                    ),
+                )
+                .await
+                .unwrap();
+                drive_drained(driver, observer.record_terminal_hello(digest))
+                    .await
+                    .unwrap();
+                Some(observer)
+            }
+            None => None,
+        };
         let data = data.1.into_tokio();
         let (mut data_read, mut data_write) = tokio::io::split(data);
         let (mut control_read, mut control_write) = tokio::io::split(control);
@@ -7273,22 +8509,85 @@ mod tests {
             data_write.flush().await.unwrap();
         })
         .await;
-        data_write
-            .write_all(script.output.as_slice())
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(driver, audit.record_terminal_ready())
+                .await
+                .unwrap();
+            drive_drained(driver, audit.record_raw_output(script.output.as_slice()))
+                .await
+                .unwrap();
+        }
+        drive_drained(driver, async {
+            data_write
+                .write_all(script.output.as_slice())
+                .await
+                .unwrap();
+            data_write.flush().await.unwrap();
+        })
+        .await;
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(
+                driver,
+                audit.record_send_outcome(
+                    crate::audit::session::DIRECTION_HOST_TO_CTRL,
+                    true,
+                    script.output.len() as u64,
+                ),
+            )
             .await
             .unwrap();
-        data_write.flush().await.unwrap();
+        }
+        if ending == HostEnding::AuditFailure {
+            let audit = audit
+                .as_ref()
+                .expect("the audit-failure scenario requires enterprise audit");
+            drive_drained(
+                driver,
+                audit.fail_closed(
+                    Some(AuditErrorCode::AuditRecordWriteFailed),
+                    AuditCloseReason::AuditFailure,
+                ),
+            )
+            .await;
+        }
+        if ending == HostEnding::AuditStreamEnd {
+            drop(audit.take());
+        }
+        if matches!(
+            ending,
+            HostEnding::AuditFailure | HostEnding::AuditStreamEnd
+        ) {
+            let mut buffer = [0_u8; 4096];
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match drive_drained(driver, data_read.read(&mut buffer)).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .await
+            .expect("the controller must close terminal data after audit failure");
+            return;
+        }
         match ending {
             HostEnding::CloseDataSilently => {
-                let _ = data_write.shutdown().await;
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                let _ = drive_drained(driver, data_write.shutdown()).await;
+                drive_drained(driver, tokio::time::sleep(Duration::from_secs(6))).await;
                 return;
             }
-            HostEnding::Stall => {
-                tokio::time::sleep(Duration::from_secs(6)).await;
-                return;
-            }
-            HostEnding::Complete | HostEnding::StallHandshake => {}
+            // The stall keeps the session Active while the scenario drives
+            // the controller.
+            HostEnding::Stall => {}
+            HostEnding::Complete
+            | HostEnding::CheckpointThenComplete
+            | HostEnding::ControllerDetach
+            | HostEnding::ControllerInterrupt
+            | HostEnding::ControllerDisplayFailure
+            | HostEnding::StallHandshake
+            | HostEnding::AuditFailure
+            | HostEnding::AuditStreamEnd
+            | HostEnding::AuditFinalizeStreamEnd => {}
         }
 
         // -- the terminal session loop: echo controller data input, record
@@ -7302,23 +8601,89 @@ mod tests {
         let mut dump_sent = false;
         let mut pending_file: Option<(PeerId, ApplicationStream)> = None;
         let mut control_pending = Vec::new();
+        let mut audit_frames = Box::pin(wait_for_audit_frame(audit.as_ref()));
         let mut data_buffer = [0_u8; 4096];
         let mut control_buffer = [0_u8; 16];
+        let mut data_open = true;
+        let mut control_open = true;
         loop {
             tokio::select! {
                 _ = driver.next() => {}
-                result = data_read.read(&mut data_buffer) => {
-                    let read = result.unwrap();
+                result = data_read.read(&mut data_buffer), if data_open => {
+                    let read = match result {
+                        Ok(read) => read,
+                        Err(_) if matches!(ending, HostEnding::Stall) => return,
+                        Err(error) => panic!("scripted terminal data read failed: {error}"),
+                    };
                     if read == 0 {
+                        if ending == HostEnding::ControllerDisplayFailure {
+                            drive_drained(
+                                driver,
+                                audit
+                                    .as_ref()
+                                    .unwrap()
+                                    .close_interrupted(AuditCloseReason::ConnectionLost),
+                            )
+                            .await;
+                            return;
+                        }
+                        if matches!(ending, HostEnding::Stall) {
+                            return;
+                        }
+                        if matches!(ending, HostEnding::ControllerDetach | HostEnding::ControllerInterrupt) {
+                            data_open = false;
+                            continue;
+                        }
                         break;
                     }
                     script.recorded_input.lock().unwrap().extend_from_slice(&data_buffer[..read]);
-                    data_write.write_all(&data_buffer[..read]).await.unwrap();
-                    data_write.flush().await.unwrap();
+                    if let Some(audit) = audit.as_ref() {
+                        drive_drained(driver, audit.record_input(&data_buffer[..read])).await.unwrap();
+                        drive_drained(driver, audit.record_pty_write_outcome(true, read as u64)).await.unwrap();
+                        drive_drained(driver, audit.record_raw_output(&data_buffer[..read])).await.unwrap();
+                    }
+                    // The scripted host echoes the typed bytes back without
+                    // a PTY.
+                    drive_drained(driver, async {
+                        data_write.write_all(&data_buffer[..read]).await.unwrap();
+                        data_write.flush().await.unwrap();
+                    }).await;
+                    if let Some(audit) = audit.as_ref() {
+                        drive_drained(
+                            driver,
+                            audit.record_send_outcome(
+                                crate::audit::session::DIRECTION_HOST_TO_CTRL,
+                                true,
+                                read as u64,
+                            ),
+                        ).await.unwrap();
+                    }
                 }
-                result = control_read.read(&mut control_buffer) => {
-                    let read = result.unwrap();
+                result = control_read.read(&mut control_buffer), if control_open => {
+                    let read = match result {
+                        Ok(read) => read,
+                        Err(_) if matches!(ending, HostEnding::Stall) => return,
+                        Err(error) => panic!("scripted terminal control read failed: {error}"),
+                    };
                     if read == 0 {
+                        if ending == HostEnding::ControllerDisplayFailure {
+                            drive_drained(
+                                driver,
+                                audit
+                                    .as_ref()
+                                    .unwrap()
+                                    .close_interrupted(AuditCloseReason::ConnectionLost),
+                            )
+                            .await;
+                            return;
+                        }
+                        if matches!(ending, HostEnding::Stall) {
+                            return;
+                        }
+                        if matches!(ending, HostEnding::ControllerDetach | HostEnding::ControllerInterrupt) {
+                            control_open = false;
+                            continue;
+                        }
                         break;
                     }
                     control_pending.extend_from_slice(&control_buffer[..read]);
@@ -7329,8 +8694,56 @@ mod tests {
                             .try_into()
                             .unwrap();
                         let resize = TerminalResize::decode(&frame).unwrap();
+                        if let Some(audit) = audit.as_ref() {
+                            drive_drained(
+                                driver,
+                                audit.record_resize(
+                                    crate::audit::session::DIRECTION_CTRL_TO_HOST,
+                                    resize.size().columns(),
+                                    resize.size().rows(),
+                                ),
+                            ).await.unwrap();
+                        }
                         *script.resize.lock().unwrap() = Some(resize.size());
                     }
+                }
+                result = &mut audit_frames, if audit.is_some() => {
+                    let audit = audit.as_ref().unwrap();
+                    let Some(frame) = result.unwrap() else {
+                        assert_eq!(ending, HostEnding::ControllerDisplayFailure);
+                        drive_drained(
+                            driver,
+                            audit.close_interrupted(AuditCloseReason::ConnectionLost),
+                        )
+                        .await;
+                        return;
+                    };
+                    let event = drive_drained(driver, audit.handle_frame(&frame)).await.unwrap();
+                    if let FrameEvent::Close(reason) = event {
+                        if ending == HostEnding::ControllerDisplayFailure {
+                            assert_eq!(reason, AuditCloseReason::ConnectionLost);
+                            drive_drained(driver, audit.close_interrupted(reason)).await;
+                        } else {
+                            let expected = if ending == HostEnding::ControllerDetach {
+                                AuditCloseReason::ControllerDetach
+                            } else {
+                                AuditCloseReason::LocalInterrupt
+                            };
+                            assert_eq!(reason, expected);
+                            drive_drained(
+                                driver,
+                                audit.close_and_finalize(
+                                    ManifestEnding::CloseReason(reason),
+                                    false,
+                                    CloseNoticeHandling::AlreadyReceived(reason),
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        return;
+                    }
+                    audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
                 }
                 stream = file_incoming.next() => {
                     pending_file = Some(stream.expect("the file transfer registration ended"));
@@ -7341,19 +8754,26 @@ mod tests {
             }
             if dump_fired && !dump_sent {
                 dump_sent = true;
-                data_write
-                    .write_all(dump.as_ref().expect("a fired dump holds bytes"))
-                    .await
-                    .unwrap();
-                data_write.flush().await.unwrap();
+                let bytes = dump.as_ref().expect("a fired dump holds bytes");
+                drive_drained(driver, async {
+                    data_write.write_all(bytes).await.unwrap();
+                    data_write.flush().await.unwrap();
+                })
+                .await;
             }
             if let Some((_peer, stream)) = pending_file.take() {
                 serve_file_stream(driver, stream, script).await;
             }
         }
+        drop(audit_frames);
 
         // -- completion: exit code, data EOF, TerminalComplete, control
         // close; the controller returns the exit code.
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(driver, audit.record_terminal_exit(script.exit_code as u8))
+                .await
+                .unwrap();
+        }
         drive_drained(driver, async {
             control_write
                 .write_all(&TerminalExit::new(script.exit_code).encode())
@@ -7362,13 +8782,34 @@ mod tests {
             control_write.flush().await.unwrap();
         })
         .await;
-        let _ = data_write.shutdown().await;
+        let _ = drive_drained(driver, data_write.shutdown()).await;
         let mut complete = [0_u8; 1];
         drive_drained(driver, control_read.read_exact(&mut complete))
             .await
             .unwrap();
         assert_eq!(complete, TerminalComplete::ENCODED);
-        let _ = control_write.shutdown().await;
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(driver, audit.record_terminal_complete())
+                .await
+                .unwrap();
+        }
+        let _ = drive_drained(driver, control_write.shutdown()).await;
+        if ending == HostEnding::AuditFinalizeStreamEnd {
+            drop(audit.take());
+            return;
+        }
+        if let Some(audit) = audit.as_ref() {
+            drive_drained(
+                driver,
+                audit.close_and_finalize(
+                    ManifestEnding::ShellExit(script.exit_code as u8),
+                    true,
+                    CloseNoticeHandling::Receiver,
+                ),
+            )
+            .await
+            .unwrap();
+        }
     }
 
     /// Registers the scripted host on the in-process relay: a real
@@ -7422,582 +8863,1144 @@ mod tests {
         )
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_controller_session_authenticates_and_completes_with_file_transfers() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(180),
-            local.run_until(async {
-                const EXIT_CODE: u32 = 23;
-                const SCRIPTED_OUTPUT: &[u8] = b"scripted-host-prompt> ";
-                const TYPED_ECHO: &[u8] = b"hello from the controller\n";
+    #[test]
+    fn in_process_controller_session_authenticates_and_completes_with_file_transfers() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined controller, audit and transfer futures exceed the
+        // default test-thread stack; the project pattern runs the scenario
+        // on a 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let local = tokio::task::LocalSet::new();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    tokio::time::timeout(
+                        Duration::from_secs(180),
+                        local.run_until(async {
+                            const EXIT_CODE: u32 = 23;
+                            const SCRIPTED_OUTPUT: &[u8] = b"scripted-host-prompt> ";
+                            const TYPED_ECHO: &[u8] = b"hello from the controller\n";
 
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
 
-                let directory = tempdir().unwrap();
-                let upload_source = directory.path().join("upload-source.bin");
-                write_pattern_file(&upload_source, 96 * 1024);
-                let upload_bytes = fs::read(&upload_source).unwrap();
-                let upload_source_text = upload_source.to_str().unwrap().to_owned();
-                let upload_destination = "remote/upload/final.bin".to_owned();
-                let download_source = directory.path().join("download-source.bin");
-                write_pattern_file(&download_source, 64 * 1024);
-                let download_bytes = fs::read(&download_source).unwrap();
-                let download_target = directory.path().join("download-target");
-                fs::create_dir(&download_target).unwrap();
-                let download_target_text = download_target.to_str().unwrap().to_owned();
-                let download_remote_source = "remote/download/source.bin".to_owned();
+                            let directory = tempdir().unwrap();
+                            let upload_source = directory.path().join("upload-source.bin");
+                            write_pattern_file(&upload_source, 96 * 1024);
+                            let upload_bytes = fs::read(&upload_source).unwrap();
+                            let upload_source_text = upload_source.to_str().unwrap().to_owned();
+                            let upload_destination = "remote/upload/final.bin".to_owned();
+                            let download_source = directory.path().join("download-source.bin");
+                            write_pattern_file(&download_source, 64 * 1024);
+                            let download_bytes = fs::read(&download_source).unwrap();
+                            let download_target = directory.path().join("download-target");
+                            fs::create_dir(&download_target).unwrap();
+                            let download_target_text = download_target.to_str().unwrap().to_owned();
+                            let download_remote_source = "remote/download/source.bin".to_owned();
 
-                let (mut driver, mut streams, locator, registration, target, mut pake, code) =
-                    register_scripted_host(&relays).await;
-                let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
-                let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
-                let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
-                let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+                            let (
+                                mut driver,
+                                mut streams,
+                                locator,
+                                registration,
+                                target,
+                                mut pake,
+                                code,
+                            ) = register_scripted_host(&relays).await;
+                            let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
 
-                let recorded_input = Arc::new(Mutex::new(Vec::new()));
-                let resize = Arc::new(Mutex::new(None));
-                let host_script = HostScript {
-                    exit_code: EXIT_CODE,
-                    output: SCRIPTED_OUTPUT.to_vec(),
-                    upload_destination: upload_destination.clone(),
-                    upload_file_name: "upload-source.bin".to_owned(),
-                    upload_bytes: upload_bytes.clone(),
-                    download_source: download_remote_source.clone(),
-                    download_file_name: "download-source.bin".to_owned(),
-                    download_bytes: download_bytes.clone(),
-                    recorded_input: Arc::clone(&recorded_input),
-                    resize: Arc::clone(&resize),
-                    retry_auth_once: true,
-                };
+                            let recorded_input = Arc::new(Mutex::new(Vec::new()));
+                            let resize = Arc::new(Mutex::new(None));
+                            let host_script = HostScript {
+                                exit_code: EXIT_CODE,
+                                output: SCRIPTED_OUTPUT.to_vec(),
+                                upload_destination: upload_destination.clone(),
+                                upload_file_name: "upload-source.bin".to_owned(),
+                                upload_bytes: upload_bytes.clone(),
+                                download_source: download_remote_source.clone(),
+                                download_file_name: "download-source.bin".to_owned(),
+                                download_bytes: download_bytes.clone(),
+                                recorded_input: Arc::clone(&recorded_input),
+                                resize: Arc::clone(&resize),
+                                retry_auth_once: true,
+                            };
 
-                let mut controller_progress = RecordingProgress::default();
-                let config = controller_config(&relays, code);
-                let (mut script_input, frontend_input) = tokio::io::duplex(64 * 1024);
-                let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
-                let size = Rc::new(Cell::new((80_u16, 24_u16)));
-                let restored = Rc::new(Cell::new(false));
-                let frontend = SessionFrontend {
-                    input: frontend_input,
-                    output: frontend_output,
-                    size: Rc::clone(&size),
-                    restored: Rc::clone(&restored),
-                };
-                let cancellation = tokio_util::sync::CancellationToken::new();
+                            let mut controller_progress = RecordingProgress::default();
+                            let config = controller_config(&relays, code);
+                            let (mut script_input, frontend_input) = tokio::io::duplex(64 * 1024);
+                            let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
+                            let size = Rc::new(Cell::new((80_u16, 24_u16)));
+                            let restored = Rc::new(Cell::new(false));
+                            let frontend = SessionFrontend {
+                                input: frontend_input,
+                                output: frontend_output,
+                                size: Rc::clone(&size),
+                                restored: Rc::clone(&restored),
+                            };
+                            let cancellation = tokio_util::sync::CancellationToken::new();
 
-                let session = run_controller_session(
-                    config,
-                    frontend,
-                    &mut controller_progress,
-                    cancellation.clone(),
-                );
-                let host = serve_scripted_host(
-                    &mut driver,
-                    &mut auth_incoming,
-                    &mut data_incoming,
-                    &mut control_incoming,
-                    &mut file_incoming,
-                    locator,
-                    &registration,
-                    &target,
-                    &mut pake,
-                    &host_script,
-                    HostEnding::Complete,
-                    None,
-                );
-                let driver_script = async {
-                    let mut seen = read_output_until(&mut script_output, SCRIPTED_OUTPUT).await;
-                    // The scripted resize reaches the host on
-                    // terminal-control. Set it here, while the session is in
-                    // pass-through, so the pump detects it before any modal
-                    // work can delay the resize arm.
-                    size.set((100, 30));
-                    script_input.write_all(&[0x1d, b'u']).await.unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, b"local source:").await);
-                    script_input
-                        .write_all(format!("{upload_source_text}\n").as_bytes())
-                        .await
-                        .unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, b"remote destination").await);
-                    script_input
-                        .write_all(format!("{upload_destination}\n").as_bytes())
-                        .await
-                        .unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, b"upload:").await);
-                    seen.extend(read_output_until(&mut script_output, b"upload complete:").await);
+                            let session = run_controller_session(
+                                config,
+                                frontend,
+                                &mut controller_progress,
+                                cancellation.clone(),
+                            );
+                            let host = serve_scripted_host(
+                                &mut driver,
+                                &mut auth_incoming,
+                                &mut data_incoming,
+                                &mut control_incoming,
+                                &mut file_incoming,
+                                None,
+                                None,
+                                locator,
+                                &registration,
+                                &target,
+                                &mut pake,
+                                &host_script,
+                                HostEnding::Complete,
+                                None,
+                            );
+                            let driver_script = async {
+                                let mut seen =
+                                    read_output_until(&mut script_output, SCRIPTED_OUTPUT).await;
+                                // The scripted resize reaches the host on
+                                // terminal-control. Set it here, while the session is in
+                                // pass-through, so the pump detects it before any modal
+                                // work can delay the resize arm.
+                                size.set((100, 30));
+                                tokio::time::timeout(Duration::from_secs(2), async {
+                                    loop {
+                                        if resize.lock().unwrap().is_some() {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(10)).await;
+                                    }
+                                })
+                                .await
+                                .expect("the resize pump must observe the new size");
+                                script_input.write_all(&[0x1d, b'u']).await.unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"local source:").await,
+                                );
+                                script_input
+                                    .write_all(format!("{upload_source_text}\n").as_bytes())
+                                    .await
+                                    .unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"remote destination")
+                                        .await,
+                                );
+                                script_input
+                                    .write_all(format!("{upload_destination}\n").as_bytes())
+                                    .await
+                                    .unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"upload:").await,
+                                );
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"upload complete:")
+                                        .await,
+                                );
 
-                    script_input.write_all(&[0x1d, b'd']).await.unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, b"remote source:").await);
-                    script_input
-                        .write_all(format!("{download_remote_source}\n").as_bytes())
-                        .await
-                        .unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, b"local destination").await);
-                    script_input
-                        .write_all(format!("{download_target_text}\n").as_bytes())
-                        .await
-                        .unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, b"download:").await);
-                    seen.extend(read_output_until(&mut script_output, b"download complete:").await);
+                                script_input.write_all(&[0x1d, b'd']).await.unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"remote source:").await,
+                                );
+                                script_input
+                                    .write_all(format!("{download_remote_source}\n").as_bytes())
+                                    .await
+                                    .unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"local destination")
+                                        .await,
+                                );
+                                script_input
+                                    .write_all(format!("{download_target_text}\n").as_bytes())
+                                    .await
+                                    .unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"download:").await,
+                                );
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"download complete:")
+                                        .await,
+                                );
 
-                    script_input.write_all(TYPED_ECHO).await.unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, TYPED_ECHO).await);
+                                script_input.write_all(TYPED_ECHO).await.unwrap();
+                                script_input.flush().await.unwrap();
+                                seen.extend(
+                                    read_output_until(&mut script_output, TYPED_ECHO).await,
+                                );
 
-                    drop(script_input);
-                    seen.extend(drain_output_until_closed(&mut script_output).await);
-                    seen
-                };
+                                drop(script_input);
+                                seen.extend(drain_output_until_closed(&mut script_output).await);
+                                seen
+                            };
 
-                let (session_result, (), seen) =
-                    tokio::join!(Box::pin(session), Box::pin(host), Box::pin(driver_script));
+                            let (session_result, (), seen) = tokio::join!(
+                                Box::pin(session),
+                                Box::pin(host),
+                                Box::pin(driver_script)
+                            );
 
-                assert_eq!(
-                    session_result.unwrap(),
-                    EXIT_CODE,
-                    "the remote shell exit code must reach the controller"
-                );
-                assert!(restored.get(), "the raw-mode guard must be restored");
-                assert_eq!(
-                    *resize.lock().unwrap(),
-                    Some(TerminalSize::new(100, 30).unwrap()),
-                    "the scripted resize must reach the host"
-                );
-                assert_eq!(
-                    *recorded_input.lock().unwrap(),
-                    TYPED_ECHO,
-                    "only pass-through input must reach the remote terminal"
-                );
-                {
-                    let stages = controller_progress.stages.lock().unwrap();
-                    for stage in [
-                        ControllerStage::ConnectingRelay,
-                        ControllerStage::ResolvingHost,
-                        ControllerStage::EstablishingPath,
-                        ControllerStage::Authenticating,
-                        ControllerStage::StartingTerminal,
-                    ] {
-                        assert!(
-                            stages.contains(&stage),
-                            "the session never reported {stage:?}: {stages:?}"
+                            assert_eq!(
+                                session_result.unwrap(),
+                                EXIT_CODE,
+                                "the remote shell exit code must reach the controller"
+                            );
+                            assert!(restored.get(), "the raw-mode guard must be restored");
+                            assert_eq!(
+                                *resize.lock().unwrap(),
+                                Some(TerminalSize::new(100, 30).unwrap()),
+                                "the scripted resize must reach the host"
+                            );
+                            assert_eq!(
+                                *recorded_input.lock().unwrap(),
+                                TYPED_ECHO,
+                                "only pass-through input must reach the remote terminal"
+                            );
+                            {
+                                let stages = controller_progress.stages.lock().unwrap();
+                                for stage in [
+                                    ControllerStage::ConnectingRelay,
+                                    ControllerStage::ResolvingHost,
+                                    ControllerStage::EstablishingPath,
+                                    ControllerStage::Authenticating,
+                                    ControllerStage::StartingTerminal,
+                                ] {
+                                    assert!(
+                                        stages.contains(&stage),
+                                        "the session never reported {stage:?}: {stages:?}"
+                                    );
+                                }
+                            }
+                            let rendered = String::from_utf8_lossy(&seen);
+                            assert!(rendered.contains("upload complete"), "{rendered:?}");
+                            assert!(rendered.contains("download complete"), "{rendered:?}");
+                            assert!(rendered.contains("scripted-host-prompt> "), "{rendered:?}");
+                            let downloaded =
+                                fs::read(download_target.join("download-source.bin")).unwrap();
+                            assert_eq!(downloaded, download_bytes);
+
+                            relay.stop().await;
+                        }),
+                    )
+                    .await
+                    .expect("the in-process controller session must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn run_enterprise_controller_case(ending: HostEnding) {
+        let _test_guard = crate::in_process_test_guard();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let local = tokio::task::LocalSet::new();
+                    let stage = Arc::new(Mutex::new("starting"));
+                    let scenario_stage = Arc::clone(&stage);
+                    let result = tokio::time::timeout(
+                        ENTERPRISE_CONTROLLER_CASE_TIMEOUT,
+                        local.run_until(async {
+                            const EXIT_CODE: u32 = 31;
+                            const OUTPUT: &[u8] = b"enterprise-host-output> ";
+                            const INPUT: &[u8] = b"enterprise controller input\n";
+
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let (
+                                mut host_driver,
+                                mut host_streams,
+                                locator,
+                                registration,
+                                target,
+                                mut host_pake,
+                                code,
+                            ) = register_scripted_host(&relays).await;
+                            let mut auth_incoming = host_streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming =
+                                host_streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                host_streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming =
+                                host_streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+                            let mut audit_incoming = host_streams.accept(AUDIT_PROTOCOL).unwrap();
+                            let host_audit_dir = tempdir().unwrap();
+                            let host_audit_root = host_audit_dir.path().join("audit");
+
+                            let recorded_input = Arc::new(Mutex::new(Vec::new()));
+                            let resize = Arc::new(Mutex::new(None));
+                            let host_script = HostScript {
+                                exit_code: EXIT_CODE,
+                                output: OUTPUT.to_vec(),
+                                upload_destination: String::new(),
+                                upload_file_name: String::new(),
+                                upload_bytes: Vec::new(),
+                                download_source: String::new(),
+                                download_file_name: String::new(),
+                                download_bytes: Vec::new(),
+                                recorded_input: Arc::clone(&recorded_input),
+                                resize,
+                                retry_auth_once: false,
+                            };
+
+                            let (mut script_input, frontend_input) = tokio::io::duplex(64 * 1024);
+                            let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
+                            let restored = Rc::new(Cell::new(false));
+                            let frontend = SessionFrontend {
+                                input: frontend_input,
+                                output: frontend_output,
+                                size: Rc::new(Cell::new((80, 24))),
+                                restored: Rc::clone(&restored),
+                            };
+                            let cancellation = tokio_util::sync::CancellationToken::new();
+                            let controller_audit_dir = tempdir().unwrap();
+                            let controller_done = Arc::new(tokio::sync::Notify::new());
+                            let controller_done_signal = Arc::clone(&controller_done);
+                            let controller_stage = Arc::clone(&scenario_stage);
+
+                            let controller = async {
+                                let (mut driver, mut streams) = build_endpoint(
+                                    Keypair::generate_ed25519(),
+                                    WssTransportConfig::client(None),
+                                )
+                                .unwrap();
+                                let relay_connection =
+                                    connect_relay_with_retry(&mut driver, &relays).await;
+                                let host = resolve_peer(
+                                    &mut driver,
+                                    &mut streams,
+                                    &relay_connection,
+                                    code.locator(),
+                                    ResolveDeadline::controller(),
+                                )
+                                .await
+                                .unwrap();
+                                let mut progress = NoopProgress;
+                                let mut prepared = prepare_controller(
+                                    driver,
+                                    streams,
+                                    relay_connection.address(),
+                                    ResolvedTarget::new(host, RelayAccessMode::Enterprise),
+                                    &code,
+                                    DirectUpgradePolicy::Disabled,
+                                    &mut progress,
+                                )
+                                .await
+                                .unwrap();
+                                *controller_stage.lock().unwrap() = "controller-prepared";
+                                prepared.audit_root_override =
+                                    Some(controller_audit_dir.path().join("audit"));
+                                let hello = TerminalHello::new(
+                                    TerminalSize::new(80, 24).unwrap(),
+                                    TerminalValue::new("xterm").unwrap(),
+                                    TerminalValue::new("truecolor").unwrap(),
+                                );
+                                *controller_stage.lock().unwrap() = "terminal-running";
+                                let result = run_terminal(
+                                    prepared,
+                                    hello,
+                                    frontend,
+                                    &mut progress,
+                                    &cancellation,
+                                )
+                                .await;
+                                *controller_stage.lock().unwrap() = "terminal-finished";
+                                controller_done_signal.notify_one();
+                                result
+                            };
+                            let host = serve_scripted_host(
+                                &mut host_driver,
+                                &mut auth_incoming,
+                                &mut data_incoming,
+                                &mut control_incoming,
+                                &mut file_incoming,
+                                Some(&mut audit_incoming),
+                                Some(&host_audit_root),
+                                locator,
+                                &registration,
+                                &target,
+                                &mut host_pake,
+                                &host_script,
+                                ending,
+                                None,
+                            );
+                            let interaction = async {
+                                if ending == HostEnding::ControllerDisplayFailure {
+                                    drop(script_output);
+                                    controller_done.notified().await;
+                                    drop(script_input);
+                                    return Vec::new();
+                                }
+                                let mut seen = if matches!(
+                                    ending,
+                                    HostEnding::AuditFailure | HostEnding::AuditStreamEnd
+                                ) {
+                                    Vec::new()
+                                } else {
+                                    read_output_until(&mut script_output, OUTPUT).await
+                                };
+                                if matches!(
+                                    ending,
+                                    HostEnding::Complete | HostEnding::CheckpointThenComplete
+                                ) {
+                                    if ending == HostEnding::CheckpointThenComplete {
+                                        tokio::time::sleep(Duration::from_millis(1_500)).await;
+                                    }
+                                    script_input.write_all(INPUT).await.unwrap();
+                                    script_input.flush().await.unwrap();
+                                    seen.extend(read_output_until(&mut script_output, INPUT).await);
+                                } else if ending == HostEnding::AuditFinalizeStreamEnd {
+                                    script_input.write_all(INPUT).await.unwrap();
+                                    script_input.flush().await.unwrap();
+                                    seen.extend(read_output_until(&mut script_output, INPUT).await);
+                                } else if ending == HostEnding::ControllerDetach {
+                                    script_input.write_all(b"\x1d.").await.unwrap();
+                                    script_input.flush().await.unwrap();
+                                } else if ending == HostEnding::ControllerInterrupt {
+                                    cancellation.cancel();
+                                }
+                                drop(script_input);
+                                seen.extend(drain_output_until_closed(&mut script_output).await);
+                                seen
+                            };
+
+                            let (controller_result, (), seen) = tokio::join!(
+                                Box::pin(controller),
+                                Box::pin(host),
+                                Box::pin(interaction),
+                            );
+                            match ending {
+                                HostEnding::Complete | HostEnding::CheckpointThenComplete => {
+                                    assert_eq!(controller_result.unwrap(), EXIT_CODE);
+                                }
+                                HostEnding::AuditFailure | HostEnding::AuditStreamEnd => {
+                                    assert!(
+                                        matches!(
+                                            &controller_result,
+                                            Err(ControllerError::Audit(AuditError::FailedClosed))
+                                        ),
+                                        "unexpected controller result: {controller_result:?}"
+                                    );
+                                }
+                                HostEnding::ControllerDetach => {
+                                    assert!(matches!(
+                                        controller_result,
+                                        Err(ControllerError::Interrupted)
+                                    ));
+                                }
+                                HostEnding::ControllerInterrupt => {
+                                    assert!(matches!(
+                                        controller_result,
+                                        Err(ControllerError::Interrupted)
+                                    ));
+                                }
+                                HostEnding::ControllerDisplayFailure => {
+                                    assert!(matches!(
+                                        controller_result,
+                                        Err(ControllerError::SessionAndTerminalOutput { .. })
+                                            | Err(ControllerError::Io(_))
+                                    ));
+                                }
+                                HostEnding::AuditFinalizeStreamEnd => {
+                                    assert!(
+                                        matches!(
+                                            &controller_result,
+                                            Err(ControllerError::Audit(_))
+                                        ),
+                                        "unexpected controller result: {controller_result:?}"
+                                    );
+                                }
+                                _ => unreachable!("unsupported enterprise controller case"),
+                            }
+                            assert!(restored.get(), "the display must be restored");
+                            if matches!(
+                                ending,
+                                HostEnding::Complete
+                                    | HostEnding::CheckpointThenComplete
+                                    | HostEnding::AuditFinalizeStreamEnd
+                            ) {
+                                assert_eq!(*recorded_input.lock().unwrap(), INPUT);
+                            } else {
+                                assert!(recorded_input.lock().unwrap().is_empty());
+                            }
+                            if !matches!(
+                                ending,
+                                HostEnding::AuditFailure
+                                    | HostEnding::AuditStreamEnd
+                                    | HostEnding::ControllerDisplayFailure
+                            ) {
+                                assert!(seen.windows(OUTPUT.len()).any(|window| window == OUTPUT));
+                            }
+                            if matches!(
+                                ending,
+                                HostEnding::Complete
+                                    | HostEnding::CheckpointThenComplete
+                                    | HostEnding::AuditFinalizeStreamEnd
+                            ) {
+                                assert!(seen.windows(INPUT.len()).any(|window| window == INPUT));
+                            }
+
+                            relay.stop().await;
+                        }),
+                    )
+                    .await;
+                    if result.is_err() {
+                        panic!(
+                            "the enterprise controller session must finish (last stage: {})",
+                            *stage.lock().unwrap()
                         );
                     }
-                }
-                let rendered = String::from_utf8_lossy(&seen);
-                assert!(rendered.contains("upload complete"), "{rendered:?}");
-                assert!(rendered.contains("download complete"), "{rendered:?}");
-                assert!(rendered.contains("scripted-host-prompt> "), "{rendered:?}");
-                let downloaded = fs::read(download_target.join("download-source.bin")).unwrap();
-                assert_eq!(downloaded, download_bytes);
-
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process controller session must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_controller_session_ends_cleanly_on_local_input_eof() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            local.run_until(async {
-                const EXIT_CODE: u32 = 7;
-                const SCRIPTED_OUTPUT: &[u8] = b"scripted-prompt> ";
-                const TYPED_ECHO: &[u8] = b"ls -la\n";
-
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                let (mut driver, mut streams, locator, registration, target, mut pake, code) =
-                    register_scripted_host(&relays).await;
-                let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
-                let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
-                let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
-                let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
-
-                let recorded_input = Arc::new(Mutex::new(Vec::new()));
-                let resize = Arc::new(Mutex::new(None));
-                let host_script = HostScript {
-                    exit_code: EXIT_CODE,
-                    output: SCRIPTED_OUTPUT.to_vec(),
-                    upload_destination: String::new(),
-                    upload_file_name: String::new(),
-                    upload_bytes: Vec::new(),
-                    download_source: String::new(),
-                    download_file_name: String::new(),
-                    download_bytes: Vec::new(),
-                    recorded_input: Arc::clone(&recorded_input),
-                    resize: Arc::clone(&resize),
-                    retry_auth_once: false,
-                };
-
-                let config = controller_config(&relays, code);
-                let (mut script_input, frontend_input) = tokio::io::duplex(64 * 1024);
-                let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
-                let size = Rc::new(Cell::new((80_u16, 24_u16)));
-                let restored = Rc::new(Cell::new(false));
-                let frontend = SessionFrontend {
-                    input: frontend_input,
-                    output: frontend_output,
-                    size: Rc::clone(&size),
-                    restored: Rc::clone(&restored),
-                };
-                let cancellation = tokio_util::sync::CancellationToken::new();
-
-                let mut progress = NoopProgress;
-                let session = run_controller_session(config, frontend, &mut progress, cancellation);
-                let host = serve_scripted_host(
-                    &mut driver,
-                    &mut auth_incoming,
-                    &mut data_incoming,
-                    &mut control_incoming,
-                    &mut file_incoming,
-                    locator,
-                    &registration,
-                    &target,
-                    &mut pake,
-                    &host_script,
-                    HostEnding::Complete,
-                    None,
-                );
-                let driver_script = async {
-                    let mut seen = read_output_until(&mut script_output, SCRIPTED_OUTPUT).await;
-                    script_input.write_all(TYPED_ECHO).await.unwrap();
-                    script_input.flush().await.unwrap();
-                    seen.extend(read_output_until(&mut script_output, TYPED_ECHO).await);
-                    drop(script_input);
-                    seen.extend(drain_output_until_closed(&mut script_output).await);
-                    seen
-                };
-
-                let (session_result, (), _) =
-                    tokio::join!(Box::pin(session), Box::pin(host), Box::pin(driver_script));
-                assert_eq!(session_result.unwrap(), EXIT_CODE);
-                assert!(restored.get(), "the raw-mode guard must be restored");
-                assert_eq!(
-                    *recorded_input.lock().unwrap(),
-                    TYPED_ECHO,
-                    "the typed line must reach the remote terminal"
-                );
-
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process EOF scenario must finish");
+    #[test]
+    fn in_process_enterprise_controller_runs_the_complete_audited_terminal() {
+        run_enterprise_controller_case(HostEnding::Complete);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_controller_session_times_out_when_the_remote_completion_is_silent() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(90),
-            local.run_until(async {
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                let (mut driver, mut streams, locator, registration, target, mut pake, code) =
-                    register_scripted_host(&relays).await;
-                let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
-                let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
-                let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
-                let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
-
-                let recorded_input = Arc::new(Mutex::new(Vec::new()));
-                let resize = Arc::new(Mutex::new(None));
-                let host_script = HostScript {
-                    exit_code: 0,
-                    output: Vec::new(),
-                    upload_destination: String::new(),
-                    upload_file_name: String::new(),
-                    upload_bytes: Vec::new(),
-                    download_source: String::new(),
-                    download_file_name: String::new(),
-                    download_bytes: Vec::new(),
-                    recorded_input: Arc::clone(&recorded_input),
-                    resize: Arc::clone(&resize),
-                    retry_auth_once: false,
-                };
-
-                let config = controller_config(&relays, code);
-                let (script_input, frontend_input) = tokio::io::duplex(64 * 1024);
-                let (frontend_output, script_output) = tokio::io::duplex(64 * 1024);
-                let size = Rc::new(Cell::new((80_u16, 24_u16)));
-                let restored = Rc::new(Cell::new(false));
-                let frontend = SessionFrontend {
-                    input: frontend_input,
-                    output: frontend_output,
-                    size: Rc::clone(&size),
-                    restored: Rc::clone(&restored),
-                };
-                let cancellation = tokio_util::sync::CancellationToken::new();
-
-                let mut progress = NoopProgress;
-                let session = run_controller_session(config, frontend, &mut progress, cancellation);
-                let host = serve_scripted_host(
-                    &mut driver,
-                    &mut auth_incoming,
-                    &mut data_incoming,
-                    &mut control_incoming,
-                    &mut file_incoming,
-                    locator,
-                    &registration,
-                    &target,
-                    &mut pake,
-                    &host_script,
-                    HostEnding::CloseDataSilently,
-                    None,
-                );
-                let driver_script = async {
-                    // The local input stays open, so only the remote-completion
-                    // deadline can end the session (§REMOTE_COMPLETION_TIMEOUT).
-                    let _keep_input = script_input;
-                    let _keep_output = script_output;
-                    tokio::time::sleep(Duration::from_secs(8)).await;
-                };
-
-                let (session_result, (), _) =
-                    tokio::join!(Box::pin(session), Box::pin(host), Box::pin(driver_script));
-                assert!(matches!(
-                    session_result,
-                    Err(ControllerError::RemoteCompletionTimeout)
-                ));
-
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process silent-remote scenario must finish");
+    #[test]
+    fn in_process_enterprise_controller_checkpoints_while_active() {
+        run_enterprise_controller_case(HostEnding::CheckpointThenComplete);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_controller_session_times_out_when_terminal_ready_never_arrives() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(90),
-            local.run_until(async {
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                let (mut driver, mut streams, locator, registration, target, mut pake, code) =
-                    register_scripted_host(&relays).await;
-                let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
-                let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
-                let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
-                let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
-
-                let recorded_input = Arc::new(Mutex::new(Vec::new()));
-                let resize = Arc::new(Mutex::new(None));
-                let host_script = HostScript {
-                    exit_code: 0,
-                    output: Vec::new(),
-                    upload_destination: String::new(),
-                    upload_file_name: String::new(),
-                    upload_bytes: Vec::new(),
-                    download_source: String::new(),
-                    download_file_name: String::new(),
-                    download_bytes: Vec::new(),
-                    recorded_input: Arc::clone(&recorded_input),
-                    resize: Arc::clone(&resize),
-                    retry_auth_once: false,
-                };
-
-                let config = controller_config(&relays, code);
-                let (script_input, frontend_input) = tokio::io::duplex(64 * 1024);
-                let (frontend_output, script_output) = tokio::io::duplex(64 * 1024);
-                let size = Rc::new(Cell::new((80_u16, 24_u16)));
-                let restored = Rc::new(Cell::new(false));
-                let frontend = SessionFrontend {
-                    input: frontend_input,
-                    output: frontend_output,
-                    size: Rc::clone(&size),
-                    restored: Rc::clone(&restored),
-                };
-                let cancellation = tokio_util::sync::CancellationToken::new();
-
-                let mut progress = NoopProgress;
-                let session = run_controller_session(config, frontend, &mut progress, cancellation);
-                let host = serve_scripted_host(
-                    &mut driver,
-                    &mut auth_incoming,
-                    &mut data_incoming,
-                    &mut control_incoming,
-                    &mut file_incoming,
-                    locator,
-                    &registration,
-                    &target,
-                    &mut pake,
-                    &host_script,
-                    HostEnding::StallHandshake,
-                    None,
-                );
-                let driver_script = async {
-                    let _keep_input = script_input;
-                    let _keep_output = script_output;
-                    tokio::time::sleep(Duration::from_secs(11)).await;
-                };
-
-                let (session_result, (), _) =
-                    tokio::join!(Box::pin(session), Box::pin(host), Box::pin(driver_script));
-                assert!(matches!(session_result, Err(ControllerError::Timeout)));
-
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process handshake-timeout scenario must finish");
+    #[test]
+    fn in_process_enterprise_controller_detaches_and_finalizes_both_audits() {
+        run_enterprise_controller_case(HostEnding::ControllerDetach);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_controller_session_stops_on_cancellation_mid_session() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(90),
-            local.run_until(async {
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+    #[test]
+    fn in_process_enterprise_controller_interrupts_and_finalizes_both_audits() {
+        run_enterprise_controller_case(HostEnding::ControllerInterrupt);
+    }
 
-                let (mut driver, mut streams, locator, registration, target, mut pake, code) =
-                    register_scripted_host(&relays).await;
-                let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
-                let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
-                let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
-                let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+    #[test]
+    fn in_process_enterprise_controller_closes_after_local_display_failure() {
+        run_enterprise_controller_case(HostEnding::ControllerDisplayFailure);
+    }
 
-                let recorded_input = Arc::new(Mutex::new(Vec::new()));
-                let resize = Arc::new(Mutex::new(None));
-                let host_script = HostScript {
-                    exit_code: 0,
-                    output: b"session-ready\n".to_vec(),
-                    upload_destination: String::new(),
-                    upload_file_name: String::new(),
-                    upload_bytes: Vec::new(),
-                    download_source: String::new(),
-                    download_file_name: String::new(),
-                    download_bytes: Vec::new(),
-                    recorded_input: Arc::clone(&recorded_input),
-                    resize: Arc::clone(&resize),
-                    retry_auth_once: false,
-                };
+    #[test]
+    fn in_process_enterprise_controller_rejects_incomplete_audit_finalization() {
+        run_enterprise_controller_case(HostEnding::AuditFinalizeStreamEnd);
+    }
 
-                let config = controller_config(&relays, code);
-                let (script_input, frontend_input) = tokio::io::duplex(64 * 1024);
-                let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
-                let size = Rc::new(Cell::new((80_u16, 24_u16)));
-                let restored = Rc::new(Cell::new(false));
-                let frontend = SessionFrontend {
-                    input: frontend_input,
-                    output: frontend_output,
-                    size: Rc::clone(&size),
-                    restored: Rc::clone(&restored),
-                };
-                let cancellation = tokio_util::sync::CancellationToken::new();
+    #[test]
+    fn in_process_enterprise_controller_fails_closed_with_the_peer_audit() {
+        run_enterprise_controller_case(HostEnding::AuditFailure);
+    }
 
-                let mut progress = NoopProgress;
-                let session =
-                    run_controller_session(config, frontend, &mut progress, cancellation.clone());
-                let host = serve_scripted_host(
-                    &mut driver,
-                    &mut auth_incoming,
-                    &mut data_incoming,
-                    &mut control_incoming,
-                    &mut file_incoming,
-                    locator,
-                    &registration,
-                    &target,
-                    &mut pake,
-                    &host_script,
-                    HostEnding::Stall,
-                    None,
-                );
-                let driver_script = async {
-                    let _keep_input = script_input;
-                    // Wait until the session is fully established (the host
-                    // wrote its scripted output after TerminalReady), then
-                    // cancel: the pump's cancellation branch ends the session.
-                    let _ready = read_output_until(&mut script_output, b"session-ready").await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    cancellation.cancel();
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                };
+    #[test]
+    fn in_process_enterprise_controller_fails_closed_when_the_audit_stream_ends() {
+        run_enterprise_controller_case(HostEnding::AuditStreamEnd);
+    }
 
-                let (session_result, (), _) =
-                    tokio::join!(Box::pin(session), Box::pin(host), Box::pin(driver_script));
-                assert!(matches!(session_result, Err(ControllerError::Interrupted)));
+    #[test]
+    fn in_process_controller_session_ends_cleanly_on_local_input_eof() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined controller and audit futures exceed the default test
+        // thread stack; the project pattern runs the scenario on a 64 MiB
+        // stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let local = tokio::task::LocalSet::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(120),
+                        local.run_until(async {
+                            const EXIT_CODE: u32 = 7;
+                            const SCRIPTED_OUTPUT: &[u8] = b"scripted-prompt> ";
+                            const TYPED_ECHO: &[u8] = b"ls -la\n";
 
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process cancellation scenario must finish");
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let (
+                                mut driver,
+                                mut streams,
+                                locator,
+                                registration,
+                                target,
+                                mut pake,
+                                code,
+                            ) = register_scripted_host(&relays).await;
+                            let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+
+                            let recorded_input = Arc::new(Mutex::new(Vec::new()));
+                            let resize = Arc::new(Mutex::new(None));
+                            let host_script = HostScript {
+                                exit_code: EXIT_CODE,
+                                output: SCRIPTED_OUTPUT.to_vec(),
+                                upload_destination: String::new(),
+                                upload_file_name: String::new(),
+                                upload_bytes: Vec::new(),
+                                download_source: String::new(),
+                                download_file_name: String::new(),
+                                download_bytes: Vec::new(),
+                                recorded_input: Arc::clone(&recorded_input),
+                                resize: Arc::clone(&resize),
+                                retry_auth_once: false,
+                            };
+
+                            let config = controller_config(&relays, code);
+                            let (mut script_input, frontend_input) = tokio::io::duplex(64 * 1024);
+                            let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
+                            let size = Rc::new(Cell::new((80_u16, 24_u16)));
+                            let restored = Rc::new(Cell::new(false));
+                            let frontend = SessionFrontend {
+                                input: frontend_input,
+                                output: frontend_output,
+                                size: Rc::clone(&size),
+                                restored: Rc::clone(&restored),
+                            };
+                            let cancellation = tokio_util::sync::CancellationToken::new();
+
+                            let mut progress = NoopProgress;
+                            let session = run_controller_session(
+                                config,
+                                frontend,
+                                &mut progress,
+                                cancellation,
+                            );
+                            let host = serve_scripted_host(
+                                &mut driver,
+                                &mut auth_incoming,
+                                &mut data_incoming,
+                                &mut control_incoming,
+                                &mut file_incoming,
+                                None,
+                                None,
+                                locator,
+                                &registration,
+                                &target,
+                                &mut pake,
+                                &host_script,
+                                HostEnding::Complete,
+                                None,
+                            );
+                            // TEMPORARY DIAGNOSTIC driver: tolerant, prints what it saw.
+                            let tolerant_driver = async {
+                                let mut text = Vec::new();
+                                let mut buffer = [0_u8; 8192];
+                                let deadline =
+                                    tokio::time::Instant::now() + Duration::from_secs(60);
+                                loop {
+                                    if !text
+                                        .windows(SCRIPTED_OUTPUT.len())
+                                        .any(|w| w == SCRIPTED_OUTPUT)
+                                    {
+                                        match tokio::time::timeout(
+                                            Duration::from_millis(500),
+                                            script_output.read(&mut buffer),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(0)) => break,
+                                            Ok(Ok(n)) => text.extend_from_slice(&buffer[..n]),
+                                            Ok(Err(_)) => break,
+                                            Err(_) => {}
+                                        }
+                                    } else {
+                                        script_input.write_all(TYPED_ECHO).await.unwrap();
+                                        script_input.flush().await.unwrap();
+                                        drop(script_input);
+                                        if let Ok(more) = tokio::time::timeout(
+                                            Duration::from_secs(5),
+                                            drain_output_until_closed(&mut script_output),
+                                        )
+                                        .await
+                                        {
+                                            text.extend_from_slice(&more);
+                                        }
+                                        break;
+                                    }
+                                    assert!(
+                                        tokio::time::Instant::now() < deadline,
+                                        "the tolerant driver timed out: {}",
+                                        String::from_utf8_lossy(&text)
+                                    );
+                                }
+                                text
+                            };
+
+                            let (session_result, (), _) = tokio::join!(
+                                Box::pin(session),
+                                Box::pin(host),
+                                Box::pin(tolerant_driver),
+                            );
+                            assert_eq!(session_result.unwrap(), EXIT_CODE);
+                            assert!(restored.get(), "the raw-mode guard must be restored");
+                            assert_eq!(
+                                *recorded_input.lock().unwrap(),
+                                TYPED_ECHO,
+                                "the typed line must reach the remote terminal"
+                            );
+
+                            relay.stop().await;
+                        }),
+                    )
+                    .await
+                    .expect("the in-process EOF scenario must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn in_process_controller_session_times_out_when_the_remote_completion_is_silent() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined controller and scripted-host futures exceed the
+        // default test-thread stack; the project pattern runs the scenario
+        // on a 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let local = tokio::task::LocalSet::new();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    tokio::time::timeout(
+                        Duration::from_secs(90),
+                        local.run_until(async {
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let (
+                                mut driver,
+                                mut streams,
+                                locator,
+                                registration,
+                                target,
+                                mut pake,
+                                code,
+                            ) = register_scripted_host(&relays).await;
+                            let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+
+                            let recorded_input = Arc::new(Mutex::new(Vec::new()));
+                            let resize = Arc::new(Mutex::new(None));
+                            let host_script = HostScript {
+                                exit_code: 0,
+                                output: Vec::new(),
+                                upload_destination: String::new(),
+                                upload_file_name: String::new(),
+                                upload_bytes: Vec::new(),
+                                download_source: String::new(),
+                                download_file_name: String::new(),
+                                download_bytes: Vec::new(),
+                                recorded_input: Arc::clone(&recorded_input),
+                                resize: Arc::clone(&resize),
+                                retry_auth_once: false,
+                            };
+
+                            let config = controller_config(&relays, code);
+                            let (script_input, frontend_input) = tokio::io::duplex(64 * 1024);
+                            let (frontend_output, script_output) = tokio::io::duplex(64 * 1024);
+                            let size = Rc::new(Cell::new((80_u16, 24_u16)));
+                            let restored = Rc::new(Cell::new(false));
+                            let frontend = SessionFrontend {
+                                input: frontend_input,
+                                output: frontend_output,
+                                size: Rc::clone(&size),
+                                restored: Rc::clone(&restored),
+                            };
+                            let cancellation = tokio_util::sync::CancellationToken::new();
+
+                            let mut progress = NoopProgress;
+                            let session = run_controller_session(
+                                config,
+                                frontend,
+                                &mut progress,
+                                cancellation,
+                            );
+                            let host = serve_scripted_host(
+                                &mut driver,
+                                &mut auth_incoming,
+                                &mut data_incoming,
+                                &mut control_incoming,
+                                &mut file_incoming,
+                                None,
+                                None,
+                                locator,
+                                &registration,
+                                &target,
+                                &mut pake,
+                                &host_script,
+                                HostEnding::CloseDataSilently,
+                                None,
+                            );
+                            let driver_script = async {
+                                // The local input stays open, so only the remote-completion
+                                // deadline can end the session (§REMOTE_COMPLETION_TIMEOUT).
+                                let _keep_input = script_input;
+                                let _keep_output = script_output;
+                                tokio::time::sleep(Duration::from_secs(8)).await;
+                            };
+
+                            let (session_result, (), _) = tokio::join!(
+                                Box::pin(session),
+                                Box::pin(host),
+                                Box::pin(driver_script)
+                            );
+                            assert!(matches!(
+                                session_result,
+                                Err(ControllerError::RemoteCompletionTimeout)
+                            ));
+
+                            relay.stop().await;
+                        }),
+                    )
+                    .await
+                    .expect("the in-process silent-remote scenario must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn in_process_controller_session_times_out_when_terminal_ready_never_arrives() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined controller and audit futures exceed the default
+        // test-thread stack; the project pattern runs the scenario on a
+        // 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let local = tokio::task::LocalSet::new();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    tokio::time::timeout(
+                        Duration::from_secs(90),
+                        local.run_until(async {
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let (
+                                mut driver,
+                                mut streams,
+                                locator,
+                                registration,
+                                target,
+                                mut pake,
+                                code,
+                            ) = register_scripted_host(&relays).await;
+                            let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+
+                            let recorded_input = Arc::new(Mutex::new(Vec::new()));
+                            let resize = Arc::new(Mutex::new(None));
+                            let host_script = HostScript {
+                                exit_code: 0,
+                                output: Vec::new(),
+                                upload_destination: String::new(),
+                                upload_file_name: String::new(),
+                                upload_bytes: Vec::new(),
+                                download_source: String::new(),
+                                download_file_name: String::new(),
+                                download_bytes: Vec::new(),
+                                recorded_input: Arc::clone(&recorded_input),
+                                resize: Arc::clone(&resize),
+                                retry_auth_once: false,
+                            };
+
+                            let config = controller_config(&relays, code);
+                            let (script_input, frontend_input) = tokio::io::duplex(64 * 1024);
+                            let (frontend_output, script_output) = tokio::io::duplex(64 * 1024);
+                            let size = Rc::new(Cell::new((80_u16, 24_u16)));
+                            let restored = Rc::new(Cell::new(false));
+                            let frontend = SessionFrontend {
+                                input: frontend_input,
+                                output: frontend_output,
+                                size: Rc::clone(&size),
+                                restored: Rc::clone(&restored),
+                            };
+                            let cancellation = tokio_util::sync::CancellationToken::new();
+
+                            let mut progress = NoopProgress;
+                            let session = run_controller_session(
+                                config,
+                                frontend,
+                                &mut progress,
+                                cancellation,
+                            );
+                            let host = serve_scripted_host(
+                                &mut driver,
+                                &mut auth_incoming,
+                                &mut data_incoming,
+                                &mut control_incoming,
+                                &mut file_incoming,
+                                None,
+                                None,
+                                locator,
+                                &registration,
+                                &target,
+                                &mut pake,
+                                &host_script,
+                                HostEnding::StallHandshake,
+                                None,
+                            );
+                            let driver_script = async {
+                                let _keep_input = script_input;
+                                let _keep_output = script_output;
+                                tokio::time::sleep(Duration::from_secs(11)).await;
+                            };
+
+                            let (session_result, (), _) = tokio::join!(
+                                Box::pin(session),
+                                Box::pin(host),
+                                Box::pin(driver_script)
+                            );
+                            assert!(matches!(session_result, Err(ControllerError::Timeout)));
+
+                            relay.stop().await;
+                        }),
+                    )
+                    .await
+                    .expect("the in-process handshake-timeout scenario must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn in_process_controller_session_stops_on_cancellation_mid_session() {
+        let _test_guard = crate::in_process_test_guard();
+        // This scenario's joined futures (the controller pump, the scripted
+        // host and the driver script) exceed the default test-thread stack,
+        // so it runs on a dedicated thread with a large stack. The
+        // serialization permit is acquired inside the runtime so it is held
+        // across the scenario's awaits.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let local = tokio::task::LocalSet::new();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    tokio::time::timeout(
+                        Duration::from_secs(90),
+                        local.run_until(async {
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let (
+                                mut driver,
+                                mut streams,
+                                locator,
+                                registration,
+                                target,
+                                mut pake,
+                                code,
+                            ) = register_scripted_host(&relays).await;
+                            let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+
+                            let recorded_input = Arc::new(Mutex::new(Vec::new()));
+                            let resize = Arc::new(Mutex::new(None));
+                            let host_script = HostScript {
+                                exit_code: 0,
+                                output: b"session-ready\n".to_vec(),
+                                upload_destination: String::new(),
+                                upload_file_name: String::new(),
+                                upload_bytes: Vec::new(),
+                                download_source: String::new(),
+                                download_file_name: String::new(),
+                                download_bytes: Vec::new(),
+                                recorded_input: Arc::clone(&recorded_input),
+                                resize: Arc::clone(&resize),
+                                retry_auth_once: false,
+                            };
+
+                            let config = controller_config(&relays, code);
+                            let (script_input, frontend_input) = tokio::io::duplex(64 * 1024);
+                            let (frontend_output, mut script_output) = tokio::io::duplex(64 * 1024);
+                            let size = Rc::new(Cell::new((80_u16, 24_u16)));
+                            let restored = Rc::new(Cell::new(false));
+                            let frontend = SessionFrontend {
+                                input: frontend_input,
+                                output: frontend_output,
+                                size: Rc::clone(&size),
+                                restored: Rc::clone(&restored),
+                            };
+                            let cancellation = tokio_util::sync::CancellationToken::new();
+
+                            let mut progress = NoopProgress;
+                            let session = run_controller_session(
+                                config,
+                                frontend,
+                                &mut progress,
+                                cancellation.clone(),
+                            );
+                            let host = serve_scripted_host(
+                                &mut driver,
+                                &mut auth_incoming,
+                                &mut data_incoming,
+                                &mut control_incoming,
+                                &mut file_incoming,
+                                None,
+                                None,
+                                locator,
+                                &registration,
+                                &target,
+                                &mut pake,
+                                &host_script,
+                                HostEnding::Stall,
+                                None,
+                            );
+                            let driver_script = async {
+                                let _keep_input = script_input;
+                                // Wait until the session is fully established
+                                // (the host wrote its scripted output after
+                                // TerminalReady), then cancel: the pump's
+                                // cancellation branch ends the session.
+                                let _ready =
+                                    read_output_until(&mut script_output, b"session-ready").await;
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                cancellation.cancel();
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                            };
+
+                            let (session_result, (), _) = tokio::join!(
+                                Box::pin(session),
+                                Box::pin(host),
+                                Box::pin(driver_script)
+                            );
+                            assert!(
+                                matches!(session_result, Err(ControllerError::Interrupted)),
+                                "unexpected session result: {session_result:?}"
+                            );
+
+                            relay.stop().await;
+                        }),
+                    )
+                    .await
+                    .expect("the in-process cancellation scenario must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
     fn in_process_controller_prompt_overflow_aborts_the_modal_and_keeps_the_session() {
+        let _test_guard = crate::in_process_test_guard();
         // This scenario's joined futures (the 300 KiB dump, the session, the
         // scripted host and the driver script) exceed the default test-thread
         // stack, so it runs on a dedicated thread with a large stack. The
@@ -8029,8 +10032,6 @@ mod tests {
                             let relays =
                                 EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
                             let relay = InProcessRelay::start(relay_identity, port);
-                            wait_for_tcp_listener(port).await;
-                            tokio::time::sleep(Duration::from_millis(200)).await;
 
                             let (
                                 mut driver,
@@ -8051,7 +10052,7 @@ mod tests {
                             let resize = Arc::new(Mutex::new(None));
                             let host_script = HostScript {
                                 exit_code: EXIT_CODE,
-                                output: Vec::new(),
+                                output: b"session-ready\n".to_vec(),
                                 upload_destination: String::new(),
                                 upload_file_name: String::new(),
                                 upload_bytes: Vec::new(),
@@ -8104,6 +10105,8 @@ mod tests {
                                 &mut data_incoming,
                                 &mut control_incoming,
                                 &mut file_incoming,
+                                None,
+                                None,
                                 locator,
                                 &registration,
                                 &target,
@@ -8113,10 +10116,13 @@ mod tests {
                                 Some((dump, dump_rx)),
                             );
                             let driver_script = async {
+                                let mut seen =
+                                    read_output_until(&mut script_output, b"session-ready").await;
                                 script_input.write_all(&[0x1d, b'u']).await.unwrap();
                                 script_input.flush().await.unwrap();
-                                let mut seen =
-                                    read_output_until(&mut script_output, b"local source:").await;
+                                seen.extend(
+                                    read_output_until(&mut script_output, b"local source:").await,
+                                );
                                 // The prompt is active now; flood the delayed buffer.
                                 let _ = dump_tx.send(());
                                 seen.extend(

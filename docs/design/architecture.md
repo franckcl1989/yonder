@@ -7,8 +7,8 @@
 | `yonder-core` | library | 连接码与领域 newtype、固定 wire 类型、PAKE trait、限速配置、状态机、结构化错误、时间和安全随机抽象 |
 | `yonder-config` | library | 严格的系统文件、当前目录文件和环境变量分层加载，schema 反序列化及路径来源解析 |
 | `yonder-net` | library | 共享 libp2p transport/behaviour、应用子流适配、路径候选与选择、relay client、连接名册和唯一连接屏障 |
-| `yon` | binary | `host`/`connect` CLI、`opaque-ke` PAKE 适配、本地终端、PTY/shell 生命周期、企业认证交互 UI 和用户可见错误 |
-| `yon-relay` | binary | 持久身份 CLI、Circuit Relay v2、AutoNAT v2 server、临时注册表、查询和滥用控制、企业认证准入（模式互斥、成员验证、回调 HTTPS、单次事务注册表） |
+| `yon` | binary | `host`/`connect` CLI、`opaque-ke` PAKE 适配、本地终端、PTY/shell 生命周期和用户可见错误 |
+| `yon-relay` | binary | 持久身份 CLI、Circuit Relay v2、AutoNAT v2 server、临时注册表、查询和滥用控制 |
 
 依赖方向固定为二进制依赖共享库、`yonder-net` 依赖 `yonder-core`，`yonder-config` 独立于领域和网络层，`yonder-core` 不依赖网络或 CLI。协议类型由 core 定义，网络库只负责在子流上精确读写。CLI 和 relay 不互相依赖。
 
@@ -29,9 +29,6 @@
 | `TerminalFrontend` | raw mode guard、尺寸、stdin/stdout | 隔离 `crossterm` 和平台 I/O，支持伪终端集成测试 |
 | `IdentityStore` | 原子创建和读取中继身份 | relay 冷路径；生产使用 `tempfile` 原子持久化 |
 | `SecretFilePolicy` | 创建前收紧并读取前验证 identity/WSS 私钥及直接父目录权限 | 平台冷路径；Unix mode/owner 与 Windows ACL 实现可独立验证 |
-| `ExchangeTransport` | 有界 GET/JSON POST 交换，返回 Send future | yon-relay 企业 OAuth 冷路径；隔离 hyper 栈，mock 传输驱动验证器 |
-| `CallbackHandler` | 处理一次已验证的浏览器回调 | `Arc<dyn>` 共享；回调服务器与单次事务会话处理器解耦 |
-| `EnterpriseResolveUi` | 平台选择与浏览器打开 | `yon` 客户端 UI 接缝；异步方法在 endpoint drive 内运行，人类交互期间连接保持存活 |
 
 固定格式解析、newtype 方法、状态转换纯函数和包内辅助函数不包装成 trait。第一方热路径不使用 `dyn`；`portable-pty` API 自身返回的第三方 trait object 只被封装在终端适配层。
 
@@ -123,4 +120,4 @@ host 在认证前最多用 `3s` 让目标 PeerId 名册收敛，并在此期间�
 - relay 复用同一官方 behaviour：pending inbound `128`、pending outbound `64`、established inbound `320`、outbound `64`、total `320`、per PeerId `8`；该上限允许同一 endpoint 竞速最多 8 个入口及短暂 AutoNAT 连接，应用协议仍要求收敛到名册唯一。relay memory connection limit 为进程 RSS `64 MiB`。
 - relay 的产品语义固定为默认 `max_reservations=128`、每 PeerId 最多 `1` 个 reservation、reservation `1h`，并且每 PeerId 最多 `1` 条 circuit。锁定的 `libp2p-relay 0.21.1` 对两个 per-peer 字段使用 `current > configured` 判断，因此适配层把对应上游字段设为 `0` 才能得到有效上限 `1`；升级上游时必须用真实双连接 reservation 回归重新核对，不能机械保留该兼容值。
 - relay 默认 `max_circuits=128`、`max_circuits_per_peer=1`、单 circuit 最长 `24h`、双向合计最多 `8 GiB`。配置可以收紧或调整，但必须通过组合 newtype 校验且不能超过平台文件描述符和内存预算。
-- memory connection limits 触发时拒绝新连接，不驱逐 Active 会话。上游平台内存统计暂时失败时可能沿用最近值，因此 connection count limits 始终作为独立硬边界，不能被关闭。ASan/TSan 插桩会让空载进程 RSS 超过生产阈值，因此只有显式启用 `yonder_sanitizer` cfg 的 sanitizer 验证构建把 endpoint 与 relay 阈值提高到 `512 MiB`；普通 dev/test/release 仍固定为上述 `96 MiB`/`64 MiB`，连接数与其他资源边界也不变。
+- memory connection limits 触发时拒绝新连接，不驱逐 Active 会话。上游平台内存统计暂时失败时可能沿用最近值，因此 connection count limits 始终作为独立硬边界，不能被关闭。debug 和 ASan/TSan 插桩构建会因调试信息、测试框架、64 MiB 测试线程栈及分配器保留使空载或同进程测试 RSS 超过生产阈值，因此这些仍有界的非发布构建把 endpoint 与 relay 阈值统一提高到 `512 MiB`；`debug_assertions = false` 且未启用 `yonder_sanitizer` 的优化发布构建严格使用上述 `96 MiB`/`64 MiB`。两套精确常量均由构建模式静态选择并由 debug/release 测试断言，连接数与其他资源边界不变。

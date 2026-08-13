@@ -28,12 +28,20 @@
 | R-024 | relay 秘密文件在受支持平台 fail-closed | `SecretFilePolicy` + `IdentityStore` | Unix 0600、可信且不可被 group/other 写入的直接父目录；Windows protected DACL/可信 owner | Unix mode/父目录/普通文件、Windows ACL 正反测试、原生 config check、空目录 identity smoke |
 | R-025 | relay 可生产托管且可低噪声观测 | relay root task + aggregate observations | 跨平台停止信号；2s shutdown；60s 低基数汇总 | Unix/Windows 原生信号 E2E、聚合计数、拓扑配置拒绝、停止期限 |
 | R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | 两个二进制 config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |
-| R-027 | 企业模式与普通模式互斥且生命周期不可切换；企业 relay 只提供 Enterprise Resolve | yon-relay service 层 + `EnterpriseContext` | 模式由 `[enterprise_auth]` 存在性决定；`/yonder/enterprise-resolve/1.0.0` 与 legacy Resolve 二选一 accept | 模式隔离 wire 测试、进程级 e2e（旧 resolve 拒绝、旧 host 注册、未认证 connect 拒绝） |
-| R-028 | 企业会话：内存单次事务、与 connect 子流绑定、断开/超时/重启失效、防重放与重复创建 | yon-relay `session.rs` + `CallbackRegistry` | 状态机 Created..Completed + 失败态；单次 OAuth state 注册表 | 全转换 unit、单次消费/重放/容量/过期测试、TransactionGuard 断连清理 |
-| R-029 | 企业成员验证失败关闭：外部用户、离职、停用、无法确认状态一律拒绝 | yon-relay `verifier.rs` + `exchange.rs` | 企业微信 gettoken/getuserinfo/user/get；飞书 OIDC/user_info/tenant/contact | 双平台逐响应单元测试（mock 交换）、超界/传输失败/平台异常全部 fail-closed |
-| R-030 | 企业认证回调：独立 HTTPS、仅两个规范路径、极简不缓存结果页、无管理面 | yon-relay `callback.rs` | `/yonder/callback/wecom`、`/yonder/callback/feishu` | TLS 环回往返、404/400/405 拒绝、no-store 头、进程级 e2e |
-| R-031 | 认证准入资源保护：全局与按源限流、事务容量、回调连接上限、日志只记请求 ID/平台/阶段/脱敏结果 | yon-relay callback/enterprise resolve | 认证限流器 1/s burst 4；64 事务容量；16 回调连接 | 限流/容量/超时测试、e2e 泄露审计（无 OPAQUE/PeerId/locator/code） |
-| R-032 | 企业凭据：独立敏感文件、启动时一次加载、不热更新、zeroize、任一启用提供商失败即拒绝启动 | yon-relay `provider.rs` + main | 每平台一份 Secret 文档（TOML、16 KiB 上限） | 文档校验/越界/零化测试、启动失败关闭、Windows 受保护目录契约 |
-| R-033 | 新 connect 自动识别企业 relay 并完成平台选择与浏览器认证；旧 connect 无法使用企业 relay | yon protocol/controller | 先开企业子流，`UnsupportedProtocol` 回退 legacy；单平台免提示、双平台交互 | 客户端 wire 锁步测试、自动识别回退、未认证拒绝 e2e、泄露审计 |
+| R-027 | relay 普通/企业模式互斥且企业模式只提供 Enterprise Resolve | yon-relay service + config | `/yonder/enterprise-resolve/2.0.0` | 模式隔离、旧 connect 拒绝、旧 host 注册、进程 E2E |
+| R-028 | 企业事务内存单次、与子流绑定、断连/超时/重启失效 | yon-relay enterprise owner | Created..Completed/失败态 | 全转换、重放、重复回调、容量、假时钟、EOF 清理 |
+| R-029 | 企业微信/飞书只放行可确认的有效内部成员 | `EnterpriseProvider` adapters | OAuth callback + typed HTTPS exchange | 双平台类型化 fixture、真实 HTTPS/TLS callback 与故障矩阵；真实自建应用正反验收是首次生产启用门槛，不计入 0.2.0 发布证据 |
+| R-030 | 企业回调只开放两个 HTTPS GET 路径且无敏感日志 | yon-relay callback | 固定 path/state/code | TLS loopback、404/400/405、no-store、泄露负断言 |
+| R-031 | 企业 secret 和审计文件跨平台强制保护 | `SecretFilePolicy` + audit store | Unix 0700/0600；Windows protected DACL | Unix mode/owner/symlink、Windows owner/ACE 正反原生测试 |
+| R-032 | controller 提示/选择 provider、先显示 URL、浏览器打开失败可继续 | yon enterprise UI | Providers/Select/Authenticate | 单/双 provider、非 TTY、open 失败、心跳与零污染测试 |
+| R-033 | 活动交互会话原生单文件上传/下载 | yon file actor | `/yonder/file-transfer/2.0.0` | 上传/下载 E2E、错误/取消不结束终端、终态后有界顺序交接、真实并发 Busy、新旧互操作 |
+| R-034 | 文件流式 64 KiB、SHA-256、安全临时文件和 no-replace | `FileTransferBackend` | Open/Data/Finish/Committed | 多块/空文件、竞态、symlink、源变化、磁盘/权限故障 |
+| R-035 | 本地控制命名空间跨平台一致且非交互字节透明 | terminal frontend | `Ctrl+] u/d/?/./Ctrl+]` | 跨块状态属性测试、PTY/ConPTY 原生 E2E、未知选择器 |
+| R-036 | 仅企业会话强制双端审计，普通会话零审计副作用 | yon audit/session | `/yonder/audit/2.0.0` | 普通回归、企业握手/旧端拒绝、目录缺失/不可写失败关闭 |
+| R-037 | 原始输入不落盘，双端以会话私有 HMAC 承诺一致 | audit observer/crypto | Input shared chain | 内容边界、承诺一致、无 key 离线猜测不可验证测试 |
+| R-038 | 输出/控制/文件事实链、周期检查点、共同清单和双签名；失败通知固定为 `AuditError -> CloseNotice`，同时就绪时审计失败不得被终端 EOF/I/O 覆盖 | audit session/wire + controller/host event pump | Hello..LedgerCommit；结构化失败码先于统一关闭；审计帧优先根因归类 | wire golden/property/fuzz、跨子流晚到、双方向序号/确认、关闭屏障、重复/mismatch、完整/中断 E2E、双端结构化审计失败与终端关闭竞态回归 |
+| R-039 | 持久身份和串行连续账本抵抗本地静默改写/分叉 | audit identity/ledger | identity + ledger + record container | 竞争、崩溃恢复、回滚/fork 检测、签名/链篡改矩阵 |
+| R-040 | 离线 verify 六状态和 vt100 安全 replay | yon audit CLI | `.yonaudit` format 2 | 退出码、截断/逐字节篡改、OSC52/DCS/查询过滤、原生 smoke |
+| R-041 | 0.2.0 产物与历史只建立在 v0.1.1 和本基线上 | release workflow | v0.1.1 -> v0.2.0 | commit provenance、六 target 资产、撤回 release/tag/run 清理审计 |
 
 实现任务只有同时关联至少一个需求 ID、一个责任 package 和一个验证项才能进入开发。该矩阵是可追踪的当前基线，不是凌驾于产品目标之上的不可变规则；真实实现、网络或运维证据证明现有条目不合理时，应同时修订需求、设计、实现和验证，而不是为保持旧文本牺牲远程终端的正确性与可用性。发现需求没有可执行证据时视为设计缺口，不能用人工目测关闭。

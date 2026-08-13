@@ -255,62 +255,23 @@
 - 网络验证采用经批准的风险驱动成对矩阵：每种传输、关键 NAT/地址族拓扑、故障类别及 Direct/Relayed 结果都必须有真实代表组合和最终选路断言，不要求制造低价值的完整笛卡尔积。中继不可信行为通过端到端认证流的篡改/截断测试与真实网络延迟、丢包、乱序、断连和重置验证；禁止为注入中继内部明文钩子而 fork 或重写官方 `libp2p-relay`。
 - tag workflow 只有在性能、资源、四目标各 `30min` 的发布 fuzz、风险驱动网络与故障矩阵、五目标覆盖率和六目标原生发布证据全部通过后才允许自动创建正式 GitHub Release。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
 
-## 0.1.2 企业认证已确认决策
+## 已确认的 0.2.0 产品与发布基线
 
-项目所有者于 2026-08-06 对 0.1.2 Enterprise Authentication 实现决策逐项确认：
+- `0.2.0` 必须从 `v0.1.1` 独立重建；已撤回 `0.1.2`、`0.1.3`、`0.1.4` 的源码、提交、设计和测试只可作为审计材料，不得整提交 cherry-pick 或沿用其完成结论。
+- 普通 relay/会话保持 `v0.1.1` 终端、认证、隐私和 wire 兼容；增加原生单文件传输，审计默认关闭且不产生本地状态。
+- 企业 relay 只提供 Enterprise Resolve，支持企业微信和飞书自建应用，有效内部成员验证失败关闭且禁止回退普通 Resolve。企业会话必须由 `0.2.0` 双端在 Terminal Active 前完成可验证审计。
+- 项目所有者无法提供真实企业微信或飞书自建应用，`0.2.0` 不以真实平台联调作为发布硬门槛；必须以类型化 provider fixture、真实 HTTPS/TLS callback、OAuth 单次事务和完整故障矩阵验证 Yonder 自身语义，且不得把这些证据表述为平台官方环境认证。任一提供商首次生产启用前仍必须由部署方在真实自建应用中验证成功、拒绝、超时和禁止降级。
+- 新增协议 ID 固定为 `/yonder/enterprise-resolve/2.0.0`、`/yonder/file-transfer/2.0.0`、`/yonder/audit/2.0.0`；拒绝版本使用过的扩展协议不得作为兼容回退。既有 auth/terminal/registry/普通 resolve 协议保持不变。
+- 文件传输固定使用交互式 `Ctrl+] u/d/?`，独立已认证子流、每会话一个传输、`64 KiB` 流式块、SHA-256、安全临时文件和 no-replace 提交；失败/取消不得结束终端。
+- 企业审计只存在于端点，不把终端/文件/审计内容交给 relay；不保存原始输入，使用会话私有 HMAC 承诺，保存完整输出，使用持久身份/账本、周期检查点、共同清单、双签名和安全离线 verify/replay。Windows 必须复用并验证受保护 DACL，不能可靠保护时失败关闭。
+- 企业审计整体建立预算固定为绝对 `30s`，包含身份/账本、记录创建、header 持久化与握手；单个审计 wire 读写继续固定为绝对 `10s`。运行期 checkpoint 是发送方签名观察与接收方签名回执，不要求接收瞬间本地快照相同；关闭必须先形成共享事实屏障、结清旧运行期交换，再以精确相同快照完成新的最终 checkpoint。sent/received 的序号和确认状态必须在运行时与离线验证中独立建模，双文件 interrupted 验证按方向交叉匹配并证明快照是双方链前缀。
+- 企业 provider 集合允许启动期有界动态分发；终端、文件和审计热路径使用静态分发。各状态由单一 owner 持有，任务间只使用有界 channel；审计磁盘 writer 在 Tokio runtime 外执行并对 append-before-effect 返回确认。
+- 正式 release 后硬删除 GitHub `v0.1.2`、`v0.1.3` Releases/tags，以 `--force-with-lease` 把 `main` 清理为 `v0.1.1 -> v0.2.0`，并删除相关 Actions runs、临时分支/worktree 和本地悬空对象。发布前只允许软撤回，以保留审计和借鉴材料。
 
-- HTTP 技术栈：hyper 单一栈（服务端与 OAuth 客户端共用同一 HTTP 实现），不引入 axum/reqwest。
-- 回调证书：[enterprise_auth] 下独立配置 certificate/certificate_der + private_key/private_key_der，与 WSS 传输证书隔离；浏览器回调必须使用公网 CA 签发的证书。
-- Secret 文件：企业微信与飞书各一个独立敏感文件（enterprise_auth.secret_wecom / enterprise_auth.secret_feishu），复用 `SecretFilePolicy` 平台保护。
-- 平台选择交互：connect 收到平台列表后终端编号选择，随后打开系统浏览器跳转授权 URL。
+## 已确认的 0.2.0 直接依赖
 
-## 0.1.2 审计轮实现阶段决定
-
-以下变更在 0.1.2 多角色交叉审计轮与第二轮对抗性复审中作出，均属于设计 §13「实现原则」允许的实现阶段决定（具体依赖、crate 版本、HTTP 参数、超时数字、性能参数等资源边界）或失败关闭修正，不改变已冻结的模式互斥、协议边界、状态机与安全语义。此处仅为发布评审记录；任何项目所有者认为超出 §13 纬度的行为变更，必须在发布前重新确认。
-
-- 企业子流 permit 上限：企业 resolve 子流在 spawn 交换任务前先取得 permit，并发硬上限 `64`，防无界空闲任务（`e4190a3`）；属 §13 资源上限/性能参数。
-- 回调监听器失败传播：监听器失败以 `EnterpriseCallback` 错误响亮传播到根循环，relay 停止而非静默继续（`e4190a3`）；属 §13 失败关闭修正。
-- 回调整连接生命周期：完成 TLS 但不发请求的连接同样纳入 `10s` 生命周期，防认证路径 DoS 耗尽回调槽（`fe8389a`）；属 §13 超时数字与资源上限。
-- 客户端预算拆分：企业 resolve 客户端机器步骤 `30s`、人类认证步骤对齐 relay 会话期限 `10min30s`（`bb7a823`）；属 §13 超时/预算参数。
-- 字面断开失效：等待期子流 EOF 使"断开立即失效"字面成立——断连即取消会话并立即释放槽位（`c96bc04`）；属 §13 失败关闭修正。
-- 限流回调会话失败：限流回调先消费注册表条目并失败会话，阻断同 state 迟到放行（`ebaa346`）；属 §13 失败关闭修正。
-
-## 已确认的企业认证 HTTP 依赖
-
-0.1.2 企业认证需要 HTTPS 回调服务器（浏览器 OAuth 回调）与 OAuth API 客户端（企业微信/飞书 token 交换与成员校验）。版本于 2026-08-06 经 crates.io 核实均为各自全局最新稳定版：
-
-- 已批准直接依赖 `hyper 1.11.0`，`default-features = false`，仅启用 `client`、`http1`、`server`；关闭 `http2`，企业微信/飞书 API 与浏览器回调均为 HTTP/1.1。锁文件中 1.10.1 为 `igd-next` 传递引入，本次升级到 1.11.0 属 semver 兼容补丁升级。
-- 已批准直接依赖 `hyper-util 0.1.20`，`default-features = false`，仅启用 `client-legacy`、`http1`、`server`、`server-auto`、`tokio`；该版本与锁文件现有传递版本一致。`server-auto` 会连带启用 `http2`，接受该依赖成本以使用官方 auto builder。
-- 已批准直接依赖 `hyper-rustls 0.27.9`，`default-features = false`，仅启用 `http1`、`ring`、`tls12`、`webpki-tokio`；仅用于 OAuth 客户端 `HttpsConnector`（该版本线无服务端能力），`webpki-tokio` 内嵌 Mozilla 根证书，适配 musl 等无系统证书库的静态目标，不再单独声明 `webpki-roots` 直接依赖。
-- 已批准直接依赖 `tokio-rustls 0.26.4`，`default-features = false`，仅启用 `ring`、`tls12`；仅用于回调 HTTPS 监听器的 `TlsAcceptor`。`ring` 与锁文件现有 rustls 0.23.42 的 crypto provider 保持一致，不引入 `aws-lc-rs`。
-- 已批准直接依赖 `http-body-util 0.1.4`，`default-features = false`，不启用任何 feature；仅用于请求/响应 `Body` 工具类型。
-- 已批准直接依赖 `serde_json 1.0.151`，`default-features = false`，仅启用 `std`；锁文件 1.0.150 原为 `criterion`/`tinytemplate` 传递版本，本次补丁升级并转为直接依赖。
-- 已批准直接依赖 `url 2.5.8`，`default-features = false`，不启用任何 feature；仅用于 OAuth 授权 URL 构造，`query_pairs_mut` 承担百分号编码。锁文件已有同版本传递依赖。
-- 已批准 workspace `tokio` 依赖新增 `net` feature，用于回调监听器的 `TcpListener` 与 OAuth 客户端连接。
-- 经核实 base64（最新 0.23.1）与 form_urlencoded 对两个提供商的 OAuth 流程均无必要（token 交换与成员校验均为 JSON 承载），不引入。
-- 上述 crate 的 MSRV 均不高于 workspace `rust-version = 1.88`（最高为 hyper-rustls 1.85），许可证均位于 `deny.toml` 允许列表（MIT / Apache-2.0 OR ISC OR MIT / MIT OR Apache-2.0）。2026-08-06 在更新后的锁文件上运行 `cargo deny check` 全项通过、`cargo audit` 除既有三个已批准例外（RUSTSEC-2026-0118/0119/2024-0436）外无新增公告；后续升级与全矩阵验证仍须走既定流程。
-
-## 已确认的企业认证浏览器打开依赖
-
-connect 企业流程在终端编号选择平台后，需要用系统默认浏览器打开企业 OAuth 授权 URL。项目所有者于 2026-08-06 明确批准改用 `open` crate（该决定同时消除了审计轮对 `crates/yon` 既有手写平台启动命令的顾虑）：
-
-- 用途：仅承担把企业 OAuth 授权 URL 交给系统默认浏览器打开的动作；OAuth state、回调与凭证不经过该依赖。
-- 版本：`open 5.4.1`，2026-08-06 经 crates.io 核实的全局最新稳定版，直接依赖使用精确版本。
-- 成熟度与维护状态：MIT 许可证，约 45M 下载、维护活跃；MSRV 1.62，低于 workspace `rust-version = 1.88` 基线。
-- 替代方案：手写 `cmd start` / `open` / `xdg-open` 平台命令被拒绝——存在 cmd 元字符与引号、Linux 回退链、WSL 等边界问题；`webbrowser` crate 未采用——`open` 是该职责的标准选择。
-- 安全风险：无已知 RustSec 公告；Unix 目标的传递依赖为 `is-wsl` / `is-docker`（经 `libc` 与 `once_cell`），两者均已在锁文件树中；Windows 在 `default-features = false` 下零传递依赖。
-- feature 列表：`default-features = false`，不启用任何 feature；`shellexecute-on-windows` 关闭以避免引入 `dunce` 传递依赖。
-- best-effort 语义保留：授权 URL 始终先打印；打开器失败绝不中止认证流程。
-
-## 已确认的 0.1.4 会话审计依赖
-
-项目所有者于 2026-08-07 批准 0.1.4 会话审计的加密与重放依赖，采用「对齐现有树」路线（与 0.1.2/0.1.3 的 digest 0.10 / curve25519-dalek 4.x 单一主版本树一致，加密树零新增）：
-
-- 已批准直接依赖 `hmac 0.12.1`，`default-features = false`；绑定 digest ^0.10，用于输入承诺的 HMAC-SHA-256。0.13 线（2026-03 发布）绑定 digest 0.11，会引入第二个 SHA-2 主版本树，未采用。
-- 已批准直接依赖 `hkdf 0.12.4`，`default-features = false`；绑定 digest ^0.10 与 hmac ^0.12.1，用于会话私有输入承诺密钥的 HKDF-SHA-256 派生。0.13 线同样绑定 digest 0.11，未采用。
-- 已批准直接依赖 `ed25519-dalek 2.2.0`，`default-features = false`；锁文件已有同版本（libp2p ed25519 feature 引入并经 0.1.2 发布审计），本次转为直接依赖，用于持久审计身份与会话临时签名密钥。3.0.0（2026-07-06 发布的新主版本）绑定 digest 0.11 与 curve25519-dalek 5.0，未采用。
-- 已批准直接依赖 `vte 0.15.0`，`default-features = false`；唯一新增依赖，用于 `yon audit replay` 的内置安全 VT 解析（设计 §26.1）。2026-08-07 经 crates.io 核实为全局最新稳定版，Apache-2.0 OR MIT，MSRV 1.62.1，2025-02 发布、维护活跃，是标准 VT 解析器（无已知 RustSec 公告，实际锁文件审计仍须执行）。
-- 共享 core 包 `yonder-core` 新增已批准的 `sha2 0.10.9` 依赖（workspace 既有直接依赖复用），用于审计哈希链；不新增 digest 主版本。
-- 全部候选的许可证均位于 deny.toml 允许列表（hmac/hkdf/vte 为 MIT OR Apache-2.0，ed25519-dalek 为 BSD-3-Clause，BSD-3-Clause 已在白名单），MSRV 均不高于 workspace `rust-version = 1.88`。实施时锁文件变更后仍须运行完整依赖、安全与许可证审计。
-- 审计容器与线协议编解码（wire::audit / audit_container）为纯字节结构，不依赖上述加密 crate；密码学运算只发生在 session、ledger 与 verify 层。
-- 已批准直接依赖 `fs4 1.1.0`，`default-features = false`；唯一用于本地账本 `ledger.lock` 的跨进程排他文件锁（设计 §12.2）。2026-08-07 经 crates.io 核实为全局最新稳定版，MIT OR Apache-2.0，MSRV 1.75，2026-04 维护活跃（fs2 0.4.3 自 2018 年起未维护，未采用）；锁只在首次初始化、崩溃恢复与最终账本提交三个短阶段持有，不得在整个会话期间持锁。
+- 企业 HTTP：`reqwest 0.13.4`（`json,query,rustls-no-provider`）、`axum 0.8.9`（`http1,json,query,tokio,tracing`）、`axum-server 0.8.0`（`tls-rustls-no-provider`）、`open 5.4.1`（无 feature）、`serde_json 1.0.151`（`std`）。全部 `default-features = false`。Rustls provider 必须安装 workspace 已有 ring 实现；禁止旁路手写 Hyper HTTP 栈。
+- 文件传输把既有 `tempfile 3.27.0` 提升为 `yon` 生产依赖，继续 `default-features = false, features = ["getrandom"]`，用于同目录安全临时文件和成熟 no-replace 提交。
+- 审计：`ed25519-dalek 3.0.0`（`zeroize`）、`fs4 1.1.0`（`sync`）、`hkdf 0.13.0`（无 feature）、`hmac 0.13.0`（`zeroize`）、`sha2 0.11.0`（无 feature）、`vt100 0.16.2`（无 feature）；全部 `default-features = false`。
+- `sha2 0.10.9` 只作为 `opaque-ke 4.0.1` 公开 Digest 0.10 约束的兼容别名保留；文件与审计等新代码统一使用 `sha2 0.11.0`。禁止让 legacy digest 类型扩散到其他模块。
+- 上述依赖版本已于 2026-08-11 核实为采用范围内的最新稳定版本，MSRV 不高于 workspace 1.88，许可证兼容现有策略。实施后仍必须以实际 lockfile 完成安全、许可证、feature、静态链接、体积、性能与分配审计。

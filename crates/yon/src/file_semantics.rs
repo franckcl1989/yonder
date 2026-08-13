@@ -1,4 +1,4 @@
-//! Native file-transfer file semantics for the 0.1.3 controller and host
+//! Native file-transfer file semantics for the 0.2.0 controller and host
 //! (design sections 8.2, 8.3, 8.4, 8.5, 13, 14 and 15.1).
 //!
 //! The module implements the file-system side of a single file transfer in
@@ -25,20 +25,15 @@
 //!   directory all fail with the corresponding structured error. Parent
 //!   directories are never created automatically (sections 8.3, 8.4).
 //! - **Private temporary files and commit.** [`PrivateTempFile::create`]
-//!   creates an unpredictable, exclusively-created file next to the final
-//!   path (the name is drawn from the project-wide [`SecureRandom`] source
-//!   and creation uses `create_new`, so an existing name is never followed).
+//!   delegates unpredictable exclusive creation next to the final path to
+//!   [`tempfile::NamedTempFile`].
 //!   Bytes are written with a streamed SHA-256 running in lock-step; on
 //!   [`PrivateTempFile::finish`] the file is flushed and synchronised, and
 //!   [`SealedTempFile::verify_finish`] enforces the declared size and digest.
-//!   The final commit is a no-replace operation: on platforms where a
-//!   no-replace rename is unavailable, an exclusive hard link plus removal of
-//!   the temporary name is used, so an existing final object fails the commit
-//!   and is never replaced, truncated or deleted first (section 13). If the
-//!   file system cannot provide such a commit (for example a file system
-//!   without hard links), the transfer fails with
-//!   [`FileSemanticsError::CommitFailed`] as the design requires. The
-//!   temporary file is removed on every failure path via `Drop`.
+//!   The final no-replace operation is owned by
+//!   [`tempfile::NamedTempFile::persist_noclobber`], so an existing final
+//!   object fails and is never replaced, truncated or deleted first. The
+//!   temporary file is removed on every failure path by the crate's guard.
 //! - **Change detection boundary.** In-place modification that preserves both
 //!   the size and the modification identity cannot be detected on every
 //!   platform (for example file systems with coarse time stamps); the design
@@ -75,12 +70,9 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 use thiserror::Error;
-use yonder_core::SecureRandom;
 use yonder_core::wire::file_transfer::{
     FileTransferErrorCode, MAX_PATH_LEN, Sha256Digest, validate_default_file_name,
     validate_protocol_path,
@@ -89,15 +81,6 @@ use yonder_core::wire::file_transfer::{
 /// The fixed streaming buffer size in bytes: file I/O, wire blocks and digest
 /// computation all work in chunks of at most this size (design 15.1).
 pub const CHUNK_SIZE: usize = 64 * 1024;
-
-/// How many fresh random names are attempted before temporary file creation
-/// fails. Collisions with 128-bit names are effectively impossible; the bound
-/// only exists so a pathological random source cannot loop forever.
-const TEMP_NAME_ATTEMPTS: usize = 8;
-
-/// The prefix of every private temporary file name. The prefix is not
-/// sensitive; the entropy is in the 128 random bits that follow it.
-const TEMP_FILE_PREFIX: &str = ".yonder-tmp-";
 
 /// The absolute working directory captured once per session.
 ///
@@ -235,7 +218,7 @@ impl SourceFile {
     /// with [`FileSemanticsError::SourceNotRegularFile`]. On Unix a
     /// path-level probe runs before the open for one reason only: opening a
     /// FIFO without `O_NONBLOCK` blocks forever and safe `std` offers no
-    /// non-blocking open flag. The probe never judges the transfer object —
+    /// non-blocking open flag. The probe never judges the transfer object;
     /// type and size are still taken exclusively from the opened handle
     /// (design 8.2). On Windows, paths in the device, verbatim or UNC
     /// namespace (`\\`-leading paths) and paths whose last component is a
@@ -258,9 +241,8 @@ impl SourceFile {
                 #[cfg(windows)]
                 {
                     // Windows refuses to open a directory; classify the
-                    // refusal from the path (only as a classification aid —
-                    // the handle remains the sole authority when an open
-                    // succeeds).
+                    // refusal from the path only as an error-classification
+                    // aid. The handle remains authoritative after an open.
                     if error.kind() == io::ErrorKind::PermissionDenied
                         && fs::metadata(path).is_ok_and(|meta| meta.is_dir())
                     {
@@ -498,17 +480,15 @@ fn ensure_destination_free(final_path: &Path) -> Result<(), FileSemanticsError> 
 
 /// A private temporary file created next to the final destination.
 ///
-/// The name is unpredictable (128 bits from the injected [`SecureRandom`]
-/// source) and the file is created with exclusive `create_new`, so an
-/// existing name is never followed or opened. Bytes are written with a
-/// streamed SHA-256 running in lock-step. The file is removed on `Drop`,
-/// covering failures, cancellation and process exit as far as best-effort
-/// cleanup can (design section 13).
+/// The name is generated by [`tempfile`] from operating-system randomness and
+/// the file is created atomically without following an existing name. Bytes
+/// are written with a streamed SHA-256 running in lock-step. The file is
+/// removed on `Drop`, covering failures, cancellation and process exit as far
+/// as best-effort cleanup can (design section 13).
 pub struct PrivateTempFile {
-    file: fs::File,
+    file: NamedTempFile,
     written: u64,
     hasher: Sha256,
-    guard: TempFileGuard,
 }
 
 impl std::fmt::Debug for PrivateTempFile {
@@ -524,52 +504,27 @@ impl std::fmt::Debug for PrivateTempFile {
 }
 
 impl PrivateTempFile {
-    /// Creates a private temporary file in `directory` with an unpredictable
-    /// name. `directory` must exist (typically [`DestinationPlan::temp_dir`]).
+    /// Creates a private temporary file in `directory` through `tempfile`.
+    /// `directory` must exist (typically [`DestinationPlan::temp_dir`]).
     ///
     /// Creation failures are classified: a missing directory is
     /// [`FileSemanticsError::DestinationParentNotFound`], denied permission
     /// or a read-only file system is [`FileSemanticsError::PermissionDenied`],
     /// a full file system is [`FileSemanticsError::NoSpace`], and everything
-    /// else is [`FileSemanticsError::TempFileCreateFailed`]. A failing
-    /// random source fails the creation; there is no weak fallback.
-    pub fn create(
-        directory: &Path,
-        random: &mut impl SecureRandom,
-    ) -> Result<Self, FileSemanticsError> {
-        let mut name_bytes = [0_u8; 16];
-        for _ in 0..TEMP_NAME_ATTEMPTS {
-            random
-                .try_fill(&mut name_bytes)
-                .map_err(|_| FileSemanticsError::TempFileCreateFailed(random_failure()))?;
-            let path = directory.join(temp_file_name(&name_bytes));
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            match options.open(&path) {
-                Ok(file) => {
-                    return Ok(Self {
-                        file,
-                        written: 0,
-                        hasher: Sha256::new(),
-                        guard: TempFileGuard { path },
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(map_temp_create_error(error)),
-            }
-        }
-        Err(FileSemanticsError::TempFileCreateFailed(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "temporary file name collisions exceeded the retry limit",
-        )))
+    /// else is [`FileSemanticsError::TempFileCreateFailed`].
+    pub fn create(directory: &Path) -> Result<Self, FileSemanticsError> {
+        let file = NamedTempFile::new_in(directory).map_err(map_temp_create_error)?;
+        Ok(Self {
+            file,
+            written: 0,
+            hasher: Sha256::new(),
+        })
     }
 
     /// The temporary file's path. It must never be logged.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.guard.path
+        self.file.path()
     }
 
     /// The number of bytes written so far.
@@ -581,7 +536,10 @@ impl PrivateTempFile {
     /// Streams one block into the temporary file, updating the running byte
     /// count and SHA-256. Blocks are typically at most [`CHUNK_SIZE`] bytes.
     pub fn write_block(&mut self, bytes: &[u8]) -> Result<(), FileSemanticsError> {
-        self.file.write_all(bytes).map_err(map_write_error)?;
+        self.file
+            .as_file_mut()
+            .write_all(bytes)
+            .map_err(map_write_error)?;
         self.written += bytes.len() as u64;
         self.hasher.update(bytes);
         Ok(())
@@ -594,14 +552,13 @@ impl PrivateTempFile {
     /// The returned [`SealedTempFile`] owns the flushed handle together with
     /// the final byte count and digest.
     pub fn finish(mut self) -> Result<SealedTempFile, FileSemanticsError> {
-        self.file.flush().map_err(map_write_error)?;
-        self.file.sync_all().map_err(map_write_error)?;
+        self.file.as_file_mut().flush().map_err(map_write_error)?;
+        self.file.as_file().sync_all().map_err(map_write_error)?;
         let digest = Sha256Digest::new(self.hasher.finalize().into());
         Ok(SealedTempFile {
             file: self.file,
             written: self.written,
             digest,
-            guard: self.guard,
         })
     }
 }
@@ -612,10 +569,9 @@ impl PrivateTempFile {
 /// impossible to write after the digest was sealed. The temporary file is
 /// removed on `Drop` if it still exists.
 pub struct SealedTempFile {
-    file: fs::File,
+    file: NamedTempFile,
     written: u64,
     digest: Sha256Digest,
-    guard: TempFileGuard,
 }
 
 impl SealedTempFile {
@@ -634,7 +590,7 @@ impl SealedTempFile {
     /// The temporary file's path. It must never be logged.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.guard.path
+        self.file.path()
     }
 
     /// Verifies the `Finish` payload against the sealed write: the written
@@ -673,22 +629,20 @@ impl SealedTempFile {
     /// no-replace commit (for example one without hard links) fails with
     /// [`FileSemanticsError::CommitFailed`], as the design requires.
     pub fn commit(self, final_path: &Path) -> Result<(), FileSemanticsError> {
-        let temp_path = self.guard.path.clone();
+        let temp_path = self.file.path();
         if temp_path.parent() != final_path.parent() {
             return Err(FileSemanticsError::CommitFailed(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the destination is not in the temporary file's directory",
             )));
         }
-        drop(self.file);
-        if let Err(error) = fs::hard_link(&temp_path, final_path) {
-            return Err(match error.kind() {
+        if let Err(error) = self.file.persist_noclobber(final_path) {
+            return Err(match error.error.kind() {
                 io::ErrorKind::AlreadyExists => FileSemanticsError::DestinationExists,
                 io::ErrorKind::InvalidFilename => FileSemanticsError::InvalidFileName,
-                _ => FileSemanticsError::CommitFailed(error),
+                _ => FileSemanticsError::CommitFailed(error.error),
             });
         }
-        fs::remove_file(&temp_path).map_err(FileSemanticsError::TemporaryCleanupFailed)?;
         Ok(())
     }
 }
@@ -702,28 +656,7 @@ impl std::fmt::Debug for SealedTempFile {
     }
 }
 
-/// Best-effort removal of the temporary file when the owning value is
-/// dropped, regardless of how the transfer ended (design section 13).
-struct TempFileGuard {
-    path: PathBuf,
-}
-
-impl std::fmt::Debug for TempFileGuard {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("TempFileGuard([REDACTED])")
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        // The path may already be committed and removed; a NotFound here is
-        // the success case, and any other error is deliberately ignored on
-        // the drop path (best effort only).
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// The fixed 1.0.0 wire error code a transfer failure maps to.
+/// The fixed 2.0.0 wire error code a transfer failure maps to.
 ///
 /// The transfer layer maps the local structured failure to this code before
 /// sending `Error`. `None` means a purely local failure that the peer is
@@ -761,7 +694,7 @@ impl FileSemanticsError {
 
 /// Structured, type-safe failures of the file semantics layer.
 ///
-/// Every variant is an error category aligned with the fixed 1.0.0 error
+/// Every variant is an error category aligned with the fixed 2.0.0 error
 /// code table; the payload is limited to the category, the error code and
 /// sizes. No variant carries a path, a file name or a temporary file name,
 /// and `Debug` output never reveals them, so ordinary logs and error
@@ -894,7 +827,7 @@ fn validate_protocol_path_string(path: &str) -> Result<(), FileSemanticsError> {
 
 /// Validates a peer-provided base file name with the receiving platform's
 /// rules (design 8.4): the frozen wire validator plus the platform rule that
-/// the name must resolve to exactly one ordinary name component — no drive
+/// the name must resolve to exactly one ordinary name component: no drive
 /// prefixes, no roots, no separators. On Windows, reserved device names,
 /// trailing dots or spaces and colons are rejected as well.
 fn validate_default_file_name_on_receiving_platform(name: &str) -> Result<(), FileSemanticsError> {
@@ -916,21 +849,6 @@ fn validate_default_file_name_on_receiving_platform(name: &str) -> Result<(), Fi
         }
     }
     Ok(())
-}
-
-fn temp_file_name(bytes: &[u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::with_capacity(TEMP_FILE_PREFIX.len() + 2 * bytes.len());
-    name.push_str(TEMP_FILE_PREFIX);
-    for byte in bytes {
-        name.push(HEX[(byte >> 4) as usize] as char);
-        name.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    name
-}
-
-fn random_failure() -> io::Error {
-    io::Error::other("the operating system secure random source failed")
 }
 
 fn map_temp_create_error(error: io::Error) -> FileSemanticsError {
@@ -1068,7 +986,6 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
-    use yonder_core::{OsSecureRandom, RandomError};
 
     // ------------------------------------------------------------------
     // Deterministic pattern helpers (bounded memory by construction).
@@ -1133,44 +1050,6 @@ mod tests {
             offset += n as u64;
         }
         Ok(())
-    }
-
-    // ------------------------------------------------------------------
-    // Deterministic random sources for the tests.
-    // ------------------------------------------------------------------
-
-    /// Fills with a byte from a sequence; the last value repeats forever.
-    #[derive(Clone)]
-    struct FixedRandom(Vec<u8>);
-
-    impl FixedRandom {
-        fn new(values: &[u8]) -> Self {
-            Self(values.to_vec())
-        }
-
-        fn repeat(value: u8) -> Self {
-            Self(vec![value])
-        }
-    }
-
-    impl SecureRandom for FixedRandom {
-        fn try_fill(&mut self, destination: &mut [u8]) -> Result<(), RandomError> {
-            let value = if self.0.len() > 1 {
-                self.0.remove(0)
-            } else {
-                self.0[0]
-            };
-            destination.fill(value);
-            Ok(())
-        }
-    }
-
-    struct FailingRandom;
-
-    impl SecureRandom for FailingRandom {
-        fn try_fill(&mut self, _destination: &mut [u8]) -> Result<(), RandomError> {
-            Err(RandomError)
-        }
     }
 
     // ------------------------------------------------------------------
@@ -1303,9 +1182,7 @@ mod tests {
             assert_eq!(source.read_chunked(&mut buffer).unwrap(), 0);
             assert_eq!(source.bytes_read(), size);
             source.recheck().unwrap();
-
-            let mut random = OsSecureRandom;
-            let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+            let mut temp = PrivateTempFile::create(directory.path()).unwrap();
             assert_eq!(temp.path().parent(), Some(directory.path()));
             write_blocks_to_temp(&mut temp, &mut buffer, size).unwrap();
             assert_eq!(temp.written(), size);
@@ -2036,69 +1913,32 @@ mod tests {
     #[test]
     fn temporary_files_are_exclusive_and_unpredictable() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let first = PrivateTempFile::create(directory.path(), &mut random).unwrap();
-        let second = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let first = PrivateTempFile::create(directory.path()).unwrap();
+        let second = PrivateTempFile::create(directory.path()).unwrap();
         assert_ne!(first.path(), second.path());
         for temp in [&first, &second] {
             assert!(temp.path().parent() == Some(directory.path()));
             assert!(fs::symlink_metadata(temp.path()).is_ok());
-            let name = temp.path().file_name().unwrap().to_str().unwrap();
-            assert!(name.starts_with(TEMP_FILE_PREFIX));
-            assert!(name.len() == TEMP_FILE_PREFIX.len() + 32);
-            assert!(
-                name[TEMP_FILE_PREFIX.len()..]
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit())
-            );
+            assert!(!temp.path().file_name().unwrap().is_empty());
         }
     }
 
     #[test]
     fn temporary_file_creation_fails_cleanly() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
         // Missing directory: the destination parent is gone.
         assert!(matches!(
-            PrivateTempFile::create(&directory.path().join("missing"), &mut random),
+            PrivateTempFile::create(&directory.path().join("missing")),
             Err(FileSemanticsError::DestinationParentNotFound)
         ));
-        // Failing random source: no weak fallback, structured failure.
-        assert!(matches!(
-            PrivateTempFile::create(directory.path(), &mut FailingRandom),
-            Err(FileSemanticsError::TempFileCreateFailed(_))
-        ));
-    }
-
-    #[test]
-    fn temporary_file_creation_retries_on_name_collisions() {
-        let directory = tempdir().unwrap();
-        // The first two fills produce the same name (collision on the
-        // second creation), the third one a fresh name.
-        let mut random = FixedRandom::new(&[0, 0, 1]);
-        let first = PrivateTempFile::create(directory.path(), &mut random).unwrap();
-        let second = PrivateTempFile::create(directory.path(), &mut random).unwrap();
-        assert_ne!(first.path(), second.path());
-    }
-
-    #[test]
-    fn temporary_file_creation_gives_up_after_persistent_collisions() {
-        let directory = tempdir().unwrap();
-        let mut random = FixedRandom::repeat(7);
-        let first = PrivateTempFile::create(directory.path(), &mut random).unwrap();
-        assert!(matches!(
-            PrivateTempFile::create(directory.path(), &mut random),
-            Err(FileSemanticsError::TempFileCreateFailed(_))
-        ));
-        // The first file is untouched.
-        assert!(fs::symlink_metadata(first.path()).is_ok());
+        // Tempfile owns secure name generation and exclusive creation.
+        assert!(PrivateTempFile::create(directory.path()).is_ok());
     }
 
     #[test]
     fn write_finish_verify_and_commit() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 300_000).unwrap();
@@ -2146,8 +1986,7 @@ mod tests {
     #[test]
     fn commit_never_overwrites_a_concurrently_created_target() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 4096).unwrap();
@@ -2173,8 +2012,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let other = directory.path().join("other");
         fs::create_dir(&other).unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
@@ -2193,8 +2031,7 @@ mod tests {
     #[test]
     fn the_sealed_temp_file_keeps_the_private_temp_file_path() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 4096).unwrap();
@@ -2213,8 +2050,7 @@ mod tests {
     #[test]
     fn commit_rejects_final_names_the_platform_cannot_create() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
@@ -2245,8 +2081,7 @@ mod tests {
     #[test]
     fn commit_fails_when_the_directory_denies_new_file_creation() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
@@ -2259,8 +2094,8 @@ mod tests {
         // rather than failing the release gate: privileged CI agents
         // (for example with SeRestorePrivilege enabled) bypass directory
         // ACL denials entirely, and Windows CreateHardLinkW checks only
-        // the target file's FILE_ADD_LINK right — not the directory's
-        // add-file ACL — so the deny may not block the link at all.
+        // the target file's FILE_ADD_LINK right, not the directory's
+        // add-file ACL, so the deny may not block the link at all.
         if fs::File::create(directory.path().join("probe.bin")).is_ok()
             || fs::hard_link(&temp_path, directory.path().join("probe-link.bin")).is_ok()
         {
@@ -2284,8 +2119,7 @@ mod tests {
     #[test]
     fn dropping_the_temporary_file_removes_it() {
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         drop(temp);
         assert!(matches!(
@@ -2298,8 +2132,7 @@ mod tests {
     fn large_receive_streams_with_bounded_memory_and_commits_verified_content() {
         const SIZE: u64 = 16 * 1024 * 1024 + 1234;
         let directory = tempdir().unwrap();
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, SIZE).unwrap();
@@ -2329,8 +2162,7 @@ mod tests {
         let blocked = directory.path().join("blocked");
         fs::create_dir(&blocked).unwrap();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).unwrap();
-        let mut random = OsSecureRandom;
-        let result = PrivateTempFile::create(&blocked, &mut random);
+        let result = PrivateTempFile::create(&blocked);
         if let Err(error) = result {
             assert!(
                 matches!(error, FileSemanticsError::PermissionDenied),
@@ -2397,9 +2229,8 @@ mod tests {
         if fs::File::create(blocked.join("probe.bin")).is_ok() {
             return;
         }
-        let mut random = OsSecureRandom;
         assert!(matches!(
-            PrivateTempFile::create(&blocked, &mut random),
+            PrivateTempFile::create(&blocked),
             Err(FileSemanticsError::PermissionDenied)
         ));
         // Destination resolution requires the parent to exist and be a
@@ -2412,16 +2243,14 @@ mod tests {
             "{plan:?}"
         );
         if let Ok(plan) = plan {
-            let mut random = OsSecureRandom;
             assert!(matches!(
-                PrivateTempFile::create(plan.temp_dir(), &mut random),
+                PrivateTempFile::create(plan.temp_dir()),
                 Err(FileSemanticsError::PermissionDenied)
             ));
         }
         drop(guard);
         // After the ACL is removed the directory works again.
-        let mut random = OsSecureRandom;
-        assert!(PrivateTempFile::create(&blocked, &mut random).is_ok());
+        assert!(PrivateTempFile::create(&blocked).is_ok());
     }
 
     // ------------------------------------------------------------------
@@ -2578,15 +2407,14 @@ mod tests {
         let parent_missing =
             resolve_destination(&test_base(&directory), Some("no-dir/child.bin"), None)
                 .unwrap_err();
-        let mut random = OsSecureRandom;
-        let temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let temp = PrivateTempFile::create(directory.path()).unwrap();
         let temp_path = temp.path().to_path_buf();
         let sub = directory.path().join("sub");
         fs::create_dir(&sub).unwrap();
         let foreign =
             resolve_destination(&test_base(&directory), Some("sub/foreign.bin"), None).unwrap();
         assert_eq!(foreign.temp_dir(), sub);
-        let mut temp2 = PrivateTempFile::create(foreign.temp_dir(), &mut random).unwrap();
+        let mut temp2 = PrivateTempFile::create(foreign.temp_dir()).unwrap();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp2, &mut buffer, 8).unwrap();
         let sealed = temp2.finish().unwrap();
@@ -2644,19 +2472,12 @@ mod tests {
         let directory = tempdir().unwrap();
         let plan = resolve_destination(&test_base(&directory), None, Some("x.bin")).unwrap();
         assert_eq!(format!("{plan:?}"), "DestinationPlan { .. }");
-        let mut random = OsSecureRandom;
-        let mut temp = PrivateTempFile::create(directory.path(), &mut random).unwrap();
+        let mut temp = PrivateTempFile::create(directory.path()).unwrap();
         let mut buffer = [0_u8; CHUNK_SIZE];
         write_blocks_to_temp(&mut temp, &mut buffer, 16).unwrap();
         assert_eq!(format!("{temp:?}"), "PrivateTempFile { written: 16, .. }");
         let sealed = temp.finish().unwrap();
         assert_eq!(format!("{sealed:?}"), "SealedTempFile { written: 16, .. }");
-        // The guard is private and never appears in derived output; its
-        // Debug implementation is fixed to the redacted marker.
-        let guard = TempFileGuard {
-            path: PathBuf::from("secret-placeholder"),
-        };
-        assert_eq!(format!("{guard:?}"), "TempFileGuard([REDACTED])");
         drop(sealed);
     }
 

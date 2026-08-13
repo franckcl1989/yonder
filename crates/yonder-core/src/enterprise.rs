@@ -1,6 +1,6 @@
 use crate::error::DomainError;
 
-/// One enterprise authentication platform supported by Yonder 0.1.2.
+/// One enterprise authentication platform supported by Yonder 0.2.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EnterpriseProvider {
     WeCom,

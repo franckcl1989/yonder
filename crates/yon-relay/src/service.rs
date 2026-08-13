@@ -223,6 +223,8 @@ pub enum RelayServiceError {
     Registry(#[from] RegistryError),
     #[error("enterprise mode failed to start or serve the callback server: {0}")]
     EnterpriseCallback(#[from] CallbackServerError),
+    #[error("enterprise mode failed to construct the provider HTTP client: {0}")]
+    EnterpriseExchange(#[source] std::io::Error),
     #[error("failed to install the process signal handler")]
     Signal(#[source] std::io::Error),
     #[error("required relay listener {listener_id:?} reported an error")]
@@ -579,8 +581,7 @@ pub async fn run_relay_until(
     let enterprise_runtime = match enterprise {
         Some(context) => {
             let (config, credentials) = context.into_parts();
-            let callback_server = CallbackServer::from_config(&config)
-                .map_err(RelayServiceError::EnterpriseCallback)?;
+            let callback_server = CallbackServer::from_config(&config).await?;
             Some(EnterpriseRuntime {
                 callback_server,
                 registry: Arc::new(CallbackRegistry::new()),
@@ -628,10 +629,11 @@ pub async fn run_relay_until(
     if let Some(runtime) = &enterprise_runtime {
         let (listener, _bound) = runtime.callback_server.bind().await?;
         let server = runtime.callback_server.clone();
+        let exchange = ExchangeClient::new().map_err(RelayServiceError::EnterpriseExchange)?;
         let handler: Arc<dyn CallbackHandler> = Arc::new(CallbackSessionHandler::new(
             Arc::clone(&runtime.registry),
             Arc::clone(&runtime.credentials),
-            ExchangeClient::new(),
+            exchange,
             clock.clone(),
         ));
         let cancellation = tasks.cancellation();
@@ -1509,7 +1511,7 @@ mod tests {
         wire::registry::{RegistryRequest, RegistryResponse},
         wire::resolve::{ResolveRequest, ResolveResponse},
     };
-    use yonder_net::behaviour::RelayBehaviourEvent;
+    use yonder_net::behaviour::{EndpointBehaviourEvent, RelayBehaviourEvent};
     use yonder_net::swarm::SwarmEvent;
     use yonder_net::{
         ApplicationStream, ApplicationStreams, ConnectedPoint, ConnectionBook, ConnectionId,
@@ -1925,6 +1927,13 @@ mod tests {
                 .unwrap();
             endpoint.dial(relay_address).unwrap();
             wait_for_connection(&mut endpoint, relay_peer).await;
+            let (standard, enterprise) =
+                wait_for_resolve_protocols(&mut endpoint, relay_peer).await;
+            assert!(standard, "normal relay must advertise standard resolve");
+            assert!(
+                !enterprise,
+                "normal relay must not advertise enterprise resolve"
+            );
             let mut streams = endpoint.streams().clone();
 
             let registry = open_stream(
@@ -2070,6 +2079,16 @@ mod tests {
                 .unwrap();
             endpoint.dial(relay_address).unwrap();
             wait_for_connection(&mut endpoint, relay_peer).await;
+            let (standard, enterprise) =
+                wait_for_resolve_protocols(&mut endpoint, relay_peer).await;
+            assert!(
+                !standard,
+                "enterprise relay must not advertise standard resolve"
+            );
+            assert!(
+                enterprise,
+                "enterprise relay must advertise enterprise resolve"
+            );
             let mut streams = endpoint.streams().clone();
 
             // A start message with an unknown tag is rejected before any
@@ -2357,6 +2376,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn enterprise_callback_bind_failure_stops_the_relay() {
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         // Regression test for the callback listener failure escalation:
         // the callback listener is occupied, so the startup bind fails and
         // run_relay_until stops with the EnterpriseCallback error instead
@@ -2385,6 +2406,16 @@ mod tests {
             error,
             RelayServiceError::EnterpriseCallback(CallbackServerError::Bind { .. })
         ));
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_enterprise_mode\""));
+        assert!(text.contains("providers=1"));
+        assert!(text.contains("event=\"relay_starting\""));
+        assert!(text.contains("relay_mode=\"enterprise\""));
+        assert!(text.contains("listen_count=1"));
+        assert!(text.contains("external_count=1"));
+        assert!(text.contains("registration_capacity="));
+        assert!(text.contains("resolve_concurrency="));
+        assert!(text.contains("circuit_capacity="));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3987,6 +4018,32 @@ mod tests {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == relay => return,
                 SwarmEvent::OutgoingConnectionError { error, .. } => {
                     panic!("relay connection failed: {error}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn wait_for_resolve_protocols(
+        endpoint: &mut EndpointNode,
+        relay: PeerId,
+    ) -> (bool, bool) {
+        loop {
+            match endpoint.next_event().await {
+                SwarmEvent::Behaviour(EndpointBehaviourEvent::Identify(
+                    yonder_net::identify::Event::Received { peer_id, info, .. },
+                )) if peer_id == relay => {
+                    let standard = info
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.as_ref() == yonder_core::wire::RESOLVE_PROTOCOL);
+                    let enterprise = info.protocols.iter().any(|protocol| {
+                        protocol.as_ref() == yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL
+                    });
+                    return (standard, enterprise);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } if peer_id == relay => {
+                    panic!("relay connection closed before Identify completed")
                 }
                 _ => {}
             }

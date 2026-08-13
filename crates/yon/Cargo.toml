@@ -12,6 +12,10 @@ publish.workspace = true
 backon.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+ed25519-dalek.workspace = true
+fs4.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
 opaque-ke.workspace = true
 open.workspace = true
 portable-pty.workspace = true
@@ -19,14 +23,17 @@ rand.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 sha2.workspace = true
+sha2-legacy.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-yonder-config = { version = "=0.1.3", path = "../yonder-config", default-features = false }
-yonder-core = { version = "=0.1.3", path = "../yonder-core", default-features = false }
-yonder-net = { version = "=0.1.3", path = "../yonder-net", default-features = false }
+vt100.workspace = true
+yonder-config = { version = "=0.2.0", path = "../yonder-config", default-features = false }
+yonder-core = { version = "=0.2.0", path = "../yonder-core", default-features = false }
+yonder-net = { version = "=0.2.0", path = "../yonder-net", default-features = false }
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -35,10 +42,7 @@ crossterm_winapi.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
-tempfile.workspace = true
-tokio-rustls.workspace = true
-url.workspace = true
-yon-relay = { version = "=0.1.3", path = "../yon-relay", default-features = false }
+yon-relay = { version = "=0.2.0", path = "../yon-relay", default-features = false }
 
 [[bench]]
 name = "opaque"

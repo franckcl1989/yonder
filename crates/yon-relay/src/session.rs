@@ -1,6 +1,6 @@
 //! Single-owner enterprise authentication session state machine.
 //!
-//! Mirrors the EnterpriseResolveSession model of the 0.1.2 design: the
+//! Models the 0.2.0 Enterprise Resolve transaction: the
 //! session is held in memory only, never persisted, single use, and bound
 //! to one connect substream. Its lifetime is bounded, it dies on
 //! disconnect, timeout or relay restart, and it cannot be resumed,

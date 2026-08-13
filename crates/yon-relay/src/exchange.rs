@@ -1,72 +1,70 @@
-//! The production hyper transport for enterprise member verification.
-//!
-//! Implements `ExchangeTransport` with the committed single HTTP stack:
-//! hyper 1.x client over rustls (webpki roots) for the WeCom and Feishu
-//! OAuth exchanges. Every exchange request is bounded in time and the
-//! response body is capped at `MAX_EXCHANGE_RESPONSE_BYTES`; oversized
-//! bodies, non-success statuses and timeouts all fail the exchange.
+//! Bounded Reqwest transport for enterprise provider exchanges.
 
 use crate::verifier::{ExchangeTransport, MAX_EXCHANGE_RESPONSE_BYTES};
-use http_body_util::BodyExt as _;
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use reqwest::header::CONTENT_TYPE;
 use std::future::Future;
 use std::io;
 use std::time::Duration;
 use url::Url;
 
-/// Bound on one provider exchange request.
+/// Absolute deadline for one provider request, including its response body.
 pub const EXCHANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A bounded hyper exchange client, safe to share across sessions.
+/// Shared high-level HTTP client for WeCom and Feishu exchanges.
 #[derive(Debug, Clone)]
 pub struct ExchangeClient {
-    client: Client<HttpsConnector<HttpConnector>, String>,
+    client: reqwest::Client,
 }
 
 impl ExchangeClient {
-    /// Builds the production client over the webpki root store, HTTPS
-    /// only: exchange secrets are never sent over cleartext. Construction
-    /// cannot fail: the webpki root bundle is static and always
-    /// installable.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::build(true)
+    /// Builds the production HTTPS-only client.
+    pub fn new() -> Result<Self, io::Error> {
+        Self::build(true, EXCHANGE_REQUEST_TIMEOUT)
     }
 
-    /// Builds a client that also accepts plaintext HTTP, reserved for the
-    /// loopback transport tests. Never used in production.
     #[cfg(test)]
-    #[must_use]
-    pub(crate) fn for_tests() -> Self {
-        Self::build(false)
+    fn for_tests(timeout: Duration) -> Result<Self, io::Error> {
+        Self::build(false, timeout)
     }
 
-    fn build(https_only: bool) -> Self {
-        let connector = if https_only {
-            HttpsConnectorBuilder::new()
-                .with_webpki_roots()
-                .https_only()
-                .enable_http1()
-                .build()
-        } else {
-            HttpsConnectorBuilder::new()
-                .with_webpki_roots()
-                .https_or_http()
-                .enable_http1()
-                .build()
-        };
-        Self {
-            client: Client::builder(TokioExecutor::new()).build(connector),
+    fn build(https_only: bool, timeout: Duration) -> Result<Self, io::Error> {
+        reqwest::Client::builder()
+            .https_only(https_only)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .build()
+            .map(|client| Self { client })
+            .map_err(map_reqwest_error)
+    }
+
+    async fn execute(&self, request: reqwest::RequestBuilder) -> Result<Vec<u8>, io::Error> {
+        let mut response = request.send().await.map_err(map_reqwest_error)?;
+        if !response.status().is_success() {
+            return Err(io::Error::other(format!(
+                "provider returned HTTP {}",
+                response.status()
+            )));
         }
-    }
-}
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_EXCHANGE_RESPONSE_BYTES)
+        {
+            return Err(response_too_large());
+        }
 
-impl Default for ExchangeClient {
-    fn default() -> Self {
-        Self::new()
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(MAX_EXCHANGE_RESPONSE_BYTES) as usize,
+        );
+        while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+            if chunk.len() > MAX_EXCHANGE_RESPONSE_BYTES as usize - body.len() {
+                return Err(response_too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
@@ -76,13 +74,11 @@ impl ExchangeTransport for ExchangeClient {
         url: &Url,
         bearer: Option<&str>,
     ) -> impl Future<Output = Result<Vec<u8>, io::Error>> + Send {
-        let client = self.client.clone();
-        let uri = url.to_string();
-        let authorization = bearer.map(str::to_owned);
-        async move {
-            let request = build_get_request(uri, authorization.as_deref())?;
-            exchange(&client, request).await
+        let mut request = self.client.get(url.clone());
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
         }
+        async move { self.execute(request).await }
     }
 
     fn post_json(
@@ -90,299 +86,143 @@ impl ExchangeTransport for ExchangeClient {
         url: &Url,
         body: &str,
     ) -> impl Future<Output = Result<Vec<u8>, io::Error>> + Send {
-        let client = self.client.clone();
-        let uri = url.to_string();
-        let body = body.to_owned();
-        async move {
-            let request = build_post_request(uri, body)?;
-            exchange(&client, request).await
-        }
+        let request = self
+            .client
+            .post(url.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_owned());
+        async move { self.execute(request).await }
     }
 }
 
-fn build_get_request(
-    uri: String,
-    authorization: Option<&str>,
-) -> Result<hyper::Request<String>, io::Error> {
-    let mut builder = hyper::Request::builder()
-        .method(hyper::Method::GET)
-        .uri(uri);
-    if let Some(token) = authorization {
-        builder = builder.header(hyper::header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-    builder
-        .body(String::new())
-        .map_err(|error| io::Error::other(format!("invalid exchange request: {error}")))
+fn response_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "provider response exceeded the configured bound",
+    )
 }
 
-fn build_post_request(uri: String, body: String) -> Result<hyper::Request<String>, io::Error> {
-    hyper::Request::builder()
-        .method(hyper::Method::POST)
-        .uri(uri)
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .map_err(|error| io::Error::other(format!("invalid exchange request: {error}")))
-}
-
-async fn exchange(
-    client: &Client<HttpsConnector<HttpConnector>, String>,
-    request: hyper::Request<String>,
-) -> Result<Vec<u8>, io::Error> {
-    let response = tokio::time::timeout(EXCHANGE_REQUEST_TIMEOUT, client.request(request))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "exchange request timed out"))?
-        .map_err(|error| io::Error::other(format!("exchange request failed: {error}")))?;
-    if !response.status().is_success() {
-        return Err(io::Error::other(format!(
-            "provider returned HTTP {}",
-            response.status()
-        )));
-    }
-    let body = response.into_body();
-    let bytes = http_body_util::Limited::new(body, MAX_EXCHANGE_RESPONSE_BYTES as usize)
-        .collect()
-        .await
-        .map_err(|error| {
-            let kind = if error
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some()
-            {
-                io::ErrorKind::InvalidData
-            } else {
-                io::ErrorKind::UnexpectedEof
-            };
-            io::Error::new(kind, format!("exchange response read failed: {error}"))
-        })?
-        .to_bytes();
-    Ok(bytes.to_vec())
+fn map_reqwest_error(error: reqwest::Error) -> io::Error {
+    let kind = if error.is_timeout() {
+        io::ErrorKind::TimedOut
+    } else if error.is_decode() || error.is_body() {
+        io::ErrorKind::InvalidData
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, error)
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{ExchangeClient, build_get_request, build_post_request};
-    use crate::verifier::ExchangeTransport as _;
-    use http_body_util::BodyExt as _;
-    use hyper::body::Incoming;
-    use std::convert::Infallible;
+    use super::{EXCHANGE_REQUEST_TIMEOUT, ExchangeClient};
+    use crate::verifier::{ExchangeTransport as _, MAX_EXCHANGE_RESPONSE_BYTES};
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::{Request, State};
+    use axum::http::{HeaderMap, Method, StatusCode, Uri};
+    use axum::response::Response;
+    use axum::routing::any;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use url::Url;
 
-    type Captured = Option<(String, String, String, String)>;
+    type CapturedRequest = (Method, Uri, HeaderMap, Vec<u8>);
 
-    /// Serves one HTTP/1 request on loopback and captures its line.
-    async fn serve_one(response: hyper::Response<String>) -> (String, Arc<Mutex<Captured>>) {
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Option<CapturedRequest>>>);
+
+    async fn capture_request(State(capture): State<Capture>, request: Request) -> Response<Body> {
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, 64 * 1024).await.unwrap().to_vec();
+        *capture.0.lock().unwrap() = Some((parts.method, parts.uri, parts.headers, bytes));
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("provider-response"))
+            .unwrap()
+    }
+
+    async fn server() -> (Url, Capture) {
+        let capture = Capture::default();
+        let app = Router::new()
+            .fallback(any(capture_request))
+            .with_state(capture.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(None));
-        let capture = captured.clone();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = hyper_util::rt::TokioIo::new(stream);
-            let service = hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
-                let capture = capture.clone();
-                let response = response.clone();
-                async move {
-                    let method = request.method().to_string();
-                    let uri = request.uri().to_string();
-                    let authorization = request
-                        .headers()
-                        .get(hyper::header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default()
-                        .to_owned();
-                    let body = request
-                        .into_body()
-                        .collect()
-                        .await
-                        .map(|collected| {
-                            String::from_utf8_lossy(&collected.to_bytes()).into_owned()
-                        })
-                        .unwrap_or_default();
-                    *capture.lock().unwrap() = Some((method, uri, authorization, body));
-                    Ok::<_, Infallible>(response)
-                }
-            });
-            let _ =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, service)
-                    .await;
-        });
-        (address.to_string(), captured)
-    }
-
-    fn client() -> ExchangeClient {
-        ExchangeClient::for_tests()
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn get_with_bearer_round_trips_over_http() {
-        let (address, captured) = serve_one(
-            hyper::Response::builder()
-                .status(200)
-                .body(r#"{"code":0}"#.to_owned())
-                .unwrap(),
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            Url::parse(&format!("http://{address}/exchange?q=1")).unwrap(),
+            capture,
         )
-        .await;
-        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
-        let body = client().get(&url, Some("tok-9")).await.unwrap();
-        assert_eq!(body, br#"{"code":0}"#);
-        let (method, uri, authorization, _) = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(method, "GET");
-        assert_eq!(uri, "/yonder/test");
-        assert_eq!(authorization, "Bearer tok-9");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn post_json_round_trips_over_http() {
-        let (address, captured) = serve_one(
-            hyper::Response::builder()
-                .status(200)
-                .body(r#"{"code":0}"#.to_owned())
-                .unwrap(),
-        )
-        .await;
-        let url = Url::parse(&format!("http://{address}/yonder/oidc")).unwrap();
-        let body = client()
-            .post_json(&url, r#"{"grant_type":"authorization_code"}"#)
-            .await
-            .unwrap();
-        assert_eq!(body, br#"{"code":0}"#);
-        let (method, uri, authorization, body) = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(method, "POST");
-        assert_eq!(uri, "/yonder/oidc");
-        assert!(authorization.is_empty());
-        assert_eq!(body, r#"{"grant_type":"authorization_code"}"#);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn non_success_status_fails_the_exchange() {
-        let (address, _) = serve_one(
-            hyper::Response::builder()
-                .status(500)
-                .body("boom".to_owned())
-                .unwrap(),
-        )
-        .await;
-        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
-        let error = client().get(&url, None).await.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert!(error.to_string().contains("HTTP 500"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn production_client_refuses_plaintext_http() {
-        // A live loopback HTTP server that would answer any cleartext
-        // request; the https-only production client must reject the URL
-        // before ever contacting it.
-        let (address, captured) = serve_one(
-            hyper::Response::builder()
-                .status(200)
-                .body("ok".to_owned())
-                .unwrap(),
-        )
-        .await;
-        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
-        assert!(ExchangeClient::new().get(&url, None).await.is_err());
-        assert!(
-            captured.lock().unwrap().is_none(),
-            "the production client must never send exchange data over cleartext"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn oversized_bodies_fail_the_exchange() {
-        let big = "x".repeat((crate::verifier::MAX_EXCHANGE_RESPONSE_BYTES + 1) as usize);
-        let (address, _) =
-            serve_one(hyper::Response::builder().status(200).body(big).unwrap()).await;
-        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
-        let error = client().get(&url, None).await.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn request_builders_set_method_uri_and_headers() {
-        let get =
-            build_get_request("https://relay.example.test/x".to_owned(), Some("tok-1")).unwrap();
-        assert_eq!(get.method(), hyper::Method::GET);
-        assert_eq!(get.uri(), "https://relay.example.test/x");
+    #[tokio::test]
+    async fn get_and_post_use_reqwest_and_preserve_required_fields() {
+        let client = ExchangeClient::for_tests(EXCHANGE_REQUEST_TIMEOUT).unwrap();
+        let (url, capture) = server().await;
         assert_eq!(
-            get.headers()
-                .get(hyper::header::AUTHORIZATION)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "Bearer tok-1"
+            client.get(&url, Some("secret-token")).await.unwrap(),
+            b"provider-response"
         );
-        let bare = build_get_request("https://relay.example.test/x".to_owned(), None).unwrap();
-        assert!(bare.headers().get(hyper::header::AUTHORIZATION).is_none());
+        let captured = capture.0.lock().unwrap().take().unwrap();
+        assert_eq!(captured.0, Method::GET);
+        assert_eq!(captured.1, "/exchange?q=1");
+        assert_eq!(captured.2["authorization"], "Bearer secret-token");
 
-        let post =
-            build_post_request("https://relay.example.test/y".to_owned(), "{}".to_owned()).unwrap();
-        assert_eq!(post.method(), hyper::Method::POST);
         assert_eq!(
-            post.headers()
-                .get(hyper::header::CONTENT_TYPE)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "application/json"
+            client.post_json(&url, r#"{"value":1}"#).await.unwrap(),
+            b"provider-response"
         );
-        assert_eq!(post.body(), "{}");
-
-        // An unparsable URI fails the request construction fail-closed.
-        let error = build_get_request("not a uri".to_owned(), None).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert!(error.to_string().contains("invalid exchange request"));
-        let error = build_post_request("not a uri".to_owned(), "{}".to_owned()).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert!(error.to_string().contains("invalid exchange request"));
+        let captured = capture.0.lock().unwrap().take().unwrap();
+        assert_eq!(captured.0, Method::POST);
+        assert_eq!(captured.2["content-type"], "application/json");
+        assert_eq!(captured.3, br#"{"value":1}"#);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn default_client_is_the_https_only_production_client() {
-        // The Default impl is the production client: it must refuse
-        // cleartext exchange URLs just like `new`.
-        let (address, captured) = serve_one(
-            hyper::Response::builder()
-                .status(200)
-                .body("ok".to_owned())
-                .unwrap(),
-        )
-        .await;
-        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
-        assert!(ExchangeClient::default().get(&url, None).await.is_err());
-        assert!(
-            captured.lock().unwrap().is_none(),
-            "the default client must never send exchange data over cleartext"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn truncated_response_bodies_fail_the_exchange() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        // A raw HTTP/1.1 server announces a 100-byte body but sends only
-        // five bytes and closes the connection: the exchange fails with an
-        // EOF-style read error, never with InvalidData (the size limit was
-        // not reached).
+    #[tokio::test]
+    async fn non_success_and_oversized_responses_fail_closed() {
+        async fn status() -> (StatusCode, &'static str) {
+            (StatusCode::UNAUTHORIZED, "denied")
+        }
+        async fn oversized() -> Vec<u8> {
+            vec![0_u8; MAX_EXCHANGE_RESPONSE_BYTES as usize + 1]
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).await;
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
-                )
-                .await
-                .unwrap();
-            // Dropping the stream closes the connection mid-body.
-        });
-        let url = Url::parse(&format!("http://{address}/yonder/test")).unwrap();
-        let error = client().get(&url, None).await.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
-        assert!(error.to_string().contains("exchange response read failed"));
+        let app = Router::new()
+            .route("/status", axum::routing::get(status))
+            .route("/large", axum::routing::get(oversized));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ExchangeClient::for_tests(EXCHANGE_REQUEST_TIMEOUT).unwrap();
+        let status = Url::parse(&format!("http://{address}/status")).unwrap();
+        let large = Url::parse(&format!("http://{address}/large")).unwrap();
+        assert!(client.get(&status, None).await.is_err());
+        assert_eq!(
+            client.get(&large, None).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn production_client_rejects_plain_http_and_deadlines_apply() {
+        let production = ExchangeClient::new().unwrap();
+        let url = Url::parse("http://127.0.0.1:1/").unwrap();
+        assert!(production.get(&url, None).await.is_err());
+
+        async fn delayed() -> &'static str {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            "late"
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/", axum::routing::get(delayed));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ExchangeClient::for_tests(Duration::from_millis(20)).unwrap();
+        let url = Url::parse(&format!("http://{address}/")).unwrap();
+        assert_eq!(
+            client.get(&url, None).await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 }

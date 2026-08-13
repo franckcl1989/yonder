@@ -1,4 +1,4 @@
-//! Native file transfer orchestration for the 0.1.3 controller and host
+//! Native file transfer orchestration for the 0.2.0 controller and host
 //! (design sections 10.3, 10.5, 11, 12, 13, 14, 15, 16 and 17).
 //!
 //! This module owns the complete run of one file transfer over an already
@@ -14,15 +14,11 @@
 //!
 //! - [`run_upload`] / [`run_download`]: controller side. `run_upload`
 //!   streams a locally opened [`SourceFile`]; `run_download` receives into a
-//!   locally resolved destination. The `base` argument is unused by
-//!   `run_upload` (the controller resolves nothing locally when uploading);
-//!   the `random` argument is unused by it as well (only receivers create
-//!   temporary files).
+//!   locally resolved destination. `run_upload` resolves nothing locally;
+//!   only receive paths need a session base directory.
 //! - [`handle_upload`] / [`handle_download`]: host side. `handle_upload`
 //!   receives into a destination resolved from the wire; `handle_download`
-//!   resolves and opens the wire-provided source and streams it. The
-//!   `random` argument is unused by `handle_download` (the download sender
-//!   creates no files).
+//!   resolves and opens the wire-provided source and streams it.
 //! - [`handle_upload_from_open`] / [`handle_download_from_open`]: host side,
 //!   entries whose opening frame was already read by the session layer
 //!   during capability probing (design 9.3). They continue from the
@@ -74,7 +70,7 @@
 //! transfer stays interruptible. Control exchanges are bounded by
 //! `config.control_timeout`; the data phase has no total deadline but each
 //! byte of a frame must make progress within `config.data_progress_timeout`.
-//! Logging records only categories, stages, byte counts and durations —
+//! Logging records only categories, stages, byte counts and durations;
 //! never paths, file names, digests or temporary file names (design 18.4).
 
 use std::io;
@@ -83,16 +79,21 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use yonder_core::SecureRandom;
 use yonder_core::wire::file_transfer::{
     FRAME_HEADER_LEN, FileTransferErrorCode, FileTransferMessage, MAX_CONTROL_FRAME_LEN,
     MAX_DATA_LEN, Sha256Digest, TransferDirection, TransferSide, TransferTag, WireSession,
     encode_frame_header, validate_payload_len,
 };
 
+use crate::audit::observer::{AuditObserver, file_transfer_id};
+use crate::audit::session::{
+    AuditError, FILE_DIRECTION_DOWNLOAD, FILE_DIRECTION_UPLOAD, FILE_KIND_CANCELLED,
+    FILE_KIND_FAILED, FILE_KIND_START, FILE_KIND_SUCCESS, FileTransferFacts,
+};
 use crate::file_semantics::{
     BaseDirectory, FileSemanticsError, PrivateTempFile, SourceFile, resolve_destination,
 };
+use yonder_core::wire::audit::Digest32;
 
 /// Timeout configuration of one transfer (design 15.4: the exact durations
 /// are fixed implementation constants, not operator configuration).
@@ -131,6 +132,120 @@ pub enum TransferOutcome {
     /// The transfer failed with a fixed 1.0.0 wire error code; no final
     /// target exists.
     Failed(FileTransferErrorCode),
+}
+
+/// The protocol facts of one transfer that the audit observer records
+/// (design section 18.6), filled progressively by the orchestrators: only
+/// fields both sides verify from the 0.2.0 file protocol enter the shared
+/// record, and the local source/target paths are intentionally absent here
+/// (they are only available to the pump).
+#[derive(Default)]
+struct TransferAuditFacts {
+    /// Whether the shared start event was recorded (the transfer really
+    /// began on the wire); the end event is only recorded for started
+    /// transfers, so a failed open never leaves an unmatched tail.
+    started: bool,
+    /// The remote protocol path.
+    remote_path: Option<String>,
+    /// The protocol base file name.
+    file_name: Option<String>,
+    /// The size announced by the transfer open.
+    declared_size: Option<u64>,
+    /// The SHA-256 of the transferred file, set at the success point.
+    digest: Option<Sha256Digest>,
+}
+
+/// The audit observer and progressively collected wire facts travel as one
+/// responsibility through the transfer implementation.
+struct TransferAuditContext<'a> {
+    observer: Option<&'a AuditObserver>,
+    facts: &'a mut TransferAuditFacts,
+}
+
+/// The three fields carried by `UploadOpen`, kept together after decoding so
+/// send and receive paths cannot accidentally mix metadata from two opens.
+#[derive(Clone, Copy)]
+struct UploadParameters<'a> {
+    destination: &'a str,
+    file_name: &'a str,
+    declared_size: u64,
+}
+
+/// Appends the shared file transfer start event (design section 18.6) and
+/// remembers the protocol facts for the end event. A failed append fails
+/// the session closed inside the observer; the transfer must then abort.
+async fn record_transfer_start(
+    audit: Option<&AuditObserver>,
+    facts: &mut TransferAuditFacts,
+    direction: u8,
+    remote_path: &str,
+    file_name: &str,
+    declared_size: u64,
+) -> Result<(), AuditError> {
+    let Some(audit) = audit else {
+        return Ok(());
+    };
+    let shared = FileTransferFacts {
+        transfer_id: file_transfer_id(direction, remote_path, file_name, declared_size),
+        direction,
+        kind: FILE_KIND_START,
+        declared_size,
+        final_size: 0,
+        digest: Digest32::new([0; 32]),
+        remote_path,
+        file_name,
+        error_code: 0,
+    };
+    audit.record_file_transfer(&shared, None).await?;
+    facts.started = true;
+    facts.remote_path = Some(remote_path.to_owned());
+    facts.file_name = Some(file_name.to_owned());
+    facts.declared_size = Some(declared_size);
+    Ok(())
+}
+
+/// Appends the shared file transfer end event (design section 18.6) from
+/// the recorded facts and the final outcome. Best-effort: the observer
+/// fails the session closed internally on a recording failure, and the
+/// pump notices through [`AuditObserver::has_failed`].
+async fn record_transfer_end(
+    audit: Option<&AuditObserver>,
+    direction: u8,
+    facts: &TransferAuditFacts,
+    outcome: TransferOutcome,
+) {
+    let Some(audit) = audit else {
+        return;
+    };
+    if !facts.started {
+        return;
+    }
+    let (Some(remote_path), Some(file_name), Some(declared_size)) = (
+        facts.remote_path.as_deref(),
+        facts.file_name.as_deref(),
+        facts.declared_size,
+    ) else {
+        return;
+    };
+    let (kind, final_size, error_code) = match outcome {
+        TransferOutcome::Committed { bytes } => (FILE_KIND_SUCCESS, bytes, 0),
+        TransferOutcome::Cancelled => (FILE_KIND_CANCELLED, 0, 0),
+        TransferOutcome::Failed(code) => (FILE_KIND_FAILED, 0, code.code()),
+    };
+    let shared = FileTransferFacts {
+        transfer_id: file_transfer_id(direction, remote_path, file_name, declared_size),
+        direction,
+        kind,
+        declared_size,
+        final_size,
+        digest: facts.digest.map_or(Digest32::new([0; 32]), |digest| {
+            Digest32::new(*digest.as_bytes())
+        }),
+        remote_path,
+        file_name,
+        error_code,
+    };
+    let _ = audit.record_file_transfer(&shared, None).await;
 }
 
 /// The interval at which a blocked control exchange re-checks the cancel
@@ -212,46 +327,71 @@ enum WriteFrameError {
 /// `destination` is the remote destination; an empty string selects the
 /// default remote destination directory, in which case `file_name` names the
 /// file there. `file_name` is the base name announced to the host and may
-/// differ from the local source name. `base` is unused on this path (the
-/// controller resolves nothing locally while uploading) and `random` is
-/// unused (only receivers create temporary files); both stay in the
-/// signature for symmetry with the other orchestrators.
+/// differ from the local source name. The controller resolves nothing
+/// locally on this path.
 ///
 /// The local cancel flag is checked before the transfer, after every data
 /// block and while any control exchange is pending; a cancel sends `Cancel`
 /// whenever the direction table allows it (every stage except after
 /// `Finish`, where the controller abandons the wait locally).
-/// The upload signature is frozen (design 11.1); all eight parameters carry
-/// distinct information for one upload run.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_upload(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
-    base: &BaseDirectory,
     source: &mut SourceFile,
     destination: &str,
     file_name: &str,
     cancel: &AtomicBool,
 ) -> TransferOutcome {
-    let started = Instant::now();
-    tracing::debug!(
-        direction = ?TransferDirection::Upload,
-        side = ?TransferSide::Controller,
-        "file transfer started"
-    );
+    let mut facts = TransferAuditFacts::default();
+    let parameters = UploadParameters {
+        destination,
+        file_name,
+        declared_size: source.size(),
+    };
+    run_upload_impl(
+        stream,
+        config,
+        source,
+        parameters,
+        cancel,
+        TransferAuditContext {
+            observer: None,
+            facts: &mut facts,
+        },
+    )
+    .await
+}
+
+/// The audited controller upload path (design section 18.6): the shared
+/// start and end events are appended around the wire transfer.
+pub async fn run_upload_audited(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    source: &mut SourceFile,
+    destination: &str,
+    file_name: &str,
+    cancel: &AtomicBool,
+    audit: Option<&AuditObserver>,
+) -> TransferOutcome {
+    let mut facts = TransferAuditFacts::default();
+    let parameters = UploadParameters {
+        destination,
+        file_name,
+        declared_size: source.size(),
+    };
     let outcome = run_upload_impl(
         stream,
         config,
-        random,
-        base,
         source,
-        destination,
-        file_name,
+        parameters,
         cancel,
+        TransferAuditContext {
+            observer: audit,
+            facts: &mut facts,
+        },
     )
     .await;
-    tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
+    record_transfer_end(audit, FILE_DIRECTION_UPLOAD, &facts, outcome).await;
     outcome
 }
 
@@ -266,29 +406,53 @@ pub async fn run_upload(
 pub async fn run_download(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     remote_source: &str,
     local_target: Option<&str>,
     cancel: &AtomicBool,
 ) -> TransferOutcome {
-    let started = Instant::now();
-    tracing::debug!(
-        direction = ?TransferDirection::Download,
-        side = ?TransferSide::Controller,
-        "file transfer started"
-    );
-    let outcome = run_download_impl(
+    let mut facts = TransferAuditFacts::default();
+    run_download_impl(
         stream,
         config,
-        random,
         base,
         remote_source,
         local_target,
         cancel,
+        TransferAuditContext {
+            observer: None,
+            facts: &mut facts,
+        },
+    )
+    .await
+}
+
+/// The audited controller download path (design section 18.6): the shared
+/// start and end events are appended around the wire transfer.
+pub async fn run_download_audited(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    base: &BaseDirectory,
+    remote_source: &str,
+    local_target: Option<&str>,
+    cancel: &AtomicBool,
+    audit: Option<&AuditObserver>,
+) -> TransferOutcome {
+    let mut facts = TransferAuditFacts::default();
+    let outcome = run_download_impl(
+        stream,
+        config,
+        base,
+        remote_source,
+        local_target,
+        cancel,
+        TransferAuditContext {
+            observer: audit,
+            facts: &mut facts,
+        },
     )
     .await;
-    tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
+    record_transfer_end(audit, FILE_DIRECTION_DOWNLOAD, &facts, outcome).await;
     outcome
 }
 
@@ -303,7 +467,6 @@ pub async fn run_download(
 pub async fn handle_upload(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     cancel: &AtomicBool,
 ) -> TransferOutcome {
@@ -313,7 +476,7 @@ pub async fn handle_upload(
         side = ?TransferSide::Host,
         "file transfer started"
     );
-    let outcome = handle_upload_impl(stream, config, random, base, cancel).await;
+    let outcome = handle_upload_impl(stream, config, base, cancel).await;
     tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
     outcome
 }
@@ -327,7 +490,6 @@ pub async fn handle_upload(
 pub async fn handle_download(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     cancel: &AtomicBool,
 ) -> TransferOutcome {
@@ -337,7 +499,7 @@ pub async fn handle_download(
         side = ?TransferSide::Host,
         "file transfer started"
     );
-    let outcome = handle_download_impl(stream, config, random, base, cancel).await;
+    let outcome = handle_download_impl(stream, config, base, cancel).await;
     tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
     outcome
 }
@@ -356,10 +518,27 @@ pub async fn handle_download(
 pub async fn handle_upload_from_open(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     cancel: &AtomicBool,
     open: &FileTransferMessage<'_>,
+    audit: Option<&AuditObserver>,
+) -> TransferOutcome {
+    handle_upload_from_open_with_settlement(stream, config, base, cancel, open, audit, None).await
+}
+
+/// The session-coordinator variant of [`handle_upload_from_open`]. Once the
+/// upload leaves its wire state machine, `wire_settled` is published before
+/// the local audit end record is appended. This lets the bounded coordinator
+/// distinguish a truly concurrent substream from the next sequential
+/// transfer without weakening audit ordering or adding a protocol frame.
+pub(crate) async fn handle_upload_from_open_with_settlement(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    open: &FileTransferMessage<'_>,
+    audit: Option<&AuditObserver>,
+    wire_settled: Option<&AtomicBool>,
 ) -> TransferOutcome {
     let started = Instant::now();
     tracing::debug!(
@@ -390,18 +569,42 @@ pub async fn handle_upload_from_open(
         }
         _ => return protocol_violation(&mut session),
     };
-    let outcome = upload_receive_tail(
-        stream,
-        config,
-        random,
-        base,
-        cancel,
-        &mut session,
+    // Design section 18.6: the shared start event once the opening frame
+    // announced the protocol facts; a failed append aborts the transfer.
+    let mut facts = TransferAuditFacts::default();
+    if record_transfer_start(
+        audit,
+        &mut facts,
+        FILE_DIRECTION_UPLOAD,
         destination,
         file_name,
         declared_size,
     )
+    .await
+    .is_err()
+    {
+        session.close();
+        return TransferOutcome::Cancelled;
+    }
+    let parameters = UploadParameters {
+        destination,
+        file_name,
+        declared_size,
+    };
+    let outcome = upload_receive_tail(
+        stream,
+        config,
+        base,
+        cancel,
+        &mut session,
+        parameters,
+        &mut facts,
+    )
     .await;
+    if let Some(wire_settled) = wire_settled {
+        wire_settled.store(true, Ordering::Release);
+    }
+    record_transfer_end(audit, FILE_DIRECTION_UPLOAD, &facts, outcome).await;
     tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
     outcome
 }
@@ -419,10 +622,25 @@ pub async fn handle_upload_from_open(
 pub async fn handle_download_from_open(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     cancel: &AtomicBool,
     open: &FileTransferMessage<'_>,
+    audit: Option<&AuditObserver>,
+) -> TransferOutcome {
+    handle_download_from_open_with_settlement(stream, config, base, cancel, open, audit, None).await
+}
+
+/// The session-coordinator variant of [`handle_download_from_open`]. See
+/// [`handle_upload_from_open_with_settlement`] for the bounded sequential
+/// hand-off invariant.
+pub(crate) async fn handle_download_from_open_with_settlement(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    config: &TransferConfig,
+    base: &BaseDirectory,
+    cancel: &AtomicBool,
+    open: &FileTransferMessage<'_>,
+    audit: Option<&AuditObserver>,
+    wire_settled: Option<&AtomicBool>,
 ) -> TransferOutcome {
     let started = Instant::now();
     tracing::debug!(
@@ -430,7 +648,6 @@ pub async fn handle_download_from_open(
         side = ?TransferSide::Host,
         "file transfer started"
     );
-    let _ = random; // The download sender creates no files.
     let mut session = WireSession::new(TransferDirection::Download, TransferSide::Host);
     if cancel.load(Ordering::Relaxed) {
         session.close();
@@ -448,23 +665,34 @@ pub async fn handle_download_from_open(
         }
         _ => return protocol_violation(&mut session),
     };
-    let outcome = download_send_tail(stream, config, base, cancel, &mut session, source).await;
+    let mut facts = TransferAuditFacts::default();
+    let outcome = download_send_tail(
+        stream,
+        config,
+        base,
+        cancel,
+        &mut session,
+        source,
+        audit,
+        &mut facts,
+    )
+    .await;
+    if let Some(wire_settled) = wire_settled {
+        wire_settled.store(true, Ordering::Release);
+    }
+    record_transfer_end(audit, FILE_DIRECTION_DOWNLOAD, &facts, outcome).await;
     tracing::debug!(?outcome, elapsed = ?started.elapsed(), "file transfer finished");
     outcome
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
-    base: &BaseDirectory,
     source: &mut SourceFile,
-    destination: &str,
-    file_name: &str,
+    parameters: UploadParameters<'_>,
     cancel: &AtomicBool,
+    audit: TransferAuditContext<'_>,
 ) -> TransferOutcome {
-    let _ = (base, random); // The upload sender resolves nothing and creates no files.
     let mut session = WireSession::new(TransferDirection::Upload, TransferSide::Controller);
 
     if cancel.load(Ordering::Relaxed) {
@@ -475,12 +703,29 @@ async fn run_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
     // UploadOpen announces the initial size recorded at open time (design
     // 14: only this many bytes are ever read).
     let open = FileTransferMessage::UploadOpen {
-        destination,
-        file_name,
-        declared_size: source.size(),
+        destination: parameters.destination,
+        file_name: parameters.file_name,
+        declared_size: parameters.declared_size,
     };
     if let Err(error) = write_frame(stream, &mut session, &open).await {
         return send_failure(&mut session, error);
+    }
+
+    // Design section 18.6: the shared start event once the transfer really
+    // began on the wire; a failed append aborts the transfer.
+    if record_transfer_start(
+        audit.observer,
+        audit.facts,
+        FILE_DIRECTION_UPLOAD,
+        parameters.destination,
+        parameters.file_name,
+        parameters.declared_size,
+    )
+    .await
+    .is_err()
+    {
+        session.close();
+        return TransferOutcome::Cancelled;
     }
 
     // Await Ready (bounded; a user cancel sends Cancel).
@@ -568,9 +813,10 @@ async fn run_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await;
     }
+    let finish_digest = Sha256Digest::new(hasher.finalize().into());
     let finish = FileTransferMessage::Finish {
         actual_size: source.bytes_read(),
-        digest: Sha256Digest::new(hasher.finalize().into()),
+        digest: finish_digest,
     };
     if let Err(error) = write_frame(stream, &mut session, &finish).await {
         return send_failure(&mut session, error);
@@ -598,6 +844,7 @@ async fn run_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
             if let Err(outcome) = record_received(&mut session, &committed, &[]) {
                 return outcome;
             }
+            audit.facts.digest = Some(finish_digest);
             TransferOutcome::Committed {
                 bytes: source.bytes_read(),
             }
@@ -612,14 +859,15 @@ async fn run_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     remote_source: &str,
     local_target: Option<&str>,
     cancel: &AtomicBool,
+    audit: TransferAuditContext<'_>,
 ) -> TransferOutcome {
     let mut session = WireSession::new(TransferDirection::Download, TransferSide::Controller);
 
@@ -670,6 +918,23 @@ async fn run_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return protocol_violation(&mut session),
     };
 
+    // Design section 18.6: the shared start event once the offer announced
+    // the protocol facts; a failed append aborts the transfer.
+    if record_transfer_start(
+        audit.observer,
+        audit.facts,
+        FILE_DIRECTION_DOWNLOAD,
+        remote_source,
+        file_name,
+        declared_size,
+    )
+    .await
+    .is_err()
+    {
+        session.close();
+        return TransferOutcome::Cancelled;
+    }
+
     // Resolve the local destination and create the private temporary file
     // (design 8.3, 8.4, 13).
     let plan = match resolve_destination(base, local_target, Some(file_name)) {
@@ -685,7 +950,7 @@ async fn run_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
             .await;
         }
     };
-    let mut temp = match PrivateTempFile::create(plan.temp_dir(), random) {
+    let mut temp = match PrivateTempFile::create(plan.temp_dir()) {
         Ok(temp) => temp,
         Err(error) => {
             return fail_local(
@@ -808,13 +1073,13 @@ async fn run_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
     if let Err(error) = write_frame(stream, &mut session, &FileTransferMessage::Committed).await {
         return send_failure(&mut session, error);
     }
+    audit.facts.digest = Some(digest);
     TransferOutcome::Committed { bytes: written }
 }
 
 async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     cancel: &AtomicBool,
 ) -> TransferOutcome {
@@ -843,7 +1108,7 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
             return TransferOutcome::Cancelled;
         }
     };
-    let (destination, file_name, declared_size) = match &open_message {
+    let parameters = match &open_message {
         OwnedMessage::UploadOpen {
             destination,
             file_name,
@@ -852,7 +1117,11 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
             if let Err(outcome) = record_received(&mut session, &open_message, &[]) {
                 return outcome;
             }
-            (destination.as_str(), file_name.as_str(), *declared_size)
+            UploadParameters {
+                destination,
+                file_name,
+                declared_size: *declared_size,
+            }
         }
         OwnedMessage::Error { code } => {
             if let Err(outcome) = record_received(&mut session, &open_message, &[]) {
@@ -871,13 +1140,11 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
     upload_receive_tail(
         stream,
         config,
-        random,
         base,
         cancel,
         &mut session,
-        destination,
-        file_name,
-        declared_size,
+        parameters,
+        &mut TransferAuditFacts::default(),
     )
     .await
 }
@@ -888,27 +1155,24 @@ async fn handle_upload_impl<S: AsyncRead + AsyncWrite + Unpin>(
 /// with a no-replace commit before sending `Committed` (design 11.2, 13,
 /// 14). `session` must be an upload host session that already recorded the
 /// received `UploadOpen`.
-#[allow(clippy::too_many_arguments)]
 async fn upload_receive_tail<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     cancel: &AtomicBool,
     session: &mut WireSession,
-    destination: &str,
-    file_name: &str,
-    declared_size: u64,
+    parameters: UploadParameters<'_>,
+    facts: &mut TransferAuditFacts,
 ) -> TransferOutcome {
     // Resolve the destination (an empty destination selects the default
     // directory) and create the private temporary file (design 8.3, 8.4,
     // 13). Parents are never created automatically.
-    let explicit_target = if destination.is_empty() {
+    let explicit_target = if parameters.destination.is_empty() {
         None
     } else {
-        Some(destination)
+        Some(parameters.destination)
     };
-    let plan = match resolve_destination(base, explicit_target, Some(file_name)) {
+    let plan = match resolve_destination(base, explicit_target, Some(parameters.file_name)) {
         Ok(plan) => plan,
         Err(error) => {
             return fail_local(
@@ -921,7 +1185,7 @@ async fn upload_receive_tail<S: AsyncRead + AsyncWrite + Unpin>(
             .await;
         }
     };
-    let mut temp = match PrivateTempFile::create(plan.temp_dir(), random) {
+    let mut temp = match PrivateTempFile::create(plan.temp_dir()) {
         Ok(temp) => temp,
         Err(error) => {
             return fail_local(
@@ -1035,13 +1299,13 @@ async fn upload_receive_tail<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let (actual_size, digest) = finish;
-    let verify = if actual_size != declared_size {
+    let verify = if actual_size != parameters.declared_size {
         Err(FileSemanticsError::SizeMismatch {
-            declared: declared_size,
+            declared: parameters.declared_size,
             received: actual_size,
         })
     } else {
-        sealed.verify_finish(declared_size, digest)
+        sealed.verify_finish(parameters.declared_size, digest)
     };
     if let Err(error) = verify {
         return fail_local(
@@ -1067,17 +1331,16 @@ async fn upload_receive_tail<S: AsyncRead + AsyncWrite + Unpin>(
     if let Err(error) = write_frame(stream, session, &FileTransferMessage::Committed).await {
         return send_failure(session, error);
     }
+    facts.digest = Some(digest);
     TransferOutcome::Committed { bytes: written }
 }
 
 async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &TransferConfig,
-    random: &mut impl SecureRandom,
     base: &BaseDirectory,
     cancel: &AtomicBool,
 ) -> TransferOutcome {
-    let _ = random; // The download sender creates no files.
     let mut session = WireSession::new(TransferDirection::Download, TransferSide::Host);
 
     if cancel.load(Ordering::Relaxed) {
@@ -1122,7 +1385,17 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
     // entry lets [`handle_download_from_open`] reuse the identical
     // continuation for the live session, where the host already read the
     // frame during capability probing (design 9.3).
-    download_send_tail(stream, config, base, cancel, &mut session, &source_path).await
+    download_send_tail(
+        stream,
+        config,
+        base,
+        cancel,
+        &mut session,
+        &source_path,
+        None,
+        &mut TransferAuditFacts::default(),
+    )
+    .await
 }
 
 /// The shared post-`DownloadOpen` host send path: resolves and opens the
@@ -1132,6 +1405,7 @@ async fn handle_download_impl<S: AsyncRead + AsyncWrite + Unpin>(
 /// recorded the received `DownloadOpen`. The host in a download never sends
 /// `Cancel` (direction table, design 10.3); a host-side cancel is expressed
 /// as `Error(SessionClosing)`.
+#[allow(clippy::too_many_arguments)]
 async fn download_send_tail<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &TransferConfig,
@@ -1139,6 +1413,8 @@ async fn download_send_tail<S: AsyncRead + AsyncWrite + Unpin>(
     cancel: &AtomicBool,
     session: &mut WireSession,
     source_path: &str,
+    audit: Option<&AuditObserver>,
+    facts: &mut TransferAuditFacts,
 ) -> TransferOutcome {
     // Resolve and open the source; type and size are judged exclusively
     // from the opened handle (design 8.2).
@@ -1185,6 +1461,22 @@ async fn download_send_tail<S: AsyncRead + AsyncWrite + Unpin>(
         file_name: &offer_name,
         declared_size: source.size(),
     };
+    // Design section 18.6: the shared start event once the protocol facts
+    // are known; a failed append aborts the transfer.
+    if record_transfer_start(
+        audit,
+        facts,
+        FILE_DIRECTION_DOWNLOAD,
+        source_path,
+        &offer_name,
+        source.size(),
+    )
+    .await
+    .is_err()
+    {
+        session.close();
+        return TransferOutcome::Cancelled;
+    }
     if let Err(error) = write_frame(stream, session, &offer).await {
         return send_failure(session, error);
     }
@@ -1296,9 +1588,10 @@ async fn download_send_tail<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await;
     }
+    let finish_digest = Sha256Digest::new(hasher.finalize().into());
     let finish = FileTransferMessage::Finish {
         actual_size: source.bytes_read(),
-        digest: Sha256Digest::new(hasher.finalize().into()),
+        digest: finish_digest,
     };
     if let Err(error) = write_frame(stream, session, &finish).await {
         return send_failure(session, error);
@@ -1326,6 +1619,7 @@ async fn download_send_tail<S: AsyncRead + AsyncWrite + Unpin>(
             if let Err(outcome) = record_received(session, &committed_message, &[]) {
                 return outcome;
             }
+            facts.digest = Some(finish_digest);
             TransferOutcome::Committed {
                 bytes: source.bytes_read(),
             }
@@ -1697,9 +1991,12 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{ReadBuf, duplex};
     use tokio::sync::Notify;
-    use yonder_core::{OsSecureRandom, RandomError, SecureRandom};
 
+    use crate::audit::observer::AuditObserver;
     use crate::file_semantics::CHUNK_SIZE;
+    use yonder_core::OsSecureRandom;
+    use yonder_core::wire::audit::{AuditCloseReason, AuditRole, Digest32};
+    use yonder_net::Keypair;
 
     // ------------------------------------------------------------------
     // Shared fixtures.
@@ -1777,6 +2074,53 @@ mod tests {
 
     fn path_string(path: &Path) -> String {
         path.to_str().unwrap().to_owned()
+    }
+
+    async fn establish_audit_pair() -> (
+        Arc<AuditObserver>,
+        Arc<AuditObserver>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let controller = Keypair::generate_ed25519().public().to_peer_id();
+        let host = Keypair::generate_ed25519().public().to_peer_id();
+        let (host_half, controller_half) = duplex(256 * 1024);
+        let binding = Digest32::new([0xCF; 32]);
+        let started_at = crate::audit::observer::utc_start_seconds();
+        let controller_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let controller_root = controller_dir.path().join("audit");
+        let host_root = host_dir.path().join("audit");
+        let mut controller_random = OsSecureRandom;
+        let mut host_random = OsSecureRandom;
+        let (controller_result, host_result) = tokio::join!(
+            Box::pin(AuditObserver::establish(
+                controller_half,
+                AuditRole::Controller,
+                controller,
+                host,
+                started_at,
+                binding,
+                &controller_root,
+                &mut controller_random,
+            )),
+            Box::pin(AuditObserver::establish(
+                host_half,
+                AuditRole::Host,
+                controller,
+                host,
+                started_at,
+                binding,
+                &host_root,
+                &mut host_random,
+            )),
+        );
+        (
+            Arc::new(controller_result.unwrap()),
+            Arc::new(host_result.unwrap()),
+            controller_dir,
+            host_dir,
+        )
     }
 
     /// Reads a file into a `Vec` and chunks it for wire `Data` frames.
@@ -2024,6 +2368,303 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn audited_transfer_end_records_every_terminal_outcome() {
+        let (controller, host, _controller_dir, _host_dir) = establish_audit_pair().await;
+        record_transfer_end(
+            Some(controller.as_ref()),
+            FILE_DIRECTION_UPLOAD,
+            &TransferAuditFacts::default(),
+            TransferOutcome::Cancelled,
+        )
+        .await;
+        let incomplete = TransferAuditFacts {
+            started: true,
+            remote_path: Some("remote/path".to_owned()),
+            ..TransferAuditFacts::default()
+        };
+        record_transfer_end(
+            Some(controller.as_ref()),
+            FILE_DIRECTION_UPLOAD,
+            &incomplete,
+            TransferOutcome::Cancelled,
+        )
+        .await;
+        assert!(!controller.has_failed().await);
+
+        let facts = TransferAuditFacts {
+            started: true,
+            remote_path: Some("remote/path".to_owned()),
+            file_name: Some("file.bin".to_owned()),
+            declared_size: Some(17),
+            digest: Some(sha256(b"audited payload")),
+        };
+
+        for outcome in [
+            TransferOutcome::Committed { bytes: 17 },
+            TransferOutcome::Cancelled,
+            TransferOutcome::Failed(FileTransferErrorCode::WriteFailed),
+        ] {
+            tokio::join!(
+                record_transfer_end(
+                    Some(controller.as_ref()),
+                    FILE_DIRECTION_UPLOAD,
+                    &facts,
+                    outcome,
+                ),
+                record_transfer_end(Some(host.as_ref()), FILE_DIRECTION_UPLOAD, &facts, outcome,),
+            );
+            assert!(!controller.has_failed().await);
+            assert!(!host.has_failed().await);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_transfer_role_aborts_before_file_effects_when_audit_has_failed() {
+        let config = test_config();
+        let base = BaseDirectory::capture().unwrap();
+        let cancel = AtomicBool::new(false);
+        let (audit, peer_audit, _audit_dir, _peer_audit_dir) = establish_audit_pair().await;
+        audit
+            .fail_closed(None, AuditCloseReason::AuditFailure)
+            .await;
+        assert!(audit.has_failed().await);
+
+        let upload_dir = tempdir().unwrap();
+        let upload_destination = path_string(&upload_dir.path().join("host-target.bin"));
+        let upload_open = FileTransferMessage::UploadOpen {
+            destination: &upload_destination,
+            file_name: "source.bin",
+            declared_size: 1,
+        };
+        let (mut host_upload, _controller_upload) = duplex(64 * 1024);
+        assert_eq!(
+            handle_upload_from_open(
+                &mut host_upload,
+                &config,
+                &base,
+                &cancel,
+                &upload_open,
+                Some(audit.as_ref()),
+            )
+            .await,
+            TransferOutcome::Cancelled
+        );
+        assert!(!upload_dir.path().join("host-target.bin").exists());
+
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("source.bin");
+        write_pattern_file(&source_path, 1);
+        let source_name = path_string(&source_path);
+        let download_open = FileTransferMessage::DownloadOpen {
+            source: &source_name,
+        };
+        let (mut host_download, _controller_download) = duplex(64 * 1024);
+        assert_eq!(
+            handle_download_from_open(
+                &mut host_download,
+                &config,
+                &base,
+                &cancel,
+                &download_open,
+                Some(audit.as_ref()),
+            )
+            .await,
+            TransferOutcome::Cancelled
+        );
+
+        let mut source = SourceFile::open(&source_path).unwrap();
+        let (mut controller_upload, _host_upload) = duplex(64 * 1024);
+        assert_eq!(
+            run_upload_audited(
+                &mut controller_upload,
+                &config,
+                &mut source,
+                "remote.bin",
+                "source.bin",
+                &cancel,
+                Some(audit.as_ref()),
+            )
+            .await,
+            TransferOutcome::Cancelled
+        );
+        assert_eq!(source.bytes_read(), 0);
+
+        let target_dir = tempdir().unwrap();
+        let target_path = path_string(&target_dir.path().join("download.bin"));
+        let (mut controller_download, host_download) = duplex(64 * 1024);
+        let mut peer = ScriptedPeer::new(
+            host_download,
+            TransferDirection::Download,
+            TransferSide::Host,
+        );
+        let (outcome, ()) = tokio::join!(
+            run_download_audited(
+                &mut controller_download,
+                &config,
+                &base,
+                "remote/source.bin",
+                Some(&target_path),
+                &cancel,
+                Some(audit.as_ref()),
+            ),
+            async {
+                assert!(matches!(
+                    peer.read_control().await,
+                    OwnedMessage::DownloadOpen { .. }
+                ));
+                peer.send(FileTransferMessage::DownloadOffer {
+                    file_name: "source.bin",
+                    declared_size: 1,
+                })
+                .await;
+            },
+        );
+        assert_eq!(outcome, TransferOutcome::Cancelled);
+        assert!(!target_dir.path().join("download.bin").exists());
+        drop(peer_audit);
+    }
+
+    #[tokio::test]
+    async fn upload_and_download_complete_through_bilateral_audit() {
+        let config = test_config();
+        let base = BaseDirectory::capture().unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let upload_source_dir = tempdir().unwrap();
+        let upload_host_dir = tempdir().unwrap();
+        let upload_source_path = upload_source_dir.path().join("source.bin");
+        write_pattern_file(&upload_source_path, 4097);
+        let mut upload_source = SourceFile::open(&upload_source_path).unwrap();
+        let upload_destination = path_string(&upload_host_dir.path().join("received.bin"));
+        let (controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
+            establish_audit_pair().await;
+        let (mut controller_stream, mut host_stream) = duplex(64 * 1024);
+        let upload_wire_settled = AtomicBool::new(false);
+        let (controller_outcome, host_outcome) = tokio::join!(
+            run_upload_audited(
+                &mut controller_stream,
+                &config,
+                &mut upload_source,
+                &upload_destination,
+                "source.bin",
+                &cancel,
+                Some(controller_audit.as_ref()),
+            ),
+            async {
+                let open = read_frame(
+                    &mut host_stream,
+                    ReadMode::Control {
+                        budget: config.control_timeout,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                let OwnedMessage::UploadOpen {
+                    destination,
+                    file_name,
+                    declared_size,
+                } = open
+                else {
+                    panic!("expected upload open");
+                };
+                let open = FileTransferMessage::UploadOpen {
+                    destination: &destination,
+                    file_name: &file_name,
+                    declared_size,
+                };
+                handle_upload_from_open_with_settlement(
+                    &mut host_stream,
+                    &config,
+                    &base,
+                    &cancel,
+                    &open,
+                    Some(host_audit.as_ref()),
+                    Some(&upload_wire_settled),
+                )
+                .await
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Committed { bytes: 4097 }
+        );
+        assert_eq!(host_outcome, controller_outcome);
+        assert!(
+            upload_wire_settled.load(Ordering::Acquire),
+            "the coordinator must observe the upload wire terminal state"
+        );
+        assert_eq!(
+            fs::read(&upload_destination).unwrap(),
+            fs::read(&upload_source_path).unwrap()
+        );
+        assert!(!controller_audit.has_failed().await);
+        assert!(!host_audit.has_failed().await);
+
+        let download_source_dir = tempdir().unwrap();
+        let download_target_dir = tempdir().unwrap();
+        let download_source_path = download_source_dir.path().join("remote.bin");
+        write_pattern_file(&download_source_path, 8193);
+        let download_source = path_string(&download_source_path);
+        let download_target = path_string(&download_target_dir.path().join("local.bin"));
+        let (controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
+            establish_audit_pair().await;
+        let (mut controller_stream, mut host_stream) = duplex(64 * 1024);
+        let download_wire_settled = AtomicBool::new(false);
+        let (controller_outcome, host_outcome) = tokio::join!(
+            run_download_audited(
+                &mut controller_stream,
+                &config,
+                &base,
+                &download_source,
+                Some(&download_target),
+                &cancel,
+                Some(controller_audit.as_ref()),
+            ),
+            async {
+                let open = read_frame(
+                    &mut host_stream,
+                    ReadMode::Control {
+                        budget: config.control_timeout,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                let OwnedMessage::DownloadOpen { source } = open else {
+                    panic!("expected download open");
+                };
+                let open = FileTransferMessage::DownloadOpen { source: &source };
+                handle_download_from_open_with_settlement(
+                    &mut host_stream,
+                    &config,
+                    &base,
+                    &cancel,
+                    &open,
+                    Some(host_audit.as_ref()),
+                    Some(&download_wire_settled),
+                )
+                .await
+            },
+        );
+        assert_eq!(
+            controller_outcome,
+            TransferOutcome::Committed { bytes: 8193 }
+        );
+        assert_eq!(host_outcome, controller_outcome);
+        assert!(
+            download_wire_settled.load(Ordering::Acquire),
+            "the coordinator must observe the download wire terminal state"
+        );
+        assert_eq!(
+            fs::read(&download_target).unwrap(),
+            fs::read(&download_source_path).unwrap()
+        );
+        assert!(!controller_audit.has_failed().await);
+        assert!(!host_audit.has_failed().await);
+    }
+
     // ------------------------------------------------------------------
     // Success paths: upload and download across the fixed size matrix
     // (0, 1, 65535, 65536, 65537 and above 16 MiB).
@@ -2034,8 +2675,6 @@ mod tests {
         let source_dir = tempdir().unwrap();
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         for size in [0_u64, 1, 65535, 65536, 65537, 17 * 1024 * 1024] {
             let source_path = source_dir.path().join(format!("source-{size}.bin"));
@@ -2051,14 +2690,12 @@ mod tests {
                 run_upload(
                     &mut controller_stream,
                     &config,
-                    &mut controller_random,
-                    &base,
                     &mut source,
                     &destination,
                     "uploaded.bin",
                     &cancel,
                 ),
-                handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel,),
+                handle_upload(&mut host_stream, &config, &base, &cancel,),
             );
             assert_eq!(
                 controller_outcome,
@@ -2085,8 +2722,6 @@ mod tests {
         let source_dir = tempdir().unwrap();
         let controller_dir = tempdir().unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         for size in [0_u64, 1, 65535, 65536, 65537, 17 * 1024 * 1024] {
             let source_path = source_dir.path().join(format!("source-{size}.bin"));
@@ -2102,13 +2737,12 @@ mod tests {
                 run_download(
                     &mut controller_stream,
                     &config,
-                    &mut controller_random,
                     &base,
                     &source_string,
                     Some(&target_string),
                     &cancel,
                 ),
-                handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel,),
+                handle_download(&mut host_stream, &config, &base, &cancel,),
             );
             assert_eq!(
                 controller_outcome,
@@ -2139,8 +2773,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut controller_stream = controller_half;
         let mut host_stream = host_half;
@@ -2149,14 +2781,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         assert_eq!(
             controller_outcome,
@@ -2179,8 +2809,6 @@ mod tests {
         let source_path = source_dir.path().join("offer-name.bin");
         write_pattern_file(&source_path, 8192);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let host_base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2191,19 +2819,12 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 None,
                 &cancel,
             ),
-            handle_download(
-                &mut host_stream,
-                &config,
-                &mut host_random,
-                &host_base,
-                &cancel
-            ),
+            handle_download(&mut host_stream, &config, &host_base, &cancel),
         );
         assert_eq!(
             controller_outcome,
@@ -2228,8 +2849,6 @@ mod tests {
         write_pattern_file(&source_path, 2048);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&out_dir);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2240,14 +2859,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "inside.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         assert_eq!(
             controller_outcome,
@@ -2271,8 +2888,6 @@ mod tests {
         let source_path = source_dir.path().join("data.bin");
         write_pattern_file(&source_path, 2048);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&out_dir);
@@ -2284,13 +2899,12 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
                 &cancel,
             ),
-            handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
         );
         assert_eq!(
             controller_outcome,
@@ -2319,8 +2933,6 @@ mod tests {
         fs::write(&final_path, b"pre-existing").unwrap();
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&final_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2331,14 +2943,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::DestinationExists);
         assert_eq!(controller_outcome, expected);
@@ -2354,8 +2964,6 @@ mod tests {
         write_pattern_file(&source_path, 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let missing = host_dir.path().join("missing").join("sub");
         let destination = path_string(&missing.join("f.bin"));
@@ -2367,14 +2975,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::DestinationParentNotFound);
         assert_eq!(controller_outcome, expected);
@@ -2387,8 +2993,6 @@ mod tests {
         let source_dir = tempdir().unwrap();
         let controller_dir = tempdir().unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let missing = source_dir.path().join("nope.bin");
         let source_string = path_string(&missing);
@@ -2401,13 +3005,12 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
                 &cancel,
             ),
-            handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::SourceNotFound);
         assert_eq!(controller_outcome, expected);
@@ -2422,8 +3025,6 @@ mod tests {
         let directory_source = source_dir.path().join("adir");
         fs::create_dir(&directory_source).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&directory_source);
         let target_string = path_string(&controller_dir.path().join("out.bin"));
@@ -2435,13 +3036,12 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
                 &cancel,
             ),
-            handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::SourceNotRegularFile);
         assert_eq!(controller_outcome, expected);
@@ -2458,8 +3058,6 @@ mod tests {
         let final_path = controller_dir.path().join("exists.bin");
         fs::write(&final_path, b"pre-existing").unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&final_path);
@@ -2471,13 +3069,12 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
                 &cancel,
             ),
-            handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::DestinationExists);
         assert_eq!(controller_outcome, expected);
@@ -2492,8 +3089,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let missing = controller_dir.path().join("missing").join("sub");
         let source_string = path_string(&source_path);
@@ -2506,13 +3101,12 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
                 &cancel,
             ),
-            handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::DestinationParentNotFound);
         assert_eq!(controller_outcome, expected);
@@ -2529,12 +3123,17 @@ mod tests {
         let locked = host_dir.path().join("locked");
         fs::create_dir(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let permission_probe = locked.join("permission-probe");
+        if let Ok(probe) = fs::File::create(&permission_probe) {
+            drop(probe);
+            fs::remove_file(permission_probe).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&locked.join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2545,14 +3144,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::PermissionDenied);
         assert_eq!(controller_outcome, expected);
@@ -2567,7 +3164,6 @@ mod tests {
     async fn upload_rejects_invalid_peer_file_names() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         for name in ["a/b", ".."] {
             let (controller_half, host_half) = duplex(64 * 1024);
@@ -2579,7 +3175,7 @@ mod tests {
             let mut host_stream = host_half;
             let cancel = AtomicBool::new(false);
             let (host_outcome, error_message) = tokio::join!(
-                handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+                handle_upload(&mut host_stream, &config, &base, &cancel),
                 async {
                     peer.send(FileTransferMessage::UploadOpen {
                         destination: "",
@@ -2611,7 +3207,6 @@ mod tests {
     async fn upload_rejects_windows_reserved_peer_file_names() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(
@@ -2622,7 +3217,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: "",
@@ -2658,7 +3253,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2670,7 +3264,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -2711,7 +3305,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2723,7 +3316,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -2764,7 +3357,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -2777,7 +3369,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -2828,7 +3419,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -2841,7 +3431,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -2896,8 +3485,6 @@ mod tests {
         write_pattern_file(&source_path, 2 * 1024 * 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2919,14 +3506,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         grow_task.await.unwrap();
         let expected = TransferOutcome::Failed(FileTransferErrorCode::SourceChanged);
@@ -2943,8 +3528,6 @@ mod tests {
         write_pattern_file(&source_path, 2 * 1024 * 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -2966,14 +3549,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         shrink_task.await.unwrap();
         let expected = TransferOutcome::Failed(FileTransferErrorCode::SourceChanged);
@@ -2989,7 +3570,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 2 * 1024 * 1024);
         let config = test_config();
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3002,7 +3582,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let grow_path = source_path.clone();
         let (host_outcome, error_message) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -3058,8 +3638,6 @@ mod tests {
         write_pattern_file(&source_path, 32 * 1024 * 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("big.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3079,14 +3657,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "big.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         cancel_task.await.unwrap();
         assert_eq!(controller_outcome, TransferOutcome::Cancelled);
@@ -3102,7 +3678,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -3115,7 +3690,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -3154,7 +3728,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (_, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3166,7 +3739,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3201,7 +3774,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3213,7 +3785,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -3259,8 +3831,6 @@ mod tests {
         write_pattern_file(&source_path, 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let mut host_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3271,14 +3841,12 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
                 &cancel,
             ),
-            handle_upload(&mut host_stream, &config, &mut host_random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
         );
         assert_eq!(controller_outcome, TransferOutcome::Cancelled);
         assert_eq!(host_outcome, TransferOutcome::Cancelled);
@@ -3297,7 +3865,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3309,7 +3876,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3342,7 +3909,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3356,7 +3922,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -3396,7 +3961,6 @@ mod tests {
     async fn committed_before_finish_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3408,7 +3972,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3431,7 +3995,6 @@ mod tests {
     #[tokio::test]
     async fn wrong_opening_message_is_a_protocol_failure() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(
@@ -3442,7 +4005,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send_fault(FileTransferMessage::DownloadOpen { source: "x" })
                     .await;
@@ -3459,7 +4022,6 @@ mod tests {
     async fn duplicate_open_after_ready_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3471,7 +4033,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3500,7 +4062,6 @@ mod tests {
     async fn unknown_tag_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3512,7 +4073,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3536,7 +4097,6 @@ mod tests {
     async fn oversized_data_declaration_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3548,7 +4108,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3575,7 +4135,6 @@ mod tests {
     async fn zero_length_data_frame_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3587,7 +4146,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3611,7 +4170,6 @@ mod tests {
     async fn error_frame_with_undefined_code_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3623,7 +4181,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3648,7 +4206,6 @@ mod tests {
     async fn control_frame_with_wrong_length_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3660,7 +4217,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3693,16 +4250,12 @@ mod tests {
         write_pattern_file(&source_path, 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&tempdir().unwrap().path().join("f.bin"));
         let (mut controller_stream, _silent_peer) = duplex(64 * 1024);
         let cancel = AtomicBool::new(false);
         let outcome = run_upload(
             &mut controller_stream,
             &config,
-            &mut random,
-            &base,
             &mut source,
             &destination,
             "src.bin",
@@ -3718,11 +4271,10 @@ mod tests {
     #[tokio::test]
     async fn control_timeout_fails_host_awaiting_open() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_stream, _silent_peer) = duplex(64 * 1024);
         let cancel = AtomicBool::new(false);
-        let outcome = handle_upload(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        let outcome = handle_upload(&mut host_stream, &config, &base, &cancel).await;
         assert_eq!(
             outcome,
             TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
@@ -3735,7 +4287,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, mut host_stream) = duplex(64 * 1024);
@@ -3746,7 +4297,7 @@ mod tests {
         );
         let cancel = AtomicBool::new(false);
         let outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -3771,7 +4322,6 @@ mod tests {
     async fn data_no_progress_timeout_fails_upload_receiver() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3783,7 +4333,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3814,7 +4364,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (bytes, _) = file_chunks(&source_path);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -3827,7 +4376,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -3864,8 +4412,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&tempdir().unwrap().path().join("f.bin"));
         let mut source = SourceFile::open(&source_path).unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3876,8 +4422,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
@@ -3915,12 +4459,11 @@ mod tests {
     #[tokio::test]
     async fn eof_before_first_frame_fails_host() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_stream, peer) = duplex(64 * 1024);
         drop(peer);
         let cancel = AtomicBool::new(false);
-        let outcome = handle_upload(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        let outcome = handle_upload(&mut host_stream, &config, &base, &cancel).await;
         assert_eq!(
             outcome,
             TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
@@ -3931,7 +4474,6 @@ mod tests {
     async fn eof_after_first_frame_fails_upload_host_and_cleans_up() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3943,7 +4485,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -3968,7 +4510,6 @@ mod tests {
     async fn eof_mid_frame_is_a_protocol_failure() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -3980,7 +4521,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -4011,8 +4552,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&tempdir().unwrap().path().join("f.bin"));
         let mut source = SourceFile::open(&source_path).unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -4023,8 +4562,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
@@ -4061,7 +4598,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -4073,7 +4609,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -4101,7 +4637,6 @@ mod tests {
         let source_dir = tempdir().unwrap();
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         for size in [0_u64, 1, 65535, 65536, 65537] {
             let source_path = source_dir.path().join(format!("source-{size}.bin"));
@@ -4132,14 +4667,7 @@ mod tests {
                 declared_size: bytes.len() as u64,
             };
             let (host_outcome, peer_observed) = tokio::join!(
-                handle_upload_from_open(
-                    &mut host_half,
-                    &config,
-                    &mut random,
-                    &base,
-                    &cancel,
-                    &open,
-                ),
+                handle_upload_from_open(&mut host_half, &config, &base, &cancel, &open, None),
                 async {
                     assert_eq!(peer.read_control().await, OwnedMessage::Ready);
                     for chunk in &chunks {
@@ -4178,7 +4706,6 @@ mod tests {
         let source_dir = tempdir().unwrap();
         let controller_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         for size in [0_u64, 1, 65535, 65536, 65537] {
             let source_path = source_dir.path().join(format!("source-{size}.bin"));
@@ -4202,14 +4729,7 @@ mod tests {
                 source: &source_string,
             };
             let (host_outcome, peer_observed) = tokio::join!(
-                handle_download_from_open(
-                    &mut host_half,
-                    &config,
-                    &mut random,
-                    &base,
-                    &cancel,
-                    &open,
-                ),
+                handle_download_from_open(&mut host_half, &config, &base, &cancel, &open, None),
                 async {
                     let offer = peer.read_control().await;
                     assert!(matches!(
@@ -4251,15 +4771,13 @@ mod tests {
     async fn upload_from_open_rejects_non_open_first_frames() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         // A Ready first frame is a protocol violation for an upload host.
         let (mut host_half, mut peer_half) = duplex(64 * 1024);
         let cancel = AtomicBool::new(false);
         let open = FileTransferMessage::Ready;
         let outcome =
-            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
-                .await;
+            handle_upload_from_open(&mut host_half, &config, &base, &cancel, &open, None).await;
         assert_eq!(
             outcome,
             TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
@@ -4278,8 +4796,7 @@ mod tests {
         let (mut host_half, mut peer_half) = duplex(64 * 1024);
         let open = FileTransferMessage::DownloadOpen { source: "x" };
         let outcome =
-            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
-                .await;
+            handle_upload_from_open(&mut host_half, &config, &base, &cancel, &open, None).await;
         assert_eq!(
             outcome,
             TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
@@ -4295,7 +4812,6 @@ mod tests {
     #[tokio::test]
     async fn download_from_open_rejects_non_open_first_frames() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_half, mut peer_half) = duplex(64 * 1024);
         let cancel = AtomicBool::new(false);
@@ -4305,8 +4821,7 @@ mod tests {
             declared_size: 1,
         };
         let outcome =
-            handle_download_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
-                .await;
+            handle_download_from_open(&mut host_half, &config, &base, &cancel, &open, None).await;
         assert_eq!(
             outcome,
             TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
@@ -4323,7 +4838,6 @@ mod tests {
     async fn upload_from_open_checks_cancel_before_any_work() {
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_half, mut peer_half) = duplex(64 * 1024);
         let cancel = AtomicBool::new(true);
@@ -4334,8 +4848,7 @@ mod tests {
             declared_size: 1,
         };
         let outcome =
-            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
-                .await;
+            handle_upload_from_open(&mut host_half, &config, &base, &cancel, &open, None).await;
         assert_eq!(outcome, TransferOutcome::Cancelled);
         let frame = tokio::time::timeout(Duration::from_millis(50), async {
             let mut byte = [0_u8; 1];
@@ -4354,7 +4867,6 @@ mod tests {
         write_pattern_file(&source_path, 1024);
         let (bytes, _) = file_chunks(&source_path);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let final_path = host_dir.path().join("exists.bin");
         fs::write(&final_path, b"pre-existing").unwrap();
@@ -4365,6 +4877,7 @@ mod tests {
             TransferSide::Controller,
         );
         let cancel = AtomicBool::new(false);
+        let wire_settled = AtomicBool::new(false);
         let destination = path_string(&final_path);
         let open = FileTransferMessage::UploadOpen {
             destination: &destination,
@@ -4372,7 +4885,15 @@ mod tests {
             declared_size: bytes.len() as u64,
         };
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open,),
+            handle_upload_from_open_with_settlement(
+                &mut host_half,
+                &config,
+                &base,
+                &cancel,
+                &open,
+                None,
+                Some(&wire_settled),
+            ),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -4385,6 +4906,7 @@ mod tests {
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::DestinationExists);
         assert_eq!(host_outcome, expected);
+        assert!(wire_settled.load(Ordering::Acquire));
         assert_eq!(
             error_message,
             OwnedMessage::Error {
@@ -4399,7 +4921,6 @@ mod tests {
         let source_dir = tempdir().unwrap();
         let controller_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let missing = source_dir.path().join("nope.bin");
         let source_string = path_string(&missing);
@@ -4415,15 +4936,25 @@ mod tests {
             .send(&FileTransferMessage::DownloadOpen { source: "consumed" })
             .unwrap();
         let cancel = AtomicBool::new(false);
+        let wire_settled = AtomicBool::new(false);
         let open = FileTransferMessage::DownloadOpen {
             source: &source_string,
         };
         let (host_outcome, error_message) = tokio::join!(
-            handle_download_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open,),
+            handle_download_from_open_with_settlement(
+                &mut host_half,
+                &config,
+                &base,
+                &cancel,
+                &open,
+                None,
+                Some(&wire_settled),
+            ),
             async { peer.read_control().await },
         );
         let expected = TransferOutcome::Failed(FileTransferErrorCode::SourceNotFound);
         assert_eq!(host_outcome, expected);
+        assert!(wire_settled.load(Ordering::Acquire));
         assert_eq!(
             error_message,
             OwnedMessage::Error {
@@ -4506,24 +5037,19 @@ mod tests {
         }
     }
 
-    /// A secure-random source that always fails, so private temporary file
-    /// creation fails with a purely local error (no wire code).
-    struct FailingRandom;
-
-    impl SecureRandom for FailingRandom {
-        fn try_fill(&mut self, _destination: &mut [u8]) -> Result<(), RandomError> {
-            Err(RandomError)
-        }
-    }
-
-    /// Asserts that no frame reaches `stream` within a short window.
+    /// Asserts that no frame reaches `stream` within a short window. A clean
+    /// EOF is also proof that the peer received no frame.
     async fn assert_no_wire_frame(stream: &mut (impl AsyncRead + Unpin)) {
         let frame = tokio::time::timeout(Duration::from_millis(50), async {
             let mut byte = [0_u8; 1];
-            stream.read(&mut byte).await.unwrap()
+            stream.read(&mut byte).await
         })
         .await;
-        assert!(frame.is_err(), "no frame may reach the peer");
+        match frame {
+            Err(_) | Ok(Ok(0)) => {}
+            Ok(Ok(_)) => panic!("no frame may reach the peer"),
+            Ok(Err(error)) => panic!("the peer read failed unexpectedly: {error}"),
+        }
     }
 
     /// Drains the sender's `Data` frames until the terminal `Finish` arrives.
@@ -4584,6 +5110,16 @@ mod tests {
             .await
             .expect_err("the injected write failure must surface");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+        let source = "x".repeat(yonder_core::wire::file_transfer::MAX_PATH_LEN + 1);
+        let (mut stream, _peer) = duplex(64 * 1024);
+        let error = write_frame_raw(
+            &mut stream,
+            &FileTransferMessage::DownloadOpen { source: &source },
+        )
+        .await
+        .expect_err("an oversized control field must fail before writing");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -4905,8 +5441,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = controller_half;
@@ -4915,8 +5449,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -4947,8 +5479,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = controller_half;
@@ -4957,8 +5487,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -4992,7 +5520,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let (bytes, chunks) = file_chunks(&source_path);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -5005,7 +5532,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -5046,7 +5572,6 @@ mod tests {
         // Error first frame is a protocol violation, not a reported code.
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(
@@ -5057,7 +5582,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send_fault(FileTransferMessage::Error {
                     code: FileTransferErrorCode::SourceNotFound,
@@ -5076,7 +5601,6 @@ mod tests {
     #[tokio::test]
     async fn handle_download_error_as_opening_frame_is_a_protocol_failure() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(
@@ -5087,7 +5611,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send_fault(FileTransferMessage::Error {
                     code: FileTransferErrorCode::SourceNotFound,
@@ -5105,7 +5629,6 @@ mod tests {
     #[tokio::test]
     async fn handle_download_ready_as_opening_frame_is_a_protocol_failure() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(
@@ -5116,7 +5639,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send_fault(FileTransferMessage::Ready).await;
             },
@@ -5139,8 +5662,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = controller_half;
@@ -5149,8 +5670,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -5177,8 +5696,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = controller_half;
@@ -5187,8 +5704,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -5218,7 +5733,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -5231,7 +5745,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -5261,7 +5774,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5273,7 +5785,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5300,7 +5812,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5312,7 +5823,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5344,7 +5855,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5356,7 +5866,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5388,8 +5898,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = controller_half;
@@ -5398,8 +5906,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -5426,7 +5932,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -5439,7 +5944,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -5468,12 +5972,10 @@ mod tests {
         let (mut controller_stream, mut peer_half) = duplex(64 * 1024);
         let cancel = AtomicBool::new(true);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let outcome = run_download(
             &mut controller_stream,
             &config,
-            &mut random,
             &base,
             "src.bin",
             Some("out.bin"),
@@ -5493,8 +5995,6 @@ mod tests {
         write_pattern_file(&source_path, 200 * 1024);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = controller_half;
@@ -5503,8 +6003,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -5530,7 +6028,6 @@ mod tests {
         // The host cannot send anything before the opening frame; a cancel
         // closes the substream silently.
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_stream, mut peer_half) = duplex(64 * 1024);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -5539,7 +6036,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             flag.store(true, Ordering::Relaxed);
         });
-        let outcome = handle_upload(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        let outcome = handle_upload(&mut host_stream, &config, &base, &cancel).await;
         cancel_task.await.unwrap();
         assert_eq!(outcome, TransferOutcome::Cancelled);
         assert_no_wire_frame(&mut peer_half).await;
@@ -5548,11 +6045,10 @@ mod tests {
     #[tokio::test]
     async fn handle_download_cancel_before_start_closes_without_wire_exchange() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_stream, mut peer_half) = duplex(64 * 1024);
         let cancel = AtomicBool::new(true);
-        let outcome = handle_download(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        let outcome = handle_download(&mut host_stream, &config, &base, &cancel).await;
         assert_eq!(outcome, TransferOutcome::Cancelled);
         assert_no_wire_frame(&mut peer_half).await;
     }
@@ -5560,7 +6056,6 @@ mod tests {
     #[tokio::test]
     async fn handle_download_cancel_during_await_open_leaves_no_frame() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_stream, mut peer_half) = duplex(64 * 1024);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -5569,7 +6064,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             flag.store(true, Ordering::Relaxed);
         });
-        let outcome = handle_download(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        let outcome = handle_download(&mut host_stream, &config, &base, &cancel).await;
         cancel_task.await.unwrap();
         assert_eq!(outcome, TransferOutcome::Cancelled);
         assert_no_wire_frame(&mut peer_half).await;
@@ -5578,14 +6073,12 @@ mod tests {
     #[tokio::test]
     async fn handle_download_from_open_cancel_before_start_closes_without_wire_exchange() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_half, mut peer_half) = duplex(64 * 1024);
         let cancel = AtomicBool::new(true);
         let open = FileTransferMessage::DownloadOpen { source: "s" };
         let outcome =
-            handle_download_from_open(&mut host_half, &config, &mut random, &base, &cancel, &open)
-                .await;
+            handle_download_from_open(&mut host_half, &config, &base, &cancel, &open, None).await;
         assert_eq!(outcome, TransferOutcome::Cancelled);
         assert_no_wire_frame(&mut peer_half).await;
     }
@@ -5596,7 +6089,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5608,7 +6100,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5631,7 +6123,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5643,7 +6134,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5672,7 +6163,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5684,7 +6174,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5707,7 +6197,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5719,7 +6208,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5746,12 +6235,11 @@ mod tests {
     #[tokio::test]
     async fn eof_before_first_frame_fails_download_host() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut host_stream, peer) = duplex(64 * 1024);
         drop(peer);
         let cancel = AtomicBool::new(false);
-        let outcome = handle_download(&mut host_stream, &config, &mut random, &base, &cancel).await;
+        let outcome = handle_download(&mut host_stream, &config, &base, &cancel).await;
         assert_eq!(
             outcome,
             TransferOutcome::Failed(FileTransferErrorCode::SessionClosing)
@@ -5761,7 +6249,6 @@ mod tests {
     #[tokio::test]
     async fn run_download_eof_awaiting_offer_fails_controller() {
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer =
@@ -5772,7 +6259,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 "src.bin",
                 Some("out.bin"),
@@ -5802,7 +6288,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 200 * 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5814,7 +6299,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let host_outcome = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5857,8 +6342,6 @@ mod tests {
             .set_len(0)
             .unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
@@ -5868,8 +6351,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
@@ -5903,7 +6384,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 2 * 1024 * 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -5915,7 +6395,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -5965,8 +6445,6 @@ mod tests {
             .set_modified(SystemTime::now() - Duration::from_secs(3600))
             .unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
@@ -5976,8 +6454,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
-                &base,
                 &mut source,
                 &destination,
                 "src.bin",
@@ -6013,7 +6489,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 1024 * 1024);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -6025,7 +6500,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -6071,16 +6546,12 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (mut controller_stream, peer) = duplex(64 * 1024);
         drop(peer);
         let cancel = AtomicBool::new(false);
         let outcome = run_upload(
             &mut controller_stream,
             &config,
-            &mut random,
-            &base,
             &mut source,
             "",
             "src.bin",
@@ -6096,7 +6567,6 @@ mod tests {
     #[tokio::test]
     async fn run_download_opening_frame_write_failure_fails_controller() {
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (mut controller_stream, peer) = duplex(64 * 1024);
         drop(peer);
@@ -6104,7 +6574,6 @@ mod tests {
         let outcome = run_download(
             &mut controller_stream,
             &config,
-            &mut random,
             &base,
             "src.bin",
             Some("out.bin"),
@@ -6126,8 +6595,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = WriteFailAfter::new(controller_half, 3);
@@ -6136,8 +6603,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -6165,8 +6630,6 @@ mod tests {
         write_pattern_file(&source_path, 4096);
         let mut source = SourceFile::open(&source_path).unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
-        let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(host_half, TransferDirection::Upload, TransferSide::Host);
         let mut controller_stream = WriteFailAfter::new(controller_half, 4);
@@ -6175,8 +6638,6 @@ mod tests {
             run_upload(
                 &mut controller_stream,
                 &config,
-                &mut random,
-                &base,
                 &mut source,
                 "",
                 "src.bin",
@@ -6210,7 +6671,6 @@ mod tests {
         write_pattern_file(&source_path, 1024);
         let (bytes, _) = file_chunks(&source_path);
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -6223,7 +6683,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -6260,7 +6719,6 @@ mod tests {
         let bytes = one_block_bytes(4096);
         fs::write(&source_path, &bytes).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -6273,7 +6731,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -6314,7 +6771,6 @@ mod tests {
         // The host's only write before the data phase is Ready.
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -6326,7 +6782,7 @@ mod tests {
         let mut host_stream = WriteFailAfter::new(host_half, 1);
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -6349,7 +6805,6 @@ mod tests {
         // happened, so the final file exists even though the transfer fails.
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let bytes = one_block_bytes(4096);
@@ -6362,7 +6817,7 @@ mod tests {
         let mut host_stream = WriteFailAfter::new(host_half, 2);
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -6395,7 +6850,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 4096);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -6407,7 +6861,7 @@ mod tests {
         let mut host_stream = WriteFailAfter::new(host_half, 1);
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -6429,7 +6883,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 4096);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -6441,7 +6894,7 @@ mod tests {
         let mut host_stream = WriteFailAfter::new(host_half, 3);
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -6467,7 +6920,6 @@ mod tests {
         let source_path = source_dir.path().join("src.bin");
         write_pattern_file(&source_path, 4096);
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let (controller_half, host_half) = duplex(64 * 1024);
@@ -6479,7 +6931,7 @@ mod tests {
         let mut host_stream = WriteFailAfter::new(host_half, 4);
         let cancel = AtomicBool::new(false);
         let (host_outcome, _) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen {
                     source: &source_string,
@@ -6507,99 +6959,12 @@ mod tests {
     //    the no-replace commit -----------------------------------------------
 
     #[tokio::test]
-    async fn upload_host_temp_creation_failure_closes_without_wire_message() {
-        // A failing random source fails the temporary-file creation; the
-        // failure has no wire code, so the substream closes silently and the
-        // nearest fixed code is reported locally.
-        let host_dir = tempdir().unwrap();
-        let config = test_config();
-        let mut random = FailingRandom;
-        let base = BaseDirectory::capture().unwrap();
-        let destination = path_string(&host_dir.path().join("f.bin"));
-        let (controller_half, host_half) = duplex(64 * 1024);
-        let mut peer = ScriptedPeer::new(
-            controller_half,
-            TransferDirection::Upload,
-            TransferSide::Controller,
-        );
-        let mut host_stream = host_half;
-        let cancel = AtomicBool::new(false);
-        let (host_outcome, _) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
-            async {
-                peer.send(FileTransferMessage::UploadOpen {
-                    destination: &destination,
-                    file_name: "src.bin",
-                    declared_size: 4096,
-                })
-                .await;
-                assert_no_wire_frame(&mut peer.stream).await;
-            },
-        );
-        assert_eq!(
-            host_outcome,
-            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
-        );
-        assert_dir_empty(host_dir.path());
-    }
-
-    #[tokio::test]
-    async fn download_controller_temp_creation_failure_closes_without_wire_message() {
-        let source_dir = tempdir().unwrap();
-        let controller_dir = tempdir().unwrap();
-        let source_path = source_dir.path().join("src.bin");
-        write_pattern_file(&source_path, 1024);
-        let (bytes, _) = file_chunks(&source_path);
-        let config = test_config();
-        let mut controller_random = FailingRandom;
-        let base = BaseDirectory::capture().unwrap();
-        let source_string = path_string(&source_path);
-        let target_string = path_string(&controller_dir.path().join("f.bin"));
-        let (controller_half, host_half) = duplex(64 * 1024);
-        let mut peer =
-            ScriptedPeer::new(host_half, TransferDirection::Download, TransferSide::Host);
-        let mut controller_stream = controller_half;
-        let cancel = AtomicBool::new(false);
-        let (controller_outcome, _) = tokio::join!(
-            run_download(
-                &mut controller_stream,
-                &config,
-                &mut controller_random,
-                &base,
-                &source_string,
-                Some(&target_string),
-                &cancel,
-            ),
-            async {
-                assert_eq!(
-                    peer.read_control().await,
-                    OwnedMessage::DownloadOpen {
-                        source: source_string.clone()
-                    }
-                );
-                peer.send(FileTransferMessage::DownloadOffer {
-                    file_name: "f.bin",
-                    declared_size: bytes.len() as u64,
-                })
-                .await;
-                assert_no_wire_frame(&mut peer.stream).await;
-            },
-        );
-        assert_eq!(
-            controller_outcome,
-            TransferOutcome::Failed(FileTransferErrorCode::InvalidRequest)
-        );
-        assert_dir_empty(controller_dir.path());
-    }
-
-    #[tokio::test]
     async fn upload_host_commit_fails_when_final_appears_concurrently() {
         // The destination is resolved and the temporary file exists before
         // Ready; a concurrent writer claiming the final path afterwards must
         // be refused by the no-replace commit.
         let host_dir = tempdir().unwrap();
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let destination = path_string(&host_dir.path().join("f.bin"));
         let bytes = one_block_bytes(4096);
@@ -6612,7 +6977,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_upload(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_upload(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::UploadOpen {
                     destination: &destination,
@@ -6655,7 +7020,6 @@ mod tests {
         let bytes = one_block_bytes(4096);
         fs::write(&source_path, &bytes).unwrap();
         let config = test_config();
-        let mut controller_random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let source_string = path_string(&source_path);
         let target_string = path_string(&controller_dir.path().join("f.bin"));
@@ -6668,7 +7032,6 @@ mod tests {
             run_download(
                 &mut controller_stream,
                 &config,
-                &mut controller_random,
                 &base,
                 &source_string,
                 Some(&target_string),
@@ -6721,7 +7084,6 @@ mod tests {
         // and both sides learn InvalidRequest. (On Unix every encodable
         // source resolves, so this path is Windows-only.)
         let config = test_config();
-        let mut random = OsSecureRandom;
         let base = BaseDirectory::capture().unwrap();
         let (controller_half, host_half) = duplex(64 * 1024);
         let mut peer = ScriptedPeer::new(
@@ -6732,7 +7094,7 @@ mod tests {
         let mut host_stream = host_half;
         let cancel = AtomicBool::new(false);
         let (host_outcome, error_message) = tokio::join!(
-            handle_download(&mut host_stream, &config, &mut random, &base, &cancel),
+            handle_download(&mut host_stream, &config, &base, &cancel),
             async {
                 peer.send(FileTransferMessage::DownloadOpen { source: "C:foo" })
                     .await;

@@ -1,8 +1,12 @@
+use crate::audit::observer::{
+    AUDIT_CHECKPOINT_POLL, AUDIT_ESTABLISH_TIMEOUT, AuditObserver, CloseNoticeHandling, FrameEvent,
+};
+use crate::audit::session::{AuditError, DIRECTION_CTRL_TO_HOST, DIRECTION_HOST_TO_CTRL};
 use crate::file_semantics::BaseDirectory;
 use crate::network::{
-    ConnectionBinding, EndpointDriver, EndpointError, EndpointEvent, RelayConnection,
-    ReservationLease, build_endpoint, connect_configured_relay, drive_bound, reconverge_relay,
-    relay_backoff, wait_for_reservation,
+    ConnectionBinding, EndpointDriver, EndpointError, EndpointEvent, RelayAccessMode,
+    RelayConnection, ReservationLease, build_endpoint, connect_configured_relay, drive_bound,
+    reconverge_relay, relay_backoff, wait_for_reservation,
 };
 use crate::pake::{OpaquePake, OpaquePakeError, OpaqueRegistration};
 use crate::progress::{NoopProgress, OperationProgress, wait_with_progress};
@@ -14,9 +18,14 @@ use crate::terminal::{
     PortablePtyBackend, PtyEventKind, TerminalBackend, TerminalError, TerminalInput,
     TerminalSession,
 };
-use crate::transfer::{TransferConfig, handle_download_from_open, handle_upload_from_open};
+use crate::transfer::{
+    TransferConfig, handle_download_from_open_with_settlement,
+    handle_upload_from_open_with_settlement,
+};
+use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +34,9 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 use tokio_util::compat::FuturesAsyncReadCompatExt as _;
+use yonder_core::wire::audit::{
+    AUDIT_PROTOCOL, AuditCloseReason, AuditRole, Digest32, ManifestEnding,
+};
 use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, CLIENT_HELLO_LEN,
     KE3_LEN, PakeContext,
@@ -89,17 +101,26 @@ pub enum HostStage {
 mod tests {
     use super::{
         EXCHANGE_TIMEOUT, FILE_SUBSTREAM_QUEUE, FileOpenError, FileOpenFrame, HostConfig,
-        HostError, HostStage, OpaquePake, PRE_AUTH_QUIESCENCE_TIMEOUT, PendingPair, binding_event,
-        classify_file_open_io, complete_terminal_exit_io, copy_controller_input,
-        copy_terminal_output, create_advertisement, file_substream_coordinator, host_error_event,
+        HostError, HostStage, IncomingFileDisposition, OpaquePake, PRE_AUTH_QUIESCENCE_TIMEOUT,
+        PendingPair, binding_event, classify_file_open_io, complete_terminal_exit_io,
+        copy_controller_input, copy_terminal_output, create_advertisement,
+        file_substream_coordinator, file_substream_disposition, host_error_event,
         read_auth_hello_io, read_file_open_frame, read_terminal_hello_io,
         report_connection_code_to, report_replacement_notice_to, retryable_relay_error, run_host,
         run_host_with, run_host_with_progress, send_auth_retry_io, send_busy_reply,
-        serve_one_file_substream, start_terminal_io, wait_for_host_retry, write_authenticated_io,
-        write_terminal_ready_io,
+        serve_one_file_substream, start_terminal_io, wait_for_audit_frame, wait_for_host_retry,
+        write_authenticated_io, write_terminal_ready_io,
     };
+    use crate::audit::observer::{
+        AUDIT_CHECKPOINT_POLL, AuditObserver, CloseNoticeHandling, FrameEvent,
+    };
+    use crate::audit::session::{
+        AuditError, DIRECTION_CTRL_TO_HOST, FILE_DIRECTION_DOWNLOAD, FILE_DIRECTION_UPLOAD,
+        FILE_KIND_START, FILE_KIND_SUCCESS, FileTransferFacts, OUTCOME_FAILED,
+    };
+    use crate::audit::verify::{StreamAction, stream_frames};
     use crate::file_semantics::BaseDirectory;
-    use crate::network::{EndpointError, relay_backoff};
+    use crate::network::{EndpointError, RelayAccessMode, relay_backoff};
     use crate::progress::NoopProgress;
     use crate::protocol::RelayProtocolError;
     use crate::terminal::{
@@ -116,10 +137,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
     use tokio::sync::{Notify, mpsc};
+    use yonder_core::wire::audit::{
+        AUDIT_PROTOCOL, AuditCloseReason, AuditErrorCode, AuditMessage, AuditRole, Digest32,
+        ManifestEnding,
+    };
+    use yonder_core::wire::audit_container::RecordType;
     use yonder_core::wire::auth::{
         AuthClientHello, AuthServerResponse, CLIENT_HELLO_LEN, PakeContext,
     };
@@ -131,8 +157,8 @@ mod tests {
         MAX_HELLO_LEN, TerminalComplete, TerminalExit, TerminalHello, TerminalResize,
     };
     use yonder_core::{
-        ConnectionCode, Locator, Pake, PakeSecret, RetryAfter, SessionEvent, TerminalSize,
-        TerminalValue,
+        ConnectionCode, Locator, OsSecureRandom, Pake, PakeSecret, RetryAfter, SessionEvent,
+        TerminalSize, TerminalValue,
     };
     use yonder_net::{
         EndpointRelayAddress, EndpointRelaySet, Keypair, NetworkBuildError, WssTransportConfig,
@@ -193,6 +219,42 @@ mod tests {
         ) -> Poll<Result<(), std::io::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    struct FailingAsyncWriter;
+
+    impl AsyncWrite for FailingAsyncWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _bytes: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed async output",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed async output",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TerminalInput for FailingAsyncWriter {
+        fn close(&mut self) {}
     }
 
     /// An async pty input that records how often it was flushed and closed.
@@ -567,82 +629,292 @@ mod tests {
         assert_eq!(shutdowns.load(Ordering::Relaxed), 3);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn terminal_pumps_make_progress_under_bidirectional_backpressure() {
-        const PAYLOAD_LEN: usize = 128 * 1024;
-        const EXIT_CODE: u32 = 37;
-        let controller_payload = patterned_bytes(PAYLOAD_LEN, 3);
-        let terminal_payload = patterned_bytes(PAYLOAD_LEN, 11);
-        let mut events = terminal_payload
-            .chunks(16 * 1024)
-            .map(|bytes| {
-                let mut chunk = TerminalChunk::new();
-                chunk.writable()[..bytes.len()].copy_from_slice(bytes);
-                chunk.set_len(bytes.len()).unwrap();
-                PtyEvent::output(chunk)
+    #[test]
+    fn terminal_pumps_make_progress_under_bidirectional_backpressure() {
+        // The combined pump, transfer and audit futures exceed the default
+        // test-thread stack; the project pattern runs the scenario on a
+        // 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    const PAYLOAD_LEN: usize = 128 * 1024;
+                    const EXIT_CODE: u32 = 37;
+                    let controller_payload = patterned_bytes(PAYLOAD_LEN, 3);
+                    let terminal_payload = patterned_bytes(PAYLOAD_LEN, 11);
+                    let mut events = terminal_payload
+                        .chunks(16 * 1024)
+                        .map(|bytes| {
+                            let mut chunk = TerminalChunk::new();
+                            chunk.writable()[..bytes.len()].copy_from_slice(bytes);
+                            chunk.set_len(bytes.len()).unwrap();
+                            PtyEvent::output(chunk)
+                        })
+                        .collect::<VecDeque<_>>();
+                    events.push_back(PtyEvent::exited(EXIT_CODE));
+                    let mut session = PumpSession { events };
+
+                    let (host_data, controller_data) = tokio::io::duplex(31);
+                    let (mut host_data_read, mut host_data_write) = tokio::io::split(host_data);
+                    let (mut controller_data_read, mut controller_data_write) =
+                        tokio::io::split(controller_data);
+                    let (host_control, controller_control) = tokio::io::duplex(31);
+                    let (mut host_control_read, mut host_control_write) =
+                        tokio::io::split(host_control);
+                    let (mut controller_control_read, mut controller_control_write) =
+                        tokio::io::split(controller_control);
+                    let (pty_input, mut captured_input) = tokio::io::duplex(31);
+                    let mut pty_input = DuplexInput(pty_input);
+
+                    let host = async {
+                        let input =
+                            copy_controller_input(&mut host_data_read, &mut pty_input, None);
+                        let output = copy_terminal_output(
+                            &mut session,
+                            &mut host_data_write,
+                            &mut host_control_read,
+                            &mut host_control_write,
+                            None,
+                        );
+                        tokio::pin!(input);
+                        tokio::pin!(output);
+                        tokio::select! {
+                            result = &mut input => match result {
+                                Ok(never) => match never {},
+                                Err(error) => Err(error),
+                            },
+                            result = &mut output => result,
+                        }
+                    };
+                    let controller = async {
+                        controller_data_write.write_all(&controller_payload).await?;
+                        controller_data_write.shutdown().await?;
+                        let mut output = Vec::with_capacity(PAYLOAD_LEN);
+                        controller_data_read.read_to_end(&mut output).await?;
+                        let mut exit = [0_u8; 5];
+                        controller_control_read.read_exact(&mut exit).await?;
+                        controller_control_write
+                            .write_all(&TerminalComplete::ENCODED)
+                            .await?;
+                        controller_control_write.flush().await?;
+                        Ok::<_, std::io::Error>((output, TerminalExit::decode(&exit).unwrap()))
+                    };
+                    let capture = async {
+                        let mut input = vec![0_u8; PAYLOAD_LEN];
+                        captured_input.read_exact(&mut input).await?;
+                        Ok::<_, std::io::Error>(input)
+                    };
+
+                    let (host, controller, captured) =
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            tokio::join!(host, controller, capture)
+                        })
+                        .await
+                        .expect("full-duplex terminal pumps deadlocked");
+                    assert_eq!(host.unwrap(), EXIT_CODE);
+                    let (output, exit) = controller.unwrap();
+                    assert_eq!(output, terminal_payload);
+                    assert_eq!(exit.code(), EXIT_CODE);
+                    assert_eq!(captured.unwrap(), controller_payload);
+                });
             })
-            .collect::<VecDeque<_>>();
-        events.push_back(PtyEvent::exited(EXIT_CODE));
-        let mut session = PumpSession { events };
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
-        let (host_data, controller_data) = tokio::io::duplex(31);
-        let (mut host_data_read, mut host_data_write) = tokio::io::split(host_data);
-        let (mut controller_data_read, mut controller_data_write) =
-            tokio::io::split(controller_data);
-        let (host_control, controller_control) = tokio::io::duplex(31);
-        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
-        let (mut controller_control_read, mut controller_control_write) =
-            tokio::io::split(controller_control);
-        let (pty_input, mut captured_input) = tokio::io::duplex(31);
-        let mut pty_input = DuplexInput(pty_input);
+    async fn establish_audit_pair() -> (
+        Arc<AuditObserver>,
+        Arc<AuditObserver>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let controller = Keypair::generate_ed25519().public().to_peer_id();
+        let host = Keypair::generate_ed25519().public().to_peer_id();
+        let (host_half, controller_half) = tokio::io::duplex(256 * 1024);
+        let digest = Digest32::new([0xCD; 32]);
+        let controller_dir = tempdir().unwrap();
+        let host_dir = tempdir().unwrap();
+        let controller_root = controller_dir.path().join("audit");
+        let host_root = host_dir.path().join("audit");
+        let mut controller_random = OsSecureRandom;
+        let mut host_random = OsSecureRandom;
+        let (controller_result, host_result) = tokio::join!(
+            Box::pin(AuditObserver::establish(
+                controller_half,
+                AuditRole::Controller,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &controller_root,
+                &mut controller_random,
+            )),
+            Box::pin(AuditObserver::establish(
+                host_half,
+                AuditRole::Host,
+                controller,
+                host,
+                crate::audit::observer::utc_start_seconds(),
+                digest,
+                &host_root,
+                &mut host_random,
+            )),
+        );
+        (
+            Arc::new(controller_result.unwrap()),
+            Arc::new(host_result.unwrap()),
+            controller_dir,
+            host_dir,
+        )
+    }
 
-        let host = async {
-            let input = copy_controller_input(&mut host_data_read, &mut pty_input);
-            let output = copy_terminal_output(
-                &mut session,
-                &mut host_data_write,
-                &mut host_control_read,
-                &mut host_control_write,
-            );
-            tokio::pin!(input);
-            tokio::pin!(output);
-            tokio::select! {
-                result = &mut input => match result {
-                    Ok(never) => match never {},
-                    Err(error) => Err(error),
-                },
-                result = &mut output => result,
-            }
-        };
-        let controller = async {
-            controller_data_write.write_all(&controller_payload).await?;
-            controller_data_write.shutdown().await?;
-            let mut output = Vec::with_capacity(PAYLOAD_LEN);
-            controller_data_read.read_to_end(&mut output).await?;
-            let mut exit = [0_u8; 5];
-            controller_control_read.read_exact(&mut exit).await?;
-            controller_control_write
-                .write_all(&TerminalComplete::ENCODED)
-                .await?;
-            controller_control_write.flush().await?;
-            Ok::<_, std::io::Error>((output, TerminalExit::decode(&exit).unwrap()))
-        };
-        let capture = async {
-            let mut input = vec![0_u8; PAYLOAD_LEN];
-            captured_input.read_exact(&mut input).await?;
-            Ok::<_, std::io::Error>(input)
-        };
+    #[test]
+    fn audit_failure_stops_further_input_from_reaching_the_pty() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (_controller_audit, host_audit, _controller_dir, _host_dir) =
+                        establish_audit_pair().await;
+                    let pump_audit = Arc::clone(&host_audit);
+                    let (host_half, controller_half) = tokio::io::duplex(64 * 1024);
+                    let (mut host_data_read, _host_data_write) = tokio::io::split(host_half);
+                    let (_controller_data_read, mut controller_data_write) =
+                        tokio::io::split(controller_half);
+                    let (pty_write, mut pty_read) = tokio::io::duplex(64 * 1024);
 
-        let (host, controller, captured) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(host, controller, capture)
-        })
-        .await
-        .expect("full-duplex terminal pumps deadlocked");
-        assert_eq!(host.unwrap(), EXIT_CODE);
-        let (output, exit) = controller.unwrap();
-        assert_eq!(output, terminal_payload);
-        assert_eq!(exit.code(), EXIT_CODE);
-        assert_eq!(captured.unwrap(), controller_payload);
+                    let pump = tokio::task::spawn(async move {
+                        copy_controller_input(
+                            &mut host_data_read,
+                            &mut DuplexInput(pty_write),
+                            Some(&pump_audit),
+                        )
+                        .await
+                    });
+
+                    let first = b"first-input-chunk";
+                    controller_data_write.write_all(first).await.unwrap();
+                    let mut captured = vec![0_u8; first.len()];
+                    pty_read.read_exact(&mut captured).await.unwrap();
+                    assert_eq!(captured, first);
+
+                    host_audit
+                        .fail_closed(None, AuditCloseReason::AuditFailure)
+                        .await;
+                    assert!(host_audit.has_failed().await);
+
+                    controller_data_write
+                        .write_all(b"second-input-chunk")
+                        .await
+                        .unwrap();
+                    let result = tokio::time::timeout(Duration::from_secs(10), pump)
+                        .await
+                        .expect("the input pump must stop after audit failure")
+                        .expect("the input pump must not panic");
+                    assert!(matches!(result, Err(HostError::Audit(_))));
+                    let mut trailing = Vec::new();
+                    pty_read.read_to_end(&mut trailing).await.unwrap();
+                    assert!(trailing.is_empty());
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn audited_terminal_effect_failures_record_failed_outcomes() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (controller_audit, host_audit, controller_dir, host_dir) =
+                        establish_audit_pair().await;
+
+                    let (host_data, mut controller_data) = tokio::io::duplex(64);
+                    let (mut host_data_read, _host_data_write) = tokio::io::split(host_data);
+                    controller_data.write_all(b"input").await.unwrap();
+                    controller_data.flush().await.unwrap();
+                    assert!(matches!(
+                        copy_controller_input(
+                            &mut host_data_read,
+                            &mut FailingAsyncWriter,
+                            Some(&host_audit),
+                        )
+                        .await,
+                        Err(HostError::Io(_))
+                    ));
+
+                    let mut chunk = TerminalChunk::new();
+                    chunk.writable()[..6].copy_from_slice(b"output");
+                    chunk.set_len(6).unwrap();
+                    let mut session = PumpSession {
+                        events: VecDeque::from([PtyEvent::output(chunk)]),
+                    };
+                    let (host_control, _controller_control) = tokio::io::duplex(8);
+                    let (mut host_control_read, mut host_control_write) =
+                        tokio::io::split(host_control);
+                    assert!(matches!(
+                        copy_terminal_output(
+                            &mut session,
+                            &mut FlushFailingWriter,
+                            &mut host_control_read,
+                            &mut host_control_write,
+                            Some(&host_audit),
+                        )
+                        .await,
+                        Err(HostError::Io(_))
+                    ));
+
+                    host_audit
+                        .close_interrupted(AuditCloseReason::ConnectionLost)
+                        .await;
+                    drop(host_audit);
+                    drop(controller_audit);
+
+                    let record = fs::read_dir(host_dir.path().join("audit").join("records"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let mut failed_pty = false;
+                    let mut failed_send = false;
+                    stream_frames(&record, &mut |record_type, payload| {
+                        let local = payload.get(40..).unwrap_or_default();
+                        match record_type {
+                            RecordType::LocalPtyWriteOutcome => {
+                                failed_pty |= local.first() == Some(&OUTCOME_FAILED);
+                            }
+                            RecordType::LocalSendOutcome => {
+                                failed_send |= local.get(1) == Some(&OUTCOME_FAILED);
+                            }
+                            _ => {}
+                        }
+                        Ok(StreamAction::Continue)
+                    })
+                    .unwrap();
+                    assert!(failed_pty, "the failed PTY write must be recorded");
+                    assert!(failed_send, "the failed substream flush must be recorded");
+                    drop(controller_dir);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -669,6 +941,7 @@ mod tests {
             &mut host_data_write,
             &mut host_control_read,
             &mut host_control_write,
+            None,
         );
         let controller = async {
             let mut terminal_bytes = Vec::new();
@@ -718,6 +991,7 @@ mod tests {
             &mut host_data_write,
             &mut host_control_read,
             &mut host_control_write,
+            None,
         );
         let controller = async {
             let mut terminal_bytes = Vec::new();
@@ -773,6 +1047,7 @@ mod tests {
             &mut host_data_write,
             &mut host_control_read,
             &mut host_control_write,
+            None,
         );
         let controller = async {
             let mut terminal_bytes = Vec::new();
@@ -807,8 +1082,12 @@ mod tests {
         let (host_control, controller_control) = tokio::io::duplex(8);
         let (mut host_read, mut host_write) = tokio::io::split(host_control);
         let (mut controller_read, mut controller_write) = tokio::io::split(controller_control);
-        let host =
-            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1));
+        let host = complete_terminal_exit_io(
+            &mut host_read,
+            &mut host_write,
+            Duration::from_secs(1),
+            None,
+        );
         let controller = async {
             controller_write
                 .write_all(&TerminalResize::new(resized).encode())
@@ -836,8 +1115,13 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1))
-                .await,
+            complete_terminal_exit_io(
+                &mut host_read,
+                &mut host_write,
+                Duration::from_secs(1),
+                None
+            )
+            .await,
             Err(HostError::Protocol(_))
         ));
 
@@ -846,8 +1130,13 @@ mod tests {
         controller_control.write_all(&[0x02, 0, 0]).await.unwrap();
         controller_control.shutdown().await.unwrap();
         assert!(matches!(
-            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1))
-                .await,
+            complete_terminal_exit_io(
+                &mut host_read,
+                &mut host_write,
+                Duration::from_secs(1),
+                None
+            )
+            .await,
             Err(HostError::Io(_))
         ));
     }
@@ -858,8 +1147,13 @@ mod tests {
         let (mut host_read, mut host_write) = tokio::io::split(host_control);
 
         assert!(matches!(
-            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_millis(10))
-                .await,
+            complete_terminal_exit_io(
+                &mut host_read,
+                &mut host_write,
+                Duration::from_millis(10),
+                None
+            )
+            .await,
             Err(HostError::Timeout)
         ));
     }
@@ -884,40 +1178,58 @@ mod tests {
         let mut failing = ErroringReader;
         let mut input = TestInput;
         assert!(matches!(
-            copy_controller_input(&mut failing, &mut input).await,
+            copy_controller_input(&mut failing, &mut input, None).await,
             Err(HostError::Io(_))
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn every_public_host_entry_rejects_invalid_tls_before_network_activity() {
-        let invalid_config = || {
-            let relay_identity = Keypair::generate_ed25519();
-            let relay: EndpointRelayAddress = format!(
-                "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
-                relay_identity.public().to_peer_id()
-            )
-            .parse()
-            .unwrap();
-            HostConfig::new(
-                Keypair::generate_ed25519(),
-                EndpointRelaySet::new(vec![relay]).unwrap(),
-                WssTransportConfig::client(Some(vec![1])),
-            )
-        };
-        let assert_invalid = |result| {
-            assert!(matches!(
-                result,
-                Err(HostError::Endpoint(EndpointError::Build(
-                    NetworkBuildError::WssTls(_)
-                )))
-            ));
-        };
+    #[test]
+    fn every_public_host_entry_rejects_invalid_tls_before_network_activity() {
+        // The host future (with the 0.2.0 audit observer state) exceeds the
+        // default test-thread stack, so the scenario runs on a dedicated
+        // thread with a large stack.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let invalid_config = || {
+                        let relay_identity = Keypair::generate_ed25519();
+                        let relay: EndpointRelayAddress = format!(
+                            "/dns4/localhost/tcp/443/tls/ws/p2p/{}",
+                            relay_identity.public().to_peer_id()
+                        )
+                        .parse()
+                        .unwrap();
+                        HostConfig::new(
+                            Keypair::generate_ed25519(),
+                            EndpointRelaySet::new(vec![relay]).unwrap(),
+                            WssTransportConfig::client(Some(vec![1])),
+                        )
+                    };
+                    let assert_invalid = |result| {
+                        assert!(matches!(
+                            result,
+                            Err(HostError::Endpoint(EndpointError::Build(
+                                NetworkBuildError::WssTls(_)
+                            )))
+                        ));
+                    };
 
-        assert_invalid(run_host(invalid_config()).await);
-        let mut progress = NoopProgress;
-        assert_invalid(run_host_with_progress(invalid_config(), &mut progress).await);
-        assert_invalid(run_host_with(invalid_config(), TestBackend::open_failure()).await);
+                    assert_invalid(run_host(invalid_config()).await);
+                    let mut progress = NoopProgress;
+                    assert_invalid(run_host_with_progress(invalid_config(), &mut progress).await);
+                    assert_invalid(
+                        run_host_with(invalid_config(), TestBackend::open_failure()).await,
+                    );
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     struct TestBackend {
@@ -1362,6 +1674,7 @@ mod tests {
             Arc::clone(&cancel),
             &config,
             super::FileSubstreamRole::Active,
+            None,
         );
         let peer = async {
             peer_half.shutdown().await.unwrap();
@@ -1383,6 +1696,7 @@ mod tests {
             Arc::clone(&cancel),
             &config,
             super::FileSubstreamRole::Busy,
+            None,
         );
         let peer = async {
             peer_half.shutdown().await.unwrap();
@@ -1403,6 +1717,7 @@ mod tests {
             Arc::clone(&cancel),
             &config,
             super::FileSubstreamRole::Active,
+            None,
         );
         let peer = async {
             send_wire_frame(
@@ -1447,6 +1762,7 @@ mod tests {
                 cancel,
                 &config,
                 super::FileSubstreamRole::Active,
+                None,
             );
             let controller = async {
                 send_wire_frame(
@@ -1511,6 +1827,7 @@ mod tests {
                 cancel,
                 &config,
                 super::FileSubstreamRole::Active,
+                None,
             );
             let controller = async {
                 send_wire_frame(
@@ -1561,7 +1878,8 @@ mod tests {
         let base = Some(BaseDirectory::capture().unwrap());
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
-        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+        let coordinator =
+            file_substream_coordinator(receiver, base.as_ref(), cancel, &config, None);
         let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
         sender.try_send(host_half).unwrap();
         // The coordinator ends when the sender is dropped, which the real
@@ -1609,7 +1927,8 @@ mod tests {
         let base = Some(BaseDirectory::capture().unwrap());
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
-        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+        let coordinator =
+            file_substream_coordinator(receiver, base.as_ref(), cancel, &config, None);
 
         let (host_first, mut peer_first) = tokio::io::duplex(64 * 1024);
         let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
@@ -1706,7 +2025,8 @@ mod tests {
         let base = Some(BaseDirectory::capture().unwrap());
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
-        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+        let coordinator =
+            file_substream_coordinator(receiver, base.as_ref(), cancel, &config, None);
 
         let (host_first, mut peer_first) = tokio::io::duplex(64 * 1024);
         let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
@@ -1841,6 +2161,7 @@ mod tests {
             Arc::clone(&cancel),
             &config,
             super::FileSubstreamRole::Active,
+            None,
         );
         let controller = async {
             send_wire_frame(
@@ -1906,6 +2227,7 @@ mod tests {
             Arc::clone(&cancel),
             &config,
             super::FileSubstreamRole::Active,
+            None,
         );
         let controller = async {
             send_wire_frame(
@@ -1944,6 +2266,7 @@ mod tests {
             Arc::clone(&cancel),
             &config,
             super::FileSubstreamRole::Active,
+            None,
         );
         let controller = async {
             send_wire_frame(
@@ -1977,6 +2300,7 @@ mod tests {
             cancel,
             &config,
             super::FileSubstreamRole::Active,
+            None,
         );
         let bytes = patterned_bytes(4096, 11);
         let controller = async {
@@ -2014,97 +2338,116 @@ mod tests {
     // keeps running while a file transfer is in flight.
     // ------------------------------------------------------------------
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn terminal_pump_runs_concurrently_with_a_file_transfer() {
-        const EXIT_CODE: u32 = 53;
-        const TRANSFER_SIZE: usize = 200 * 1024;
-        let config = file_transfer_config();
-        let directory = tempdir().unwrap();
-        let base = Some(BaseDirectory::capture().unwrap());
-        let cancel = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn terminal_pump_runs_concurrently_with_a_file_transfer() {
+        // The combined pump, transfer and audit futures exceed the default
+        // test-thread stack; the project pattern runs the scenario on a
+        // 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    const EXIT_CODE: u32 = 53;
+                    const TRANSFER_SIZE: usize = 200 * 1024;
+                    let config = file_transfer_config();
+                    let directory = tempdir().unwrap();
+                    let base = Some(BaseDirectory::capture().unwrap());
+                    let cancel = Arc::new(AtomicBool::new(false));
 
-        let mut events = VecDeque::new();
-        let terminal_bytes = patterned_bytes(16 * 1024, 13);
-        for chunk in terminal_bytes.chunks(4096) {
-            let mut terminal_chunk = TerminalChunk::new();
-            terminal_chunk.writable()[..chunk.len()].copy_from_slice(chunk);
-            terminal_chunk.set_len(chunk.len()).unwrap();
-            events.push_back(PtyEvent::output(terminal_chunk));
-        }
-        events.push_back(PtyEvent::exited(EXIT_CODE));
-        let mut session = PumpSession { events };
+                    let mut events = VecDeque::new();
+                    let terminal_bytes = patterned_bytes(16 * 1024, 13);
+                    for chunk in terminal_bytes.chunks(4096) {
+                        let mut terminal_chunk = TerminalChunk::new();
+                        terminal_chunk.writable()[..chunk.len()].copy_from_slice(chunk);
+                        terminal_chunk.set_len(chunk.len()).unwrap();
+                        events.push_back(PtyEvent::output(terminal_chunk));
+                    }
+                    events.push_back(PtyEvent::exited(EXIT_CODE));
+                    let mut session = PumpSession { events };
 
-        let (host_data, mut controller_data) = tokio::io::duplex(8);
-        let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
-        let (host_control, controller_control) = tokio::io::duplex(8);
-        let (mut host_control_read, mut host_control_write) = tokio::io::split(host_control);
-        let (mut controller_control_read, mut controller_control_write) =
-            tokio::io::split(controller_control);
-        let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
+                    let (host_data, mut controller_data) = tokio::io::duplex(8);
+                    let (_host_data_read, mut host_data_write) = tokio::io::split(host_data);
+                    let (host_control, controller_control) = tokio::io::duplex(8);
+                    let (mut host_control_read, mut host_control_write) =
+                        tokio::io::split(host_control);
+                    let (mut controller_control_read, mut controller_control_write) =
+                        tokio::io::split(controller_control);
+                    let (host_half, mut peer_half) = tokio::io::duplex(64 * 1024);
 
-        let final_path = directory.path().join("during.bin");
-        let destination = final_path.to_str().unwrap().to_owned();
-        let transfer_bytes = patterned_bytes(TRANSFER_SIZE, 17);
+                    let final_path = directory.path().join("during.bin");
+                    let destination = final_path.to_str().unwrap().to_owned();
+                    let transfer_bytes = patterned_bytes(TRANSFER_SIZE, 17);
 
-        let pump = copy_terminal_output(
-            &mut session,
-            &mut host_data_write,
-            &mut host_control_read,
-            &mut host_control_write,
-        );
-        let served = serve_one_file_substream(
-            host_half,
-            base.as_ref(),
-            cancel,
-            &config,
-            super::FileSubstreamRole::Active,
-        );
-        let controller = async {
-            // Drive the file transfer to completion.
-            send_wire_frame(
-                &mut peer_half,
-                &FileTransferMessage::UploadOpen {
-                    destination: &destination,
-                    file_name: "during.bin",
-                    declared_size: TRANSFER_SIZE as u64,
-                },
-            )
-            .await;
-            expect_wire_control(&mut peer_half, &FileTransferMessage::Ready).await;
-            for chunk in transfer_bytes.chunks(65536) {
-                send_wire_data(&mut peer_half, chunk).await;
-            }
-            send_wire_frame(
-                &mut peer_half,
-                &FileTransferMessage::Finish {
-                    actual_size: TRANSFER_SIZE as u64,
-                    digest: sha256_bytes(&transfer_bytes),
-                },
-            )
-            .await;
-            expect_wire_control(&mut peer_half, &FileTransferMessage::Committed).await;
-            // Observe the terminal output and complete the session.
-            let mut observed = Vec::new();
-            controller_data.read_to_end(&mut observed).await.unwrap();
-            let mut exit = [0_u8; 5];
-            controller_control_read.read_exact(&mut exit).await.unwrap();
-            controller_control_write
-                .write_all(&TerminalComplete::ENCODED)
-                .await
-                .unwrap();
-            controller_control_write.flush().await.unwrap();
-            (observed, TerminalExit::decode(&exit).unwrap())
-        };
-        let (pump_result, (observed, exit), ()) =
-            tokio::time::timeout(Duration::from_secs(10), async {
-                tokio::join!(pump, controller, served)
+                    let pump = copy_terminal_output(
+                        &mut session,
+                        &mut host_data_write,
+                        &mut host_control_read,
+                        &mut host_control_write,
+                        None,
+                    );
+                    let served = serve_one_file_substream(
+                        host_half,
+                        base.as_ref(),
+                        cancel,
+                        &config,
+                        super::FileSubstreamRole::Active,
+                        None,
+                    );
+                    let controller = async {
+                        // Drive the file transfer to completion.
+                        send_wire_frame(
+                            &mut peer_half,
+                            &FileTransferMessage::UploadOpen {
+                                destination: &destination,
+                                file_name: "during.bin",
+                                declared_size: TRANSFER_SIZE as u64,
+                            },
+                        )
+                        .await;
+                        expect_wire_control(&mut peer_half, &FileTransferMessage::Ready).await;
+                        for chunk in transfer_bytes.chunks(65536) {
+                            send_wire_data(&mut peer_half, chunk).await;
+                        }
+                        send_wire_frame(
+                            &mut peer_half,
+                            &FileTransferMessage::Finish {
+                                actual_size: TRANSFER_SIZE as u64,
+                                digest: sha256_bytes(&transfer_bytes),
+                            },
+                        )
+                        .await;
+                        expect_wire_control(&mut peer_half, &FileTransferMessage::Committed).await;
+                        // Observe the terminal output and complete the session.
+                        let mut observed = Vec::new();
+                        controller_data.read_to_end(&mut observed).await.unwrap();
+                        let mut exit = [0_u8; 5];
+                        controller_control_read.read_exact(&mut exit).await.unwrap();
+                        controller_control_write
+                            .write_all(&TerminalComplete::ENCODED)
+                            .await
+                            .unwrap();
+                        controller_control_write.flush().await.unwrap();
+                        (observed, TerminalExit::decode(&exit).unwrap())
+                    };
+                    let (pump_result, (observed, exit), ()) =
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            tokio::join!(pump, controller, served)
+                        })
+                        .await
+                        .expect("terminal pump and file transfer deadlocked");
+                    assert_eq!(pump_result.unwrap(), EXIT_CODE);
+                    assert_eq!(exit.code(), EXIT_CODE);
+                    assert_eq!(observed, terminal_bytes);
+                    assert_eq!(fs::read(&final_path).unwrap(), transfer_bytes);
+                });
             })
-            .await
-            .expect("terminal pump and file transfer deadlocked");
-        assert_eq!(pump_result.unwrap(), EXIT_CODE);
-        assert_eq!(exit.code(), EXIT_CODE);
-        assert_eq!(observed, terminal_bytes);
-        assert_eq!(fs::read(&final_path).unwrap(), transfer_bytes);
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     // ------------------------------------------------------------------
@@ -2292,6 +2635,7 @@ mod tests {
             cancel,
             &config,
             super::FileSubstreamRole::Active,
+            None,
         );
         let peer = async {
             send_wire_frame(
@@ -2343,8 +2687,16 @@ mod tests {
         let directory = tempdir().unwrap();
         let base = Some(BaseDirectory::capture().unwrap());
         let cancel = Arc::new(AtomicBool::new(false));
+        let (_controller_audit, host_audit, _controller_audit_dir, _host_audit_dir) =
+            establish_audit_pair().await;
         let (sender, receiver) = mpsc::channel::<tokio::io::DuplexStream>(FILE_SUBSTREAM_QUEUE);
-        let coordinator = file_substream_coordinator(receiver, base.as_ref(), cancel, &config);
+        let coordinator = file_substream_coordinator(
+            receiver,
+            base.as_ref(),
+            cancel,
+            &config,
+            Some(host_audit.as_ref()),
+        );
 
         let first_bytes = patterned_bytes(64 * 1024, 5);
         let second_bytes = patterned_bytes(64 * 1024, 7);
@@ -2382,13 +2734,16 @@ mod tests {
                 )
                 .await;
                 expect_wire_control(&mut peer_first, &FileTransferMessage::Committed).await;
+                // `Committed` is the wire terminal point. Let the next
+                // operation start before this substream reaches EOF, while
+                // the host is still appending its local audit end record.
+                first_done.notify_one();
                 let mut trailing = [0_u8; 1];
                 assert_eq!(
                     peer_first.read(&mut trailing).await.unwrap(),
                     0,
                     "the first substream must be closed by the host"
                 );
-                first_done.notify_one();
             }
         };
         let second = {
@@ -2397,11 +2752,9 @@ mod tests {
             let second_destination = &second_destination;
             async move {
                 first_done.notified().await;
-                // Let the coordinator observe the completed serve future and
-                // free the active slot before the next substream arrives.
-                for _ in 0..16 {
-                    tokio::task::yield_now().await;
-                }
+                // Deliver the next substream immediately after the first
+                // peer observes its terminal frame. The coordinator must
+                // defer it until the prior local audit append completes.
                 let (host_second, mut peer_second) = tokio::io::duplex(64 * 1024);
                 sender.try_send(host_second).unwrap();
                 send_wire_frame(
@@ -2436,6 +2789,34 @@ mod tests {
         assert_eq!(fs::read(&second_path).unwrap(), second_bytes);
     }
 
+    #[test]
+    fn coordinator_defers_only_a_wire_settled_active_handoff() {
+        assert_eq!(
+            file_substream_disposition(false, false, false),
+            IncomingFileDisposition::Active
+        );
+        assert_eq!(
+            file_substream_disposition(true, false, false),
+            IncomingFileDisposition::Busy
+        );
+        assert_eq!(
+            file_substream_disposition(true, true, false),
+            IncomingFileDisposition::Deferred
+        );
+        assert_eq!(
+            file_substream_disposition(true, false, true),
+            IncomingFileDisposition::Drop
+        );
+        assert_eq!(
+            file_substream_disposition(false, false, true),
+            IncomingFileDisposition::Deferred
+        );
+        assert_eq!(
+            file_substream_disposition(true, true, true),
+            IncomingFileDisposition::Deferred
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn controller_input_flush_and_close_are_invoked_at_stream_end() {
         let (mut host_data, peer) = tokio::io::duplex(8);
@@ -2446,7 +2827,7 @@ mod tests {
             flushes: Arc::clone(&flushes),
             closes: Arc::clone(&closes),
         };
-        let copy = copy_controller_input(&mut host_data, &mut input);
+        let copy = copy_controller_input(&mut host_data, &mut input, None);
         tokio::pin!(copy);
         // The peer half is dropped, so the read side reports EOF on the
         // first poll; the copy then flushes, closes the pty input and
@@ -2473,8 +2854,8 @@ mod tests {
         );
         assert_eq!(
             flushes.load(Ordering::Relaxed),
-            2,
-            "one flush from tokio::io::copy at EOF plus the explicit flush"
+            1,
+            "the explicit flush after the input EOF"
         );
     }
 
@@ -2499,6 +2880,7 @@ mod tests {
             &mut host_data_write,
             &mut host_control_read,
             &mut host_control_write,
+            None,
         );
         let controller = async {
             // Deliver the five-byte resize in two fragments so the control
@@ -2559,6 +2941,7 @@ mod tests {
                 &mut host_data_write,
                 &mut host_control_read,
                 &mut host_control_write,
+                None,
             )
             .await,
             Err(HostError::Protocol(_))
@@ -2582,6 +2965,7 @@ mod tests {
                 &mut host_data_write,
                 &mut host_control_read,
                 &mut host_control_write,
+                None,
             )
             .await,
             Err(HostError::Io(_))
@@ -2605,6 +2989,7 @@ mod tests {
                 &mut host_data_write,
                 &mut host_control_read,
                 &mut host_control_write,
+                None,
             )
             .await,
             Err(HostError::Io(_))
@@ -2627,6 +3012,7 @@ mod tests {
                 &mut host_data_write,
                 &mut failing,
                 &mut host_control_write,
+                None,
             )
             .await,
             Err(HostError::Io(_))
@@ -2648,6 +3034,7 @@ mod tests {
                 &mut host_data_write,
                 &mut host_control_read,
                 &mut host_control_write,
+                None,
             )
             .await,
             Err(HostError::Terminal(TerminalError::TaskStopped))
@@ -2661,8 +3048,12 @@ mod tests {
         let (host_control, controller_control) = tokio::io::duplex(8);
         let (mut host_read, mut host_write) = tokio::io::split(host_control);
         let (mut controller_read, mut controller_write) = tokio::io::split(controller_control);
-        let host =
-            complete_terminal_exit_io(&mut host_read, &mut host_write, Duration::from_secs(1));
+        let host = complete_terminal_exit_io(
+            &mut host_read,
+            &mut host_write,
+            Duration::from_secs(1),
+            None,
+        );
         let controller = async {
             controller_write
                 .write_all(&TerminalResize::new(first).encode())
@@ -2693,7 +3084,8 @@ mod tests {
         let mut failing = ErroringReader;
         let mut host_write = FlushFailingWriter;
         assert!(matches!(
-            complete_terminal_exit_io(&mut failing, &mut host_write, Duration::from_secs(1)).await,
+            complete_terminal_exit_io(&mut failing, &mut host_write, Duration::from_secs(1), None)
+                .await,
             Err(HostError::Io(_))
         ));
     }
@@ -2710,11 +3102,7 @@ mod tests {
     // a code the test itself created.
     // ------------------------------------------------------------------
 
-    use super::{
-        FileSubstreamIo, InboundProtocols, acknowledge_and_wait_for_terminal_streams, authenticate,
-        bridge_terminal, drive_session_inputs, read_auth_hello, run_host_session, start_terminal,
-        wait_for_auth, wait_for_controller_quiescence,
-    };
+    use super::{FileSubstreamIo, HostSession, run_host_session};
     use crate::network::{
         EndpointDriver, RelayConnection, build_endpoint, connect_configured_relay,
         wait_for_reservation,
@@ -2740,14 +3128,9 @@ mod tests {
     };
 
     fn available_tcp_port() -> u16 {
-        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        crate::available_test_tcp_port()
     }
 
-    /// Waits until the relay's TCP listener accepts connections.
     /// Connects to the in-process relay with bounded retries: the relay's
     /// listener is up before its swarm is fully ready, so under parallel
     /// test load the first dial may transiently fail.
@@ -2770,26 +3153,10 @@ mod tests {
         }
     }
 
-    async fn wait_for_tcp_listener(port: u16) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(_) => return,
-                Err(_) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "the relay listener did not open on port {port}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-    }
-
     /// A real relay service running inside the test runtime on a pinned
     /// port, restartable with the same identity for the recovery scenario.
     struct InProcessRelay {
-        task: tokio::task::JoinHandle<Result<(), RelayServiceError>>,
+        task: Option<tokio::task::JoinHandle<Result<(), RelayServiceError>>>,
         shutdown: Option<oneshot::Sender<()>>,
     }
 
@@ -2811,7 +3178,7 @@ mod tests {
                 Ok(())
             }));
             Self {
-                task,
+                task: Some(task),
                 shutdown: Some(shutdown_tx),
             }
         }
@@ -2820,7 +3187,20 @@ mod tests {
             if let Some(shutdown) = self.shutdown.take() {
                 let _ = shutdown.send(());
             }
-            let _ = self.task.await;
+            if let Some(task) = self.task.take() {
+                let _ = task.await;
+            }
+        }
+    }
+
+    impl Drop for InProcessRelay {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
         }
     }
 
@@ -2941,32 +3321,49 @@ mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
             loop {
                 let open = self.streams.open(self.relay_peer, RESOLVE_PROTOCOL);
-                tokio::pin!(open);
-                let stream = match tokio::time::timeout_at(deadline, &mut open).await {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(_)) => {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
-                    }
-                    Err(_) => panic!("locator resolve substream never opened"),
-                };
+                let stream =
+                    match tokio::time::timeout_at(deadline, drive_test_node(&mut self.node, open))
+                        .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(_)) => {
+                            drive_test_node(
+                                &mut self.node,
+                                tokio::time::sleep(Duration::from_millis(200)),
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(_) => panic!("locator resolve substream never opened"),
+                    };
                 let mut stream = stream.into_tokio();
-                stream
-                    .write_all(&ResolveRequest::new(locator).encode())
-                    .await
-                    .unwrap();
-                stream.shutdown().await.unwrap();
                 let mut response = Vec::new();
-                stream.read_to_end(&mut response).await.unwrap();
+                drive_test_node(&mut self.node, async {
+                    stream
+                        .write_all(&ResolveRequest::new(locator).encode())
+                        .await
+                        .unwrap();
+                    stream.shutdown().await.unwrap();
+                    stream.read_to_end(&mut response).await.unwrap();
+                })
+                .await;
                 match ResolveResponse::decode(&response).unwrap() {
                     ResolveResponse::Resolved(peer) => {
                         return PeerId::from_bytes(peer.as_bytes()).unwrap();
                     }
                     ResolveResponse::Unavailable => {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(200)),
+                        )
+                        .await;
                     }
                     ResolveResponse::Retry(after) => {
-                        tokio::time::sleep(Duration::from_millis(u64::from(after.millis()))).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(u64::from(after.millis()))),
+                        )
+                        .await;
                     }
                 }
             }
@@ -2991,7 +3388,11 @@ mod tests {
                     tokio::time::Instant::now() < deadline,
                     "the controller could not reach the host through the relay"
                 );
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                drive_test_node(
+                    &mut self.node,
+                    tokio::time::sleep(Duration::from_millis(250)),
+                )
+                .await;
             }
         }
 
@@ -3043,35 +3444,53 @@ mod tests {
                     .client_start(&target, code.secret())
                     .map_err(|_| ())?;
                 let hello = AuthClientHello::new(nonce, ke1).encode();
-                match stream.write_all(&hello).await {
+                match drive_test_node(&mut self.node, stream.write_all(&hello)).await {
                     Ok(()) => {}
                     Err(_) => {
                         if tokio::time::Instant::now() >= deadline {
                             return Err(());
                         }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(200)),
+                        )
+                        .await;
                         continue;
                     }
                 }
-                stream.flush().await.map_err(|_| ())?;
+                drive_test_node(&mut self.node, stream.flush())
+                    .await
+                    .map_err(|_| ())?;
                 let mut tag = [0_u8; 1];
-                match tokio::time::timeout_at(deadline, stream.read_exact(&mut tag)).await {
+                match tokio::time::timeout_at(
+                    deadline,
+                    drive_test_node(&mut self.node, stream.read_exact(&mut tag)),
+                )
+                .await
+                {
                     Ok(Ok(_)) => {}
                     _ => {
                         if tokio::time::Instant::now() >= deadline {
                             return Err(());
                         }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        drive_test_node(
+                            &mut self.node,
+                            tokio::time::sleep(Duration::from_millis(200)),
+                        )
+                        .await;
                         continue;
                     }
                 }
                 let response = match tag[0] {
                     0x01 => {
                         let mut rest = [0_u8; PROCEED_LEN - 1];
-                        tokio::time::timeout_at(deadline, stream.read_exact(&mut rest))
-                            .await
-                            .map_err(|_| ())?
-                            .map_err(|_| ())?;
+                        tokio::time::timeout_at(
+                            deadline,
+                            drive_test_node(&mut self.node, stream.read_exact(&mut rest)),
+                        )
+                        .await
+                        .map_err(|_| ())?
+                        .map_err(|_| ())?;
                         let mut frame = [0_u8; PROCEED_LEN];
                         frame[0] = tag[0];
                         frame[1..].copy_from_slice(&rest);
@@ -3079,10 +3498,13 @@ mod tests {
                     }
                     0x02 => {
                         let mut rest = [0_u8; RETRY_LEN - 1];
-                        tokio::time::timeout_at(deadline, stream.read_exact(&mut rest))
-                            .await
-                            .map_err(|_| ())?
-                            .map_err(|_| ())?;
+                        tokio::time::timeout_at(
+                            deadline,
+                            drive_test_node(&mut self.node, stream.read_exact(&mut rest)),
+                        )
+                        .await
+                        .map_err(|_| ())?
+                        .map_err(|_| ())?;
                         let mut frame = [0_u8; RETRY_LEN];
                         frame[0] = tag[0];
                         frame[1..].copy_from_slice(&rest);
@@ -3128,12 +3550,16 @@ mod tests {
                 PakeContext::new(code.locator(), &controller, &target, &nonce, target_nonce);
             match self.pake.client_finish(state, ke2, context.as_bytes()) {
                 Ok((ke3, session_key)) => {
-                    stream.write_all(&ke3).await.map_err(|_| ())?;
-                    stream.flush().await.map_err(|_| ())?;
+                    drive_test_node(&mut self.node, async {
+                        stream.write_all(&ke3).await?;
+                        stream.flush().await
+                    })
+                    .await
+                    .map_err(|_| ())?;
                     let mut acknowledgement = [0_u8; 1];
                     tokio::time::timeout(
                         Duration::from_secs(10),
-                        stream.read_exact(&mut acknowledgement),
+                        drive_test_node(&mut self.node, stream.read_exact(&mut acknowledgement)),
                     )
                     .await
                     .map_err(|_| ())?
@@ -3144,8 +3570,12 @@ mod tests {
                     drop(session_key);
                 }
                 Err(_) => {
-                    stream.write_all(&[0xAB; KE3_LEN]).await.map_err(|_| ())?;
-                    stream.flush().await.map_err(|_| ())?;
+                    drive_test_node(&mut self.node, async {
+                        stream.write_all(&[0xAB; KE3_LEN]).await?;
+                        stream.flush().await
+                    })
+                    .await
+                    .map_err(|_| ())?;
                 }
             }
             Ok(response)
@@ -3173,6 +3603,89 @@ mod tests {
         host: PeerId,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EnterpriseControllerEnding {
+        Complete,
+        CheckpointThenComplete,
+        ControllerDetach,
+        AuditFailure,
+        AuditStreamEnd,
+        AuditFinalizeStreamEnd,
+    }
+
+    // This is the aggregate harness bound, not a product timeout. The case
+    // deliberately composes relay setup, OPAQUE, terminal startup, two file
+    // transfers and bilateral audit finalization, each of which retains its
+    // own shorter protocol deadline. Instrumented and contended CI runners
+    // need enough aggregate room to exercise that complete sequence.
+    const ENTERPRISE_HOST_CASE_TIMEOUT: Duration = Duration::from_secs(300);
+
+    async fn drive_test_node<F: Future>(node: &mut EndpointNode, future: F) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                result = &mut future => return result,
+                _ = node.next_event() => {}
+            }
+        }
+    }
+
+    async fn drive_active_audit_checkpoint(
+        controller: &mut ScriptedController,
+        audit: &AuditObserver,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut frames = Box::pin(wait_for_audit_frame(Some(audit)));
+        let mut local_checkpoint_sent = false;
+        let mut local_checkpoint_acknowledged = false;
+        let mut peer_checkpoint_received = false;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("the bilateral active checkpoint did not converge");
+                }
+                _ = controller.node.next_event() => {}
+                result = tokio::time::timeout(AUDIT_CHECKPOINT_POLL, &mut frames) => {
+                    match result {
+                        Err(_) => {
+                            if !local_checkpoint_sent && audit.checkpoint_due().await {
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.send_due_checkpoint(),
+                                )
+                                .await
+                                .unwrap();
+                                local_checkpoint_sent = true;
+                            }
+                        }
+                        Ok(Ok(Some(frame))) => {
+                            match AuditMessage::decode_frame(&frame).unwrap() {
+                                AuditMessage::Checkpoint(_) => peer_checkpoint_received = true,
+                                AuditMessage::CheckpointAck(_) => {
+                                    local_checkpoint_acknowledged = true;
+                                }
+                                _ => {}
+                            }
+                            let event = drive_test_node(
+                                &mut controller.node,
+                                audit.handle_frame(&frame),
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(event, FrameEvent::None);
+                            frames = Box::pin(wait_for_audit_frame(Some(audit)));
+                        }
+                        Ok(Ok(None)) => panic!("the active audit stream ended"),
+                        Ok(Err(error)) => panic!("the active audit stream failed: {error}"),
+                    }
+                }
+            }
+            if local_checkpoint_sent && local_checkpoint_acknowledged && peer_checkpoint_received {
+                break;
+            }
+        }
+    }
+
     /// A backend whose session records controller input on a duplex and
     /// emits one scripted output block before waiting for the shared exit
     /// flag, so a real bridge can drive a full terminal lifecycle.
@@ -3181,6 +3694,7 @@ mod tests {
         exit_flag: Arc<AtomicBool>,
         exit_code: u32,
         input_write: Mutex<Option<DuplexStream>>,
+        resized: Arc<Mutex<Option<TerminalSize>>>,
     }
 
     impl TerminalBackend for ScriptedBackend {
@@ -3192,7 +3706,7 @@ mod tests {
                 exit_flag: Arc::clone(&self.exit_flag),
                 exit_code: self.exit_code,
                 input_write: self.input_write.lock().unwrap().take(),
-                resized: None,
+                resized: Arc::clone(&self.resized),
                 exited: false,
             })
         }
@@ -3203,7 +3717,7 @@ mod tests {
         exit_flag: Arc<AtomicBool>,
         exit_code: u32,
         input_write: Option<DuplexStream>,
-        resized: Option<TerminalSize>,
+        resized: Arc<Mutex<Option<TerminalSize>>>,
         exited: bool,
     }
 
@@ -3219,7 +3733,7 @@ mod tests {
         }
 
         async fn resize(&mut self, size: TerminalSize) -> Result<(), TerminalError> {
-            self.resized = Some(size);
+            *self.resized.lock().unwrap() = Some(size);
             Ok(())
         }
 
@@ -3234,7 +3748,10 @@ mod tests {
             // The shell may only exit after the scripted resize has been
             // applied, so the bridge processes the resize before the
             // completion handshake regardless of select ordering.
-            if self.resized.is_some() && self.exit_flag.load(Ordering::Relaxed) && !self.exited {
+            if self.resized.lock().unwrap().is_some()
+                && self.exit_flag.load(Ordering::Relaxed)
+                && !self.exited
+            {
                 self.exited = true;
                 return Ok(PtyEvent::exited(self.exit_code));
             }
@@ -3253,15 +3770,27 @@ mod tests {
     // aborted, which is the in-process equivalent of a forced exit.
     // ------------------------------------------------------------------
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_host_session_rejects_an_unknown_secret_and_keeps_serving() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        // The host session future is not Send: the production bridge owns
-        // `Box<dyn FileSubstreamIo>` and `Pin<Box<dyn Future>>` trait
-        // objects, so the session runs on a LocalSet instead of a spawned
-        // Send task (the relay service stays a regular Send spawn).
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
+    #[test]
+    fn in_process_host_session_rejects_an_unknown_secret_and_keeps_serving() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined host session and audit futures exceed the
+        // default test-thread stack; the project pattern runs the
+        // scenario on a 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    // The host session future is not Send: the production bridge owns
+                    // `Box<dyn FileSubstreamIo>` and `Pin<Box<dyn Future>>` trait
+                    // objects, so the session runs on a LocalSet instead of a spawned
+                    // Send task (the relay service stays a regular Send spawn).
+                    let local = tokio::task::LocalSet::new();
+                    tokio::time::timeout(
             Duration::from_secs(90),
             local.run_until(async {
                 let port = available_tcp_port();
@@ -3274,8 +3803,6 @@ mod tests {
                 .unwrap();
                 let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
                 let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
 
                 let host_identity = Keypair::generate_ed25519();
                 let host_peer = host_identity.public().to_peer_id();
@@ -3327,17 +3854,33 @@ mod tests {
                 );
                 host.abort();
                 relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process rejection scenario must finish");
+                        }),
+                    )
+                    .await
+                    .expect("the in-process rejection scenario must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_host_session_answers_retry_after_the_auth_burst() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
+    #[test]
+    fn in_process_host_session_answers_retry_after_the_auth_burst() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined host session and audit futures exceed the
+        // default test-thread stack; the project pattern runs the
+        // scenario on a 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let local = tokio::task::LocalSet::new();
+                    tokio::time::timeout(
             Duration::from_secs(90),
             local.run_until(async {
                 let port = available_tcp_port();
@@ -3350,8 +3893,6 @@ mod tests {
                 .unwrap();
                 let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
                 let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
 
                 let host_identity = Keypair::generate_ed25519();
                 let host_peer = host_identity.public().to_peer_id();
@@ -3434,460 +3975,1193 @@ mod tests {
                 controller.await.unwrap();
                 host.abort();
                 relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process rate-limit scenario must finish");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_host_session_answers_an_extra_auth_stream_with_retry() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(90),
-            local.run_until(async {
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                let host_identity = Keypair::generate_ed25519();
-                let host_peer = host_identity.public().to_peer_id();
-                let progress = SharedSessionProgress::default();
-                let mut observed = progress.clone();
-                let host = tokio::task::spawn_local(async move {
-                    run_host_session(
-                        HostConfig::new(host_identity, relays, WssTransportConfig::client(None)),
-                        TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
-                        &mut observed,
+                        }),
                     )
                     .await
+                    .expect("the in-process rate-limit scenario must finish");
                 });
-                progress.wait_for(HostStage::WaitingForController).await;
-
-                // While one auth exchange is in flight, a second auth stream
-                // from the same controller must be answered with Retry and
-                // closed without disturbing the active exchange (design 0.1.1
-                // extra-auth rejection).
-                let wrong_code = ConnectionCode::new(
-                    Locator::new(1).unwrap(),
-                    PakeSecret::from_u64(0x9ABC).unwrap(),
-                );
-                let controller = tokio::task::spawn_local(async move {
-                    let mut controller = ScriptedController::connect(&relay_address).await;
-                    controller.reach_host(host_peer).await;
-                    let first = controller
-                        .auth_start(host_peer, &wrong_code)
-                        .await
-                        .expect("the first auth stream must be answered");
-                    assert!(
-                        first.response.proceed_parts().is_some(),
-                        "the first stream must proceed"
-                    );
-                    let extra = controller
-                        .auth_start(host_peer, &wrong_code)
-                        .await
-                        .expect("the extra auth stream must be answered");
-                    assert!(
-                        extra.response.retry_after().is_some(),
-                        "the extra auth stream must be answered with Retry"
-                    );
-                    controller
-                        .finish_auth(first, &wrong_code)
-                        .await
-                        .expect("the active exchange must finish after the extra rejection");
-                });
-
-                controller.await.unwrap();
-                host.abort();
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process extra-auth scenario must finish");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_host_session_recovers_when_the_relay_restarts() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            local.run_until(async {
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity.clone(), port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                let host_identity = Keypair::generate_ed25519();
-                let host_peer = host_identity.public().to_peer_id();
-                let progress = SharedSessionProgress::default();
-                let mut observed = progress.clone();
-                let host = tokio::task::spawn_local(async move {
-                    run_host_session(
-                        HostConfig::new(host_identity, relays, WssTransportConfig::client(None)),
-                        TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
-                        &mut observed,
-                    )
-                    .await
-                });
-                progress.wait_for(HostStage::WaitingForController).await;
-
-                // The relay dies mid-session: the host must notice the lost
-                // lease, reconnect to a restarted relay on the same identity
-                // and port, reclaim the locator, and keep waiting for a
-                // controller (design 0.1.1 relay recovery).
-                relay.stop().await;
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                progress.wait_for(HostStage::ReconnectingRelay).await;
-                progress
-                    .wait_for_count(HostStage::WaitingForController, 3)
-                    .await;
-
-                let wrong_code = ConnectionCode::new(
-                    Locator::new(1).unwrap(),
-                    PakeSecret::from_u64(0xDEF0).unwrap(),
-                );
-                let controller = tokio::task::spawn_local(async move {
-                    let mut controller = ScriptedController::connect(&relay_address).await;
-                    controller.reach_host(host_peer).await;
-                    let response = controller
-                        .auth_exchange(host_peer, &wrong_code)
-                        .await
-                        .expect("the recovered session must answer authentication");
-                    assert!(
-                        response.proceed_parts().is_some(),
-                        "the recovered session must still serve the exchange"
-                    );
-                });
-
-                controller.await.unwrap();
-                host.abort();
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process relay recovery scenario must finish");
-    }
-
-    // ------------------------------------------------------------------
-    // The authenticated happy path. The code is generated inside the
-    // session and only ever printed, so this test drives the same
-    // private session functions in the same order with a code the test
-    // itself created: resolve -> direct connection -> OPAQUE success ->
-    // terminal handshake -> data flow -> file transfer (0.1.3) ->
-    // TerminalComplete -> the host-side exit code.
-    // ------------------------------------------------------------------
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_controller_completes_an_authenticated_terminal_session() {
-        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
-        let local = tokio::task::LocalSet::new();
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            local.run_until(async {
-                const EXIT_CODE: u32 = 7;
-                const OUTPUT: &[u8] = b"scripted-host-output";
-                const INPUT: &[u8] = b"scripted-controller-input";
-                let port = available_tcp_port();
-                let relay_identity = Keypair::generate_ed25519();
-                let relay_address: EndpointRelayAddress = format!(
-                    "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
-                    relay_identity.public().to_peer_id()
-                )
-                .parse()
-                .unwrap();
-                let relays = EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
-                let relay = InProcessRelay::start(relay_identity, port);
-                wait_for_tcp_listener(port).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                let upload_directory = tempdir().unwrap();
-                let upload_source = upload_directory.path().join("upload-source.bin");
-                write_pattern_file(&upload_source, 128 * 1024);
-                let upload_bytes = fs::read(&upload_source).unwrap();
-                let destination = upload_directory.path().join("upload-final.bin");
-                let destination = destination.to_str().unwrap().to_owned();
-                let download_source = upload_directory.path().join("download-source.bin");
-                write_pattern_file(&download_source, 64 * 1024);
-                let download_bytes = fs::read(&download_source).unwrap();
-                let download_source = download_source.to_str().unwrap().to_owned();
-
-                let host_identity = Keypair::generate_ed25519();
-                let host_peer = host_identity.public().to_peer_id();
-                let (input_write, input_read) = tokio::io::duplex(64 * 1024);
-                let exit_flag = Arc::new(AtomicBool::new(false));
-                let input_read = Arc::new(Mutex::new(Some(input_read)));
-                let backend = ScriptedBackend {
-                    output: OUTPUT.to_vec(),
-                    exit_flag: Arc::clone(&exit_flag),
-                    exit_code: EXIT_CODE,
-                    input_write: Mutex::new(Some(input_write)),
-                };
-
-                let (mut driver, mut streams) =
-                    build_endpoint(host_identity, WssTransportConfig::client(None)).unwrap();
-                let relay_connection = connect_relay_with_retry(&mut driver, &relays).await;
-                let listener = driver.reserve(relay_connection.address()).unwrap();
-                let lease = wait_for_reservation(&mut driver, relay_connection, listener)
-                    .await
+    #[test]
+    fn in_process_host_session_answers_an_extra_auth_stream_with_retry() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined host session and audit futures exceed the
+        // default test-thread stack; the project pattern runs the
+        // scenario on a 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                     .unwrap();
-                let locator = allocate_locator(&mut driver, &mut streams, lease.relay())
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let local = tokio::task::LocalSet::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(90),
+                        local.run_until(async {
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let host_identity = Keypair::generate_ed25519();
+                            let host_peer = host_identity.public().to_peer_id();
+                            let progress = SharedSessionProgress::default();
+                            let mut observed = progress.clone();
+                            let host = tokio::task::spawn_local(async move {
+                                run_host_session(
+                                    HostConfig::new(
+                                        host_identity,
+                                        relays,
+                                        WssTransportConfig::client(None),
+                                    ),
+                                    TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
+                                    &mut observed,
+                                )
+                                .await
+                            });
+                            progress.wait_for(HostStage::WaitingForController).await;
+
+                            // While one auth exchange is in flight, a second auth stream
+                            // from the same controller must be answered with Retry and
+                            // closed without disturbing the active exchange (design 0.1.1
+                            // extra-auth rejection).
+                            let wrong_code = ConnectionCode::new(
+                                Locator::new(1).unwrap(),
+                                PakeSecret::from_u64(0x9ABC).unwrap(),
+                            );
+                            let controller = tokio::task::spawn_local(async move {
+                                let mut controller =
+                                    ScriptedController::connect(&relay_address).await;
+                                controller.reach_host(host_peer).await;
+                                let first = controller
+                                    .auth_start(host_peer, &wrong_code)
+                                    .await
+                                    .expect("the first auth stream must be answered");
+                                assert!(
+                                    first.response.proceed_parts().is_some(),
+                                    "the first stream must proceed"
+                                );
+                                let extra = controller
+                                    .auth_start(host_peer, &wrong_code)
+                                    .await
+                                    .expect("the extra auth stream must be answered");
+                                assert!(
+                                    extra.response.retry_after().is_some(),
+                                    "the extra auth stream must be answered with Retry"
+                                );
+                                controller.finish_auth(first, &wrong_code).await.expect(
+                                    "the active exchange must finish after the extra rejection",
+                                );
+                            });
+
+                            controller.await.unwrap();
+                            host.abort();
+                            relay.stop().await;
+                        }),
+                    )
                     .await
+                    .expect("the in-process extra-auth scenario must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn in_process_host_session_recovers_when_the_relay_restarts() {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined host session and audit futures exceed the
+        // default test-thread stack; the project pattern runs the
+        // scenario on a 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                     .unwrap();
-                let target = peer_id_bytes(driver.peer_id()).unwrap();
-                let mut pake = OpaquePake;
-                let (advertised, code) = create_advertisement(locator, &target, &mut pake).unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let local = tokio::task::LocalSet::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(120),
+                        local.run_until(async {
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity.clone(), port);
 
-                let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
-                let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
-                let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
-                let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
-                let mut incoming = InboundProtocols {
-                    auth: &mut auth_incoming,
-                    data: &mut data_incoming,
-                    control: &mut control_incoming,
-                    file: &mut file_incoming,
-                };
+                            let host_identity = Keypair::generate_ed25519();
+                            let host_peer = host_identity.public().to_peer_id();
+                            let progress = SharedSessionProgress::default();
+                            let mut observed = progress.clone();
+                            let host = tokio::task::spawn_local(async move {
+                                run_host_session(
+                                    HostConfig::new(
+                                        host_identity,
+                                        relays,
+                                        WssTransportConfig::client(None),
+                                    ),
+                                    TestBackend::session(Arc::new(AtomicUsize::new(0)), false),
+                                    &mut observed,
+                                )
+                                .await
+                            });
+                            progress.wait_for(HostStage::WaitingForController).await;
 
-                let controller = tokio::task::spawn_local(async move {
-                    let mut controller = ScriptedController::connect(&relay_address).await;
-                    let resolved = controller.resolve_locator(locator).await;
-                    assert_eq!(resolved, host_peer, "the locator must resolve to the host");
-                    controller.reach_host(host_peer).await;
-                    let response = controller
-                        .auth_exchange(host_peer, &code)
-                        .await
-                        .expect("the real code must authenticate");
-                    assert!(
-                        response.proceed_parts().is_some(),
-                        "the authentication must proceed and confirm"
-                    );
+                            // The relay dies mid-session: the host must notice the lost
+                            // lease, reconnect to a restarted relay on the same identity
+                            // and port, reclaim the locator, and keep waiting for a
+                            // controller (design 0.1.1 relay recovery).
+                            relay.stop().await;
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            let relay = InProcessRelay::start(relay_identity, port);
+                            progress.wait_for(HostStage::ReconnectingRelay).await;
+                            progress
+                                .wait_for_count(HostStage::WaitingForController, 3)
+                                .await;
 
-                    let mut data = controller
-                        .open(host_peer, TERMINAL_DATA_PROTOCOL)
-                        .await
-                        .into_tokio();
-                    let mut control = controller
-                        .open(host_peer, TERMINAL_CONTROL_PROTOCOL)
-                        .await
-                        .into_tokio();
-                    let hello = TerminalHello::new(
-                        TerminalSize::new(80, 24).unwrap(),
-                        TerminalValue::new("xterm").unwrap(),
-                        TerminalValue::new("truecolor").unwrap(),
-                    );
-                    control.write_all(hello.encode().as_slice()).await.unwrap();
-                    control.flush().await.unwrap();
-                    data.write_all(INPUT).await.unwrap();
-                    data.flush().await.unwrap();
-                    let mut ready = [0_u8; 1];
-                    data.read_exact(&mut ready).await.unwrap();
-                    assert_eq!(
-                        ready,
-                        TerminalReady::ENCODED,
-                        "the host must flush TerminalReady"
-                    );
+                            let wrong_code = ConnectionCode::new(
+                                Locator::new(1).unwrap(),
+                                PakeSecret::from_u64(0xDEF0).unwrap(),
+                            );
+                            let controller = tokio::task::spawn_local(async move {
+                                let mut controller =
+                                    ScriptedController::connect(&relay_address).await;
+                                controller.reach_host(host_peer).await;
+                                let response = controller
+                                    .auth_exchange(host_peer, &wrong_code)
+                                    .await
+                                    .expect("the recovered session must answer authentication");
+                                assert!(
+                                    response.proceed_parts().is_some(),
+                                    "the recovered session must still serve the exchange"
+                                );
+                            });
 
-                    // File transfer over the real session connection (0.1.3
-                    // file-transfer semantics on the bridge substream queue).
-                    let mut file = controller
-                        .open(host_peer, FILE_TRANSFER_PROTOCOL)
-                        .await
-                        .into_tokio();
-                    send_wire_frame(
-                        &mut file,
-                        &FileTransferMessage::UploadOpen {
-                            destination: &destination,
-                            file_name: "upload-source.bin",
-                            declared_size: upload_bytes.len() as u64,
-                        },
+                            controller.await.unwrap();
+                            host.abort();
+                            relay.stop().await;
+                        }),
                     )
-                    .await;
-                    expect_wire_control(&mut file, &FileTransferMessage::Ready).await;
-                    for chunk in upload_bytes.chunks(65536) {
-                        send_wire_data(&mut file, chunk).await;
-                    }
-                    send_wire_frame(
-                        &mut file,
-                        &FileTransferMessage::Finish {
-                            actual_size: upload_bytes.len() as u64,
-                            digest: sha256_bytes(&upload_bytes),
-                        },
-                    )
-                    .await;
-                    expect_wire_control(&mut file, &FileTransferMessage::Committed).await;
-                    drop(file);
+                    .await
+                    .expect("the in-process relay recovery scenario must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    fn run_enterprise_host_case(ending: EnterpriseControllerEnding) {
+        let _test_guard = crate::in_process_test_guard();
+        // The combined host and controller futures (with the 0.2.0 audit
+        // observer state) exceed the default test-thread stack; the project
+        // pattern runs the scenario on a 64 MiB stack thread.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let local = tokio::task::LocalSet::new();
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let stage = Arc::new(Mutex::new(("starting", Instant::now())));
+                    let scenario_stage = Arc::clone(&stage);
+                    let scenario = local.run_until(async move {
+                            const EXIT_CODE: u32 = 7;
+                            const OUTPUT: &[u8] = b"scripted-host-output";
+                            const INPUT: &[u8] = b"scripted-controller-input";
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
 
-                    let mut file = controller
-                        .open(host_peer, FILE_TRANSFER_PROTOCOL)
-                        .await
-                        .into_tokio();
-                    send_wire_frame(
-                        &mut file,
-                        &FileTransferMessage::DownloadOpen {
-                            source: &download_source,
-                        },
-                    )
-                    .await;
-                    let offer = read_wire_frame(&mut file).await;
-                    match FileTransferMessage::decode_frame(&offer).unwrap() {
-                        FileTransferMessage::DownloadOffer { declared_size, .. } => {
-                            assert_eq!(declared_size, download_bytes.len() as u64)
+                            let upload_directory = tempdir().unwrap();
+                            let upload_source = upload_directory.path().join("upload-source.bin");
+                            write_pattern_file(&upload_source, 128 * 1024);
+                            let upload_bytes = fs::read(&upload_source).unwrap();
+                            let destination = upload_directory.path().join("upload-final.bin");
+                            let destination = destination.to_str().unwrap().to_owned();
+                            let download_source =
+                                upload_directory.path().join("download-source.bin");
+                            write_pattern_file(&download_source, 64 * 1024);
+                            let download_bytes = fs::read(&download_source).unwrap();
+                            let download_source = download_source.to_str().unwrap().to_owned();
+
+                            let host_identity = Keypair::generate_ed25519();
+                            let host_peer = host_identity.public().to_peer_id();
+                            let (input_write, input_read) = tokio::io::duplex(64 * 1024);
+                            let exit_flag = Arc::new(AtomicBool::new(false));
+                            let input_read = Arc::new(Mutex::new(Some(input_read)));
+                            let resized = Arc::new(Mutex::new(None));
+                            let backend = ScriptedBackend {
+                                output: OUTPUT.to_vec(),
+                                exit_flag: Arc::clone(&exit_flag),
+                                exit_code: EXIT_CODE,
+                                input_write: Mutex::new(Some(input_write)),
+                                resized: Arc::clone(&resized),
+                            };
+
+                            let (mut driver, mut streams) =
+                                build_endpoint(host_identity, WssTransportConfig::client(None))
+                                    .unwrap();
+                            let relay_connection =
+                                connect_relay_with_retry(&mut driver, &relays).await;
+                            let listener = driver.reserve(relay_connection.address()).unwrap();
+                            let lease =
+                                wait_for_reservation(&mut driver, relay_connection, listener)
+                                    .await
+                                    .unwrap();
+                            let locator =
+                                allocate_locator(&mut driver, &mut streams, lease.relay())
+                                    .await
+                                    .unwrap();
+                            let target = peer_id_bytes(driver.peer_id()).unwrap();
+                            let mut pake = OpaquePake;
+                            let (advertised, code) =
+                                create_advertisement(locator, &target, &mut pake).unwrap();
+                            *scenario_stage.lock().unwrap() = ("host-advertised", Instant::now());
+
+                            let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+                            let mut audit_incoming = streams.accept(AUDIT_PROTOCOL).unwrap();
+                            let controller_audit_dir = tempdir().unwrap();
+                            let controller_audit_root =
+                                controller_audit_dir.path().join("audit");
+                            let host_audit_dir = tempdir().unwrap();
+                            let host_audit_root = host_audit_dir.path().join("audit");
+                            if ending == EnterpriseControllerEnding::CheckpointThenComplete {
+                                crate::audit::ledger::Ledger::open(
+                                    &controller_audit_root,
+                                    &mut OsSecureRandom,
+                                )
+                                .unwrap();
+                                crate::audit::ledger::Ledger::open(
+                                    &host_audit_root,
+                                    &mut OsSecureRandom,
+                                )
+                                .unwrap();
+                            }
+                            let (host_done_tx, mut host_done_rx) = oneshot::channel();
+
+                            let controller_stage = Arc::clone(&scenario_stage);
+                            let controller = tokio::task::spawn_local(async move {
+                                let mark = |next| {
+                                    *controller_stage.lock().unwrap() = (next, Instant::now());
+                                };
+                                let mut controller =
+                                    ScriptedController::connect(&relay_address).await;
+                                mark("controller-connected");
+                                let resolved = controller.resolve_locator(locator).await;
+                                assert_eq!(
+                                    resolved, host_peer,
+                                    "the locator must resolve to the host"
+                                );
+                                controller.reach_host(host_peer).await;
+                                mark("controller-reached-host");
+                                let response = controller
+                                    .auth_exchange(host_peer, &code)
+                                    .await
+                                    .expect("the real code must authenticate");
+                                assert!(
+                                    response.proceed_parts().is_some(),
+                                    "the authentication must proceed and confirm"
+                                );
+                                mark("controller-authenticated");
+
+                                let mut data = controller
+                                    .open(host_peer, TERMINAL_DATA_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                let mut control = controller
+                                    .open(host_peer, TERMINAL_CONTROL_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                mark("terminal-streams-open");
+                                let hello = TerminalHello::new(
+                                    TerminalSize::new(80, 24).unwrap(),
+                                    TerminalValue::new("xterm").unwrap(),
+                                    TerminalValue::new("truecolor").unwrap(),
+                                );
+                                drive_test_node(&mut controller.node, async {
+                                    control.write_all(hello.encode().as_slice()).await?;
+                                    control.flush().await
+                                })
+                                .await
+                                .unwrap();
+                                // The mandatory audit handshake (design sections 13 and
+                                // 14): the audit substream is opened and the handshake
+                                // completes before TerminalReady is awaited.
+                                let hello_digest =
+                                    Digest32::new(Sha256::digest(hello.encode().as_slice()).into());
+                                let audit_stream = controller.open(host_peer, AUDIT_PROTOCOL).await;
+                                let controller_peer = controller.node.peer_id();
+                                let audit = drive_test_node(
+                                    &mut controller.node,
+                                    AuditObserver::establish(
+                                        audit_stream.into_tokio(),
+                                        AuditRole::Controller,
+                                        controller_peer,
+                                        host_peer,
+                                        crate::audit::observer::utc_start_seconds(),
+                                        hello_digest,
+                                        &controller_audit_root,
+                                        &mut OsSecureRandom,
+                                    ),
+                                )
+                                .await
+                                .unwrap();
+                                mark("audit-established");
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_terminal_hello(hello_digest),
+                                )
+                                .await
+                                .unwrap();
+                                let mut ready = [0_u8; 1];
+                                drive_test_node(&mut controller.node, data.read_exact(&mut ready))
+                                    .await
+                                    .unwrap();
+                                assert_eq!(
+                                    ready,
+                                    TerminalReady::ENCODED,
+                                    "the host must flush TerminalReady"
+                                );
+                                mark("terminal-ready");
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_terminal_ready(),
+                                )
+                                .await
+                                .unwrap();
+
+                                // While the session is active, a second
+                                // authentication start on the same unique
+                                // connection must be answered with a Retry
+                                // (design 9.5); the bridge must serve it
+                                // without suspending the session streams.
+                                let mut extra_auth = controller
+                                    .open(host_peer, AUTH_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                let hello =
+                                    AuthClientHello::new([0x22; 32], [0xCD; 96]).encode();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    extra_auth.write_all(&hello),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, extra_auth.flush())
+                                    .await
+                                    .unwrap();
+                                let mut retry = [0_u8; RETRY_LEN];
+                                tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        extra_auth.read_exact(&mut retry),
+                                    ),
+                                )
+                                .await
+                                .expect("the extra authentication must be answered")
+                                .unwrap();
+                                assert_eq!(
+                                    retry[0], 0x02,
+                                    "the extra authentication start must be answered with Retry"
+                                );
+                                drop(extra_auth);
+
+                                if ending == EnterpriseControllerEnding::CheckpointThenComplete {
+                                    drive_active_audit_checkpoint(&mut controller, &audit).await;
+                                }
+
+                                if ending == EnterpriseControllerEnding::ControllerDetach {
+                                    let mut output = [0_u8; OUTPUT.len()];
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        data.read_exact(&mut output),
+                                    )
+                                    .await
+                                    .unwrap();
+                                    assert_eq!(&output, OUTPUT);
+                                    drive_test_node(&mut controller.node, async {
+                                        audit.record_raw_output(&output).await?;
+                                        audit.record_display_bytes(&output).await?;
+                                        audit
+                                            .record_display_write_outcome(
+                                                true,
+                                                output.len() as u64,
+                                            )
+                                            .await
+                                    })
+                                    .await
+                                    .unwrap();
+                                    let finalize = audit.close_and_finalize(
+                                        ManifestEnding::CloseReason(
+                                            AuditCloseReason::ControllerDetach,
+                                        ),
+                                        false,
+                                        CloseNoticeHandling::Sender(
+                                            AuditCloseReason::ControllerDetach,
+                                        ),
+                                    );
+                                    tokio::pin!(finalize);
+                                    let mut finalized = false;
+                                    let mut host_done = false;
+                                    tokio::time::timeout(Duration::from_secs(30), async {
+                                        while !finalized || !host_done {
+                                            tokio::select! {
+                                                result = &mut finalize, if !finalized => {
+                                                    result.unwrap();
+                                                    finalized = true;
+                                                }
+                                                result = &mut host_done_rx, if !host_done => {
+                                                    result.expect("the host completion signal must arrive");
+                                                    host_done = true;
+                                                }
+                                                _ = controller.node.next_event() => {}
+                                            }
+                                        }
+                                    })
+                                    .await
+                                    .expect("controller detach must finalize both audit records");
+                                    return;
+                                }
+
+                                if ending == EnterpriseControllerEnding::AuditFailure {
+                                    let fail = audit.fail_closed(
+                                        Some(AuditErrorCode::AuditRecordWriteFailed),
+                                        AuditCloseReason::AuditFailure,
+                                    );
+                                    tokio::pin!(fail);
+                                    tokio::time::timeout(Duration::from_secs(20), async {
+                                        loop {
+                                            tokio::select! {
+                                                () = &mut fail => break,
+                                                _ = controller.node.next_event() => {}
+                                            }
+                                        }
+                                    })
+                                    .await
+                                    .expect("the controller audit failure notice must be sent");
+                                    tokio::time::timeout(Duration::from_secs(30), async {
+                                        loop {
+                                            tokio::select! {
+                                                result = &mut host_done_rx => {
+                                                    result.expect("the host completion signal must arrive");
+                                                    return;
+                                                }
+                                                _ = controller.node.next_event() => {}
+                                            }
+                                        }
+                                    })
+                                    .await
+                                    .expect("the host must fail closed after the audit notice");
+                                    return;
+                                }
+                                if ending == EnterpriseControllerEnding::AuditStreamEnd {
+                                    drop(audit);
+                                    loop {
+                                        tokio::select! {
+                                            result = &mut host_done_rx => {
+                                                result.expect("the host completion signal must arrive");
+                                                return;
+                                            }
+                                            _ = controller.node.next_event() => {}
+                                        }
+                                    }
+                                }
+
+                                // Controller input is legal only after TerminalReady and
+                                // the mandatory audit path remain healthy. The matching
+                                // records preserve the host receive chain (section 18.1).
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_input(INPUT),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    data.write_all(INPUT).await?;
+                                    data.flush().await?;
+                                    Ok::<(), std::io::Error>(())
+                                })
+                                .await
+                                .unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_send_outcome(
+                                        DIRECTION_CTRL_TO_HOST,
+                                        true,
+                                        INPUT.len() as u64,
+                                    ),
+                                )
+                                .await
+                                .unwrap();
+                                mark("terminal-input-sent");
+
+                                // File transfer over the real session connection (0.2.0
+                                // file-transfer semantics on the bridge substream queue).
+                                // The shared file transfer events are recorded on the
+                                // controller side too (design section 18.6).
+                                let upload_id = crate::audit::observer::file_transfer_id(
+                                    FILE_DIRECTION_UPLOAD,
+                                    &destination,
+                                    "upload-source.bin",
+                                    upload_bytes.len() as u64,
+                                );
+                                let mut file = controller
+                                    .open(host_peer, FILE_TRANSFER_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(
+                                        &mut file,
+                                        &FileTransferMessage::UploadOpen {
+                                            destination: &destination,
+                                            file_name: "upload-source.bin",
+                                            declared_size: upload_bytes.len() as u64,
+                                        },
+                                    ),
+                                )
+                                .await;
+                                let upload_start = FileTransferFacts {
+                                    transfer_id: upload_id,
+                                    direction: FILE_DIRECTION_UPLOAD,
+                                    kind: FILE_KIND_START,
+                                    declared_size: upload_bytes.len() as u64,
+                                    final_size: 0,
+                                    digest: Digest32::new([0; 32]),
+                                    remote_path: &destination,
+                                    file_name: "upload-source.bin",
+                                    error_code: 0,
+                                };
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&upload_start, None),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    expect_wire_control(&mut file, &FileTransferMessage::Ready),
+                                )
+                                .await;
+                                mark("upload-ready");
+                                for chunk in upload_bytes.chunks(65536) {
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        send_wire_data(&mut file, chunk),
+                                    )
+                                    .await;
+                                }
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(
+                                        &mut file,
+                                        &FileTransferMessage::Finish {
+                                            actual_size: upload_bytes.len() as u64,
+                                            digest: sha256_bytes(&upload_bytes),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                drive_test_node(
+                                    &mut controller.node,
+                                    expect_wire_control(&mut file, &FileTransferMessage::Committed),
+                                )
+                                .await;
+                                mark("upload-committed");
+                                let upload_end = FileTransferFacts {
+                                    transfer_id: upload_id,
+                                    direction: FILE_DIRECTION_UPLOAD,
+                                    kind: FILE_KIND_SUCCESS,
+                                    declared_size: upload_bytes.len() as u64,
+                                    final_size: upload_bytes.len() as u64,
+                                    digest: Digest32::new(*sha256_bytes(&upload_bytes).as_bytes()),
+                                    remote_path: &destination,
+                                    file_name: "upload-source.bin",
+                                    error_code: 0,
+                                };
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&upload_end, None),
+                                )
+                                .await
+                                .unwrap();
+                                mark("upload-audit-recorded");
+                                drop(file);
+
+                                let mut file = controller
+                                    .open(host_peer, FILE_TRANSFER_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                mark("download-stream-opened");
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(
+                                        &mut file,
+                                        &FileTransferMessage::DownloadOpen {
+                                            source: &download_source,
+                                        },
+                                    ),
+                                )
+                                .await;
+                                mark("download-open-sent");
+                                let offer = drive_test_node(
+                                    &mut controller.node,
+                                    read_wire_frame(&mut file),
+                                )
+                                .await;
+                                mark("download-offered");
+                                let download_name =
+                                    match FileTransferMessage::decode_frame(&offer).unwrap() {
+                                        FileTransferMessage::DownloadOffer {
+                                            file_name,
+                                            declared_size,
+                                        } => {
+                                            assert_eq!(declared_size, download_bytes.len() as u64);
+                                            file_name.to_owned()
+                                        }
+                                        other => panic!("expected DownloadOffer, got {other:?}"),
+                                    };
+                                let download_id = crate::audit::observer::file_transfer_id(
+                                    FILE_DIRECTION_DOWNLOAD,
+                                    &download_source,
+                                    &download_name,
+                                    download_bytes.len() as u64,
+                                );
+                                let download_start = FileTransferFacts {
+                                    transfer_id: download_id,
+                                    direction: FILE_DIRECTION_DOWNLOAD,
+                                    kind: FILE_KIND_START,
+                                    declared_size: download_bytes.len() as u64,
+                                    final_size: 0,
+                                    digest: Digest32::new([0; 32]),
+                                    remote_path: &download_source,
+                                    file_name: &download_name,
+                                    error_code: 0,
+                                };
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&download_start, None),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(&mut file, &FileTransferMessage::Ready),
+                                )
+                                .await;
+                                let received = drive_test_node(
+                                    &mut controller.node,
+                                    receive_download_bytes(
+                                        &mut file,
+                                        download_bytes.len() as u64,
+                                    ),
+                                )
+                                .await;
+                                mark("download-received");
+                                drive_test_node(
+                                    &mut controller.node,
+                                    send_wire_frame(&mut file, &FileTransferMessage::Committed),
+                                )
+                                .await;
+                                let download_end = FileTransferFacts {
+                                    transfer_id: download_id,
+                                    direction: FILE_DIRECTION_DOWNLOAD,
+                                    kind: FILE_KIND_SUCCESS,
+                                    declared_size: download_bytes.len() as u64,
+                                    final_size: download_bytes.len() as u64,
+                                    digest: Digest32::new(
+                                        *sha256_bytes(&download_bytes).as_bytes(),
+                                    ),
+                                    remote_path: &download_source,
+                                    file_name: &download_name,
+                                    error_code: 0,
+                                };
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_file_transfer(&download_end, None),
+                                )
+                                .await
+                                .unwrap();
+                                drop(file);
+                                assert_eq!(
+                                    received, download_bytes,
+                                    "the downloaded bytes must match"
+                                );
+                                mark("file-transfers-complete");
+
+                                // The pty output, one resize, and the controller-completion
+                                // handshake that lets the host return the exit code.
+                                let mut output = [0_u8; OUTPUT.len()];
+                                drive_test_node(
+                                    &mut controller.node,
+                                    data.read_exact(&mut output),
+                                )
+                                .await
+                                .unwrap();
+                                assert_eq!(&output, OUTPUT);
+                                mark("terminal-output-received");
+                                // The controller output records (design section 18.4) so
+                                // the shared chains match the host's send records.
+                                drive_test_node(&mut controller.node, async {
+                                    audit.record_raw_output(&output).await?;
+                                    audit.record_display_bytes(&output).await?;
+                                    audit
+                                        .record_display_write_outcome(true, output.len() as u64)
+                                        .await
+                                })
+                                .await
+                                .unwrap();
+                                let resize = TerminalSize::new(100, 30).unwrap();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    audit.record_resize(
+                                        DIRECTION_CTRL_TO_HOST,
+                                        resize.columns(),
+                                        resize.rows(),
+                                    ),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    control
+                                        .write_all(&TerminalResize::new(resize).encode())
+                                        .await?;
+                                    control.flush().await
+                                })
+                                .await
+                                .unwrap();
+                                exit_flag.store(true, Ordering::Relaxed);
+                                let mut exit = [0_u8; 5];
+                                drive_test_node(
+                                    &mut controller.node,
+                                    control.read_exact(&mut exit),
+                                )
+                                .await
+                                .unwrap();
+                                assert_eq!(TerminalExit::decode(&exit).unwrap().code(), EXIT_CODE);
+                                mark("terminal-exit-received");
+                                drive_test_node(&mut controller.node, async {
+                                    audit.record_terminal_exit(EXIT_CODE as u8).await?;
+                                    audit.record_terminal_complete().await
+                                })
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, async {
+                                    control.write_all(&TerminalComplete::ENCODED).await?;
+                                    control.flush().await
+                                })
+                                .await
+                                .unwrap();
+                                let mut trailing = [0_u8; 1];
+                                assert_eq!(
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        control.read(&mut trailing),
+                                    )
+                                    .await
+                                    .unwrap(),
+                                    0,
+                                    "the host must shut down the control half after the completion"
+                                );
+                                assert_eq!(
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        data.read(&mut trailing),
+                                    )
+                                    .await
+                                    .unwrap(),
+                                    0,
+                                    "the host must shut down the data half after the shell exit"
+                                );
+                                mark("terminal-streams-closed");
+                                if ending == EnterpriseControllerEnding::AuditFinalizeStreamEnd {
+                                    drop(audit);
+                                    loop {
+                                        tokio::select! {
+                                            result = &mut host_done_rx => {
+                                                result.expect("the host completion signal must arrive");
+                                                return;
+                                            }
+                                            _ = controller.node.next_event() => {}
+                                        }
+                                    }
+                                }
+                                // The mandatory audit finalization (design sections 21
+                                // and 22.1). The scripted endpoint node is polled
+                                // throughout so the peer's finalization frames arrive.
+                                let finalize = audit.close_and_finalize(
+                                    ManifestEnding::ShellExit(EXIT_CODE as u8),
+                                    true,
+                                    CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                                );
+                                tokio::pin!(finalize);
+                                loop {
+                                    tokio::select! {
+                                        result = &mut finalize => {
+                                            result.unwrap();
+                                            break;
+                                        }
+                                        _ = controller.node.next_event() => {}
+                                    }
+                                }
+                                mark("audit-finalized");
+                                loop {
+                                    tokio::select! {
+                                        result = &mut host_done_rx => {
+                                            result.expect("the host completion signal must arrive");
+                                            break;
+                                        }
+                                        _ = controller.node.next_event() => {}
+                                    }
+                                }
+                                mark("host-completed");
+                            });
+
+                            let mut progress = NoopProgress;
+                            let mut session = HostSession {
+                                driver: &mut driver,
+                                streams: &mut streams,
+                                auth_incoming: &mut auth_incoming,
+                                data_incoming: &mut data_incoming,
+                                control_incoming: &mut control_incoming,
+                                file_incoming: &mut file_incoming,
+                                audit_incoming: &mut audit_incoming,
+                                relays: &relays,
+                                relay_lease: lease,
+                                relay_access: RelayAccessMode::Enterprise,
+                                advertised,
+                                target,
+                                pake: &mut pake,
+                                backend: &backend,
+                                audit_root_override: Some(host_audit_root),
+                            };
+                            let session_result = session.run(&mut progress).await;
+                            drop(session);
+                            host_done_tx
+                                .send(())
+                                .expect("the scripted controller must remain alive");
+                            match ending {
+                                EnterpriseControllerEnding::Complete
+                                | EnterpriseControllerEnding::CheckpointThenComplete => {
+                                    assert_eq!(
+                                        session_result.unwrap(),
+                                        EXIT_CODE,
+                                        "the shell exit code must reach the host"
+                                    );
+                                }
+                                EnterpriseControllerEnding::AuditFailure
+                                | EnterpriseControllerEnding::AuditStreamEnd => {
+                                    assert!(matches!(
+                                        session_result,
+                                        Err(HostError::Audit(AuditError::FailedClosed))
+                                    ));
+                                }
+                                EnterpriseControllerEnding::AuditFinalizeStreamEnd => {
+                                    assert!(matches!(session_result, Err(HostError::Audit(_))));
+                                }
+                                EnterpriseControllerEnding::ControllerDetach => {
+                                    assert!(
+                                        matches!(&session_result, Err(HostError::ConnectionLost)),
+                                        "unexpected host result: {session_result:?}"
+                                    );
+                                }
+                            }
+
+                            controller
+                                .await
+                                .expect("the scripted controller must finish");
+                            *scenario_stage.lock().unwrap() = ("controller-joined", Instant::now());
+                            if matches!(
+                                ending,
+                                EnterpriseControllerEnding::Complete
+                                    | EnterpriseControllerEnding::CheckpointThenComplete
+                                    | EnterpriseControllerEnding::AuditFinalizeStreamEnd
+                            ) {
+                                assert_eq!(
+                                    *resized.lock().unwrap(),
+                                    Some(TerminalSize::new(100, 30).unwrap()),
+                                    "the resize must reach the session before the completion"
+                                );
+                            } else {
+                                assert!(resized.lock().unwrap().is_none());
+                            }
+
+                            let mut recorded = Vec::new();
+                            let mut captured_input = input_read
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .expect("the input capture exists");
+                            captured_input.read_to_end(&mut recorded).await.unwrap();
+                            if matches!(
+                                ending,
+                                EnterpriseControllerEnding::Complete
+                                    | EnterpriseControllerEnding::CheckpointThenComplete
+                                    | EnterpriseControllerEnding::AuditFinalizeStreamEnd
+                            ) {
+                                assert_eq!(
+                                    recorded, INPUT,
+                                    "the controller input must reach the session"
+                                );
+                            } else {
+                                assert!(recorded.is_empty());
+                            }
+
+                            relay.stop().await;
+                            *scenario_stage.lock().unwrap() = ("relay-stopped", Instant::now());
+                        });
+                    tokio::pin!(scenario);
+                    loop {
+                        tokio::select! {
+                            () = &mut scenario => break,
+                            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                                let (name, changed_at) = *stage.lock().unwrap();
+                                assert!(
+                                    changed_at.elapsed() < ENTERPRISE_HOST_CASE_TIMEOUT,
+                                    "the in-process happy path made no progress for {ENTERPRISE_HOST_CASE_TIMEOUT:?} (last stage: {name})"
+                                );
+                            }
                         }
-                        other => panic!("expected DownloadOffer, got {other:?}"),
                     }
-                    send_wire_frame(&mut file, &FileTransferMessage::Ready).await;
-                    let received =
-                        receive_download_bytes(&mut file, download_bytes.len() as u64).await;
-                    send_wire_frame(&mut file, &FileTransferMessage::Committed).await;
-                    drop(file);
-                    assert_eq!(received, download_bytes, "the downloaded bytes must match");
-
-                    // The pty output, one resize, and the controller-completion
-                    // handshake that lets the host return the exit code.
-                    let mut output = [0_u8; OUTPUT.len()];
-                    data.read_exact(&mut output).await.unwrap();
-                    assert_eq!(&output, OUTPUT);
-                    let resize = TerminalSize::new(100, 30).unwrap();
-                    control
-                        .write_all(&TerminalResize::new(resize).encode())
-                        .await
-                        .unwrap();
-                    control.flush().await.unwrap();
-                    exit_flag.store(true, Ordering::Relaxed);
-                    let mut exit = [0_u8; 5];
-                    control.read_exact(&mut exit).await.unwrap();
-                    assert_eq!(TerminalExit::decode(&exit).unwrap().code(), EXIT_CODE);
-                    control.write_all(&TerminalComplete::ENCODED).await.unwrap();
-                    control.flush().await.unwrap();
-                    let mut trailing = [0_u8; 1];
-                    assert_eq!(
-                        control.read(&mut trailing).await.unwrap(),
-                        0,
-                        "the host must shut down the control half after the completion"
-                    );
-                    assert_eq!(
-                        data.read(&mut trailing).await.unwrap(),
-                        0,
-                        "the host must shut down the data half after the shell exit"
-                    );
                 });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
-                let (controller_peer, mut auth_stream) =
-                    wait_for_auth(&mut driver, &mut incoming, &lease)
-                        .await
-                        .expect("the auth wait must not fail")
-                        .expect("an authenticated controller must arrive");
-                let binding =
-                    wait_for_controller_quiescence(&mut driver, &mut incoming, controller_peer)
-                        .await
-                        .expect("the controller direct upgrade must settle");
-                let hello = drive_session_inputs(
-                    &mut driver,
-                    binding,
-                    &mut incoming,
-                    read_auth_hello(&mut auth_stream),
-                )
-                .await
-                .expect("the auth hello read must not fail")
-                .expect("the controller must send a valid hello");
-                drive_session_inputs(
-                    &mut driver,
-                    binding,
-                    &mut incoming,
-                    authenticate(
-                        &mut auth_stream,
-                        hello,
-                        advertised.locator,
-                        &target,
-                        controller_peer,
-                        &advertised.registration,
-                        &mut pake,
-                    ),
-                )
-                .await
-                .expect("the authentication exchange must not fail")
-                .expect("the real code must authenticate");
-                let (data, control) = acknowledge_and_wait_for_terminal_streams(
-                    &mut driver,
-                    binding,
-                    &mut incoming,
-                    controller_peer,
-                    auth_stream,
-                )
-                .await
-                .expect("the controller must open both terminal streams");
-                let (mut pty, base, data, control) = drive_session_inputs(
-                    &mut driver,
-                    binding,
-                    &mut incoming,
-                    start_terminal(&backend, data, control),
-                )
-                .await
-                .expect("the terminal start must not fail")
-                .expect("the controller must send a valid terminal hello");
-                let exit_code = bridge_terminal(
-                    &mut driver,
-                    binding,
-                    &mut incoming,
-                    &mut pty,
-                    data,
-                    control,
-                    base.as_ref(),
-                )
-                .await
-                .expect("the terminal bridge must complete");
-                assert_eq!(
-                    exit_code, EXIT_CODE,
-                    "the shell exit code must reach the host"
-                );
+    #[test]
+    fn in_process_controller_completes_an_authenticated_terminal_session() {
+        run_enterprise_host_case(EnterpriseControllerEnding::Complete);
+    }
 
-                controller
+    #[test]
+    fn in_process_host_checkpoints_while_active() {
+        run_enterprise_host_case(EnterpriseControllerEnding::CheckpointThenComplete);
+    }
+
+    #[test]
+    fn in_process_host_finalizes_a_controller_detach() {
+        run_enterprise_host_case(EnterpriseControllerEnding::ControllerDetach);
+    }
+
+    #[test]
+    fn in_process_host_rejects_incomplete_audit_finalization() {
+        run_enterprise_host_case(EnterpriseControllerEnding::AuditFinalizeStreamEnd);
+    }
+
+    #[test]
+    fn in_process_host_fails_closed_with_the_controller_audit() {
+        run_enterprise_host_case(EnterpriseControllerEnding::AuditFailure);
+    }
+
+    #[test]
+    fn in_process_host_fails_closed_when_the_audit_stream_ends() {
+        run_enterprise_host_case(EnterpriseControllerEnding::AuditStreamEnd);
+    }
+
+    #[test]
+    fn in_process_standard_host_completes_a_terminal_session() {
+        let _test_guard = crate::in_process_test_guard();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+                    let local = tokio::task::LocalSet::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(90),
+                        local.run_until(async {
+                            const EXIT_CODE: u32 = 23;
+                            const OUTPUT: &[u8] = b"standard-host-output";
+                            const INPUT: &[u8] = b"standard-controller-input";
+
+                            let port = available_tcp_port();
+                            let relay_identity = Keypair::generate_ed25519();
+                            let relay_address: EndpointRelayAddress = format!(
+                                "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+                                relay_identity.public().to_peer_id()
+                            )
+                            .parse()
+                            .unwrap();
+                            let relays =
+                                EndpointRelaySet::new(vec![relay_address.clone()]).unwrap();
+                            let relay = InProcessRelay::start(relay_identity, port);
+
+                            let host_identity = Keypair::generate_ed25519();
+                            let host_peer = host_identity.public().to_peer_id();
+                            let (input_write, input_read) = tokio::io::duplex(64 * 1024);
+                            let exit_flag = Arc::new(AtomicBool::new(false));
+                            let input_read = Arc::new(Mutex::new(Some(input_read)));
+                            let resized = Arc::new(Mutex::new(None));
+                            let backend = ScriptedBackend {
+                                output: OUTPUT.to_vec(),
+                                exit_flag: Arc::clone(&exit_flag),
+                                exit_code: EXIT_CODE,
+                                input_write: Mutex::new(Some(input_write)),
+                                resized: Arc::clone(&resized),
+                            };
+
+                            let (mut driver, mut streams) =
+                                build_endpoint(host_identity, WssTransportConfig::client(None))
+                                    .unwrap();
+                            let relay_connection =
+                                connect_relay_with_retry(&mut driver, &relays).await;
+                            let listener = driver.reserve(relay_connection.address()).unwrap();
+                            let lease =
+                                wait_for_reservation(&mut driver, relay_connection, listener)
+                                    .await
+                                    .unwrap();
+                            let locator =
+                                allocate_locator(&mut driver, &mut streams, lease.relay())
+                                    .await
+                                    .unwrap();
+                            let target = peer_id_bytes(driver.peer_id()).unwrap();
+                            let mut pake = OpaquePake;
+                            let (advertised, code) =
+                                create_advertisement(locator, &target, &mut pake).unwrap();
+
+                            let mut auth_incoming = streams.accept(AUTH_PROTOCOL).unwrap();
+                            let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL).unwrap();
+                            let mut control_incoming =
+                                streams.accept(TERMINAL_CONTROL_PROTOCOL).unwrap();
+                            let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL).unwrap();
+                            let mut audit_incoming = streams.accept(AUDIT_PROTOCOL).unwrap();
+
+                            let controller = tokio::task::spawn_local(async move {
+                                let mut controller =
+                                    ScriptedController::connect(&relay_address).await;
+                                assert_eq!(controller.resolve_locator(locator).await, host_peer);
+                                controller.reach_host(host_peer).await;
+                                let response = controller
+                                    .auth_exchange(host_peer, &code)
+                                    .await
+                                    .expect("the real code must authenticate");
+                                assert!(response.proceed_parts().is_some());
+
+                                let mut data = controller
+                                    .open(host_peer, TERMINAL_DATA_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                let mut control = controller
+                                    .open(host_peer, TERMINAL_CONTROL_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                let hello = TerminalHello::new(
+                                    TerminalSize::new(80, 24).unwrap(),
+                                    TerminalValue::new("xterm").unwrap(),
+                                    TerminalValue::new("truecolor").unwrap(),
+                                );
+                                control.write_all(hello.encode().as_slice()).await.unwrap();
+                                control.flush().await.unwrap();
+
+                                let mut ready = [0_u8; 1];
+                                data.read_exact(&mut ready).await.unwrap();
+                                assert_eq!(ready, TerminalReady::ENCODED);
+                                let mut output = [0_u8; OUTPUT.len()];
+                                data.read_exact(&mut output).await.unwrap();
+                                assert_eq!(&output, OUTPUT);
+                                data.write_all(INPUT).await.unwrap();
+                                data.flush().await.unwrap();
+
+                                let size = TerminalSize::new(100, 30).unwrap();
+                                control
+                                    .write_all(&TerminalResize::new(size).encode())
+                                    .await
+                                    .unwrap();
+                                control.flush().await.unwrap();
+                                exit_flag.store(true, Ordering::Relaxed);
+                                let mut exit = [0_u8; 5];
+                                control.read_exact(&mut exit).await.unwrap();
+                                assert_eq!(TerminalExit::decode(&exit).unwrap().code(), EXIT_CODE);
+                                control.write_all(&TerminalComplete::ENCODED).await.unwrap();
+                                control.flush().await.unwrap();
+
+                                let mut trailing = [0_u8; 1];
+                                assert_eq!(control.read(&mut trailing).await.unwrap(), 0);
+                                assert_eq!(data.read(&mut trailing).await.unwrap(), 0);
+                            });
+
+                            let mut progress = NoopProgress;
+                            let mut session = HostSession {
+                                driver: &mut driver,
+                                streams: &mut streams,
+                                auth_incoming: &mut auth_incoming,
+                                data_incoming: &mut data_incoming,
+                                control_incoming: &mut control_incoming,
+                                file_incoming: &mut file_incoming,
+                                audit_incoming: &mut audit_incoming,
+                                relays: &relays,
+                                relay_lease: lease,
+                                relay_access: RelayAccessMode::Standard,
+                                advertised,
+                                target,
+                                pake: &mut pake,
+                                backend: &backend,
+                                audit_root_override: None,
+                            };
+                            assert_eq!(session.run(&mut progress).await.unwrap(), EXIT_CODE);
+                            controller.await.unwrap();
+                            assert_eq!(
+                                *resized.lock().unwrap(),
+                                Some(TerminalSize::new(100, 30).unwrap())
+                            );
+                            let mut recorded = Vec::new();
+                            let mut captured_input = input_read.lock().unwrap().take().unwrap();
+                            captured_input.read_to_end(&mut recorded).await.unwrap();
+                            assert_eq!(recorded, INPUT);
+                            relay.stop().await;
+                        }),
+                    )
                     .await
-                    .expect("the scripted controller must finish");
-                assert_eq!(
-                    pty.resized,
-                    Some(TerminalSize::new(100, 30).unwrap()),
-                    "the resize must reach the session before the completion"
-                );
-
-                let mut recorded = Vec::new();
-                let mut captured_input = input_read
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("the input capture exists");
-                captured_input.read_to_end(&mut recorded).await.unwrap();
-                assert_eq!(
-                    recorded, INPUT,
-                    "the controller input must reach the session"
-                );
-
-                relay.stop().await;
-            }),
-        )
-        .await
-        .expect("the in-process happy path must finish");
+                    .expect("the standard host session must finish");
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 
@@ -3918,12 +5192,18 @@ pub enum HostError {
     Terminal(#[from] TerminalError),
     #[error("the controller connection was lost")]
     ConnectionLost,
+    #[error("the relay did not advertise a supported access policy")]
+    RelayAccessUnavailable,
+    #[error("the relay access policy changed while recovering the host connection")]
+    RelayAccessChanged,
     #[error("a required inbound application protocol registration ended")]
     ProtocolRegistrationEnded,
     #[error("the host was interrupted")]
     Interrupted,
     #[error("failed to report the connection code")]
     Output(#[source] std::io::Error),
+    #[error(transparent)]
+    Audit(#[from] AuditError),
 }
 
 /// Runs one advertised code through at most one committed terminal session.
@@ -3964,9 +5244,10 @@ async fn run_host_session<B: TerminalBackend>(
     let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL)?;
     let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL)?;
     let mut file_incoming = streams.accept(FILE_TRANSFER_PROTOCOL)?;
+    let mut audit_incoming = streams.accept(AUDIT_PROTOCOL)?;
     let target = peer_id_bytes(driver.peer_id()).map_err(|_| HostError::PeerIdentity)?;
     let mut pake = OpaquePake;
-    let (relay_lease, advertised) = initialize_host_relay(
+    let (relay_lease, advertised, relay_access) = initialize_host_relay(
         &mut driver,
         &mut streams,
         &relays,
@@ -3983,12 +5264,15 @@ async fn run_host_session<B: TerminalBackend>(
         data_incoming: &mut data_incoming,
         control_incoming: &mut control_incoming,
         file_incoming: &mut file_incoming,
+        audit_incoming: &mut audit_incoming,
         relays: &relays,
         relay_lease,
+        relay_access,
         advertised,
         target,
         pake: &mut pake,
         backend: &backend,
+        audit_root_override: None,
     };
     let result = session.run(progress).await;
     let relay = session.relay_lease.relay().peer();
@@ -4070,7 +5354,7 @@ async fn initialize_host_relay(
     target: &PeerIdBytes,
     pake: &mut OpaquePake,
     progress: &mut impl OperationProgress<HostStage>,
-) -> Result<(ReservationLease, AdvertisedLease), HostError> {
+) -> Result<(ReservationLease, AdvertisedLease, RelayAccessMode), HostError> {
     let mut backoff = relay_backoff();
     loop {
         let candidate = establish_host_relay(
@@ -4081,6 +5365,15 @@ async fn initialize_host_relay(
             progress,
         )
         .await?;
+        let access = match wait_for_relay_access(driver, candidate.relay().peer()).await {
+            Ok(access) => access,
+            Err(error) => {
+                tracing::debug!(%error, "relay access policy discovery will be retried");
+                driver.remove_reservation(candidate.listener());
+                wait_for_host_retry(&mut backoff, HostStage::ConnectingRelay, progress).await?;
+                continue;
+            }
+        };
         let allocation = tokio::select! {
             result = allocate_advertisement(
                 driver,
@@ -4101,7 +5394,7 @@ async fn initialize_host_relay(
             return Err(HostError::Interrupted);
         };
         match allocation {
-            Ok(advertised) => return Ok((candidate, advertised)),
+            Ok(advertised) => return Ok((candidate, advertised, access)),
             Err(HostError::Relay(error)) if retryable_relay_error(&error) => {
                 tracing::debug!(%error, "initial locator allocation will be retried after reconnect");
                 driver.remove_reservation(candidate.listener());
@@ -4113,6 +5406,25 @@ async fn initialize_host_relay(
             }
         }
     }
+}
+
+async fn wait_for_relay_access(
+    driver: &mut EndpointDriver,
+    relay: PeerId,
+) -> Result<RelayAccessMode, HostError> {
+    tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+        loop {
+            if let Some(mode) = driver.relay_access_mode(&relay) {
+                return Ok(mode);
+            }
+            let _ = driver.next().await;
+            if driver.connection_count(&relay) == 0 {
+                return Err(HostError::RelayAccessUnavailable);
+            }
+        }
+    })
+    .await
+    .map_err(|_| HostError::RelayAccessUnavailable)?
 }
 
 async fn wait_for_host_retry(
@@ -4238,6 +5550,7 @@ struct RelayRecovery<'a> {
     advertised: &'a mut AdvertisedLease,
     target: &'a PeerIdBytes,
     pake: &'a mut OpaquePake,
+    access: RelayAccessMode,
 }
 
 impl RelayRecovery<'_> {
@@ -4256,6 +5569,25 @@ impl RelayRecovery<'_> {
                 progress,
             )
             .await?;
+            let candidate_access = match wait_for_relay_access(
+                self.driver,
+                candidate.relay().peer(),
+            )
+            .await
+            {
+                Ok(access) => access,
+                Err(error) => {
+                    tracing::debug!(%error, "relay access policy discovery failed during recovery");
+                    self.driver.remove_reservation(candidate.listener());
+                    wait_for_host_retry(&mut backoff, HostStage::ReconnectingRelay, progress)
+                        .await?;
+                    continue;
+                }
+            };
+            if candidate_access != self.access {
+                self.driver.remove_reservation(candidate.listener());
+                return Err(HostError::RelayAccessChanged);
+            }
             let reclaim = tokio::select! {
                 result = wait_with_progress(
                     progress,
@@ -4352,12 +5684,17 @@ struct HostSession<'a, B> {
     data_incoming: &'a mut IncomingApplicationStreams,
     control_incoming: &'a mut IncomingApplicationStreams,
     file_incoming: &'a mut IncomingApplicationStreams,
+    audit_incoming: &'a mut IncomingApplicationStreams,
     relays: &'a EndpointRelaySet,
     relay_lease: ReservationLease,
+    relay_access: RelayAccessMode,
     advertised: AdvertisedLease,
     target: PeerIdBytes,
     pake: &'a mut OpaquePake,
     backend: &'a B,
+    /// Test and embedding seam for isolating audit artifacts. Production
+    /// sessions leave this unset and use the platform audit directory.
+    audit_root_override: Option<PathBuf>,
 }
 
 struct InboundProtocols<'a> {
@@ -4379,12 +5716,15 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             data_incoming,
             control_incoming,
             file_incoming,
+            audit_incoming,
             relays,
             relay_lease,
+            relay_access,
             advertised,
             target,
             pake,
             backend,
+            audit_root_override,
         } = self;
         let limiter = DirectRateLimiter::new(RateLimit::authentication());
         let mut session = TargetSession::new();
@@ -4406,6 +5746,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                     advertised,
                     target,
                     pake,
+                    access: *relay_access,
                 }
                 .run(progress)
                 .await?;
@@ -4524,14 +5865,31 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             };
             session.apply(SessionEvent::TerminalStreamsReady)?;
 
+            let self_peer = driver.peer_id();
+            let audit_root = match relay_access {
+                RelayAccessMode::Standard => None,
+                RelayAccessMode::Enterprise => Some(match audit_root_override.as_ref() {
+                    Some(root) => root.clone(),
+                    None => crate::audit::observer::platform_audit_root()?,
+                }),
+            };
             let result = drive_session_inputs(
                 driver,
                 binding,
                 &mut incoming,
-                start_terminal(*backend, data, control),
+                start_terminal(
+                    *backend,
+                    data,
+                    control,
+                    audit_incoming,
+                    binding,
+                    self_peer,
+                    *relay_access,
+                    audit_root.as_deref(),
+                ),
             )
             .await;
-            let (mut pty, base, data, control) = match result {
+            let (mut pty, base, data, control, audit) = match result {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => {
                     session.apply(host_error_event(&error, SessionEvent::TerminalStartFailed))?;
@@ -4572,6 +5930,7 @@ impl<B: TerminalBackend> HostSession<'_, B> {
                 data,
                 control,
                 base.as_ref(),
+                audit.as_ref(),
             )
             .await;
             if let Err(error) = &outcome {
@@ -4580,11 +5939,63 @@ impl<B: TerminalBackend> HostSession<'_, B> {
             let shutdown = pty.shutdown().await;
             match outcome {
                 Ok(code) => {
-                    session.apply(SessionEvent::ShellExited)?;
-                    shutdown?;
-                    return Ok(code);
+                    // The mandatory audit finalization runs before the
+                    // session ends (design sections 21 and 22.1); a
+                    // finalization failure is never hidden behind the shell
+                    // exit code.
+                    // The finalization exchange reads and writes the audit
+                    // substream, so the endpoint driver is polled
+                    // throughout (drive_bound); without it the peer's
+                    // finalization frames would never be delivered.
+                    let finalized = match audit.as_ref() {
+                        Some(audit) => {
+                            drive_bound(
+                                driver,
+                                binding,
+                                audit.close_and_finalize(
+                                    ManifestEnding::ShellExit(code as u8),
+                                    true,
+                                    CloseNoticeHandling::Receiver,
+                                ),
+                            )
+                            .await
+                        }
+                        None => Ok(Ok(())),
+                    };
+                    match finalized {
+                        Ok(Ok(())) => {
+                            session.apply(SessionEvent::ShellExited)?;
+                            shutdown?;
+                            return Ok(code);
+                        }
+                        Ok(Err(error)) => {
+                            session.apply(SessionEvent::ConnectionLost)?;
+                            if let Err(cleanup) = shutdown {
+                                tracing::warn!(%cleanup, "terminal cleanup failed after the audit finalization error");
+                            }
+                            return Err(HostError::Audit(error));
+                        }
+                        Err(endpoint) => {
+                            session.apply(SessionEvent::ConnectionLost)?;
+                            if let Err(cleanup) = shutdown {
+                                tracing::warn!(%cleanup, "terminal cleanup failed after the audit finalization error");
+                            }
+                            return Err(endpoint.into());
+                        }
+                    }
                 }
                 Err(error) => {
+                    // The interrupted close: the peer's audit failure was
+                    // already handled by the bridge; every other failure
+                    // completes the local tail without a manifest (design
+                    // section 22.4).
+                    if !matches!(error, HostError::Audit(_))
+                        && let Some(audit) = audit.as_ref()
+                    {
+                        audit
+                            .close_interrupted(AuditCloseReason::ConnectionLost)
+                            .await;
+                    }
                     session.apply(host_error_event(&error, SessionEvent::ConnectionLost))?;
                     if let Err(cleanup) = shutdown {
                         tracing::warn!(%cleanup, "terminal cleanup failed after the root session error");
@@ -4733,6 +6144,22 @@ async fn reject_extra_auth(
         Err(_) => {
             tracing::debug!(%peer, "extra authentication Retry response timed out");
             Ok(())
+        }
+    }
+}
+
+/// The in-flight half of an extra-authentication Retry used by
+/// `bridge_terminal`: the write and its timeout, without driving the swarm
+/// (the bridge's own driver branch keeps the swarm polled, and the pinned
+/// branch must not borrow the driver).
+async fn auth_retry_reply(stream: ApplicationStream) {
+    match tokio::time::timeout(EXCHANGE_TIMEOUT, send_auth_retry(stream)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "extra authentication Retry response failed");
+        }
+        Err(_) => {
+            tracing::debug!("extra authentication Retry response timed out");
         }
     }
 }
@@ -4919,32 +6346,106 @@ impl<D, C> PendingPair<D, C> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_terminal<B: TerminalBackend>(
     backend: &B,
     mut data: ApplicationStream,
     mut control: ApplicationStream,
+    audit_incoming: &mut IncomingApplicationStreams,
+    binding: ConnectionBinding,
+    self_peer: PeerId,
+    access: RelayAccessMode,
+    audit_root: Option<&Path>,
 ) -> Result<
     (
         B::Session,
         Option<BaseDirectory>,
         ApplicationStream,
         ApplicationStream,
+        Option<AuditObserver>,
     ),
     HostError,
 > {
+    // 1. The terminal hello (bounded), which the controller conveyed before
+    //    the audit handshake so both sides share its digest (design
+    //    section 13.5).
+    let hello = {
+        let mut control_io = (&mut control).compat();
+        tokio::time::timeout(EXCHANGE_TIMEOUT, read_terminal_hello_io(&mut control_io))
+            .await
+            .map_err(|_| HostError::Timeout)??
+    };
+    let digest = Digest32::new(Sha256::digest(hello.encode().as_slice()).into());
+    let audit = match access {
+        RelayAccessMode::Standard => None,
+        RelayAccessMode::Enterprise => {
+            let audit_root = audit_root.ok_or(HostError::RelayAccessUnavailable)?;
+            let audit_stream = match tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+                loop {
+                    let (peer, stream) = audit_incoming
+                        .next()
+                        .await
+                        .ok_or(HostError::ProtocolRegistrationEnded)?;
+                    if peer == binding.peer() {
+                        return Ok::<_, HostError>(stream);
+                    }
+                    drop(stream);
+                }
+            })
+            .await
+            {
+                Ok(stream) => stream?,
+                Err(_) => return Err(HostError::Audit(AuditError::peer_unsupported())),
+            };
+            let audit = tokio::time::timeout(
+                AUDIT_ESTABLISH_TIMEOUT,
+                AuditObserver::establish(
+                    audit_stream.into_tokio(),
+                    AuditRole::Host,
+                    binding.peer(),
+                    self_peer,
+                    crate::audit::observer::utc_start_seconds(),
+                    digest,
+                    audit_root,
+                    &mut OsSecureRandom,
+                ),
+            )
+            .await
+            .map_err(|_| HostError::Timeout)??;
+            audit.record_terminal_hello(digest).await?;
+            Some(audit)
+        }
+    };
+    // 3. The remote terminal is only opened and made active after the
+    //    audit handshake (design section 13.2).
     let pty = {
         let mut data_io = (&mut data).compat();
-        let mut control_io = (&mut control).compat();
-        start_terminal_io(backend, &mut data_io, &mut control_io).await?
+        let pty = backend.open(hello).await?;
+        if let Some(audit) = audit.as_ref()
+            && let Err(error) = audit.record_terminal_ready().await
+        {
+            if let Err(cleanup) = pty.shutdown().await {
+                tracing::warn!(%cleanup, "failed to clean up PTY after the audit failure");
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = write_terminal_ready_io(&mut data_io).await {
+            if let Err(cleanup) = pty.shutdown().await {
+                tracing::warn!(%cleanup, "failed to clean up PTY after TerminalReady failure");
+            }
+            return Err(error);
+        }
+        pty
     };
-    // The session base directory is captured once, when the session shell
-    // starts; every remote path resolves against it for the whole session
-    // (design 8.5). The shell spawns with the process working directory
-    // (design 21), so the capture equals the shell's initial directory.
-    // The portable-pty session does not expose the directory, so the
-    // process working directory is captured here instead. If the working
-    // directory is unavailable (for example deleted), the terminal session
-    // continues and every file request fails closed without state.
+    // 4. The session base directory is captured once, when the session
+    //    shell starts; every remote path resolves against it for the whole
+    //    session (design 8.5). The shell spawns with the process working
+    //    directory (design 21), so the capture equals the shell's initial
+    //    directory. The portable-pty session does not expose the directory,
+    //    so the process working directory is captured here instead. If the
+    //    working directory is unavailable (for example deleted), the
+    //    terminal session continues and every file request fails closed
+    //    without state.
     let base = match BaseDirectory::capture() {
         Ok(base) => Some(base),
         Err(error) => {
@@ -4952,9 +6453,10 @@ async fn start_terminal<B: TerminalBackend>(
             None
         }
     };
-    Ok((pty, base, data, control))
+    Ok((pty, base, data, control, audit))
 }
 
+#[cfg(test)]
 async fn start_terminal_io<B, D, C>(
     backend: &B,
     data: &mut D,
@@ -5012,6 +6514,21 @@ async fn write_terminal_ready_io(
     Ok(())
 }
 
+async fn wait_for_audit_frame(
+    audit: Option<&AuditObserver>,
+) -> Result<Option<Vec<u8>>, AuditError> {
+    match audit {
+        Some(audit) => audit.wait_for_frame().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The pinned audit-pump step carried by `bridge_terminal`: a checkpoint
+/// send or a received-frame processing future that must never suspend the
+/// inbound-registration branches of the bridge select.
+type AuditPumpStep<'a, T> = Pin<Box<dyn Future<Output = Result<T, AuditError>> + 'a>>;
+
+#[allow(clippy::too_many_arguments)]
 async fn bridge_terminal<S: TerminalSession>(
     driver: &mut EndpointDriver,
     binding: ConnectionBinding,
@@ -5020,6 +6537,7 @@ async fn bridge_terminal<S: TerminalSession>(
     data: ApplicationStream,
     control: ApplicationStream,
     base: Option<&BaseDirectory>,
+    audit: Option<&AuditObserver>,
 ) -> Result<u32, HostError> {
     let (mut data_read, mut data_write) = tokio::io::split(data.into_tokio());
     let (mut control_read, mut control_write) = tokio::io::split(control.into_tokio());
@@ -5036,16 +6554,35 @@ async fn bridge_terminal<S: TerminalSession>(
         base,
         Arc::clone(&cancel),
         &config,
+        audit,
     ));
     let result = {
-        let controller_input = copy_controller_input(&mut data_read, &mut pty_input);
-        let terminal_output =
-            copy_terminal_output(pty, &mut data_write, &mut control_read, &mut control_write);
+        let controller_input = copy_controller_input(&mut data_read, &mut pty_input, audit);
+        let terminal_output = copy_terminal_output(
+            pty,
+            &mut data_write,
+            &mut control_read,
+            &mut control_write,
+            audit,
+        );
+        let mut audit_frames = Box::pin(wait_for_audit_frame(audit));
+        // The checkpoint send and the received-frame processing are pinned
+        // branches rather than inline awaits: while either runs (ledger
+        // fsync, substream write) the inbound registrations below must keep
+        // being polled, otherwise a substream delivered by the swarm in
+        // that window is silently dropped by the stream adapter's
+        // zero-capacity rendezvous channel.
+        let mut audit_send: Option<AuditPumpStep<'_, ()>> = None;
+        let mut audit_process: Option<AuditPumpStep<'_, FrameEvent>> = None;
+        // The extra-auth Retry reply runs as a pinned branch for the same
+        // reason: its write must not suspend the receive loop.
+        let mut auth_retry: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
         tokio::pin!(controller_input);
         tokio::pin!(terminal_output);
         loop {
             driver.enforce_binding(binding)?;
             tokio::select! {
+            biased;
             event = driver.next() => match event {
                 EndpointEvent::Established { peer, .. } | EndpointEvent::Closed { peer, .. }
                     if peer == binding.peer() => driver.enforce_binding(binding)?,
@@ -5053,7 +6590,26 @@ async fn bridge_terminal<S: TerminalSession>(
             },
             stream = incoming.auth.next() => {
                 let (peer, stream) = stream.ok_or(HostError::ProtocolRegistrationEnded)?;
-                reject_extra_auth(driver, binding, peer, stream).await?;
+                if !driver.has_unique_connection(&peer) {
+                    // The peer is not the unique authenticated controller
+                    // (or has no connection left): no retry is owed (the
+                    // same check as `reject_extra_auth`).
+                    drop(stream);
+                } else if auth_retry.is_none() {
+                    auth_retry = Some(Box::pin(auth_retry_reply(stream)));
+                } else {
+                    // A rejection is already in flight: closing the new
+                    // substream is the same denial of service without state.
+                    drop(stream);
+                }
+            }
+            () = async {
+                auth_retry
+                    .as_mut()
+                    .expect("the retry branch is gated on the slot")
+                    .await;
+            }, if auth_retry.is_some() => {
+                auth_retry = None;
             }
             stream = incoming.data.next() => {
                 drop(stream.ok_or(HostError::ProtocolRegistrationEnded)?);
@@ -5074,6 +6630,132 @@ async fn bridge_terminal<S: TerminalSession>(
                     // transfer and at most one busy reply at a time
                     // (design 15.1, 15.3).
                     let _ = file_sender.try_send(Box::new(stream.into_tokio()));
+                }
+            }
+            result = tokio::time::timeout(AUDIT_CHECKPOINT_POLL, &mut audit_frames),
+                if audit.is_some() && audit_send.is_none() && audit_process.is_none() => {
+                let audit = audit
+                    .expect("the audit branch is enabled only for enterprise sessions");
+                match result {
+                    // The periodic poll: a due checkpoint is handed to the
+                    // pinned send branch (design sections 20.1 and 27.4);
+                    // the substream write never suspends the receive loop.
+                    Err(_elapsed) => {
+                        audit_send = Some(Box::pin(audit.send_due_checkpoint()));
+                    }
+                    Ok(Ok(Some(frame))) => {
+                        // The received frame is handed to the pinned process
+                        // branch; the substream stays unread while it runs,
+                        // so the ordered frame sequence (final checkpoint,
+                        // then manifest) can never be handled out of order.
+                        audit_process = Some(Box::pin(async move {
+                            audit.handle_frame(&frame).await
+                        }));
+                    }
+                    // The audit substream ended: the connection is gone.
+                    Ok(Ok(None)) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        break Err(HostError::Audit(AuditError::FailedClosed));
+                    }
+                    Ok(Err(error)) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        break Err(HostError::Audit(error));
+                    }
+                }
+            }
+            result = async {
+                audit_send
+                    .as_mut()
+                    .expect("the send branch is gated on the slot")
+                    .await
+            }, if audit_send.is_some() => {
+                audit_send = None;
+                match result {
+                    Ok(()) => {}
+                    Err(error) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        break Err(HostError::Audit(error));
+                    }
+                }
+            }
+            result = async {
+                audit_process
+                    .as_mut()
+                    .expect("the process branch is gated on the slot")
+                    .await
+            }, if audit_process.is_some() => {
+                audit_process = None;
+                let audit = audit
+                    .expect("the audit branch is enabled only for enterprise sessions");
+                match result {
+                    Ok(FrameEvent::None) => {
+                        // The completed frame is re-armed only now: the
+                        // substream stays unread while the previous frame
+                        // is being processed, so the ordered frame
+                        // sequence (final checkpoint, then manifest) can
+                        // never be handled out of order.
+                        audit_frames = Box::pin(wait_for_audit_frame(Some(audit)));
+                    }
+                    Ok(FrameEvent::Close(reason)) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        match reason {
+                            // The controller's own audit failed:
+                            // fail closed locally (design 18.7).
+                            AuditCloseReason::AuditFailure => {
+                                drive_bound(
+                                    driver,
+                                    binding,
+                                    audit.fail_closed(None, reason),
+                                )
+                                .await
+                                .ok();
+                                break Err(HostError::Audit(AuditError::FailedClosed));
+                            }
+                            // The controller closed the session
+                            // (detach or local interrupt): finalize
+                            // with the received reason (design
+                            // sections 22.2 and 22.3). The driver is
+                            // polled throughout so the peer's
+                            // finalization frames arrive.
+                            reason => {
+                                let finalized = drive_bound(
+                                    driver,
+                                    binding,
+                                    audit.close_and_finalize(
+                                        ManifestEnding::CloseReason(reason),
+                                        false,
+                                        CloseNoticeHandling::AlreadyReceived(reason),
+                                    ),
+                                )
+                                .await;
+                                match finalized {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        break Err(HostError::Audit(error));
+                                    }
+                                    Err(endpoint) => {
+                                        break Err(endpoint.into());
+                                    }
+                                }
+                                break Err(HostError::ConnectionLost);
+                            }
+                        }
+                    }
+                    Ok(FrameEvent::PeerAuditError(code)) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        drive_bound(
+                            driver,
+                            binding,
+                            audit.fail_closed(Some(code), AuditCloseReason::AuditFailure),
+                        )
+                        .await
+                        .ok();
+                        break Err(HostError::Audit(AuditError::FailedClosed));
+                    }
+                    Err(error) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        break Err(HostError::Audit(error));
+                    }
                 }
             }
             result = &mut controller_input => match result {
@@ -5130,6 +6812,40 @@ enum FileSubstreamRole {
     /// Another transfer is already running: the opening frame is answered
     /// with `Error(Busy)` and the substream is closed.
     Busy,
+}
+
+#[derive(Clone, Copy)]
+struct FileSubstreamDispatch<'a> {
+    role: FileSubstreamRole,
+    wire_settled: Option<&'a AtomicBool>,
+}
+
+/// The bounded coordinator decision for one newly opened file substream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingFileDisposition {
+    Active,
+    Busy,
+    /// The prior transfer has left its wire state machine or an earlier Busy
+    /// response is still closing. One explicit local slot retains this
+    /// substream until both serving roles are free.
+    Deferred,
+    Drop,
+}
+
+fn file_substream_disposition(
+    active: bool,
+    active_wire_settled: bool,
+    busy_reply: bool,
+) -> IncomingFileDisposition {
+    if !active && !busy_reply {
+        IncomingFileDisposition::Active
+    } else if active && active_wire_settled || !active && busy_reply {
+        IncomingFileDisposition::Deferred
+    } else if active && !busy_reply {
+        IncomingFileDisposition::Busy
+    } else {
+        IncomingFileDisposition::Drop
+    }
 }
 
 /// The bounded, zero-side-effect result of the first-frame read of a file
@@ -5268,11 +6984,34 @@ fn classify_file_open_io(error: std::io::Error) -> FileOpenError {
 /// failure only terminates the current substream and the remote terminal
 /// stays Active (design 17.2).
 async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+    stream: S,
     base: Option<&BaseDirectory>,
     cancel: Arc<AtomicBool>,
     config: &TransferConfig,
     role: FileSubstreamRole,
+    audit: Option<&AuditObserver>,
+) {
+    serve_one_file_substream_with_settlement(
+        stream,
+        base,
+        cancel,
+        config,
+        FileSubstreamDispatch {
+            role,
+            wire_settled: None,
+        },
+        audit,
+    )
+    .await;
+}
+
+async fn serve_one_file_substream_with_settlement<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    base: Option<&BaseDirectory>,
+    cancel: Arc<AtomicBool>,
+    config: &TransferConfig,
+    dispatch: FileSubstreamDispatch<'_>,
+    audit: Option<&AuditObserver>,
 ) {
     match read_file_open_frame(&mut stream, config.control_timeout).await {
         Ok(FileOpenFrame::Probe) | Err(_) => {
@@ -5284,7 +7023,7 @@ async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
             destination,
             file_name,
             declared_size,
-        }) if role == FileSubstreamRole::Active => {
+        }) if dispatch.role == FileSubstreamRole::Active => {
             let Some(base) = base else {
                 // The session base directory is unavailable; the request
                 // cannot be resolved and the substream closes without
@@ -5296,10 +7035,18 @@ async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
                 file_name: &file_name,
                 declared_size,
             };
-            let mut random = OsSecureRandom;
-            handle_upload_from_open(&mut stream, config, &mut random, base, &cancel, &open).await;
+            handle_upload_from_open_with_settlement(
+                &mut stream,
+                config,
+                base,
+                &cancel,
+                &open,
+                audit,
+                dispatch.wire_settled,
+            )
+            .await;
         }
-        Ok(FileOpenFrame::Download { source }) if role == FileSubstreamRole::Active => {
+        Ok(FileOpenFrame::Download { source }) if dispatch.role == FileSubstreamRole::Active => {
             let Some(base) = base else {
                 // The session base directory is unavailable; the request
                 // cannot be resolved and the substream closes without
@@ -5307,8 +7054,16 @@ async fn serve_one_file_substream<S: AsyncRead + AsyncWrite + Unpin>(
                 return;
             };
             let open = FileTransferMessage::DownloadOpen { source: &source };
-            let mut random = OsSecureRandom;
-            handle_download_from_open(&mut stream, config, &mut random, base, &cancel, &open).await;
+            handle_download_from_open_with_settlement(
+                &mut stream,
+                config,
+                base,
+                &cancel,
+                &open,
+                audit,
+                dispatch.wire_settled,
+            )
+            .await;
         }
         Ok(_) => {
             // Another file operation is active: answer the opening frame
@@ -5356,48 +7111,43 @@ async fn file_substream_coordinator<S>(
     base: Option<&BaseDirectory>,
     cancel: Arc<AtomicBool>,
     config: &TransferConfig,
+    audit: Option<&AuditObserver>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let active_wire_settled = AtomicBool::new(false);
     let mut active: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
     let mut busy_reply: Option<Pin<Box<dyn Future<Output = ()> + '_>>> = None;
+    let mut deferred: Option<S> = None;
+    let mut pending_closed = false;
     loop {
+        if active.is_none()
+            && busy_reply.is_none()
+            && let Some(stream) = deferred.take()
+        {
+            active_wire_settled.store(false, Ordering::Relaxed);
+            active = Some(Box::pin(serve_one_file_substream_with_settlement(
+                stream,
+                base,
+                cancel.clone(),
+                config,
+                FileSubstreamDispatch {
+                    role: FileSubstreamRole::Active,
+                    wire_settled: Some(&active_wire_settled),
+                },
+                audit,
+            )));
+            continue;
+        }
+        if pending_closed && active.is_none() && busy_reply.is_none() {
+            return;
+        }
         tokio::select! {
-            stream = pending.recv() => {
-                match stream {
-                    None => {
-                        // The queue is closed (the bridge dropped the
-                        // sender at session teardown): finish any in-flight
-                        // work, then end.
-                        if active.is_none() && busy_reply.is_none() {
-                            return;
-                        }
-                    }
-                    Some(stream) => {
-                        if active.is_none() && busy_reply.is_none() {
-                            active = Some(Box::pin(serve_one_file_substream(
-                                stream,
-                                base,
-                                cancel.clone(),
-                                config,
-                                FileSubstreamRole::Active,
-                            )));
-                        } else if busy_reply.is_none() {
-                            // A transfer is active: answer this opening
-                            // with `Error(Busy)` (design 15.3).
-                            busy_reply = Some(Box::pin(serve_one_file_substream(
-                                stream,
-                                base,
-                                cancel.clone(),
-                                config,
-                                FileSubstreamRole::Busy,
-                            )));
-                        }
-                        // Else both slots are occupied; the substream is
-                        // dropped.
-                    }
-                }
-            }
+            // A completed serving future must release its role before an
+            // already-ready next substream is classified. Without this
+            // priority, `select!` can randomly retain a completed active or
+            // busy slot and reject/drop a truly sequential transfer.
+            biased;
             _ = async {
                 if let Some(future) = active.as_mut() {
                     future.await;
@@ -5412,6 +7162,54 @@ async fn file_substream_coordinator<S>(
             }, if busy_reply.is_some() => {
                 busy_reply = None;
             }
+            stream = pending.recv(), if !pending_closed && deferred.is_none() => {
+                match stream {
+                    None => {
+                        // The queue is closed (the bridge dropped the
+                        // sender at session teardown). Disable this always-
+                        // ready branch, finish in-flight work, then end.
+                        pending_closed = true;
+                    }
+                    Some(stream) => {
+                        match file_substream_disposition(
+                            active.is_some(),
+                            active_wire_settled.load(Ordering::Acquire),
+                            busy_reply.is_some(),
+                        ) {
+                            IncomingFileDisposition::Active => {
+                                active_wire_settled.store(false, Ordering::Relaxed);
+                                active = Some(Box::pin(serve_one_file_substream_with_settlement(
+                                    stream,
+                                    base,
+                                    cancel.clone(),
+                                    config,
+                                    FileSubstreamDispatch {
+                                        role: FileSubstreamRole::Active,
+                                        wire_settled: Some(&active_wire_settled),
+                                    },
+                                    audit,
+                                )));
+                            }
+                            IncomingFileDisposition::Busy => {
+                                // A transfer is active: answer this opening
+                                // with `Error(Busy)` (design 15.3).
+                                busy_reply = Some(Box::pin(serve_one_file_substream(
+                                    stream,
+                                    base,
+                                    cancel.clone(),
+                                    config,
+                                    FileSubstreamRole::Busy,
+                                    audit,
+                                )));
+                            }
+                            IncomingFileDisposition::Deferred => {
+                                deferred = Some(stream);
+                            }
+                            IncomingFileDisposition::Drop => {}
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -5419,8 +7217,30 @@ async fn file_substream_coordinator<S>(
 async fn copy_controller_input(
     data_read: &mut (impl tokio::io::AsyncRead + Unpin),
     pty_input: &mut impl TerminalInput,
+    audit: Option<&AuditObserver>,
 ) -> Result<Infallible, HostError> {
-    tokio::io::copy(data_read, pty_input).await?;
+    // Design sections 18.2: the input commitment is appended before the
+    // PTY write and the write outcome after it.
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = data_read.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let bytes = &buffer[..read];
+        if let Some(audit) = audit {
+            audit.record_input(bytes).await?;
+        }
+        if let Err(error) = pty_input.write_all(bytes).await {
+            if let Some(audit) = audit {
+                let _ = audit.record_pty_write_outcome(false, read as u64).await;
+            }
+            return Err(error.into());
+        }
+        if let Some(audit) = audit {
+            audit.record_pty_write_outcome(true, read as u64).await?;
+        }
+    }
     pty_input.flush().await?;
     pty_input.close();
     std::future::pending().await
@@ -5431,6 +7251,7 @@ async fn copy_terminal_output<S: TerminalSession>(
     data_write: &mut (impl tokio::io::AsyncWrite + Unpin),
     control_read: &mut (impl tokio::io::AsyncRead + Unpin),
     control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    audit: Option<&AuditObserver>,
 ) -> Result<u32, HostError> {
     loop {
         let mut resize = [0_u8; 5];
@@ -5438,6 +7259,17 @@ async fn copy_terminal_output<S: TerminalSession>(
             read = control_read.read_exact(&mut resize) => {
                 read?;
                 let resize = TerminalResize::decode(&resize)?;
+                // Design section 18.5: both sides record the resize with
+                // the sender's direction before it is applied.
+                if let Some(audit) = audit {
+                    audit
+                        .record_resize(
+                            DIRECTION_CTRL_TO_HOST,
+                            resize.size().columns(),
+                            resize.size().rows(),
+                        )
+                        .await?;
+                }
                 pty.resize(resize.size()).await?;
                 tokio::task::yield_now().await;
             }
@@ -5446,11 +7278,37 @@ async fn copy_terminal_output<S: TerminalSession>(
                 match event.kind() {
                     PtyEventKind::Output => {
                         let output = event.into_output();
-                        data_write.write_all(output.as_slice()).await?;
-                        data_write.flush().await?;
+                        // Design section 18.3: the raw output is appended
+                        // before it is sent, the send outcome after it.
+                        if let Some(audit) = audit {
+                            audit.record_raw_output(output.as_slice()).await?;
+                        }
+                        let length = output.as_slice().len() as u64;
+                        let sent = async {
+                            data_write.write_all(output.as_slice()).await?;
+                            data_write.flush().await
+                        }
+                        .await;
+                        if let Err(error) = sent {
+                            if let Some(audit) = audit {
+                                let _ =
+                                    audit.record_send_outcome(DIRECTION_HOST_TO_CTRL, false, length).await;
+                            }
+                            return Err(error.into());
+                        }
+                        if let Some(audit) = audit {
+                            audit
+                                .record_send_outcome(DIRECTION_HOST_TO_CTRL, true, length)
+                                .await?;
+                        }
                         tokio::task::yield_now().await;
                     }
                     PtyEventKind::Exited(code) => {
+                        // Design section 15.2: the shared TerminalExit event
+                        // before it is conveyed.
+                        if let Some(audit) = audit {
+                            audit.record_terminal_exit(code as u8).await?;
+                        }
                         data_write.shutdown().await?;
                         control_write
                             .write_all(&TerminalExit::new(code).encode())
@@ -5460,6 +7318,7 @@ async fn copy_terminal_output<S: TerminalSession>(
                             control_read,
                             control_write,
                             TERMINAL_COMPLETION_TIMEOUT,
+                            audit,
                         )
                         .await?;
                         return Ok(code);
@@ -5474,6 +7333,7 @@ async fn complete_terminal_exit_io(
     control_read: &mut (impl tokio::io::AsyncRead + Unpin),
     control_write: &mut (impl tokio::io::AsyncWrite + Unpin),
     timeout: Duration,
+    audit: Option<&AuditObserver>,
 ) -> Result<(), HostError> {
     tokio::time::timeout(timeout, async {
         loop {
@@ -5484,6 +7344,11 @@ async fn complete_terminal_exit_io(
             }
             if tag == TerminalComplete::ENCODED {
                 TerminalComplete::decode(&tag)?;
+                // Design section 15.2: the shared TerminalComplete event
+                // once the controller conveyed it.
+                if let Some(audit) = audit {
+                    audit.record_terminal_complete().await?;
+                }
                 control_write.shutdown().await?;
                 return Ok(());
             }

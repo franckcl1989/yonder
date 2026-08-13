@@ -1,6 +1,6 @@
 use crate::network::{
-    ConnectionBinding, EndpointDriver, EndpointError, RelayConnection, drive, drive_bound,
-    reconverge_relay,
+    ConnectionBinding, EndpointDriver, EndpointError, RelayAccessMode, RelayConnection, drive,
+    drive_bound, reconverge_relay,
 };
 use backon::{BackoffBuilder as _, ConstantBuilder};
 use std::time::Duration;
@@ -291,6 +291,30 @@ enum EnterpriseAttempt {
     Retry(RetryAfter),
 }
 
+/// A resolved endpoint together with the relay policy that admitted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedTarget {
+    peer: PeerId,
+    access: RelayAccessMode,
+}
+
+impl ResolvedTarget {
+    #[must_use]
+    pub const fn new(peer: PeerId, access: RelayAccessMode) -> Self {
+        Self { peer, access }
+    }
+
+    #[must_use]
+    pub const fn peer(self) -> PeerId {
+        self.peer
+    }
+
+    #[must_use]
+    pub const fn access(self) -> RelayAccessMode {
+        self.access
+    }
+}
+
 /// Resolves the locator through the relay, automatically detecting
 /// enterprise mode (design section 3): the enterprise resolve substream
 /// is tried first, and a normal relay, which does not offer it, falls
@@ -302,12 +326,14 @@ pub async fn resolve_peer_auto(
     locator: Locator,
     deadline: ResolveDeadline,
     ui: &mut impl EnterpriseResolveUi,
-) -> Result<PeerId, RelayProtocolError> {
+) -> Result<ResolvedTarget, RelayProtocolError> {
     match enterprise_resolve_peer(driver, streams, relay, locator, deadline, ui).await {
         Err(RelayProtocolError::Endpoint(EndpointError::Application(
             ApplicationStreamError::UnsupportedProtocol,
-        ))) => resolve_peer(driver, streams, relay, locator, deadline).await,
-        result => result,
+        ))) => resolve_peer(driver, streams, relay, locator, deadline)
+            .await
+            .map(|peer| ResolvedTarget::new(peer, RelayAccessMode::Standard)),
+        result => result.map(|peer| ResolvedTarget::new(peer, RelayAccessMode::Enterprise)),
     }
 }
 
