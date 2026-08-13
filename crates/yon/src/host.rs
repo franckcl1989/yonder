@@ -4367,6 +4367,43 @@ mod tests {
                                 .await
                                 .unwrap();
 
+                                // While the session is active, a second
+                                // authentication start on the same unique
+                                // connection must be answered with a Retry
+                                // (design 9.5); the bridge must serve it
+                                // without suspending the session streams.
+                                let mut extra_auth = controller
+                                    .open(host_peer, AUTH_PROTOCOL)
+                                    .await
+                                    .into_tokio();
+                                let hello =
+                                    AuthClientHello::new([0x22; 32], [0xCD; 96]).encode();
+                                drive_test_node(
+                                    &mut controller.node,
+                                    extra_auth.write_all(&hello),
+                                )
+                                .await
+                                .unwrap();
+                                drive_test_node(&mut controller.node, extra_auth.flush())
+                                    .await
+                                    .unwrap();
+                                let mut retry = [0_u8; RETRY_LEN];
+                                tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    drive_test_node(
+                                        &mut controller.node,
+                                        extra_auth.read_exact(&mut retry),
+                                    ),
+                                )
+                                .await
+                                .expect("the extra authentication must be answered")
+                                .unwrap();
+                                assert_eq!(
+                                    retry[0], 0x02,
+                                    "the extra authentication start must be answered with Retry"
+                                );
+                                drop(extra_auth);
+
                                 if ending == EnterpriseControllerEnding::CheckpointThenComplete {
                                     drive_active_audit_checkpoint(&mut controller, &audit).await;
                                 }
