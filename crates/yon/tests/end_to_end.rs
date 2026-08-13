@@ -7,7 +7,7 @@ use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -73,6 +73,17 @@ const WINDOWS_ARROW_PROBE: &str = concat!(
 );
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+// Each process scenario owns several real TCP/UDP listeners and endpoint
+// swarms. Serializing those scenarios inside this integration-test binary
+// prevents instrumentation overhead from turning unrelated port competition
+// into product protocol timeouts; concurrency within each scenario is intact.
+static PROCESS_E2E_GUARD: Mutex<()> = Mutex::new(());
+
+fn process_e2e_guard() -> MutexGuard<'static, ()> {
+    PROCESS_E2E_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct EndpointConfigDirectory {
     path: PathBuf,
@@ -128,6 +139,7 @@ impl Drop for EndpointConfigDirectory {
 
 #[test]
 fn three_process_terminal_session_executes_a_real_shell() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -150,6 +162,7 @@ fn three_process_terminal_session_executes_a_real_shell() -> Result<(), std::io:
 #[test]
 #[ignore = "release process performance gate"]
 fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     const SAMPLE_COUNT: usize = 10;
     const MIN_REMOTE_BYTES_PER_SECOND: f64 = 384.0 * 1024.0;
     const MIN_REMOTE_TO_LOCAL_PTY_RATIO: f64 = 0.70;
@@ -267,6 +280,7 @@ fn process_terminal_throughput_baseline_uses_the_real_product_path() -> Result<(
 #[test]
 fn pinned_relay_identity_rejects_an_impersonator_before_code_publication()
 -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let port = available_port()?;
     let impersonator = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -288,6 +302,7 @@ fn pinned_relay_identity_rejects_an_impersonator_before_code_publication()
 
 #[test]
 fn tampering_transport_proxy_fails_closed_before_code_publication() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let relay_port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -309,6 +324,7 @@ fn tampering_transport_proxy_fails_closed_before_code_publication() -> Result<()
 #[cfg(yonder_e2e_rebuild)]
 #[test]
 fn strict_relay_only_fallback_rebuilds_the_controller_swarm() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -326,6 +342,7 @@ fn strict_relay_only_fallback_rebuilds_the_controller_swarm() -> Result<(), std:
 
 #[test]
 fn quic_and_websocket_relay_transports_run_real_terminal_sessions() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     for transport in [RelayTransport::Quic, RelayTransport::WebSocket] {
         let port = transport.available_port()?;
         let identity = generate_identity(&mut OsSecureRandom)
@@ -374,6 +391,7 @@ fn run_secure_websocket_session(
     trust_anchor_der: &[u8],
     issuer_der: Option<&[u8]>,
 ) -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -405,6 +423,7 @@ fn run_secure_websocket_session(
 
 #[test]
 fn blocked_udp_candidate_falls_back_to_tcp() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let tcp_port = available_port()?;
     let quic_port = available_udp_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
@@ -434,6 +453,7 @@ fn blocked_udp_candidate_falls_back_to_tcp() -> Result<(), std::io::Error> {
 
 #[test]
 fn blocked_tcp_candidate_falls_back_to_quic() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let tcp_port = available_port()?;
     let quic_port = available_udp_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
@@ -498,6 +518,7 @@ fn interactive_pty_appends_diagnostics_without_contaminating_terminal() -> Resul
 
 #[cfg(unix)]
 fn run_interactive_pty(diagnostic_log: bool) -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -823,6 +844,7 @@ fn windows_conpty_appends_diagnostics_without_contaminating_terminal() -> Result
 
 #[cfg(windows)]
 fn run_windows_conpty(diagnostic_log: bool) -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     const REMOTE_BEGIN_MARKER: &[u8] = b"YON_REMOTE_BEGIN";
     const OUTPUT_MARKER: &[u8] = b"YON_WINDOWS_CONPTY_OUTPUT";
     const UTF8_SCALAR: &[u8] = "\u{4e2d}".as_bytes();
@@ -1042,6 +1064,7 @@ fn windows_conpty_probe_echo_cannot_satisfy_readiness() {
 
 #[test]
 fn host_reclaims_the_same_code_after_relay_restart() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let port = available_port()?;
     let identity = generate_identity(&mut OsSecureRandom)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -1124,6 +1147,7 @@ fn wait_for_resolved_locator(relay: &str, locator: Locator) -> Result<(), std::i
 
 #[test]
 fn host_replaces_the_complete_code_after_reclaim_conflict() -> Result<(), std::io::Error> {
+    let _guard = process_e2e_guard();
     let relay_port = available_port()?;
     let gate = PausableTcpGate::start(relay_port)?;
     let identity = generate_identity(&mut OsSecureRandom)
