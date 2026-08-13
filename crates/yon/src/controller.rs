@@ -8069,6 +8069,13 @@ mod tests {
         AuditFinalizeStreamEnd,
     }
 
+    // This is the aggregate harness bound, not a product timeout. The case
+    // composes relay setup, OPAQUE, terminal startup, active checkpoints and
+    // bilateral audit finalization; every product protocol step retains its
+    // own shorter absolute deadline. Instrumented CI needs the same aggregate
+    // budget as the corresponding enterprise host harness.
+    const ENTERPRISE_CONTROLLER_CASE_TIMEOUT: Duration = Duration::from_secs(300);
+
     /// Reads the controller's rendered output until `needle` appears.
     /// Returns the bytes read in this call (the caller accumulates).
     async fn read_output_until(output: &mut DuplexStream, needle: &[u8]) -> Vec<u8> {
@@ -9101,8 +9108,10 @@ mod tests {
                 runtime.block_on(async {
                     let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
                     let local = tokio::task::LocalSet::new();
-                    tokio::time::timeout(
-                        Duration::from_secs(120),
+                    let stage = Arc::new(Mutex::new("starting"));
+                    let scenario_stage = Arc::clone(&stage);
+                    let result = tokio::time::timeout(
+                        ENTERPRISE_CONTROLLER_CASE_TIMEOUT,
                         local.run_until(async {
                             const EXIT_CODE: u32 = 31;
                             const OUTPUT: &[u8] = b"enterprise-host-output> ";
@@ -9169,6 +9178,7 @@ mod tests {
                             let controller_audit_dir = tempdir().unwrap();
                             let controller_done = Arc::new(tokio::sync::Notify::new());
                             let controller_done_signal = Arc::clone(&controller_done);
+                            let controller_stage = Arc::clone(&scenario_stage);
 
                             let controller = async {
                                 let (mut driver, mut streams) = build_endpoint(
@@ -9199,6 +9209,7 @@ mod tests {
                                 )
                                 .await
                                 .unwrap();
+                                *controller_stage.lock().unwrap() = "controller-prepared";
                                 prepared.audit_root_override =
                                     Some(controller_audit_dir.path().join("audit"));
                                 let hello = TerminalHello::new(
@@ -9206,18 +9217,16 @@ mod tests {
                                     TerminalValue::new("xterm").unwrap(),
                                     TerminalValue::new("truecolor").unwrap(),
                                 );
-                                let result = tokio::time::timeout(
-                                    Duration::from_secs(60),
-                                    run_terminal(
-                                        prepared,
-                                        hello,
-                                        frontend,
-                                        &mut progress,
-                                        &cancellation,
-                                    ),
+                                *controller_stage.lock().unwrap() = "terminal-running";
+                                let result = run_terminal(
+                                    prepared,
+                                    hello,
+                                    frontend,
+                                    &mut progress,
+                                    &cancellation,
                                 )
-                                .await
-                                .expect("the controller terminal stage must finish");
+                                .await;
+                                *controller_stage.lock().unwrap() = "terminal-finished";
                                 controller_done_signal.notify_one();
                                 result
                             };
@@ -9356,8 +9365,13 @@ mod tests {
                             relay.stop().await;
                         }),
                     )
-                    .await
-                    .expect("the enterprise controller session must finish");
+                    .await;
+                    if result.is_err() {
+                        panic!(
+                            "the enterprise controller session must finish (last stage: {})",
+                            *stage.lock().unwrap()
+                        );
+                    }
                 });
             })
             .unwrap()
