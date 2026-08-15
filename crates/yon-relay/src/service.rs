@@ -2407,6 +2407,9 @@ mod tests {
             RelayServiceError::EnterpriseCallback(CallbackServerError::Bind { .. })
         ));
         let text = logs.text();
+        if !text.contains("event=\"relay_starting\"") {
+            println!("TSAN-DEBUG enterprise log text follows\n{text}");
+        }
         assert!(text.contains("event=\"relay_enterprise_mode\""));
         assert!(text.contains("providers=1"));
         assert!(text.contains("event=\"relay_starting\""));
