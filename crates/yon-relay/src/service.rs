@@ -1639,6 +1639,14 @@ mod tests {
             .push(external.as_multiaddr().clone());
         let logs = SharedLog::default();
         let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
+        // A parallel subscriber-less test can register these tracing callsites
+        // first and cache `Interest::never` in the process-wide callsite table
+        // (tracing-core `DefaultCallsite` + the `has_just_one` dispatcher fast
+        // path), which would silently drop the events asserted below. Warm the
+        // callsites from this thread and rebuild the interest cache before the
+        // asserting call so the recorded events are deterministic.
+        report_ready(peer, &listeners, std::slice::from_ref(&external)).unwrap();
+        tracing::callsite::rebuild_interest_cache();
         report_ready(peer, &listeners, std::slice::from_ref(&external)).unwrap();
         let text = logs.text();
         assert!(text.contains("event=\"relay_ready\""));
@@ -1799,6 +1807,12 @@ mod tests {
     async fn relay_starts_and_obeys_injected_shutdown_results() {
         let logs = SharedLog::default();
         let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
+        // Warm the relay callsites from this thread and rebuild the
+        // process-wide interest cache before the asserting run: a parallel
+        // subscriber-less test can register a callsite first and cache
+        // `Interest::never`, silently dropping the events asserted below.
+        let _ = run_relay_until(config(), async { Ok(()) }).await;
+        tracing::callsite::rebuild_interest_cache();
         let relay_config = config();
         let resources = relay_config.resources;
         run_relay_until(relay_config, async { Ok(()) })
@@ -1832,6 +1846,11 @@ mod tests {
     async fn relay_process_shutdown_maps_the_typed_reason_before_stopping() {
         let logs = SharedLog::default();
         let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
+        // Warm the relay callsites from this thread and rebuild the
+        // process-wide interest cache before the asserting run (see
+        // `relay_starts_and_obeys_injected_shutdown_results`).
+        let _ = run_relay_until_shutdown(config(), async { Ok(ShutdownReason::Interrupt) }).await;
+        tracing::callsite::rebuild_interest_cache();
         run_relay_until_shutdown(config(), async { Ok(ShutdownReason::Interrupt) })
             .await
             .unwrap();
@@ -2387,19 +2406,29 @@ mod tests {
         // OS dropping the listener the serve task owns.
         let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = occupied.local_addr().unwrap().port();
-        let relay_config = RelayServeConfig::with_enterprise(
-            Keypair::generate_ed25519(),
-            vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
-            vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
-            WssTransportConfig::client(None),
-            RelayResourceConfig::default(),
-            Some(EnterpriseContext::new(
-                enterprise_config(format!("127.0.0.1:{port}").parse().unwrap()),
-                enterprise_credentials(),
-            )),
-        )
-        .unwrap();
-        let error = run_relay_until(relay_config, async { Ok(()) })
+        // Warm the enterprise-mode callsites from this thread and rebuild the
+        // process-wide interest cache before the asserting run: a parallel
+        // subscriber-less test can register a callsite first and cache
+        // `Interest::never`, silently dropping the events asserted below. The
+        // warm-up bind fails on the occupied callback port exactly like the
+        // asserting run, so both runs record the same startup events.
+        let enterprise_serve = || {
+            RelayServeConfig::with_enterprise(
+                Keypair::generate_ed25519(),
+                vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config(format!("127.0.0.1:{port}").parse().unwrap()),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap()
+        };
+        let _ = run_relay_until(enterprise_serve(), async { Ok(()) }).await;
+        tracing::callsite::rebuild_interest_cache();
+        let error = run_relay_until(enterprise_serve(), async { Ok(()) })
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2407,9 +2436,6 @@ mod tests {
             RelayServiceError::EnterpriseCallback(CallbackServerError::Bind { .. })
         ));
         let text = logs.text();
-        if !text.contains("event=\"relay_starting\"") {
-            println!("TSAN-DEBUG enterprise log text follows\n{text}");
-        }
         assert!(text.contains("event=\"relay_enterprise_mode\""));
         assert!(text.contains("providers=1"));
         assert!(text.contains("event=\"relay_starting\""));
