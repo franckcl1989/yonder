@@ -11,6 +11,10 @@ on:
         description: Successful Release candidate run for this exact commit
         required: true
         type: string
+      source_sha:
+        description: Candidate commit; only set when recovering this workflow itself
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -31,11 +35,18 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - name: Check out the promoted main commit
+      - name: Check out the promoted candidate source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           path: source
+          persist-credentials: false
+          ref: ${{ inputs.source_sha || github.sha }}
+      - name: Check out the publication automation source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          path: automation
           persist-credentials: false
       - name: Select and validate the exact candidate run
         id: candidate
@@ -48,7 +59,16 @@ jobs:
           [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           source_sha="$(git -C source rev-parse HEAD)"
-          test "$source_sha" = "$GITHUB_SHA"
+          automation_sha="$(git -C automation rev-parse HEAD)"
+          test "$automation_sha" = "$GITHUB_SHA"
+          if [[ "$source_sha" != "$GITHUB_SHA" ]]; then
+            git -C automation merge-base --is-ancestor "$source_sha" "$GITHUB_SHA"
+            mapfile -t recovery_changes < <(
+              git -C automation diff --name-only "$source_sha..$GITHUB_SHA"
+            )
+            test "${#recovery_changes[@]}" -eq 1
+            test "${recovery_changes[0]}" = .github/workflows/publish-release.yml
+          fi
 
           run_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
           jq --exit-status \
@@ -142,13 +162,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
         run: |
           while IFS= read -r -d '' asset; do
             gh attestation verify "$asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
-              --source-digest "$SOURCE_SHA" \
+              --source-digest "$GITHUB_SHA" \
               --source-ref refs/heads/main
           done < <(find dist -maxdepth 1 -type f -print0 | sort --zero-terminated)
       - name: Publish and verify the immutable release
@@ -162,9 +181,9 @@ jobs:
           test "${#assets[@]}" -eq 19
 
           release_exists=false
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            if [[ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft')" == true ]]; then
-              gh release delete "$VERSION" --yes
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ "$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" == true ]]; then
+              gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes
             else
               release_exists=true
             fi
@@ -172,6 +191,7 @@ jobs:
 
           if [[ "$release_exists" == false ]]; then
             gh release create "$VERSION" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
               --title "Yonder $VERSION" \
@@ -188,20 +208,20 @@ jobs:
             printf '%s\tsha256:%s\n' \
               "${asset##*/}" "$(sha256sum "$asset" | cut -d ' ' -f 1)"
           done | LC_ALL=C sort >"$expected_digests"
-          gh release view "$VERSION" --json assets \
+          gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[].name' | LC_ALL=C sort >"$uploaded"
-          gh release view "$VERSION" --json assets \
+          gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[] | [.name, .digest] | @tsv' \
             | LC_ALL=C sort >"$uploaded_digests"
           diff --unified "$expected" "$uploaded"
           diff --unified "$expected_digests" "$uploaded_digests"
-          if [[ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft')" == true ]]; then
-            gh release edit "$VERSION" --draft=false
+          if [[ "$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" == true ]]; then
+            gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
           fi
 
           verified=false
           for _ in {1..20}; do
-            if gh release verify "$VERSION"; then
+            if gh release verify "$VERSION" --repo "$GITHUB_REPOSITORY"; then
               verified=true
               break
             fi
@@ -209,5 +229,5 @@ jobs:
           done
           test "$verified" = true
           for asset in "${assets[@]}"; do
-            gh release verify-asset "$VERSION" "$asset"
+            gh release verify-asset "$VERSION" "$asset" --repo "$GITHUB_REPOSITORY"
           done
