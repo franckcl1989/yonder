@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Receives type-safe operation milestones without coupling state machines to a UI.
 pub trait OperationProgress<Stage> {

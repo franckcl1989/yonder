@@ -6,6 +6,7 @@
 pub mod code;
 pub mod diagnostic;
 pub mod domain;
+pub mod enterprise;
 pub mod error;
 pub mod pake;
 pub mod random;
@@ -13,6 +14,7 @@ pub mod rate;
 pub mod resource;
 pub mod roster;
 pub mod secret;
+pub mod secret_file;
 pub mod session;
 pub mod time;
 pub mod wire;
@@ -20,6 +22,7 @@ pub mod wire;
 pub use code::{ConnectionCode, Locator, PakeSecret};
 pub use diagnostic::write_error_report;
 pub use domain::{PeerIdBytes, RetryAfter, TerminalSize, TerminalValue};
+pub use enterprise::{EnterpriseProvider, EnterpriseProviders};
 pub use error::{CodeError, DomainError, ProtocolError};
 pub use pake::Pake;
 pub use random::{IdentitySeed, OsSecureRandom, RandomError, SecureRandom};
@@ -32,5 +35,9 @@ pub use resource::{
 };
 pub use roster::{ConnectionRoster, RosterError};
 pub use secret::SecretDocument;
+pub use secret_file::{
+    PrivateDirectoryPolicy, SecretFileError, SecretFilePolicy, SystemPrivateDirectoryPolicy,
+    SystemSecretFilePolicy,
+};
 pub use session::{SessionEvent, TargetSession, TargetSessionState, TransitionError};
 pub use time::{MonotonicClock, MonotonicTime, SystemClock};

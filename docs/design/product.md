@@ -21,7 +21,7 @@ yon-relay [--log-level <LEVEL>] serve
 ```
 
 - relay、TLS 和资源设置只通过分层配置读取。优先级从高到低固定为环境变量、当前目录文件、系统文件；`yon` 使用 `yon.toml`/`YON_`，relay 使用 `yon-relay.toml`/`YON_RELAY_`。Linux 系统目录是 `/etc/yonder`，macOS 是 `/Library/Application Support/Yonder`，Windows 是 `%PROGRAMDATA%\Yonder`。Windows 必须能取得非空绝对路径形式的 `PROGRAMDATA` 才能安全定位系统层；该系统环境异常时启动失败，即使更高层已完整配置也不猜测或静默改用其他目录。嵌套环境键使用 `__`，列表使用逗号。
-- `yon.toml` 必须提供 `relays`，可选 `wss_ca`。`wss_ca` 接受一个路径或 `1..=8` 个有序路径；显式空列表和超量列表在文件 I/O 前拒绝。每个文件可以是单个 DER 证书或只包含证书块的 PEM bundle，合计解析后的 DER 不超过 `1 MiB`。`relays` 接受 `1..=8` 个、文本长度各不超过 `512` 字节的中继地址；只允许 `/ip4`、`/ip6`、`/dns4`、`/dns6` 加 QUIC v1、TCP、WS 或 canonical `/tls/ws`，禁止 `/dnsaddr`、未指定 IP 和端口 `0`。所有地址必须以同一个 `/p2p/<PeerId>` 结尾，因此它们只是同一中继的不同入口，不是多个独立中继。
+- `yon.toml` 必须提供 `relays`，可选 `wss_ca`，并以类型化 `access_mode` 声明 endpoint 期望的准入策略；只接受 `standard`/`enterprise`，缺省为 `standard`。主控端和被控端必须使用相同值，并与 relay 通过 Identify 发布的唯一 Resolve 模式一致；任一不匹配都在 registry/resolve 前失败，禁止自动切换或降级。环境变量名固定为 `YON_ACCESS_MODE`，不得占用 relay 的 `YON_RELAY_` 命名空间。`wss_ca` 接受一个路径或 `1..=8` 个有序路径；显式空列表和超量列表在文件 I/O 前拒绝。每个文件可以是单个 DER 证书或只包含证书块的 PEM bundle，合计解析后的 DER 不超过 `1 MiB`。`relays` 接受 `1..=8` 个、文本长度各不超过 `512` 字节的中继地址；只允许 `/ip4`、`/ip6`、`/dns4`、`/dns6` 加 QUIC v1、TCP、WS 或 canonical `/tls/ws`，禁止 `/dnsaddr`、未指定 IP 和端口 `0`。所有地址必须以同一个 `/p2p/<PeerId>` 结尾，因此它们只是同一中继的不同入口，不是多个独立中继。
 - `CODE` 可作为位置参数传入。省略时，TTY 使用隐藏输入；非 TTY 从标准输入读取一行后再把标准输入交给终端会话。三条输入路径得到的 `String` 都必须立即移入 `Zeroizing<String>` 并在解析后尽快销毁；位置参数的内容校验在应用边界完成，错误信息只报告“连接码无效”，Clap 和应用日志均不得回显原值。位置参数仍会暴露在 shell history 和短暂的进程参数列表中，交互使用默认采用省略参数的隐藏输入。
 - 连接码、PAKE 秘密和终端字节不属于配置 schema，也不允许通过环境变量配置。`LEVEL` 是 `off/error/warn/info/debug/trace` 枚举，`yon` 默认 `error`、`yon-relay` 默认 `info`；日志级别和 `--log-file` 仍是显式 CLI 操作项。当 `connect` 的 stdout 与 stderr 同为终端且未提供日志文件时，tracing 必须关闭，应用错误仍在进度行清理后由结构化错误链显示；显式 `warn/info/debug/trace` 必须指定 `--log-file` 或重定向 stderr，避免诊断事件破坏远端终端，未分离时在网络活动前拒绝并给出命令提示。日志文件以追加模式打开，打开失败必须在网络活动前报告。
 - `yon config check` 在不启动网络的情况下加载并验证有效 endpoint 配置；两个二进制的 `config sources` 都只展示固定系统/当前目录路径、文件状态、优先级和环境变量前缀，不输出配置值。`yon connect` 必须先完成配置校验，再向交互用户请求隐藏连接码，避免用户输入秘密后才发现本地配置错误。`yon-relay config check` 必须验证配置、identity、地址、资源组合及 TLS 材料，但不绑定 listener；`identity show` 只从受保护的 identity 文件导出公开 PeerId。
@@ -38,6 +38,7 @@ yon-relay [--log-level <LEVEL>] serve
 
 ```toml
 # yon.toml
+access_mode = "standard" # 企业 relay 使用 "enterprise"；两端必须一致
 relays = ["/dns4/relay.example/tcp/4001/p2p/12D3KooW..."]
 wss_ca = "private-ca.pem" # 可选；也可写为路径数组
 ```
@@ -121,10 +122,11 @@ raw mode 只在网络、认证和两条终端子流都已成功后启用，但�
 - 成功进入 Active 后，主控端返回远端 shell 的 `0..=255` 退出码；更大的平台退出值映射为 `1` 并在结束期警告中记录原值，不依赖 tracing 级别。被信号结束时使用 `portable-pty` 给出的可移植退出码。Active 后的应用错误、退出码警告和本地 raw mode 恢复失败必须在共享终端上先另起一行再显示；raw mode 正常恢复和会话根错误同时失败时结构化错误必须保留两者。
 - `host` 在等待阶段收到 Ctrl+C 时有界清理并安静返回 `130`；controller 在 Active 前收到本地终止信号同样返回 `130`。Active 中的 Ctrl+C 是远端终端字节，本地脱离使用 `Ctrl+] .`。被控端收到会话关闭后终止 shell、关闭 PTY 并退出失败。已经主动脱离该 PTY/session 的后台进程不保证被终止，这与本地 shell 的脱离语义一致。
 
-## v1 非目标
+## 0.2.0 非目标
 
 - SSH 协议、OpenSSH 配置、SSH agent、SFTP 或 SSH 端口转发兼容。
-- 文件传输、剪贴板同步、图形界面、浏览器端、多人会话和会话恢复。
+- 目录/递归传输、同步、断点续传、剪贴板同步、图形界面、浏览器终端、多人会话和会话恢复。`0.2.0` 只增加活动交互终端内的单文件上传与下载。
+- 通用 IAM、细粒度企业授权、中心化审计平台和普通会话强制审计。企业认证只控制企业 relay 的 connect 准入；可验证审计只对企业会话强制。
 - 公共中继发现、中继联盟、跨中继复制、多个不同中继间故障转移或中继持久化连接码数据库。
 - 隐藏流量元数据、抵抗已入侵端点、抵抗拥有当前用户权限的本地攻击者。
 - Active 会话的路径热迁移。当前连接失败即结束会话，不恢复已经消费的连接码。

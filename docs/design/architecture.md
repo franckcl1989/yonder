@@ -47,7 +47,7 @@ endpoint 默认分别监听 IPv4/IPv6 的 `udp/0/quic-v1`、`tcp/0`、`tcp/0/ws`
 
 WSS 主要用于 endpoint 到 relay 的受限网络入口。临时 endpoint 没有域名和受信证书，因此 endpoint 间直接候选只包括 QUIC、TCP 和 WS；共享代码仍能拨号 WSS relay。WSS transport 必须包在 DNS(TCP) 外侧以保留主机名和 SNI。
 
-endpoint 会并发拨号已配置的同一 relay 入口，使用相同的 Ping 样本排序并只保留一条基础连接，之后才申请 reservation 或执行 resolve。relay 为每个 endpoint PeerId 维护连接名册；registry/resolve 只在名册恰好一条时接受，并从该唯一 `ConnectedPoint` 取得来源 IP 前缀。迟到入口造成临时第二条连接时应用请求返回 Retry，额外连接结束后恢复。这样无需手写 ConnectionHandler 也不会把一个子流错误归因到另一个来源地址。
+endpoint 会并发拨号已配置的同一 relay 入口，使用相同的 Ping 样本排序并只保留一条基础连接，之后才申请 reservation 或执行 resolve。每个 endpoint 还从类型化 `access_mode`（`standard`/`enterprise`，缺省 `standard`）取得本地期望策略；主控端与被控端必须配置相同值，并与 relay 通过 Identify 发布的唯一 Resolve 模式一致。模式不匹配在 registry/resolve 前失败，不能根据 relay 声明自动切换，以免不可信 relay 把企业会话降级为普通会话。relay 为每个 endpoint PeerId 维护连接名册；registry/resolve 只在名册恰好一条时接受，并从该唯一 `ConnectedPoint` 取得来源 IP 前缀。迟到入口造成临时第二条连接时应用请求返回 Retry，额外连接结束后恢复。这样无需手写 ConnectionHandler 也不会把一个子流错误归因到另一个来源地址。
 
 libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、打洞、relay circuit、Ping 和子流协商。Yonder 只负责枚举/约束候选、并发触发这些能力、按策略选择、关闭败选连接以及驱动业务状态机；rust-libp2p 不会替应用自动完成跨 transport 的质量选择。
 
@@ -86,8 +86,8 @@ libp2p 提供 transport 握手、加密、复用、地址、NAT 探测、UPnP、
 - `SwarmTask` 独占 `Swarm`、连接 roster 和 `libp2p-stream::Control`；命令通道容量 `32`，业务事件通道容量 `64`。
 - 每个入站协议接收循环必须持续 poll。endpoint 的 auth、terminal-control、terminal-data 各只有容量 `1` 的会话入口；入口占用时立即关闭多余子流，不建立等待队列。relay 用 `tokio::sync::Semaphore::try_acquire` 限制 registry reader 最多 `16`、resolve reader 最多 `64`，每个 reader 受消息超时约束；无 permit 时立即关闭新子流。结构校验后的请求分别进入容量 `16`/`64` 的 actor channel，由单 owner 修改状态并通过 oneshot 返回响应。
 - relay 的 reservation 视图、注册表、前缀状态和 direct governor limiter 由同一个 actor 独占，不使用第一方 `Arc<Mutex<_>>`、CAS 状态机或跨任务共享可变映射。`Arc<Semaphore>` 只表达不可绕过的任务准入计数，不承载业务状态。
-- `yon` 的会话状态由一个 `SessionTask` 独占。PTY 同步 API 最多使用三个 `spawn_blocking` 任务：PTY 读、PTY 写和 child supervisor；supervisor 是真实 `portable_pty::Child` 的唯一所有者，以有界间隔调用 `try_wait`，收到取消后直接调用该 `Child::kill`。runtime 的 `max_blocking_threads` 固定为 `4`。
-- `TaskTracker` 收集任务，`CancellationToken` 单向广播关闭；每次 spawn 同时保留有界清理所需的 `AbortHandle`，并及时裁剪已经完成的句柄。首个根错误触发取消；其他任务只回报清理错误，不能覆盖根因。全部异步任务共享一个绝对 `2s` 协作截止时间，截止后 abort 仍存活的任务并等待 tracker 确认归零。
+- `yon` 的会话状态由一个 `SessionTask` 独占。PTY 同步 API 最多使用三个长生命周期 `spawn_blocking` 任务：PTY 读、PTY 写和 child supervisor；supervisor 是真实 `portable_pty::Child` 的唯一所有者，以有界间隔调用 `try_wait`，收到取消后直接调用该 `Child::kill`。runtime 的 `max_blocking_threads` 固定为 `4`，第四个 worker 保留给 Tokio 文件 backend 的短路径/临时文件/提交操作；企业审计 writer 使用独立命名 `std::thread` 及线程私有 runtime，不占该 blocking pool。
+- `TaskTracker` 收集普通后台任务，`CancellationToken` 单向广播关闭；每次 spawn 同时保留有界清理所需的 `AbortHandle`，并及时裁剪已经完成的句柄。首个根错误触发取消；其他任务只回报清理错误，不能覆盖根因。普通可中止异步任务共享一个绝对 `2s` 协作截止时间，截止后 abort 仍存活的任务并等待 tracker 确认归零。唯一在途文件 transfer 是显式 Closing owner：先拒绝新操作并请求取消，再持续 poll 到确定本地结果；已经进入 blocking no-replace 的提交不能由 abort/drop 撤销，也不得越过会话返回继续落盘。
 
 所有 channel、map、候选集、协议消息和复制缓冲区均有硬上限。生产代码不得调用 `tokio::spawn` 后丢弃 handle，也不得依赖任务退出顺序碰巧正确。
 
@@ -120,4 +120,4 @@ host 在认证前最多用 `3s` 让目标 PeerId 名册收敛，并在此期间�
 - relay 复用同一官方 behaviour：pending inbound `128`、pending outbound `64`、established inbound `320`、outbound `64`、total `320`、per PeerId `8`；该上限允许同一 endpoint 竞速最多 8 个入口及短暂 AutoNAT 连接，应用协议仍要求收敛到名册唯一。relay memory connection limit 为进程 RSS `64 MiB`。
 - relay 的产品语义固定为默认 `max_reservations=128`、每 PeerId 最多 `1` 个 reservation、reservation `1h`，并且每 PeerId 最多 `1` 条 circuit。锁定的 `libp2p-relay 0.21.1` 对两个 per-peer 字段使用 `current > configured` 判断，因此适配层把对应上游字段设为 `0` 才能得到有效上限 `1`；升级上游时必须用真实双连接 reservation 回归重新核对，不能机械保留该兼容值。
 - relay 默认 `max_circuits=128`、`max_circuits_per_peer=1`、单 circuit 最长 `24h`、双向合计最多 `8 GiB`。配置可以收紧或调整，但必须通过组合 newtype 校验且不能超过平台文件描述符和内存预算。
-- memory connection limits 触发时拒绝新连接，不驱逐 Active 会话。上游平台内存统计暂时失败时可能沿用最近值，因此 connection count limits 始终作为独立硬边界，不能被关闭。ASan/TSan 插桩会让空载进程 RSS 超过生产阈值，因此只有显式启用 `yonder_sanitizer` cfg 的 sanitizer 验证构建把 endpoint 与 relay 阈值提高到 `512 MiB`；普通 dev/test/release 仍固定为上述 `96 MiB`/`64 MiB`，连接数与其他资源边界也不变。
+- memory connection limits 触发时拒绝新连接，不驱逐 Active 会话。上游平台内存统计暂时失败时可能沿用最近值，因此 connection count limits 始终作为独立硬边界，不能被关闭。debug 和 ASan/TSan 插桩构建会因调试信息、测试框架、64 MiB 测试线程栈及分配器保留使空载或同进程测试 RSS 超过生产阈值，因此这些仍有界的非发布构建把 endpoint 与 relay 阈值统一提高到 `512 MiB`；`debug_assertions = false` 且未启用 `yonder_sanitizer` 的优化发布构建严格使用上述 `96 MiB`/`64 MiB`。两套精确常量均由构建模式静态选择并由 debug/release 测试断言，连接数与其他资源边界不变。

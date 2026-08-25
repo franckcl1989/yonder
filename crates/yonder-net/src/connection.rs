@@ -135,6 +135,33 @@ impl ConnectionBook {
         self.rosters.get(peer).map_or(0, ConnectionRoster::len)
     }
 
+    /// Reports whether one roster entry is a transport-authenticated direct connection.
+    #[must_use]
+    pub fn is_direct(&self, peer: &PeerId, connection: ConnectionId) -> bool {
+        self.rosters
+            .get(peer)
+            .is_some_and(|roster| roster.iter().any(|candidate| *candidate == connection))
+            && self
+                .endpoints
+                .get(&connection)
+                .is_some_and(|endpoint| !endpoint.is_relayed())
+    }
+
+    /// Counts direct connections without allocating a temporary candidate set.
+    #[must_use]
+    pub fn direct_count(&self, peer: &PeerId) -> usize {
+        self.rosters.get(peer).map_or(0, |roster| {
+            roster
+                .iter()
+                .filter(|connection| {
+                    self.endpoints
+                        .get(connection)
+                        .is_some_and(|endpoint| !endpoint.is_relayed())
+                })
+                .count()
+        })
+    }
+
     /// Iterates the connection IDs that must be closed to enforce the barrier.
     pub fn connections(&self, peer: &PeerId) -> impl Iterator<Item = ConnectionId> + '_ {
         self.rosters

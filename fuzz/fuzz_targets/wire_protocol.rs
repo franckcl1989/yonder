@@ -2,8 +2,19 @@
 #![forbid(unsafe_code)]
 
 use libfuzzer_sys::fuzz_target;
+use yonder_core::wire::audit::{
+    AuditHello, AuditMessage, AuditReady, Checkpoint, CheckpointAck, JointManifest, LedgerCommit,
+    LocalRecordSeal, ManifestSignature, SecretContributionMessage,
+};
+use yonder_core::wire::audit_container::{
+    AuditContainerHeader, ContainerReader, decode_footer, decode_frame as decode_record_frame,
+};
 use yonder_core::wire::auth::{
     AuthClientFinish, AuthClientHello, AuthServerResponse, Authenticated, PakeContext,
+};
+use yonder_core::wire::enterprise::{EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart};
+use yonder_core::wire::file_transfer::{
+    FileTransferMessage, decode_frame_header as decode_file_frame_header,
 };
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
@@ -17,6 +28,9 @@ fuzz_target!(|input: &[u8]| {
     let _ = RegistryResponse::decode(input);
     let _ = ResolveRequest::decode(input);
     let _ = ResolveResponse::decode(input);
+    let _ = EnterpriseStart::decode(input);
+    let _ = EnterpriseSelect::decode(input);
+    let _ = EnterpriseResolveResponse::decode(input);
     let _ = AuthClientHello::decode(input);
     let _ = AuthServerResponse::decode(input);
     let _ = AuthClientFinish::decode(input);
@@ -26,6 +40,35 @@ fuzz_target!(|input: &[u8]| {
     let _ = TerminalExit::decode(input);
     let _ = TerminalComplete::decode(input);
     let _ = TerminalReady::decode(input);
+    let _ = FileTransferMessage::decode_frame(input);
+    let _ = decode_file_frame_header(input);
+    let _ = AuditMessage::decode_frame(input);
+    let _ = AuditHello::decode_payload(input);
+    let _ = SecretContributionMessage::decode_payload(input);
+    let _ = AuditReady::decode_payload(input);
+    let _ = Checkpoint::decode_payload(input);
+    let _ = CheckpointAck::decode_payload(input);
+    let _ = JointManifest::decode_payload(input);
+    let _ = ManifestSignature::decode_payload(input);
+    let _ = LocalRecordSeal::decode_payload(input);
+    let _ = LedgerCommit::decode_payload(input);
+    let _ = AuditContainerHeader::decode(input);
+    let _ = decode_record_frame(input);
+    let _ = decode_footer(input);
+    if let Ok(mut reader) = ContainerReader::new(input) {
+        for _ in 0..256 {
+            match reader.next_frame() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if reader.has_footer() {
+                        let _ = reader.footer();
+                    }
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
 
     let fallback = [0_u8];
     let peer_len = input.len().clamp(1, PeerIdBytes::MAX_LEN);

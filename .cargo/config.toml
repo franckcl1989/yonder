@@ -1,3 +1,6 @@
+[env]
+RUST_TEST_THREADS = { value = "4", force = false }
+
 [target.x86_64-unknown-linux-musl]
 rustflags = [
     "-C",

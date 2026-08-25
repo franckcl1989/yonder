@@ -1,0 +1,213 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version in vMAJOR.MINOR.PATCH form
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful Release candidate run for this exact commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out the promoted main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Select and validate the exact candidate run
+        id: candidate
+        shell: bash
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          source_sha="$(git -C source rev-parse HEAD)"
+          test "$source_sha" = "$GITHUB_SHA"
+
+          run_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
+          jq --exit-status \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$source_sha" \
+            '.path == ".github/workflows/release.yml"
+              and .event == "workflow_dispatch"
+              and .status == "completed"
+              and .conclusion == "success"
+              and .head_sha == $sha
+              and .head_repository.full_name == $repository' \
+            <<<"$run_json" >/dev/null
+
+          jobs="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/jobs?filter=latest&per_page=100")"
+          test "$(jq '[.jobs[] | select(.name == "release-candidate" and .conclusion == "success")] | length' <<<"$jobs")" -eq 1
+
+          artifact_name="release-candidate-$VERSION"
+          artifacts="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100")"
+          test "$(jq --arg name "$artifact_name" '[.artifacts[] | select(.name == $name and (.expired | not))] | length' <<<"$artifacts")" -eq 1
+
+          head_branch="$(jq --raw-output '.head_branch' <<<"$run_json")"
+          test -n "$head_branch"
+          test "$head_branch" != null
+          {
+            printf 'run_id=%s\n' "$CANDIDATE_RUN_ID"
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'source_ref=refs/heads/%s\n' "$head_branch"
+          } >>"$GITHUB_OUTPUT"
+          jq --raw-output '"trusted candidate: \(.html_url)"' <<<"$run_json"
+      - name: Download the exact aggregated candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          name: release-candidate-${{ env.VERSION }}
+          path: dist
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate.outputs.run_id }}
+      - name: Verify inventory, checksums, and candidate provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ steps.candidate.outputs.source_ref }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: |
+          bash source/.github/scripts/verify-release-assets.sh dist
+          (
+            cd dist
+            sha256sum --check --strict SHA256SUMS
+          )
+          while IFS= read -r -d '' asset; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$SOURCE_SHA" \
+              --source-ref "$SOURCE_REF"
+          done < <(find dist -maxdepth 1 -type f -print0 | sort --zero-terminated)
+      - name: Create or verify the annotated release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: |
+          if ref_json="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION" 2>/dev/null)"; then
+            object_type="$(jq --raw-output '.object.type' <<<"$ref_json")"
+            object_sha="$(jq --raw-output '.object.sha' <<<"$ref_json")"
+            if [[ "$object_type" == tag ]]; then
+              tag_json="$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$object_sha")"
+              test "$(jq --raw-output '.object.type' <<<"$tag_json")" = commit
+              tagged_sha="$(jq --raw-output '.object.sha' <<<"$tag_json")"
+            else
+              test "$object_type" = commit
+              tagged_sha="$object_sha"
+            fi
+            test "$tagged_sha" = "$SOURCE_SHA"
+          else
+            tag_json="$(gh api --method POST "/repos/$GITHUB_REPOSITORY/git/tags" \
+              -f tag="$VERSION" \
+              -f message="Yonder $VERSION" \
+              -f object="$SOURCE_SHA" \
+              -f type=commit)"
+            tag_object="$(jq --raw-output '.sha' <<<"$tag_json")"
+            gh api --method POST "/repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$VERSION" \
+              -f sha="$tag_object" >/dev/null
+          fi
+      - name: Attest the exact promoted candidate from main
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/*
+      - name: Verify promotion provenance as a consumer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: |
+          while IFS= read -r -d '' asset; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
+              --source-digest "$SOURCE_SHA" \
+              --source-ref refs/heads/main
+          done < <(find dist -maxdepth 1 -type f -print0 | sort --zero-terminated)
+      - name: Publish and verify the immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -d '' assets < <(
+            find dist -maxdepth 1 -type f -print0 | sort --zero-terminated
+          )
+          test "${#assets[@]}" -eq 19
+
+          release_exists=false
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            if [[ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft')" == true ]]; then
+              gh release delete "$VERSION" --yes
+            else
+              release_exists=true
+            fi
+          fi
+
+          if [[ "$release_exists" == false ]]; then
+            gh release create "$VERSION" "${assets[@]}" \
+              --verify-tag \
+              --draft \
+              --title "Yonder $VERSION" \
+              --generate-notes
+          fi
+
+          expected="$(mktemp)"
+          expected_digests="$(mktemp)"
+          uploaded="$(mktemp)"
+          uploaded_digests="$(mktemp)"
+          trap 'rm -f "$expected" "$expected_digests" "$uploaded" "$uploaded_digests"' EXIT
+          printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort >"$expected"
+          for asset in "${assets[@]}"; do
+            printf '%s\tsha256:%s\n' \
+              "${asset##*/}" "$(sha256sum "$asset" | cut -d ' ' -f 1)"
+          done | LC_ALL=C sort >"$expected_digests"
+          gh release view "$VERSION" --json assets \
+            --jq '.assets[].name' | LC_ALL=C sort >"$uploaded"
+          gh release view "$VERSION" --json assets \
+            --jq '.assets[] | [.name, .digest] | @tsv' \
+            | LC_ALL=C sort >"$uploaded_digests"
+          diff --unified "$expected" "$uploaded"
+          diff --unified "$expected_digests" "$uploaded_digests"
+          if [[ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft')" == true ]]; then
+            gh release edit "$VERSION" --draft=false
+          fi
+
+          verified=false
+          for _ in {1..20}; do
+            if gh release verify "$VERSION"; then
+              verified=true
+              break
+            fi
+            sleep 3
+          done
+          test "$verified" = true
+          for asset in "${assets[@]}"; do
+            gh release verify-asset "$VERSION" "$asset"
+          done

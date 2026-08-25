@@ -1,15 +1,21 @@
 //! Bounded wire messages for Yonder application protocols.
 
+pub mod audit;
+pub mod audit_container;
 pub mod auth;
+pub mod enterprise;
+pub mod file_transfer;
 pub mod registry;
 pub mod resolve;
 pub mod terminal;
 
 pub const REGISTRY_PROTOCOL: &str = "/yonder/registry/1.0.0";
+pub const ENTERPRISE_RESOLVE_PROTOCOL: &str = "/yonder/enterprise-resolve/2.0.0";
 pub const RESOLVE_PROTOCOL: &str = "/yonder/resolve/1.0.0";
 pub const AUTH_PROTOCOL: &str = "/yonder/auth/1.0.0";
 pub const TERMINAL_DATA_PROTOCOL: &str = "/yonder/terminal/1.0.0";
 pub const TERMINAL_CONTROL_PROTOCOL: &str = "/yonder/terminal-control/1.0.0";
+pub const FILE_TRANSFER_PROTOCOL: &str = "/yonder/file-transfer/2.0.0";
 
 /// A stack-backed encoded message with a validated used length.
 #[derive(Debug, Clone, PartialEq, Eq)]

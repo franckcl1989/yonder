@@ -1,14 +1,18 @@
 use crate::RelayExternalAddress;
 use crate::error::NetworkBuildError;
 use libp2p::core::muxing::StreamMuxerBox;
-use libp2p::core::transport::Boxed;
+use libp2p::core::transport::{Boxed, DialOpts, ListenerId, TransportError, TransportEvent};
 use libp2p::core::{Transport, upgrade};
 use libp2p::identity::Keypair;
-use libp2p::{PeerId, dns, noise, quic, relay, tcp, websocket, yamux};
+use libp2p::multiaddr::Protocol;
+use libp2p::{Multiaddr, PeerId, dns, noise, quic, relay, tcp, websocket, yamux};
 use rustls_pki_types::{
     CertificateDer, PrivateKeyDer,
     pem::{SectionKind, SliceIter},
 };
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use yonder_core::{IdentitySeed, SecretDocument, SecureRandom};
 
@@ -309,7 +313,8 @@ fn parse_certificate_documents(
     Ok(certificates)
 }
 
-fn contains_pem_marker(document: &[u8]) -> bool {
+/// Detects a PEM `BEGIN` marker so callers can branch between DER and PEM.
+pub fn contains_pem_marker(document: &[u8]) -> bool {
     document
         .windows(b"-----BEGIN".len())
         .any(|window| window == b"-----BEGIN")
@@ -354,28 +359,50 @@ fn build_direct_transport(
     identity: &Keypair,
     wss: WssTransportConfig,
 ) -> Result<Boxed<(PeerId, StreamMuxerBox)>, NetworkBuildError> {
-    let tcp = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-    let tcp = dns::tokio::Transport::system(tcp).map_err(NetworkBuildError::Dns)?;
-    let tcp = tcp
+    build_direct_transport_with_dns(identity, wss, system_dns_transport, TRANSPORT_TIMEOUT)
+}
+
+fn build_direct_transport_with_dns<F>(
+    identity: &Keypair,
+    wss: WssTransportConfig,
+    dns_factory: F,
+    timeout: Duration,
+) -> Result<Boxed<(PeerId, StreamMuxerBox)>, NetworkBuildError>
+where
+    F: FnOnce(Boxed<(PeerId, StreamMuxerBox)>) -> io::Result<Boxed<(PeerId, StreamMuxerBox)>>
+        + Send
+        + Unpin
+        + 'static,
+{
+    let websocket_tls = websocket_tls(wss)?;
+    let direct = build_resolved_direct_transport(identity, websocket_tls.clone())?;
+    let dns_inner = build_resolved_direct_transport(identity, websocket_tls)?;
+    let transport = LazySystemDnsTransport::new(direct, dns_inner, dns_factory);
+    Ok(libp2p::core::transport::timeout::TransportTimeout::new(transport, timeout).boxed())
+}
+
+fn build_resolved_direct_transport(
+    identity: &Keypair,
+    websocket_tls: websocket::tls::Config,
+) -> Result<Boxed<(PeerId, StreamMuxerBox)>, NetworkBuildError> {
+    let tcp = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(upgrade::Version::V1Lazy)
         .authenticate(noise::Config::new(identity).map_err(NetworkBuildError::Security)?)
         .multiplex(yamux::Config::default())
-        .timeout(TRANSPORT_TIMEOUT)
         .boxed();
 
     let websocket_tcp = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-    let websocket_tcp =
-        dns::tokio::Transport::system(websocket_tcp).map_err(NetworkBuildError::Dns)?;
     let mut websocket = websocket::Config::new(websocket_tcp);
-    websocket.set_tls_config(websocket_tls(wss)?);
+    websocket.set_tls_config(websocket_tls);
     let websocket = websocket
         .upgrade(upgrade::Version::V1Lazy)
         .authenticate(noise::Config::new(identity).map_err(NetworkBuildError::Security)?)
         .multiplex(yamux::Config::default())
-        .timeout(TRANSPORT_TIMEOUT)
         .boxed();
 
-    let quic = build_quic_transport(identity, TRANSPORT_TIMEOUT);
+    let quic = quic::tokio::Transport::new(quic::Config::new(identity))
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+        .boxed();
 
     Ok(quic
         .or_transport(websocket)
@@ -385,13 +412,110 @@ fn build_direct_transport(
         .boxed())
 }
 
-fn build_quic_transport(identity: &Keypair, timeout: Duration) -> Boxed<(PeerId, StreamMuxerBox)> {
-    libp2p::core::transport::timeout::TransportTimeout::new(
-        quic::tokio::Transport::new(quic::Config::new(identity)),
-        timeout,
-    )
-    .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
-    .boxed()
+fn system_dns_transport<O>(inner: Boxed<O>) -> io::Result<Boxed<O>>
+where
+    O: Send + 'static,
+{
+    dns::tokio::Transport::system(inner).map(Transport::boxed)
+}
+
+struct LazySystemDnsTransport<O, F> {
+    direct: Boxed<O>,
+    dns: DnsTransportState<O, F>,
+}
+
+enum DnsTransportState<O, F> {
+    Pending { inner: Boxed<O>, factory: F },
+    Ready(Boxed<O>),
+    Unavailable,
+}
+
+impl<O, F> LazySystemDnsTransport<O, F> {
+    fn new(direct: Boxed<O>, dns_inner: Boxed<O>, dns_factory: F) -> Self {
+        Self {
+            direct,
+            dns: DnsTransportState::Pending {
+                inner: dns_inner,
+                factory: dns_factory,
+            },
+        }
+    }
+
+    fn dns(&mut self) -> io::Result<&mut Boxed<O>>
+    where
+        O: Send + 'static,
+        F: FnOnce(Boxed<O>) -> io::Result<Boxed<O>>,
+    {
+        if let DnsTransportState::Pending { .. } = self.dns {
+            match std::mem::replace(&mut self.dns, DnsTransportState::Unavailable) {
+                DnsTransportState::Pending { inner, factory } => {
+                    self.dns = DnsTransportState::Ready(factory(inner)?);
+                }
+                DnsTransportState::Ready(transport) => {
+                    self.dns = DnsTransportState::Ready(transport);
+                }
+                DnsTransportState::Unavailable => {}
+            }
+        }
+        match &mut self.dns {
+            DnsTransportState::Ready(transport) => Ok(transport),
+            DnsTransportState::Pending { .. } | DnsTransportState::Unavailable => {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "system DNS resolver is unavailable",
+                ))
+            }
+        }
+    }
+}
+
+impl<O, F> Transport for LazySystemDnsTransport<O, F>
+where
+    O: Send + 'static,
+    F: FnOnce(Boxed<O>) -> io::Result<Boxed<O>> + Unpin,
+{
+    type Output = O;
+    type Error = io::Error;
+    type ListenerUpgrade = <Boxed<O> as Transport>::ListenerUpgrade;
+    type Dial = <Boxed<O> as Transport>::Dial;
+
+    fn listen_on(
+        &mut self,
+        id: ListenerId,
+        address: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
+        self.direct.listen_on(id, address)
+    }
+
+    fn remove_listener(&mut self, id: ListenerId) -> bool {
+        self.direct.remove_listener(id)
+    }
+
+    fn dial(
+        &mut self,
+        address: Multiaddr,
+        options: DialOpts,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        if address.iter().any(|protocol| {
+            matches!(
+                protocol,
+                Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)
+            )
+        }) {
+            return self
+                .dns()
+                .map_err(TransportError::Other)?
+                .dial(address, options);
+        }
+        self.direct.dial(address, options)
+    }
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        Pin::new(&mut self.direct).poll(context)
+    }
 }
 
 fn websocket_tls(config: WssTransportConfig) -> Result<websocket::tls::Config, NetworkBuildError> {
@@ -423,15 +547,19 @@ fn websocket_tls(config: WssTransportConfig) -> Result<websocket::tls::Config, N
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        MAX_WSS_CERTIFICATE_BYTES, TRANSPORT_TIMEOUT, WSS_CERTIFICATE_LIMIT, WssCertificateChain,
-        WssPrivateKey, WssTransportConfig, WssTrustAnchors, build_endpoint_transport,
-        build_quic_transport, build_relay_transport, generate_identity,
+        MAX_WSS_CERTIFICATE_BYTES, MAX_WSS_PRIVATE_KEY_BYTES, TRANSPORT_TIMEOUT,
+        WSS_CERTIFICATE_LIMIT, WssCertificateChain, WssPrivateKey, WssTransportConfig,
+        WssTrustAnchors, build_direct_transport_with_dns, build_endpoint_transport,
+        build_relay_transport, generate_identity,
     };
     use crate::{NetworkBuildError, RelayExternalAddress};
     use libp2p::core::Endpoint;
     use libp2p::core::transport::{DialOpts, PortUse, Transport as _};
     use libp2p::identity::Keypair;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use yonder_core::{RandomError, SecretDocument, SecureRandom};
 
     const TEST_SAN_CERTIFICATE_DER: &[u8] =
@@ -475,9 +603,146 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ip_only_transport_matrix_never_initializes_the_system_dns_resolver() {
+        let identity = Keypair::generate_ed25519();
+        let resolver_initializations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&resolver_initializations);
+        let mut transport = build_direct_transport_with_dns(
+            &identity,
+            WssTransportConfig::client(None),
+            move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no system nameservers",
+                ))
+            },
+            TRANSPORT_TIMEOUT,
+        )
+        .unwrap();
+
+        for address in [
+            "/ip4/127.0.0.1/tcp/9",
+            "/ip6/::1/tcp/9",
+            "/ip4/127.0.0.1/tcp/9/ws",
+            "/ip6/::1/tcp/9/ws",
+            "/ip4/127.0.0.1/tcp/9/tls/ws",
+            "/ip6/::1/tcp/9/tls/ws",
+            "/ip4/127.0.0.1/udp/9/quic-v1",
+            "/ip6/::1/udp/9/quic-v1",
+        ] {
+            let dial = transport.dial(address.parse().unwrap(), dial_options());
+            assert!(dial.is_ok(), "IP transport rejected {address}");
+        }
+
+        assert_eq!(resolver_initializations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dns_transport_matrix_initializes_the_resolver_and_fails_closed() {
+        for address in [
+            "/dns4/relay.example/tcp/9",
+            "/dns6/relay.example/tcp/9",
+            "/dns4/relay.example/tcp/9/ws",
+            "/dns6/relay.example/tcp/9/ws",
+            "/dns4/relay.example/tcp/9/tls/ws",
+            "/dns6/relay.example/tcp/9/tls/ws",
+            "/dns4/relay.example/udp/9/quic-v1",
+            "/dns6/relay.example/udp/9/quic-v1",
+        ] {
+            let identity = Keypair::generate_ed25519();
+            let resolver_initializations = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&resolver_initializations);
+            let mut transport = build_direct_transport_with_dns(
+                &identity,
+                WssTransportConfig::client(None),
+                move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "no system nameservers",
+                    ))
+                },
+                TRANSPORT_TIMEOUT,
+            )
+            .unwrap();
+
+            let result = transport.dial(address.parse().unwrap(), dial_options());
+            match result {
+                Err(libp2p::core::transport::TransportError::Other(error)) => {
+                    assert_eq!(error.kind(), io::ErrorKind::Other);
+                    assert!(error.to_string().contains("no system nameservers"));
+                }
+                Err(error) => panic!("unexpected DNS transport error for {address}: {error}"),
+                Ok(_) => panic!("DNS transport unexpectedly accepted {address}"),
+            }
+            assert_eq!(resolver_initializations.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_dns_initialization_remains_unavailable_without_retrying_the_factory() {
+        let identity = Keypair::generate_ed25519();
+        let resolver_initializations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&resolver_initializations);
+        let mut transport = build_direct_transport_with_dns(
+            &identity,
+            WssTransportConfig::client(None),
+            move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "resolver configuration denied",
+                ))
+            },
+            TRANSPORT_TIMEOUT,
+        )
+        .unwrap();
+        let address: libp2p::Multiaddr = "/dns4/relay.example/tcp/9".parse().unwrap();
+
+        let first = match transport.dial(address.clone(), dial_options()) {
+            Err(error) => error,
+            Ok(_) => panic!("the failed DNS factory must reject the dial"),
+        };
+        let libp2p::core::transport::TransportError::Other(first) = first else {
+            panic!("the DNS factory failure must remain an I/O error");
+        };
+        assert_eq!(first.kind(), io::ErrorKind::Other);
+        assert!(first.to_string().contains("resolver configuration denied"));
+
+        let second = match transport.dial(address, dial_options()) {
+            Err(error) => error,
+            Ok(_) => panic!("an unavailable resolver must reject the dial"),
+        };
+        let libp2p::core::transport::TransportError::Other(second) = second else {
+            panic!("an unavailable resolver must remain an I/O error");
+        };
+        assert_eq!(second.kind(), io::ErrorKind::Other);
+        assert!(
+            second
+                .to_string()
+                .contains("system DNS resolver is unavailable")
+        );
+        assert_eq!(resolver_initializations.load(Ordering::SeqCst), 1);
+    }
+
+    const fn dial_options() -> DialOpts {
+        DialOpts {
+            role: Endpoint::Dialer,
+            port_use: PortUse::New,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn quic_connection_setup_obeys_the_shared_transport_timeout() {
         let identity = Keypair::generate_ed25519();
-        let mut transport = build_quic_transport(&identity, std::time::Duration::ZERO);
+        let mut transport = build_direct_transport_with_dns(
+            &identity,
+            WssTransportConfig::client(None),
+            Ok,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
         let address = "/ip4/127.0.0.1/udp/9/quic-v1".parse().unwrap();
         let dial = transport
             .dial(
@@ -583,6 +848,21 @@ mod tests {
                 [TEST_PRIVATE_KEY_PEM, TEST_CERTIFICATE_PEM].concat()
             )),
             Err(NetworkBuildError::InvalidWssPrivateKey)
+        ));
+        assert!(matches!(
+            WssPrivateKey::from_document(SecretDocument::new(TEST_CERTIFICATE_PEM.to_vec())),
+            Err(NetworkBuildError::InvalidWssPrivateKey)
+        ));
+        assert!(matches!(
+            WssPrivateKey::from_document(SecretDocument::new(vec![
+                0;
+                MAX_WSS_PRIVATE_KEY_BYTES + 1
+            ])),
+            Err(NetworkBuildError::InvalidWssPrivateKey)
+        ));
+        assert!(matches!(
+            WssTrustAnchors::from_documents([b"prefix -----BEGIN without a PEM section".to_vec()]),
+            Err(NetworkBuildError::InvalidWssTrustBundle)
         ));
     }
 

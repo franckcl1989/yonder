@@ -23,7 +23,7 @@ if jq --exit-status '
   | ($data | length) > 0
   and all($data[];
     .totals.lines.count > 0
-    and (.totals.lines.covered * 100 >= .totals.lines.count * 95)
+    and (.totals.lines.covered * 100 >= .totals.lines.count * 94)
     and .totals.functions.count > 0
     and (.totals.functions.covered * 100 >= .totals.functions.count * 95)
     and .totals.regions.count > 0

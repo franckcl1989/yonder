@@ -1,4 +1,19 @@
+use crate::callback::{
+    CallbackHandler, CallbackServer, CallbackServerError, MAX_CALLBACK_CONNECTIONS,
+};
+use crate::callback_session::{
+    CallbackRegistry, CallbackRegistryRequest, CallbackSessionHandler,
+    handle_callback_registry_request,
+};
+use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig};
+use crate::enterprise_resolve::{
+    EnterpriseExchangeContext, EnterpriseLimiters, EnterpriseResolveRequest,
+    EnterpriseTransactionRequest, enterprise_resolve_exchange, handle_enterprise_admission,
+};
+use crate::exchange::ExchangeClient;
+use crate::provider::{ProviderCredentials, ProviderError};
 use crate::registry::{Registry, RegistryError, ResolveLimiters};
+use crate::session::TransitionError;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -6,11 +21,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use yonder_core::wire::enterprise::EnterpriseResolveResponse;
 use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
 use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
-use yonder_core::wire::{REGISTRY_PROTOCOL, RESOLVE_PROTOCOL};
-use yonder_core::{OsSecureRandom, ProtocolError, RelayResourceConfig, RetryAfter, SystemClock};
+use yonder_core::wire::{ENTERPRISE_RESOLVE_PROTOCOL, REGISTRY_PROTOCOL, RESOLVE_PROTOCOL};
+use yonder_core::{
+    OsSecureRandom, ProtocolError, RandomError, RelayResourceConfig, RetryAfter, SystemClock,
+};
 use yonder_net::behaviour::RelayBehaviourEvent;
 use yonder_net::swarm::SwarmEvent;
 use yonder_net::{
@@ -25,6 +43,55 @@ const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const REJECTED_CONNECTION_DRAIN: Duration = Duration::from_secs(1);
 const REGISTRY_READERS: usize = 16;
 const OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
+/// Bounded concurrent enterprise resolve transactions, matching the
+/// default transaction registry capacity. Used both as the calls-channel
+/// capacity and as the concurrent exchange permit bound.
+const ENTERPRISE_RESOLVE_READERS: usize = 64;
+
+/// Enterprise-mode runtime context: the validated configuration and the
+/// provider credentials loaded once at startup. Both halves always exist
+/// together, so the mode invariant holds by construction.
+#[derive(Debug)]
+pub struct EnterpriseContext {
+    config: EnterpriseAuthConfig,
+    credentials: ProviderCredentials,
+}
+
+impl EnterpriseContext {
+    /// Bundles the validated enterprise configuration and credentials.
+    #[must_use]
+    pub const fn new(config: EnterpriseAuthConfig, credentials: ProviderCredentials) -> Self {
+        Self {
+            config,
+            credentials,
+        }
+    }
+
+    /// The validated enterprise-mode configuration.
+    #[must_use]
+    pub const fn config(&self) -> &EnterpriseAuthConfig {
+        &self.config
+    }
+
+    /// The provider credentials loaded once at startup.
+    #[must_use]
+    pub const fn credentials(&self) -> &ProviderCredentials {
+        &self.credentials
+    }
+
+    /// Consumes the context into its two halves for the service runtime.
+    #[must_use]
+    pub fn into_parts(self) -> (EnterpriseAuthConfig, ProviderCredentials) {
+        (self.config, self.credentials)
+    }
+}
+
+/// Enterprise-mode service runtime: everything the serving layer needs.
+struct EnterpriseRuntime {
+    callback_server: CallbackServer,
+    credentials: Arc<ProviderCredentials>,
+    callback_url: CallbackExternalUrl,
+}
 
 /// Fully validated inputs required to run a relay process.
 pub struct RelayServeConfig {
@@ -33,6 +100,9 @@ pub struct RelayServeConfig {
     external: Vec<RelayExternalAddress>,
     wss: WssTransportConfig,
     resources: RelayResourceConfig,
+    /// `None` is normal mode; `Some` is enterprise mode. The two modes are
+    /// mutually exclusive and fixed for the process lifetime.
+    enterprise: Option<EnterpriseContext>,
 }
 
 impl RelayServeConfig {
@@ -43,12 +113,13 @@ impl RelayServeConfig {
         external: Vec<RelayExternalAddress>,
         wss: WssTransportConfig,
     ) -> Result<Self, RelayServiceError> {
-        Self::with_resources(
+        Self::with_enterprise(
             identity,
             listen,
             external,
             wss,
             RelayResourceConfig::default(),
+            None,
         )
     }
 
@@ -59,6 +130,19 @@ impl RelayServeConfig {
         external: Vec<RelayExternalAddress>,
         wss: WssTransportConfig,
         resources: RelayResourceConfig,
+    ) -> Result<Self, RelayServiceError> {
+        Self::with_enterprise(identity, listen, external, wss, resources, None)
+    }
+
+    /// Attaches an already validated enterprise-mode runtime context;
+    /// `None` keeps the relay in normal mode.
+    pub fn with_enterprise(
+        identity: Keypair,
+        listen: Vec<RelayListenAddress>,
+        external: Vec<RelayExternalAddress>,
+        wss: WssTransportConfig,
+        resources: RelayResourceConfig,
+        enterprise: Option<EnterpriseContext>,
     ) -> Result<Self, RelayServiceError> {
         if listen.is_empty() || listen.len() > 8 || external.is_empty() || external.len() > 8 {
             return Err(RelayServiceError::InvalidConfiguration);
@@ -103,6 +187,7 @@ impl RelayServeConfig {
             external,
             wss,
             resources,
+            enterprise,
         })
     }
 }
@@ -140,6 +225,10 @@ pub enum RelayServiceError {
     ProtocolTask(#[from] TaskFailure),
     #[error(transparent)]
     Registry(#[from] RegistryError),
+    #[error("enterprise mode failed to start or serve the callback server: {0}")]
+    EnterpriseCallback(#[from] CallbackServerError),
+    #[error("enterprise mode failed to construct the provider HTTP client: {0}")]
+    EnterpriseExchange(#[source] std::io::Error),
     #[error("failed to install the process signal handler")]
     Signal(#[source] std::io::Error),
     #[error("required relay listener {listener_id:?} reported an error")]
@@ -250,7 +339,7 @@ struct ResolveCall {
 }
 
 #[derive(Debug, Error)]
-enum ProtocolTaskError {
+pub(crate) enum ProtocolTaskError {
     #[error("protocol exchange timed out")]
     Timeout,
     #[error("protocol stream I/O failed")]
@@ -261,6 +350,12 @@ enum ProtocolTaskError {
     OwnerStopped,
     #[error("the relay state owner rejected the request")]
     Registry(#[from] RegistryError),
+    #[error("the enterprise session random source failed")]
+    Random(#[from] RandomError),
+    #[error("the enterprise session rejected the transition: {0}")]
+    Session(#[from] TransitionError),
+    #[error("the enterprise provider state is invalid: {0}")]
+    EnterpriseProvider(#[from] ProviderError),
 }
 
 #[derive(Debug, Default)]
@@ -278,6 +373,7 @@ struct RelayObservability {
     protocol_invalid: AtomicU64,
     protocol_owner_stopped: AtomicU64,
     protocol_registry: AtomicU64,
+    protocol_enterprise_failed: AtomicU64,
 }
 
 impl RelayObservability {
@@ -295,6 +391,11 @@ impl RelayObservability {
             Err(ProtocolTaskError::Protocol(_)) => &self.protocol_invalid,
             Err(ProtocolTaskError::OwnerStopped) => &self.protocol_owner_stopped,
             Err(ProtocolTaskError::Registry(_)) => &self.protocol_registry,
+            Err(
+                ProtocolTaskError::Random(_)
+                | ProtocolTaskError::Session(_)
+                | ProtocolTaskError::EnterpriseProvider(_),
+            ) => &self.protocol_enterprise_failed,
         };
         Self::increment(counter);
     }
@@ -313,6 +414,7 @@ impl RelayObservability {
         let protocol_invalid = self.protocol_invalid.swap(0, Ordering::Relaxed);
         let protocol_owner_stopped = self.protocol_owner_stopped.swap(0, Ordering::Relaxed);
         let protocol_registry = self.protocol_registry.swap(0, Ordering::Relaxed);
+        let protocol_enterprise_failed = self.protocol_enterprise_failed.swap(0, Ordering::Relaxed);
         tracing::info!(
             event = "relay_activity_summary",
             active_registrations,
@@ -329,6 +431,7 @@ impl RelayObservability {
             protocol_invalid,
             protocol_owner_stopped,
             protocol_registry,
+            protocol_enterprise_failed,
             "relay activity summary"
         );
     }
@@ -397,6 +500,33 @@ async fn run_relay_until_shutdown(
     .await
 }
 
+/// Acquires one enterprise exchange permit, counting an overload when the
+/// pool is exhausted. Returns `None` (fail closed: the caller drops the
+/// substream without spawning an exchange task) when all concurrent
+/// enterprise resolve transactions are in flight.
+fn try_acquire_enterprise_permit(
+    permits: &Arc<Semaphore>,
+    observations: &RelayObservability,
+) -> Option<OwnedSemaphorePermit> {
+    let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+        RelayObservability::increment(&observations.resolve_overload);
+        return None;
+    };
+    Some(permit)
+}
+
+fn resolve_enterprise_target(
+    registry: &mut Registry<SystemClock>,
+    locator: yonder_core::Locator,
+) -> Result<EnterpriseResolveResponse, ProtocolTaskError> {
+    match registry.resolve(locator)? {
+        ResolveResponse::Resolved(peer) => Ok(EnterpriseResolveResponse::Resolved(peer)),
+        ResolveResponse::Retry(_) | ResolveResponse::Unavailable => {
+            Ok(EnterpriseResolveResponse::Unavailable)
+        }
+    }
+}
+
 /// Runs the relay until an injected shutdown signal completes.
 pub async fn run_relay_until(
     config: RelayServeConfig,
@@ -408,9 +538,22 @@ pub async fn run_relay_until(
         external,
         wss,
         resources,
+        enterprise,
     } = config;
+    let relay_mode = match &enterprise {
+        None => "normal",
+        Some(context) => {
+            tracing::info!(
+                event = "relay_enterprise_mode",
+                providers = context.config().providers().len(),
+                "relay is running in enterprise authentication mode"
+            );
+            "enterprise"
+        }
+    };
     tracing::info!(
         event = "relay_starting",
+        relay_mode,
         listen_count = listen.len(),
         external_count = external.len(),
         registration_capacity = resources.registration().capacity().get(),
@@ -430,7 +573,51 @@ pub async fn run_relay_until(
     let mut listeners = RequiredListeners::new(listener_ids);
 
     let mut registry_incoming = node.streams().accept(REGISTRY_PROTOCOL)?;
-    let mut resolve_incoming = node.streams().accept(RESOLVE_PROTOCOL)?;
+    // Mode exclusivity (design section 2): enterprise mode serves only
+    // Enterprise Resolve, normal mode serves only the legacy Resolve.
+    // A legacy connect cannot use an enterprise relay, and a normal relay
+    // never starts the enterprise protocol.
+    let mut resolve_incoming = match &enterprise {
+        Some(_) => node.streams().accept(ENTERPRISE_RESOLVE_PROTOCOL)?,
+        None => node.streams().accept(RESOLVE_PROTOCOL)?,
+    };
+
+    let mut enterprise_calls_tx: Option<mpsc::Sender<EnterpriseResolveRequest>> = None;
+    let mut enterprise_calls_rx: Option<mpsc::Receiver<EnterpriseResolveRequest>> = None;
+    let mut transaction_calls_tx: Option<mpsc::Sender<EnterpriseTransactionRequest>> = None;
+    let mut transaction_calls_rx: Option<mpsc::Receiver<EnterpriseTransactionRequest>> = None;
+    let mut callback_calls_tx: Option<mpsc::Sender<CallbackRegistryRequest>> = None;
+    let mut callback_calls_rx: Option<mpsc::Receiver<CallbackRegistryRequest>> = None;
+    let mut callback_registry: Option<CallbackRegistry> = None;
+    let mut enterprise_limiters: Option<EnterpriseLimiters> = None;
+    if enterprise.is_some() {
+        let (tx, rx) = mpsc::channel(ENTERPRISE_RESOLVE_READERS);
+        enterprise_calls_tx = Some(tx);
+        enterprise_calls_rx = Some(rx);
+        let (tx, rx) = mpsc::channel(ENTERPRISE_RESOLVE_READERS);
+        transaction_calls_tx = Some(tx);
+        transaction_calls_rx = Some(rx);
+        let (tx, rx) = mpsc::channel(MAX_CALLBACK_CONNECTIONS);
+        callback_calls_tx = Some(tx);
+        callback_calls_rx = Some(rx);
+        callback_registry = Some(CallbackRegistry::new());
+        enterprise_limiters = Some(EnterpriseLimiters::new());
+    }
+    // Enterprise mode owns the callback server, the transaction registry,
+    // the startup-loaded provider credentials and the external callback
+    // origin; normal mode owns none of them.
+    let enterprise_runtime = match enterprise {
+        Some(context) => {
+            let (config, credentials) = context.into_parts();
+            let callback_server = CallbackServer::preflight(&config)?;
+            Some(EnterpriseRuntime {
+                callback_server,
+                credentials: Arc::new(credentials),
+                callback_url: config.callback_external().clone(),
+            })
+        }
+        None => None,
+    };
 
     let resolve_concurrency = resources.resolve().concurrency().get();
     let retry_after = resources.resolve().retry_after();
@@ -440,6 +627,7 @@ pub async fn run_relay_until(
     let (resolve_done_tx, mut resolve_done_rx) = mpsc::channel(resolve_concurrency);
     let registry_permits = Arc::new(Semaphore::new(REGISTRY_READERS));
     let resolve_permits = Arc::new(Semaphore::new(resolve_concurrency));
+    let enterprise_permits = Arc::new(Semaphore::new(ENTERPRISE_RESOLVE_READERS));
     let mut registry_active = HashSet::with_capacity(REGISTRY_READERS);
     let mut rejected_peers = HashSet::with_capacity(REGISTRY_READERS);
     let mut resolve_active = HashSet::with_capacity(resolve_concurrency);
@@ -460,6 +648,43 @@ pub async fn run_relay_until(
         OBSERVABILITY_INTERVAL,
     );
     observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Enterprise mode serves the dedicated HTTPS callback listener until
+    // the task group is cancelled (design section 9). A listener failure
+    // is escalated through this channel instead of silently closing the
+    // callback port for the process lifetime.
+    let mut callback_failure_rx: Option<oneshot::Receiver<CallbackServerError>> = None;
+    if let Some(runtime) = &enterprise_runtime {
+        let (listener, _bound) = runtime.callback_server.bind().await?;
+        let server = runtime.callback_server.clone();
+        let exchange = ExchangeClient::new().map_err(RelayServiceError::EnterpriseExchange)?;
+        let handler: Arc<dyn CallbackHandler> = Arc::new(CallbackSessionHandler::new(
+            callback_calls_tx
+                .as_ref()
+                .expect("enterprise mode owns a callback channel")
+                .clone(),
+            Arc::clone(&runtime.credentials),
+            exchange,
+            clock.clone(),
+        ));
+        let cancellation = tasks.cancellation();
+        let (callback_failure_tx, callback_failure_rx_owned) = oneshot::channel();
+        callback_failure_rx = Some(callback_failure_rx_owned);
+        tasks.spawn(async move {
+            let served = server
+                .serve_on(listener, handler, async move {
+                    cancellation.cancelled().await;
+                })
+                .await;
+            if let Err(error) = served {
+                tracing::error!(
+                    event = "enterprise_callback_listener_failed",
+                    %error,
+                    "the enterprise callback listener failed"
+                );
+                let _ = callback_failure_tx.send(error);
+            }
+        });
+    }
     tokio::pin!(shutdown);
 
     let root_result = loop {
@@ -573,6 +798,62 @@ pub async fn run_relay_until(
                 let Some((peer, stream)) = incoming else {
                     break Err(RelayServiceError::ProtocolRegistrationEnded);
                 };
+                // Enterprise mode runs every accepted substream through
+                // the enterprise resolve exchange; the same branch never
+                // serves the legacy resolve in enterprise mode.
+                if let Some(runtime) = enterprise_runtime.as_ref() {
+                    // A full exchange pool drops the substream fail-closed
+                    // and counts the overload.
+                    let Some(permit) = try_acquire_enterprise_permit(&enterprise_permits, &observations) else {
+                        continue;
+                    };
+                    let calls = enterprise_calls_tx
+                        .as_ref()
+                        .expect("enterprise mode owns a calls channel")
+                        .clone();
+                    let context = EnterpriseExchangeContext {
+                        transactions: transaction_calls_tx
+                            .as_ref()
+                            .expect("enterprise mode owns a transaction channel")
+                            .clone(),
+                        credentials: Arc::clone(&runtime.credentials),
+                        callback_url: runtime.callback_url.clone(),
+                    };
+                    let cancellation = tasks.cancellation();
+                    let exchange_clock = clock.clone();
+                    let task_observations = Arc::clone(&observations);
+                    tasks.spawn(async move {
+                        let exchange = enterprise_resolve_exchange(
+                            peer,
+                            stream,
+                            calls,
+                            context,
+                            exchange_clock,
+                            OsSecureRandom,
+                        );
+                        tokio::select! {
+                            result = exchange => {
+                                // Failures after session creation are
+                                // logged inside the exchange with the
+                                // request id; this site only sees
+                                // pre-session failures (start read,
+                                // admission channel), so it stays at
+                                // debug level.
+                                if let Err(error) = &result {
+                                    tracing::debug!(
+                                        event = "enterprise_resolve_failed",
+                                        %error,
+                                        "enterprise resolve exchange failed"
+                                    );
+                                }
+                                task_observations.observe_protocol_result(result);
+                            }
+                            () = cancellation.cancelled() => {}
+                        }
+                        drop(permit);
+                    });
+                    continue;
+                }
                 let Ok(permit) = Arc::clone(&resolve_permits).try_acquire_owned() else {
                     RelayObservability::increment(&observations.resolve_overload);
                     continue;
@@ -644,6 +925,102 @@ pub async fn run_relay_until(
                     Err(error) => Err(error),
                 };
                 let _ = call.response.send(response);
+            }
+            enterprise_calls = async {
+                match enterprise_calls_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(call) = enterprise_calls else {
+                    continue;
+                };
+                let limiters = enterprise_limiters
+                    .as_mut()
+                    .expect("enterprise calls imply enterprise mode");
+                match call {
+                    EnterpriseResolveRequest::AdmitStart { peer, response } => {
+                        let decision = handle_enterprise_admission(
+                            peer,
+                            &connections,
+                            &clock,
+                            limiters,
+                            resources.resolve().retry_after(),
+                        );
+                        let _ = response.send(decision);
+                    }
+                    EnterpriseResolveRequest::ResolveTarget { locator, response } => {
+                        let result = resolve_enterprise_target(&mut registry, locator);
+                        let _ = response.send(result);
+                    }
+                }
+            }
+            transaction_call = async {
+                match transaction_calls_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(call) = transaction_call else {
+                    transaction_calls_rx = None;
+                    continue;
+                };
+                match call {
+                    EnterpriseTransactionRequest::RegisterTransaction {
+                        state,
+                        entry,
+                        now,
+                        response,
+                    } => {
+                        let result = callback_registry
+                            .as_mut()
+                            .expect("enterprise calls imply a callback registry")
+                            .insert(state, entry, now);
+                        let _ = response.send(result);
+                    }
+                    EnterpriseTransactionRequest::RemoveTransaction { state, response } => {
+                        let entry = callback_registry
+                            .as_mut()
+                            .expect("enterprise calls imply a callback registry")
+                            .remove(&state);
+                        let _ = response.send(entry);
+                    }
+                }
+            }
+            callback_call = async {
+                match callback_calls_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(call) = callback_call else {
+                    callback_calls_rx = None;
+                    continue;
+                };
+                handle_callback_registry_request(
+                    callback_registry
+                        .as_mut()
+                        .expect("callback calls imply enterprise mode"),
+                    call,
+                );
+            }
+            callback_failed = async {
+                match callback_failure_rx.as_mut() {
+                    Some(receiver) => receiver.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match callback_failed {
+                    Ok(error) => break Err(RelayServiceError::EnterpriseCallback(error)),
+                    Err(_) => {
+                        // The callback task ended without reporting a
+                        // failure, only reachable if it was aborted or
+                        // panicked; the task-group reap escalates any
+                        // panic. Stop polling the closed channel.
+                        callback_failure_rx = None;
+                        continue;
+                    }
+                }
             }
             Some(done) = registry_done_rx.recv() => {
                 registry_active.remove(&done.peer);
@@ -1007,7 +1384,7 @@ fn handle_resolve_call_inner<C: yonder_core::MonotonicClock>(
         .map_err(ProtocolTaskError::from)
 }
 
-trait ProtocolIo {
+pub(crate) trait ProtocolIo {
     fn into_protocol_io(self) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin;
 }
 
@@ -1096,10 +1473,50 @@ async fn resolve_immediate_retry<S: ProtocolIo>(
     .await
 }
 
-async fn with_timeout(
+pub(crate) async fn with_timeout(
     exchange: impl Future<Output = Result<(), ProtocolTaskError>>,
 ) -> Result<(), ProtocolTaskError> {
     tokio::time::timeout(MESSAGE_TIMEOUT, exchange)
+        .await
+        .map_err(|_| ProtocolTaskError::Timeout)?
+}
+
+/// Reads exactly one fixed-length message without the trailing-byte EOF
+/// check: the enterprise substream carries a sequence of messages, so the
+/// next message legitimately follows the previous one.
+pub(crate) async fn read_timeout<const LENGTH: usize>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<[u8; LENGTH], ProtocolTaskError> {
+    read_deadline::<LENGTH>(stream, MESSAGE_TIMEOUT).await
+}
+
+/// Reads one fixed-length message bounded by an explicit deadline, used
+/// for steps that wait on human interaction.
+pub(crate) async fn read_deadline<const LENGTH: usize>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    deadline: Duration,
+) -> Result<[u8; LENGTH], ProtocolTaskError> {
+    let mut message = [0_u8; LENGTH];
+    tokio::time::timeout(deadline, stream.read_exact(&mut message))
+        .await
+        .map_err(|_| ProtocolTaskError::Timeout)??;
+    Ok(message)
+}
+
+pub(crate) async fn write_message(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &[u8],
+) -> Result<(), ProtocolTaskError> {
+    stream.write_all(message).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+pub(crate) async fn write_timeout(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &[u8],
+) -> Result<(), ProtocolTaskError> {
+    tokio::time::timeout(MESSAGE_TIMEOUT, write_message(stream, message))
         .await
         .map_err(|_| ProtocolTaskError::Timeout)?
 }
@@ -1130,33 +1547,45 @@ async fn write_close(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        ProtocolIo, ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision,
-        RelayObservability, RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall,
-        ShutdownReason, completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
+        CallbackServerError, ENTERPRISE_RESOLVE_READERS, EnterpriseContext, ProtocolIo,
+        ProtocolTaskError, REGISTRY_READERS, RegistryCall, RegistryDecision, RelayObservability,
+        RelayServeConfig, RelayServiceError, RequiredListeners, ResolveCall, ShutdownReason,
+        completed_task_result, finish_relay_run, finish_relay_run_with_timeout,
         handle_registry_call, handle_resolve_call, handle_resolve_call_observed,
-        handle_swarm_event as handle_swarm_event_inner, read_exact_eof, registry_exchange,
-        registry_immediate_retry, report_ready_to, resolve_exchange, resolve_immediate_retry,
-        run_relay, run_relay_until, run_relay_until_shutdown, with_timeout, write_close,
+        handle_swarm_event as handle_swarm_event_inner, read_deadline, read_exact_eof,
+        registry_exchange, registry_immediate_retry, report_ready, report_ready_to,
+        resolve_enterprise_target, resolve_exchange, resolve_immediate_retry, run_relay,
+        run_relay_until, run_relay_until_shutdown, try_acquire_enterprise_permit, with_timeout,
+        write_close, write_message, write_timeout,
     };
     #[cfg(windows)]
     use super::{process_shutdown_signal, select_windows_shutdown};
+    use crate::enterprise::{CallbackExternalUrl, EnterpriseAuthConfig, ProviderSecrets};
+    use crate::provider::{ProviderCredentials, ProviderField, SecretText, WeComCredentials};
     use crate::registry::{Registry, ResolveLimiters};
     use std::io;
     use std::num::NonZeroU32;
+    use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{Semaphore, mpsc, oneshot};
+    use url::Url;
+    use yonder_core::wire::enterprise::{
+        EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart,
+    };
     use yonder_core::{
-        Locator, MonotonicClock, OsSecureRandom, ProtocolError, RegistrationCapacity,
-        RegistrationLimits, RelayResourceConfig, ReservationDuration, ResolveConcurrency,
-        ResolveLimits, RetryAfter, SecretDocument, SourceRegistrationCapacity, SystemClock,
+        EnterpriseProvider, EnterpriseProviders, Locator, MonotonicClock, OsSecureRandom,
+        ProtocolError, RegistrationCapacity, RegistrationLimits, RelayResourceConfig,
+        ReservationDuration, ResolveConcurrency, ResolveLimits, RetryAfter, SecretDocument,
+        SourceRegistrationCapacity, SystemClock,
         wire::registry::{RegistryRequest, RegistryResponse},
         wire::resolve::{ResolveRequest, ResolveResponse},
     };
-    use yonder_net::behaviour::RelayBehaviourEvent;
+    use yonder_net::behaviour::{EndpointBehaviourEvent, RelayBehaviourEvent};
     use yonder_net::swarm::SwarmEvent;
     use yonder_net::{
         ApplicationStream, ApplicationStreams, ConnectedPoint, ConnectionBook, ConnectionId,
@@ -1169,6 +1598,7 @@ mod tests {
         include_bytes!("../../yon/tests/fixtures/localhost-test-cert.der");
     const TEST_WSS_PRIVATE_KEY_DER: &[u8] =
         include_bytes!("../../yon/tests/fixtures/localhost-test-key.der");
+    const TEST_WSS_CA_DER: &[u8] = include_bytes!("../../yon/tests/fixtures/localhost-test-ca.der");
 
     impl ProtocolIo for tokio::io::DuplexStream {
         fn into_protocol_io(self) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
@@ -1213,6 +1643,47 @@ mod tests {
         }
     }
 
+    /// An in-memory tracing writer: every formatted event lands in a
+    /// shared buffer the test can assert on after the relay run.
+    #[derive(Clone, Default)]
+    struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for SharedLog {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&self) -> Self::Writer {
+            SharedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct SharedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn shared_log_subscriber(logs: SharedLog) -> impl tracing::Subscriber {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(logs)
+            .finish()
+    }
+
+    impl SharedLog {
+        /// The captured formatted events as text.
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     #[test]
     fn ready_output_contains_only_public_addresses_and_propagates_failures() {
         let peer = Keypair::generate_ed25519().public().to_peer_id();
@@ -1230,8 +1701,25 @@ mod tests {
         );
         assert_eq!(lines[1], format!("Relay PeerId: {peer}"));
 
-        let error = report_ready_to(&mut FailingOutput, peer, &[external]).unwrap_err();
+        let error =
+            report_ready_to(&mut FailingOutput, peer, std::slice::from_ref(&external)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+        // The readiness wrapper reports every ready listener address and
+        // the public endpoints, then logs the relay_ready event with the
+        // exact counts.
+        let mut listeners = RequiredListeners::new([]);
+        listeners
+            .ready_addresses
+            .push(external.as_multiaddr().clone());
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
+        report_ready(peer, &listeners, std::slice::from_ref(&external)).unwrap();
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_ready\""));
+        assert!(text.contains("listener_count=1"));
+        assert!(text.contains("external_count=1"));
+        assert!(text.contains("relay listener is active"));
     }
 
     #[test]
@@ -1384,10 +1872,30 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_starts_and_obeys_injected_shutdown_results() {
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         let relay_config = config();
+        let resources = relay_config.resources;
         run_relay_until(relay_config, async { Ok(()) })
             .await
             .unwrap();
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_starting\""));
+        assert!(text.contains("relay_mode=\"normal\""));
+        assert!(text.contains("listen_count=1"));
+        assert!(text.contains("external_count=1"));
+        assert!(text.contains(&format!(
+            "registration_capacity={}",
+            resources.registration().capacity().get()
+        )));
+        assert!(text.contains(&format!(
+            "resolve_concurrency={}",
+            resources.resolve().concurrency().get()
+        )));
+        assert!(text.contains(&format!(
+            "circuit_capacity={}",
+            resources.circuit().capacity().get()
+        )));
 
         let error = run_relay_until(config(), async { Err(io::Error::other("signal")) })
             .await
@@ -1397,14 +1905,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_process_shutdown_maps_the_typed_reason_before_stopping() {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         run_relay_until_shutdown(config(), async { Ok(ShutdownReason::Interrupt) })
             .await
             .unwrap();
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_shutdown_requested\""));
+        assert!(text.contains("reason=\"interrupt\""));
 
         let error = run_relay_until_shutdown(config(), async {
             Err(io::Error::other("shutdown source failed"))
@@ -1494,6 +2002,13 @@ mod tests {
                 .unwrap();
             endpoint.dial(relay_address).unwrap();
             wait_for_connection(&mut endpoint, relay_peer).await;
+            let (standard, enterprise) =
+                wait_for_resolve_protocols(&mut endpoint, relay_peer).await;
+            assert!(standard, "normal relay must advertise standard resolve");
+            assert!(
+                !enterprise,
+                "normal relay must not advertise enterprise resolve"
+            );
             let mut streams = endpoint.streams().clone();
 
             let registry = open_stream(
@@ -1582,6 +2097,524 @@ mod tests {
         .expect("the bounded live relay scenario must finish");
     }
 
+    #[test]
+    fn enterprise_context_exposes_config_and_credentials() {
+        let config = enterprise_config("127.0.0.1:0".parse().unwrap());
+        let credentials = enterprise_credentials();
+        let context = EnterpriseContext::new(config, credentials);
+        assert_eq!(
+            context.config().providers(),
+            EnterpriseProviders::new(true, false).unwrap()
+        );
+        assert!(context.credentials().wecom().is_some());
+        assert!(context.credentials().feishu().is_none());
+        let (config, credentials) = context.into_parts();
+        assert_eq!(
+            config.providers(),
+            EnterpriseProviders::new(true, false).unwrap()
+        );
+        assert!(credentials.wecom().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_enterprise_relay_rejects_malformed_starts_without_disturbing_the_relay() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::with_enterprise(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config("127.0.0.1:0".parse().unwrap()),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let (standard, enterprise) =
+                wait_for_resolve_protocols(&mut endpoint, relay_peer).await;
+            assert!(
+                !standard,
+                "enterprise relay must not advertise standard resolve"
+            );
+            assert!(
+                enterprise,
+                "enterprise relay must advertise enterprise resolve"
+            );
+            let mut streams = endpoint.streams().clone();
+
+            // A start message with an unknown tag is rejected before any
+            // admission: the substream closes without a response and the
+            // relay keeps serving.
+            let stream = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+            )
+            .await;
+            let mut stream = stream.into_tokio();
+            stream.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await;
+            match read {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => panic!("the relay answered a malformed enterprise start"),
+                Err(_) => panic!("the relay did not close the malformed start substream"),
+            }
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the malformed enterprise start scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_relay_rejects_malformed_resolve_requests_without_a_response() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::new(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+
+            // A resolve request with an out-of-range locator is rejected:
+            // the substream closes without a response and the relay keeps
+            // serving.
+            let stream = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::RESOLVE_PROTOCOL,
+            )
+            .await;
+            let mut stream = stream.into_tokio();
+            stream.write_all(&[0xFF, 0xFF, 0xFF]).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                response.is_empty(),
+                "the relay answered a malformed resolve request"
+            );
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the malformed resolve request scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_enterprise_relay_drops_substreams_when_the_exchange_pool_is_full() {
+        // Regression test for the enterprise exchange permit bound: with
+        // the pool full, an additional substream is dropped fail-closed.
+        // The relay runs in enterprise mode and every idle substream pins
+        // one of the ENTERPRISE_RESOLVE_READERS exchange permits (the
+        // attack the bound was added for), so the pool is full by the time
+        // the last stream is opened.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::with_enterprise(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config("127.0.0.1:0".parse().unwrap()),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+
+            let mut enterprise_streams = Vec::with_capacity(ENTERPRISE_RESOLVE_READERS);
+            for _ in 0..ENTERPRISE_RESOLVE_READERS {
+                enterprise_streams.push(
+                    open_stream(
+                        &mut endpoint,
+                        &mut streams,
+                        relay_peer,
+                        yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+                    )
+                    .await,
+                );
+            }
+            tokio::task::yield_now().await;
+            let overflow = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+            )
+            .await;
+            assert_stream_closed(&mut endpoint, overflow).await;
+
+            drop(enterprise_streams);
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the bounded enterprise relay scenario must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_enterprise_relay_serves_the_admitted_start_to_authenticate_flow() {
+        // One substream walks the whole pre-callback enterprise flow over
+        // the wire: a valid start is admitted, the provider set is offered,
+        // the selection is accepted and the authorization URL carries the
+        // single-use state. The client then closes the substream while the
+        // browser callback is pending, which cancels the transaction
+        // (design section 8: 断开立即失效) and keeps the relay serving.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_config = RelayServeConfig::with_enterprise(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config("127.0.0.1:0".parse().unwrap()),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+            let stream = open_stream(
+                &mut endpoint,
+                &mut streams,
+                relay_peer,
+                yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+            )
+            .await;
+            let mut stream = stream.into_tokio();
+
+            let locator = Locator::new(7).unwrap();
+            stream
+                .write_all(&EnterpriseStart::new(locator).encode())
+                .await
+                .unwrap();
+            assert_eq!(
+                read_enterprise_frame(&mut stream).await,
+                EnterpriseResolveResponse::Providers(
+                    EnterpriseProviders::new(true, false).unwrap()
+                )
+            );
+
+            stream
+                .write_all(&EnterpriseSelect::new(EnterpriseProvider::WeCom).encode())
+                .await
+                .unwrap();
+            let EnterpriseResolveResponse::Authenticate(url) =
+                read_enterprise_frame(&mut stream).await
+            else {
+                panic!("expected an authorization URL after the provider selection");
+            };
+            let authorization = Url::parse(url.as_str()).expect("the authorization URL parses");
+            let state = authorization
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .expect("state parameter")
+                .1;
+            assert!(
+                !state.is_empty() && state.len() <= 64,
+                "the state is the fixed-length lowercase hex state"
+            );
+
+            // Half-close the client write side while the browser callback is
+            // pending. Waiting for the relay's EOF makes transaction removal
+            // an observable prerequisite instead of racing relay shutdown.
+            stream.shutdown().await.unwrap();
+            let mut trailing = Vec::new();
+            stream.read_to_end(&mut trailing).await.unwrap();
+            assert!(trailing.is_empty());
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the admitted enterprise flow must finish");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_enterprise_relay_completes_a_denied_https_callback() {
+        // This is the complete no-provider-network denial path: the enterprise
+        // stream registers a single-use transaction, the real HTTPS callback
+        // consumes it, and the owner reports the denial back on that stream.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let logs = SharedLog::default();
+            let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
+            let port = available_tcp_port();
+            let callback_port = loop {
+                let candidate = available_tcp_port();
+                if candidate != port {
+                    break candidate;
+                }
+            };
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let callback_listen = format!("127.0.0.1:{callback_port}").parse().unwrap();
+            let callback_external = format!("https://localhost.:{callback_port}");
+            let relay_config = RelayServeConfig::with_enterprise(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                RelayResourceConfig::default(),
+                Some(EnterpriseContext::new(
+                    enterprise_config_with_external(callback_listen, &callback_external),
+                    enterprise_credentials(),
+                )),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut endpoint = EndpointNode::new(
+                Keypair::generate_ed25519(),
+                WssTransportConfig::client(None),
+            )
+            .unwrap();
+            let relay_address = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+            endpoint.dial(relay_address).unwrap();
+            wait_for_connection(&mut endpoint, relay_peer).await;
+            let mut streams = endpoint.streams().clone();
+            let client = reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_der(TEST_WSS_CA_DER).unwrap())
+                .https_only(true)
+                .build()
+                .unwrap();
+            for (provider_error, expected_status) in [
+                ("access_denied", reqwest::StatusCode::OK),
+                (
+                    "temporarily_unavailable",
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                ),
+            ] {
+                let mut stream = open_stream(
+                    &mut endpoint,
+                    &mut streams,
+                    relay_peer,
+                    yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL,
+                )
+                .await
+                .into_tokio();
+                stream
+                    .write_all(&EnterpriseStart::new(Locator::new(7).unwrap()).encode())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_enterprise_frame(&mut stream).await,
+                    EnterpriseResolveResponse::Providers(
+                        EnterpriseProviders::new(true, false).unwrap()
+                    )
+                );
+                stream
+                    .write_all(&EnterpriseSelect::new(EnterpriseProvider::WeCom).encode())
+                    .await
+                    .unwrap();
+                let EnterpriseResolveResponse::Authenticate(url) =
+                    read_enterprise_frame(&mut stream).await
+                else {
+                    panic!("expected an authorization URL after the provider selection");
+                };
+                let authorization = Url::parse(url.as_str()).unwrap();
+                let state = authorization
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .expect("authorization URL carries its single-use state")
+                    .1
+                    .into_owned();
+                let callback = client
+                    .get(format!(
+                        "https://localhost:{callback_port}/yonder/callback/wecom?error={provider_error}&state={state}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(callback.status(), expected_status);
+                assert!(callback.text().await.unwrap().contains("Yonder"));
+                assert_eq!(
+                    read_enterprise_frame(&mut stream).await,
+                    EnterpriseResolveResponse::Failed
+                );
+            }
+            let text = logs.text();
+            assert!(text.contains("event=\"enterprise_callback\""));
+            assert!(text.contains("platform=\"wecom\""));
+            assert!(text.contains("result=\"rejected\""));
+            assert!(text.contains("result=\"platform\""));
+
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the denied callback flow must finish");
+    }
+
+    #[test]
+    fn enterprise_exchange_permits_count_overload_when_exhausted() {
+        // The permit acquisition is a pure function at the call site of
+        // the accept loop; a full pool returns None (the caller drops the
+        // substream) and counts the overload exactly once per rejection.
+        let permits = Arc::new(Semaphore::new(3));
+        let observations = RelayObservability::default();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let permit = try_acquire_enterprise_permit(&permits, &observations)
+                .expect("the first three acquisitions succeed");
+            held.push(permit);
+        }
+        assert!(try_acquire_enterprise_permit(&permits, &observations).is_none());
+        assert_eq!(observations.resolve_overload.load(Ordering::Relaxed), 1);
+        drop(held.pop());
+        assert!(try_acquire_enterprise_permit(&permits, &observations).is_some());
+        assert_eq!(observations.resolve_overload.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_callback_bind_failure_stops_the_relay() {
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
+        // Regression test for the callback listener failure escalation:
+        // the callback listener is occupied, so the startup bind fails and
+        // run_relay_until stops with the EnterpriseCallback error instead
+        // of serving without a callback listener. The runtime accept
+        // failure path reports through the same oneshot wiring inside the
+        // task group, but an accept error cannot be forced without the
+        // OS dropping the listener the serve task owns.
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let relay_config = RelayServeConfig::with_enterprise(
+            Keypair::generate_ed25519(),
+            vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
+            WssTransportConfig::client(None),
+            RelayResourceConfig::default(),
+            Some(EnterpriseContext::new(
+                enterprise_config(format!("127.0.0.1:{port}").parse().unwrap()),
+                enterprise_credentials(),
+            )),
+        )
+        .unwrap();
+        let error = run_relay_until(relay_config, async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RelayServiceError::EnterpriseCallback(CallbackServerError::Bind { .. })
+        ));
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_enterprise_mode\""));
+        assert!(text.contains("providers=1"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn live_capacity_response_precedes_bounded_same_peer_disconnect() {
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -1665,6 +2698,134 @@ mod tests {
         })
         .await
         .expect("capacity rejection must respond and disconnect every same-peer connection");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_capacity_rejection_tracks_the_peer_until_cleanup_and_drain_cancellation() {
+        // The capacity decision inserts the peer into the rejected set and
+        // closes its connections; a further registry substream from the
+        // rejected peer is answered with an immediate retry instead of a
+        // fresh exchange. Once the exchange drain ends and the peer has no
+        // connections left, the registry_done handler drops the rejected
+        // marker. A shutdown arriving during a later rejection drain hits
+        // the cancellation branch of the drain wait.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let port = available_tcp_port();
+            let relay_identity = Keypair::generate_ed25519();
+            let relay_peer = relay_identity.public().to_peer_id();
+            let listen: RelayListenAddress = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let external: RelayExternalAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+            let relay_address: EndpointRelayAddress =
+                format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                    .parse()
+                    .unwrap();
+            let relay_config = RelayServeConfig::with_resources(
+                relay_identity,
+                vec![listen],
+                vec![external],
+                WssTransportConfig::client(None),
+                resources_with_registration_capacity(1, 1),
+            )
+            .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let relay = tokio::spawn(run_relay_until(relay_config, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            }));
+
+            tokio::task::yield_now().await;
+            let mut accepted = connected_reserved_endpoint(&relay_address, relay_peer).await;
+            let mut accepted_streams = accepted.streams().clone();
+            let stream = open_stream(
+                &mut accepted,
+                &mut accepted_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut accepted, stream, &RegistryRequest::Allocate.encode()).await;
+            assert!(matches!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Acquired(_)
+            ));
+            drop(accepted);
+
+            // The second peer exhausts the registration capacity. Its
+            // rejected marker is already set, so any further registry
+            // substream from the same peer is answered with an immediate
+            // retry instead of a fresh exchange.
+            let rejected_identity = Keypair::generate_ed25519();
+            let mut rejected = connected_reserved_endpoint_with_identity(
+                &relay_address,
+                relay_peer,
+                rejected_identity.clone(),
+            )
+            .await;
+            let mut rejected_streams = rejected.streams().clone();
+            let stream = open_stream(
+                &mut rejected,
+                &mut rejected_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut rejected, stream, &RegistryRequest::Allocate.encode()).await;
+            assert_eq!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Capacity
+            );
+            let stream = open_stream(
+                &mut rejected,
+                &mut rejected_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut rejected, stream, &RegistryRequest::Allocate.encode()).await;
+            assert!(matches!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Retry(_)
+            ));
+
+            // Closing the rejected peer's connection before the exchange
+            // drain ends means the registry_done cleanup observes zero
+            // connections and drops the rejected marker there.
+            drop(rejected);
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+
+            // The same peer reconnects and is admitted fresh again; the
+            // capacity decision still rejects it. Shutting down while the
+            // rejected-connection drain is in flight reaches the
+            // cancellation branch of the drain wait.
+            let mut readmitted = connected_reserved_endpoint_with_identity(
+                &relay_address,
+                relay_peer,
+                rejected_identity,
+            )
+            .await;
+            let mut readmitted_streams = readmitted.streams().clone();
+            let stream = open_stream(
+                &mut readmitted,
+                &mut readmitted_streams,
+                relay_peer,
+                yonder_core::wire::REGISTRY_PROTOCOL,
+            )
+            .await;
+            let response =
+                exchange_stream(&mut readmitted, stream, &RegistryRequest::Allocate.encode()).await;
+            assert_eq!(
+                RegistryResponse::decode(&response).unwrap(),
+                RegistryResponse::Capacity
+            );
+            shutdown_tx.send(()).unwrap();
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .expect("capacity tracking must finish");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1868,6 +3029,31 @@ mod tests {
             write_close(&mut shutdown_failure, &[1]).await,
             Err(ProtocolTaskError::Io(_))
         ));
+
+        // A silent stream never completes a bounded read: the explicit
+        // deadline fires and the read fails closed with a timeout.
+        let (writer, mut reader) = tokio::io::duplex(16);
+        assert!(matches!(
+            read_deadline::<3>(&mut reader, Duration::from_millis(50)).await,
+            Err(ProtocolTaskError::Timeout)
+        ));
+        drop(writer);
+
+        // write_message propagates a flush failure fail-closed after the
+        // write itself succeeded.
+        let mut flush_failure = FailingWrite::new(WriteFailure::Flush);
+        assert!(matches!(
+            write_message(&mut flush_failure, &[1]).await,
+            Err(ProtocolTaskError::Io(_))
+        ));
+
+        // A duplex whose buffer is full and whose reader never drains
+        // blocks the write until the message timeout fires.
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        assert!(matches!(
+            write_timeout(&mut writer, &[1, 2, 3]).await,
+            Err(ProtocolTaskError::Timeout)
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1894,6 +3080,14 @@ mod tests {
         observations.observe_protocol_result(Err(ProtocolTaskError::Registry(
             crate::registry::RegistryError::PeerIdTooLong,
         )));
+        observations
+            .observe_protocol_result(Err(ProtocolTaskError::Random(yonder_core::RandomError)));
+        observations.observe_protocol_result(Err(ProtocolTaskError::Session(
+            crate::session::TransitionError::Terminal,
+        )));
+        observations.observe_protocol_result(Err(ProtocolTaskError::EnterpriseProvider(
+            crate::provider::ProviderError::NoCredentials,
+        )));
         assert_eq!(observations.protocol_timeout.load(Ordering::Relaxed), 1);
         assert_eq!(observations.protocol_io.load(Ordering::Relaxed), 1);
         assert_eq!(observations.protocol_invalid.load(Ordering::Relaxed), 1);
@@ -1902,6 +3096,12 @@ mod tests {
             1
         );
         assert_eq!(observations.protocol_registry.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            observations
+                .protocol_enterprise_failed
+                .load(Ordering::Relaxed),
+            3
+        );
         observations.report_and_reset(3);
         assert_eq!(observations.protocol_timeout.load(Ordering::Relaxed), 0);
         assert_eq!(observations.protocol_io.load(Ordering::Relaxed), 0);
@@ -1911,6 +3111,12 @@ mod tests {
             0
         );
         assert_eq!(observations.protocol_registry.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observations
+                .protocol_enterprise_failed
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(retry_after().millis(), 250);
         assert_eq!(RegistryResponse::Retry(retry_after()).encode()[0], 0x82);
     }
@@ -2143,6 +3349,24 @@ mod tests {
         assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
         assert!(response.is_empty());
 
+        // A reserved-field violation is rejected by decode just like an
+        // unknown tag, in both the full exchange and the immediate retry.
+        let reserved_field_registry = [0x01, 0, 0, 1];
+        let (client, server) = tokio::io::duplex(32);
+        let (result, response) = tokio::join!(
+            registry_exchange_without_rejection(peer, server, mpsc::channel(1).0),
+            request_response(client, &reserved_field_registry),
+        );
+        assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
+        assert!(response.is_empty());
+        let (client, server) = tokio::io::duplex(32);
+        let (result, response) = tokio::join!(
+            registry_immediate_retry(server, retry_after()),
+            request_response(client, &reserved_field_registry),
+        );
+        assert!(matches!(result, Err(ProtocolTaskError::Protocol(_))));
+        assert!(response.is_empty());
+
         let (client, server) = tokio::io::duplex(32);
         let (result, response) = tokio::join!(
             resolve_exchange(peer, server, mpsc::channel(1).0),
@@ -2354,6 +3578,55 @@ mod tests {
             RegistryResponse::Retry(_)
         ));
 
+        // Reclaiming into a full registry reports the capacity decision
+        // and marks the unique connection for rejection, exactly like
+        // allocation does.
+        let limits = RegistrationLimits::new(
+            RegistrationCapacity::new(1).unwrap(),
+            SourceRegistrationCapacity::new(1).unwrap(),
+            ReservationDuration::from_seconds(60).unwrap(),
+        )
+        .unwrap();
+        let mut full_registry = Registry::with_limits(SystemClock::new(), limits, retry_after());
+        full_registry.set_connection(peer, true);
+        full_registry.set_reservation(peer, true);
+        let reclaimed = handle_registry_call(
+            &registry_call(
+                peer,
+                ConnectionId::new_unchecked(1),
+                RegistryRequest::Reclaim(Locator::new(21).unwrap()),
+            ),
+            &connections,
+            &mut full_registry,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(
+            reclaimed.response,
+            RegistryResponse::Acquired(Locator::new(21).unwrap())
+        );
+        assert_eq!(reclaimed.rejected_connection, None);
+        let competing = Keypair::generate_ed25519().public().to_peer_id();
+        let competing_connection = ConnectionId::new_unchecked(4);
+        connections
+            .established(competing, competing_connection, endpoint())
+            .unwrap();
+        full_registry.set_connection(competing, true);
+        full_registry.set_reservation(competing, true);
+        let rejected = handle_registry_call(
+            &registry_call(
+                competing,
+                competing_connection,
+                RegistryRequest::Reclaim(Locator::new(22).unwrap()),
+            ),
+            &connections,
+            &mut full_registry,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(rejected.response, RegistryResponse::Capacity);
+        assert_eq!(rejected.rejected_connection, Some(competing_connection));
+
         let valid = resolve_call(peer, locator);
         let observations = RelayObservability::default();
         let mut exhausted_global = ResolveLimiters::new();
@@ -2437,6 +3710,97 @@ mod tests {
             .unwrap(),
             ResolveResponse::Resolved(_)
         ));
+    }
+
+    #[test]
+    fn resolve_limit_observations_count_every_admission_branch() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let locator = Locator::new(7).unwrap();
+        let mut connections = ConnectionBook::new();
+        connections
+            .established(peer, ConnectionId::new_unchecked(1), endpoint())
+            .unwrap();
+        let clock = SystemClock::new();
+        let mut registry = Registry::new(clock.clone());
+        let source = connections.unique(&peer).unwrap().source_prefix().unwrap();
+        let call = resolve_call(peer, locator);
+
+        // The global limiter is exhausted: the request never reaches the
+        // connection or per-source checks.
+        let observations = RelayObservability::default();
+        let mut exhausted_global = ResolveLimiters::new();
+        for _ in 0..128 {
+            assert!(exhausted_global.check_global());
+        }
+        assert!(matches!(
+            handle_resolve_call_observed(
+                &call,
+                &connections,
+                &clock,
+                &mut registry,
+                &mut exhausted_global,
+                &observations,
+            )
+            .unwrap(),
+            ResolveResponse::Retry(_)
+        ));
+        assert_eq!(
+            observations.resolve_global_limited.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(observations.resolve_retry.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observations.resolve_source_limited.load(Ordering::Relaxed),
+            0
+        );
+
+        // A peer without a unique connection is deferred and counted as a
+        // retry before any per-source accounting.
+        let observations = RelayObservability::default();
+        let stranger = Keypair::generate_ed25519().public().to_peer_id();
+        let mut fresh = ResolveLimiters::new();
+        assert!(matches!(
+            handle_resolve_call_observed(
+                &resolve_call(stranger, locator),
+                &connections,
+                &clock,
+                &mut registry,
+                &mut fresh,
+                &observations,
+            )
+            .unwrap(),
+            ResolveResponse::Retry(_)
+        ));
+        assert_eq!(observations.resolve_retry.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            observations.resolve_global_limited.load(Ordering::Relaxed),
+            0
+        );
+
+        // The per-source limiter is exhausted: the request passes the
+        // global and connection checks and is deferred at the source check.
+        let observations = RelayObservability::default();
+        let mut exhausted_source = ResolveLimiters::new();
+        for _ in 0..32 {
+            assert!(exhausted_source.check_source(source, clock.now()));
+        }
+        assert!(matches!(
+            handle_resolve_call_observed(
+                &call,
+                &connections,
+                &clock,
+                &mut registry,
+                &mut exhausted_source,
+                &observations,
+            )
+            .unwrap(),
+            ResolveResponse::Retry(_)
+        ));
+        assert_eq!(
+            observations.resolve_source_limited.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(observations.resolve_retry.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2615,6 +3979,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn required_listener_readiness_and_failures_are_authoritative() {
+        let logs = SharedLog::default();
+        let _guard = tracing::subscriber::set_default(shared_log_subscriber(logs.clone()));
         let identity = Keypair::generate_ed25519();
         let mut node = RelayNode::new(identity, WssTransportConfig::client(None)).unwrap();
         let first = node
@@ -2678,6 +4044,15 @@ mod tests {
         .unwrap();
         assert!(listeners.ready_reported);
         assert_eq!(listeners.ready_addresses.len(), 2);
+        // The BecameReady transition reported every ready listener and
+        // logged the readiness event with the exact counts.
+        let text = logs.text();
+        assert!(text.contains("event=\"relay_ready\""));
+        assert!(text.contains("listener_count=2"));
+        assert!(text.contains("external_count=0"));
+        assert!(text.contains("relay listener is active"));
+        assert!(text.contains("/ip4/127.0.0.1/tcp/4001"));
+        assert!(text.contains("/ip4/127.0.0.1/udp/4002/quic-v1"));
         handle_swarm_event_inner(
             SwarmEvent::NewListenAddr {
                 listener_id: second,
@@ -2818,6 +4193,36 @@ mod tests {
         assert!(!limiters.check_source(source, clock.now()));
     }
 
+    #[test]
+    fn enterprise_target_resolution_exposes_only_active_peers() {
+        let owner = Keypair::generate_ed25519().public().to_peer_id();
+        let locator = Locator::new(7).unwrap();
+        let mut registry = Registry::new(SystemClock::new());
+        registry.set_reservation(owner, true);
+        registry.set_connection(owner, true);
+        assert_eq!(
+            registry.reclaim(owner, source(), locator),
+            RegistryResponse::Acquired(locator)
+        );
+
+        assert_eq!(
+            resolve_enterprise_target(&mut registry, locator).unwrap(),
+            EnterpriseResolveResponse::Resolved(yonder_net::peer_id_bytes(owner).unwrap())
+        );
+
+        registry.set_connection(owner, false);
+        assert_eq!(
+            resolve_enterprise_target(&mut registry, locator).unwrap(),
+            EnterpriseResolveResponse::Unavailable
+        );
+
+        registry.release(owner, locator);
+        assert_eq!(
+            resolve_enterprise_target(&mut registry, locator).unwrap(),
+            EnterpriseResolveResponse::Unavailable
+        );
+    }
+
     async fn request_response(mut stream: tokio::io::DuplexStream, request: &[u8]) -> Vec<u8> {
         stream.write_all(request).await.unwrap();
         stream.shutdown().await.unwrap();
@@ -2840,6 +4245,32 @@ mod tests {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == relay => return,
                 SwarmEvent::OutgoingConnectionError { error, .. } => {
                     panic!("relay connection failed: {error}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn wait_for_resolve_protocols(
+        endpoint: &mut EndpointNode,
+        relay: PeerId,
+    ) -> (bool, bool) {
+        loop {
+            match endpoint.next_event().await {
+                SwarmEvent::Behaviour(EndpointBehaviourEvent::Identify(
+                    yonder_net::identify::Event::Received { peer_id, info, .. },
+                )) if peer_id == relay => {
+                    let standard = info
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.as_ref() == yonder_core::wire::RESOLVE_PROTOCOL);
+                    let enterprise = info.protocols.iter().any(|protocol| {
+                        protocol.as_ref() == yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL
+                    });
+                    return (standard, enterprise);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } if peer_id == relay => {
+                    panic!("relay connection closed before Identify completed")
                 }
                 _ => {}
             }
@@ -2967,6 +4398,46 @@ mod tests {
                 _ = endpoint.next_event() => {}
             }
         }
+    }
+
+    /// Reads one encoded enterprise response from the client side of a
+    /// live enterprise substream.
+    async fn read_enterprise_frame(
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> EnterpriseResolveResponse {
+        let mut tag = [0_u8; 1];
+        stream.read_exact(&mut tag).await.unwrap();
+        let message = match tag[0] {
+            0x10 => {
+                let mut payload = [0_u8; 1];
+                stream.read_exact(&mut payload).await.unwrap();
+                vec![0x10, payload[0]]
+            }
+            0x11 => {
+                let mut payload = [0_u8; 4];
+                stream.read_exact(&mut payload).await.unwrap();
+                std::iter::once(0x11).chain(payload).collect()
+            }
+            0x12 => {
+                let mut length = [0_u8; 2];
+                stream.read_exact(&mut length).await.unwrap();
+                let mut url = vec![0_u8; usize::from(u16::from_be_bytes(length))];
+                stream.read_exact(&mut url).await.unwrap();
+                std::iter::once(0x12).chain(length).chain(url).collect()
+            }
+            0x13 => {
+                let mut peer_length = [0_u8; 1];
+                stream.read_exact(&mut peer_length).await.unwrap();
+                let mut peer = vec![0_u8; usize::from(peer_length[0])];
+                stream.read_exact(&mut peer).await.unwrap();
+                std::iter::once(0x13)
+                    .chain(peer_length)
+                    .chain(peer)
+                    .collect()
+            }
+            tag => vec![tag],
+        };
+        EnterpriseResolveResponse::decode(&message).unwrap()
     }
 
     struct ExactThenError<const LENGTH: usize> {
@@ -3158,6 +4629,42 @@ mod tests {
             vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()],
             WssTransportConfig::client(None),
+        )
+        .unwrap()
+    }
+
+    /// In-process enterprise credentials without any secret file: the
+    /// test-only constructor is crate-internal like the accept loop it
+    /// feeds.
+    fn enterprise_credentials() -> ProviderCredentials {
+        let wecom = WeComCredentials {
+            corp_id: SecretText::new("ww1234567890abcdef".into(), ProviderField::CorpId).unwrap(),
+            agent_id: 7,
+            app_secret: SecretText::new("s3cret".into(), ProviderField::AppSecret).unwrap(),
+        };
+        ProviderCredentials::from_credentials(Some(wecom), None)
+    }
+
+    /// An enterprise-mode configuration bound to the given callback
+    /// listener, using the same fixture TLS material as the WSS tests.
+    fn enterprise_config(callback_listen: std::net::SocketAddr) -> EnterpriseAuthConfig {
+        enterprise_config_with_external(callback_listen, "https://localhost.")
+    }
+
+    fn enterprise_config_with_external(
+        callback_listen: std::net::SocketAddr,
+        callback_external: &str,
+    ) -> EnterpriseAuthConfig {
+        let providers = EnterpriseProviders::new(true, false).unwrap();
+        let secrets =
+            ProviderSecrets::new(providers, Some(PathBuf::from("wecom.secret")), None).unwrap();
+        EnterpriseAuthConfig::new(
+            callback_listen,
+            CallbackExternalUrl::new(Url::parse(callback_external).unwrap()).unwrap(),
+            vec![SecretDocument::new(TEST_WSS_CERTIFICATE_DER.to_vec())],
+            SecretDocument::new(TEST_WSS_PRIVATE_KEY_DER.to_vec()),
+            providers,
+            secrets,
         )
         .unwrap()
     }

@@ -1,13 +1,14 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v[0-9]*.[0-9]*.[0-9]*"
   workflow_dispatch:
     inputs:
       version:
         description: Version in vMAJOR.MINOR.PATCH form
+        required: true
+        type: string
+      ci_run_id:
+        description: Successful release-candidate CI run for this exact commit
         required: true
         type: string
 
@@ -15,11 +16,56 @@ permissions:
   contents: read
 
 env:
-  CANDIDATE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  CANDIDATE_VERSION: ${{ inputs.version }}
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  quality:
+  ci-evidence:
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for trusted CI evidence from the exact candidate commit
+        shell: bash
+        env:
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          deadline=$((SECONDS + 5100))
+          while true; do
+            run_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID")"
+            jq --exit-status \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg sha "$GITHUB_SHA" \
+              '.path == ".github/workflows/ci.yml"
+                and .event == "workflow_dispatch"
+                and .head_sha == $sha
+                and .head_repository.full_name == $repository' \
+              <<<"$run_json" >/dev/null
+
+            status="$(jq --raw-output '.status' <<<"$run_json")"
+            if [[ "$status" == completed ]]; then
+              jq --exit-status '.conclusion == "success"' <<<"$run_json" >/dev/null
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              jq '{html_url, status, conclusion, head_sha, event, path}' <<<"$run_json" >&2
+              echo 'timed out waiting for the trusted CI run' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+          jobs="$(gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/jobs?filter=latest&per_page=100")"
+          test "$(jq '[.jobs[] | select(.name == "CI gate" and .conclusion == "success")] | length' <<<"$jobs")" -eq 1
+          test "$(jq '[.jobs[] | select(.name == "Release gate" and .conclusion == "success")] | length' <<<"$jobs")" -eq 1
+          jq --raw-output '"trusted CI: \(.html_url)"' <<<"$run_json"
+
+  release-metadata:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,15 +73,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
-          components: clippy, rustfmt
-      - name: Install actionlint 1.7.12
-        shell: bash
-        run: bash .github/scripts/install-actionlint.sh
-      - run: actionlint
+          toolchain: 1.97.0
       - name: Test release asset inventory validation
         shell: bash
         run: bash .github/scripts/test-verify-release-assets.sh
+      - name: Test deterministic release packaging
+        run: python3 .github/scripts/test-package-release.py
       - name: Verify candidate version matches the workspace version
         shell: bash
         run: |
@@ -51,116 +94,21 @@ jobs:
           )
           test "${#versions[@]}" -eq 1
           test "$CANDIDATE_VERSION" = "v${versions[0]}"
-      - run: cargo fmt --all --check
-      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --workspace --all-targets --all-features
-      - name: Run 10,000-iteration lifecycle stress gates
-        run: cargo test --locked --release --workspace stress_10000 -- --ignored --nocapture
-      - name: Lint strict relay-only controller rebuild
-        env:
-          RUSTFLAGS: --cfg yonder_e2e_rebuild
-        run: cargo clippy --locked -p yon --tests -- -D warnings
-      - name: Prove strict relay-only controller rebuild
-        env:
-          RUSTFLAGS: --cfg yonder_e2e_rebuild
-        run: >-
-          cargo test --locked -p yon --test end_to_end
-          strict_relay_only_fallback_rebuilds_the_controller_swarm -- --exact
-      - name: Reject the test-only rebuild cfg in release builds
-        shell: bash
-        run: |
-          if RUSTFLAGS='--cfg yonder_e2e_rebuild' cargo check --locked --release -p yon; then
-            echo 'test-only rebuild cfg entered a release build' >&2
-            exit 1
-          fi
-      - run: cargo test --locked --workspace --doc
-      - name: Reject unsafe first-party Rust
-        shell: bash
-        run: |
-          if git grep -n -E '(^|[^[:alnum:]_])unsafe([^[:alnum:]_]|$)' -- '*.rs'; then
-            echo 'first-party Rust source contains the unsafe keyword' >&2
-            exit 1
-          fi
-      - name: Verify security-sensitive dependency versions
-        shell: bash
-        run: |
-          for manifest in Cargo.toml fuzz/Cargo.toml; do
-            bash .github/scripts/verify-security-exceptions.sh "$manifest"
-          done
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
-        with:
-          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
-      - name: Audit production lockfile
-        run: >-
-          cargo audit --deny warnings
-          --ignore RUSTSEC-2026-0118
-          --ignore RUSTSEC-2026-0119
-          --ignore RUSTSEC-2024-0436
-      - run: cargo deny -L error --locked check
-      - name: Audit fuzz lockfile
-        run: >-
-          cargo audit --file fuzz/Cargo.lock --deny warnings
-          --ignore RUSTSEC-2026-0118
-          --ignore RUSTSEC-2026-0119
-          --ignore RUSTSEC-2024-0436
-      - run: cargo deny -L error --manifest-path fuzz/Cargo.toml --locked --config fuzz/deny.toml check
 
-  coverage:
-    needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
+  release-stress:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly-2026-07-22
-          components: llvm-tools-preview
-          targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
-        with:
-          tool: cargo-llvm-cov@0.8.7
-      - name: Install musl linker
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
-      - name: Generate first-party coverage report
-        shell: bash
-        run: |
-          cargo +nightly-2026-07-22 llvm-cov \
-            --locked --workspace --all-targets --all-features \
-            --target "${{ matrix.target }}" \
-            --branch --json --output-path coverage.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-${{ matrix.target }}
-          path: coverage.json
-          if-no-files-found: error
-          overwrite: true
-      - name: Enforce risk-based first-party coverage
-        shell: bash
-        run: bash .github/scripts/enforce-coverage.sh coverage.json
+          toolchain: 1.97.0
+      - name: Run 10,000-iteration lifecycle stress gates
+        run: cargo test --locked --release --workspace stress_10000 -- --ignored --nocapture
 
   sbom:
-    needs: quality
+    needs: release-metadata
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,7 +117,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
+          toolchain: 1.97.0
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
         with:
           tool: cargo-cyclonedx@0.5.9
@@ -240,7 +188,7 @@ jobs:
           overwrite: true
 
   licenses:
-    needs: quality
+    needs: release-metadata
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -248,7 +196,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
+          toolchain: 1.97.0
       - name: Install cargo-about 0.9.1
         run: cargo install --locked --version 0.9.1 --features cli cargo-about
       - name: Generate third-party license bundle
@@ -266,117 +214,8 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  msrv:
-    needs: quality
-    name: MSRV ${{ matrix.target }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.88.0
-          targets: ${{ matrix.target }}
-      - name: Install musl linker
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
-      - run: cargo build --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
-      - name: Check fuzz workspace for Linux musl
-        if: runner.os == 'Linux'
-        env:
-          CXX: clang++
-        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
-      - name: Check fuzz workspace
-        if: runner.os != 'Linux'
-        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target ${{ matrix.target }}
-
-  miri:
-    needs: quality
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: nightly-2026-07-22
-          components: miri
-      - run: cargo +nightly-2026-07-22 miri test --locked -p yonder-core
-
-  sanitizer:
-    needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address, thread]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: nightly-2026-07-22
-          components: rust-src
-      - name: Run ${{ matrix.sanitizer }} sanitizer
-        env:
-          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
-          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg yonder_sanitizer
-        run: >-
-          cargo +nightly-2026-07-22 test --locked -Zbuild-std
-          --target x86_64-unknown-linux-gnu
-          --workspace --all-targets --all-features
-
-  release-fuzz:
-    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, build]
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [connection_code, wire_protocol, session_state, network_address]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: nightly-2026-07-22
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
-        with:
-          tool: cargo-fuzz@0.13.2
-      - name: Fuzz ${{ matrix.target }} for 30 minutes
-        shell: bash
-        env:
-          FUZZ_TARGET: ${{ matrix.target }}
-        run: |
-          if [[ "$FUZZ_TARGET" == "network_address" ]]; then
-            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time=1800 -timeout=10
-          else
-            cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu -- -max_total_time=1800 -timeout=10
-          fi
-
   build:
+    needs: release-metadata
     name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -414,8 +253,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
-          components: clippy
+          toolchain: 1.97.0
           targets: ${{ matrix.target }}
       - name: Install musl linker
         if: runner.os == 'Linux'
@@ -423,8 +261,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - run: cargo clippy --locked --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
-      - run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Stage Unix binaries
         if: runner.os != 'Windows'
@@ -592,12 +428,19 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          tar --create --gzip \
-            --file "dist/yon-${{ matrix.suffix }}.tar.gz" \
-            --directory stage yon
-          tar --create --gzip \
-            --file "dist/yon-relay-${{ matrix.suffix }}.tar.gz" \
-            --directory stage yon-relay
+          source_date_epoch="$(git show --no-patch --format=%ct HEAD)"
+          python3 .github/scripts/package-release.py \
+            --format tar.gz \
+            --input stage/yon \
+            --output "dist/yon-${{ matrix.suffix }}.tar.gz" \
+            --name yon \
+            --source-date-epoch "$source_date_epoch"
+          python3 .github/scripts/package-release.py \
+            --format tar.gz \
+            --input stage/yon-relay \
+            --output "dist/yon-relay-${{ matrix.suffix }}.tar.gz" \
+            --name yon-relay \
+            --source-date-epoch "$source_date_epoch"
           test "$(tar --list --gzip --file "dist/yon-${{ matrix.suffix }}.tar.gz" | wc -l)" -eq 1
           test "$(tar --list --gzip --file "dist/yon-relay-${{ matrix.suffix }}.tar.gz" | wc -l)" -eq 1
       - name: Package Windows binaries
@@ -605,8 +448,28 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist
-          Compress-Archive -LiteralPath stage/yon.exe -DestinationPath "dist/yon-${{ matrix.suffix }}.zip"
-          Compress-Archive -LiteralPath stage/yon-relay.exe -DestinationPath "dist/yon-relay-${{ matrix.suffix }}.zip"
+          $sourceDateEpoch = git show --no-patch --format=%ct HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw 'failed to read SOURCE_DATE_EPOCH from the release commit'
+          }
+          python .github/scripts/package-release.py `
+            --format zip `
+            --input stage/yon.exe `
+            --output "dist/yon-${{ matrix.suffix }}.zip" `
+            --name yon.exe `
+            --source-date-epoch $sourceDateEpoch
+          if ($LASTEXITCODE -ne 0) {
+            throw 'failed to package yon.exe'
+          }
+          python .github/scripts/package-release.py `
+            --format zip `
+            --input stage/yon-relay.exe `
+            --output "dist/yon-relay-${{ matrix.suffix }}.zip" `
+            --name yon-relay.exe `
+            --source-date-epoch $sourceDateEpoch
+          if ($LASTEXITCODE -ne 0) {
+            throw 'failed to package yon-relay.exe'
+          }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           foreach ($archive in Get-ChildItem dist/*.zip) {
@@ -627,7 +490,7 @@ jobs:
           overwrite: true
 
   network-matrix:
-    needs: [quality, build]
+    needs: build
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
@@ -660,13 +523,13 @@ jobs:
           overwrite: true
 
   performance-baseline:
-    needs: quality
+    needs: release-metadata
     name: Performance baseline ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -674,13 +537,33 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
-      - name: Run Criterion benchmarks
+          toolchain: 1.97.0
+      - name: Record runner identity before performance gates
+        shell: bash
+        run: |
+          mkdir -p performance
+          rustc -Vv > performance/rustc.txt
+          uname -a > performance/system.txt
+          printf 'ImageOS=%s\nImageVersion=%s\nRUNNER_OS=%s\nRUNNER_ARCH=%s\n' \
+            "${ImageOS:-unknown}" "${ImageVersion:-unknown}" \
+            "${RUNNER_OS:-unknown}" "${RUNNER_ARCH:-unknown}" \
+            > performance/runner-image.txt
+      - name: Test performance gate parser
+        shell: pwsh
+        run: .github/scripts/test-enforce-performance.ps1
+      - name: Run production-path Criterion benchmarks
         shell: bash
         run: |
           cargo bench --locked --all-features -p yon --bench opaque -- --noplot
           cargo bench --locked --all-features -p yonder-core --bench core -- --noplot
           cargo bench --locked --all-features -p yonder-net --bench path -- --noplot
+      - name: Enforce performance thresholds
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force performance | Out-Null
+          .github/scripts/enforce-performance.ps1 `
+            -CriterionRoot target/criterion `
+            -OutputPath performance/performance-gate.json
       - name: Build optimized product binaries for process samples
         run: cargo build --locked --release -p yon -p yon-relay
       - name: Create protected Windows resource-sampling directory
@@ -688,8 +571,8 @@ jobs:
         uses: ./.github/actions/secure-directory
         with:
           path: ${{ runner.temp }}/yonder-performance-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Run real Linux process terminal throughput gate
-        if: runner.os == 'Linux'
+      - name: Run real Unix process terminal throughput gate
+        if: runner.os != 'Windows'
         shell: bash
         env:
           YONDER_E2E_YON_RELAY: ${{ github.workspace }}/target/release/yon-relay
@@ -867,7 +750,72 @@ jobs:
             Remove-Item -Recurse -Force $relayRoot
           }
           Copy-Item -Recurse target/criterion performance/criterion
+      - name: Record macOS runner and relay resource samples
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p performance
+          rustc -Vv > performance/rustc.txt
+          uname -a > performance/system.txt
+          (sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model) \
+            > performance/cpu.txt
+          sysctl -n hw.memsize > performance/memory.txt
+          printf 'ImageOS=%s\nImageVersion=%s\nRUNNER_ARCH=%s\n' \
+            "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "${RUNNER_ARCH:-unknown}" \
+            > performance/runner-image.txt
+          pmset -g custom > performance/power-mode.txt
+          printf 'binary,iteration,elapsed_ns\n' > performance/startup.csv
+          for binary in yon yon-relay; do
+            for iteration in $(seq 1 11); do
+              started="$(python3 -c 'import time; print(time.monotonic_ns())')"
+              "target/release/$binary" --version >/dev/null
+              finished="$(python3 -c 'import time; print(time.monotonic_ns())')"
+              printf '%s,%s,%s\n' "$binary" "$iteration" "$((finished - started))" \
+                >> performance/startup.csv
+            done
+          done
+          sample_root="$(mktemp -d)"
+          chmod 700 "$sample_root"
+          relay="$(pwd)/target/release/yon-relay"
+          "$relay" identity init --output "$sample_root/relay.key" >/dev/null
+          cat > "$sample_root/yon-relay.toml" <<'EOF'
+          identity = "relay.key"
+          listen = ["/ip4/127.0.0.1/tcp/0"]
+          external = ["/ip4/127.0.0.1/tcp/46001"]
+          EOF
+          (
+            cd "$sample_root"
+            exec "$relay" serve
+          ) >"$sample_root/stdout" 2>"$sample_root/stderr" &
+          relay_pid="$!"
+          cleanup() {
+            if kill -0 "$relay_pid" 2>/dev/null; then
+              kill -INT "$relay_pid"
+              wait "$relay_pid" || true
+            fi
+            rm -rf "$sample_root"
+          }
+          trap cleanup EXIT
+          deadline=$((SECONDS + 30))
+          while ! grep -q '^Relay PeerId:' "$sample_root/stdout"; do
+            if ! kill -0 "$relay_pid" 2>/dev/null || ((SECONDS >= deadline)); then
+              cat "$sample_root/stderr" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          sleep 2
+          rss_kib="$(ps -o rss= -p "$relay_pid" | tr -d ' ')"
+          fd_count="$(lsof -a -p "$relay_pid" -d 0-99999 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+          thread_count="$(ps -M -p "$relay_pid" | tail -n +2 | wc -l | tr -d ' ')"
+          printf 'pid=%s\nrss_kib=%s\nthread_count=%s\nfd_count=%s\n' \
+            "$relay_pid" "$rss_kib" "$thread_count" "$fd_count" \
+            > performance/relay-idle.txt
+          test "$rss_kib" -le 49152
+          test "$fd_count" -le 256
+          cp -R target/criterion performance/criterion
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
           name: yonder-performance-${{ runner.os }}-${{ runner.arch }}
           path: performance
@@ -875,7 +823,7 @@ jobs:
           overwrite: true
 
   release-candidate:
-    needs: [quality, coverage, sbom, licenses, msrv, miri, sanitizer, release-fuzz, build, network-matrix, performance-baseline]
+    needs: [ci-evidence, release-metadata, release-stress, sbom, licenses, build, network-matrix, performance-baseline]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -949,35 +897,3 @@ jobs:
           path: dist/*
           if-no-files-found: error
           overwrite: true
-      - name: Publish GitHub Release
-        if: github.event_name == 'push'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mapfile -d '' assets < <(
-            find dist -maxdepth 1 -type f -print0 | sort --zero-terminated
-          )
-          test "${#assets[@]}" -eq 19
-          gh release create "$CANDIDATE_VERSION" "${assets[@]}" \
-            --verify-tag \
-            --title "Yonder $CANDIDATE_VERSION" \
-            --generate-notes
-
-          expected="$(mktemp)"
-          expected_digests="$(mktemp)"
-          uploaded="$(mktemp)"
-          uploaded_digests="$(mktemp)"
-          trap 'rm -f "$expected" "$expected_digests" "$uploaded" "$uploaded_digests"' EXIT
-          printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort >"$expected"
-          for asset in "${assets[@]}"; do
-            printf '%s\tsha256:%s\n' \
-              "${asset##*/}" "$(sha256sum "$asset" | cut -d ' ' -f 1)"
-          done | LC_ALL=C sort >"$expected_digests"
-          gh release view "$CANDIDATE_VERSION" --json assets \
-            --jq '.assets[].name' | LC_ALL=C sort >"$uploaded"
-          gh release view "$CANDIDATE_VERSION" --json assets \
-            --jq '.assets[] | [.name, .digest] | @tsv' \
-            | LC_ALL=C sort >"$uploaded_digests"
-          diff --unified "$expected" "$uploaded"
-          diff --unified "$expected_digests" "$uploaded_digests"

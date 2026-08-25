@@ -2,6 +2,7 @@ use backon::{BackoffBuilder as _, ExponentialBuilder};
 use std::future::Future;
 use std::time::Duration;
 use thiserror::Error;
+use yonder_core::wire::{ENTERPRISE_RESOLVE_PROTOCOL, RESOLVE_PROTOCOL};
 use yonder_net::behaviour::EndpointBehaviourEvent;
 use yonder_net::swarm::SwarmEvent;
 use yonder_net::{
@@ -9,7 +10,7 @@ use yonder_net::{
     ConnectionId, ConnectionSelection, ConnectionSelectionResult, DirectUpgradePolicy,
     EndpointNode, EndpointRelayAddress, EndpointRelaySet, Keypair, Libp2pApplicationStreams,
     ListenerId, Multiaddr, NetworkBuildError, NetworkNodeError, PeerId, SelectedPath,
-    TRANSPORT_TIMEOUT, WssTransportConfig, multiaddr, ping, relay,
+    TRANSPORT_TIMEOUT, WssTransportConfig, identify, multiaddr, ping, relay,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,6 +88,17 @@ pub enum EndpointEvent {
     ReservationReady(ReservationListenerId),
     ReservationClosed(ReservationListenerId),
     DialFailed(ConnectionId),
+    RelayAccessIdentified {
+        peer: PeerId,
+        mode: RelayAccessMode,
+    },
+}
+
+/// The access policy advertised by a configured relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAccessMode {
+    Standard,
+    Enterprise,
 }
 
 /// Terminal outcome of libp2p's bounded DCUtR attempt for one peer.
@@ -123,6 +135,11 @@ pub struct ConnectionBinding {
 }
 
 impl ConnectionBinding {
+    #[cfg(test)]
+    pub(crate) const fn for_test(peer: PeerId, connection: ConnectionId) -> Self {
+        Self { peer, connection }
+    }
+
     #[must_use]
     pub const fn peer(self) -> PeerId {
         self.peer
@@ -234,6 +251,7 @@ pub struct EndpointDriver {
     reservation: Option<ReservationSlot>,
     pending_relay_dials: PendingRelayDials,
     direct_upgrades: DirectUpgradeTracker,
+    relay_access: Option<(PeerId, RelayAccessMode)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +269,7 @@ impl EndpointDriver {
             reservation: None,
             pending_relay_dials: PendingRelayDials::new(),
             direct_upgrades: DirectUpgradeTracker::new(),
+            relay_access: None,
         }
     }
 
@@ -262,6 +281,13 @@ impl EndpointDriver {
     #[must_use]
     pub fn connection_count(&self, peer: &PeerId) -> usize {
         self.connections.count(peer)
+    }
+
+    #[must_use]
+    pub fn relay_access_mode(&self, peer: &PeerId) -> Option<RelayAccessMode> {
+        self.relay_access
+            .filter(|(identified, _)| identified == peer)
+            .map(|(_, mode)| mode)
     }
 
     #[must_use]
@@ -280,6 +306,23 @@ impl EndpointDriver {
             self.direct_upgrades.outcome(peer),
             Some(DirectUpgradeOutcome::Failed)
         )
+    }
+
+    /// Identifies the host-local DCUtR dial when symmetric hole punching left
+    /// two direct connections. The controller selects only from its own
+    /// roster; discarding this host-local duplicate leaves the counterpart of
+    /// the controller-initiated connection for the unique-connection barrier.
+    pub(crate) fn host_local_dcutr_duplicate(&self, peer: &PeerId) -> Option<ConnectionId> {
+        if self.connections.direct_count(peer) < 2 {
+            return None;
+        }
+        let DirectUpgradeOutcome::Connected(connection) = self.direct_upgrades.outcome(peer)?
+        else {
+            return None;
+        };
+        self.connections
+            .is_direct(peer, connection)
+            .then_some(connection)
     }
 
     pub fn bind(&self, peer: PeerId) -> Result<ConnectionBinding, EndpointError> {
@@ -445,6 +488,12 @@ impl EndpointDriver {
                     self.connections.closed(&peer_id, &connection_id);
                     if self.connections.count(&peer_id) == 0 {
                         self.direct_upgrades.remove(&peer_id);
+                        if self
+                            .relay_access
+                            .is_some_and(|(identified, _)| identified == peer_id)
+                        {
+                            self.relay_access = None;
+                        }
                     }
                     return EndpointEvent::Closed {
                         peer: peer_id,
@@ -471,6 +520,32 @@ impl EndpointDriver {
                         peer: event.remote_peer_id,
                         outcome,
                     };
+                }
+                SwarmEvent::Behaviour(EndpointBehaviourEvent::Identify(
+                    identify::Event::Received { peer_id, info, .. },
+                )) => {
+                    let enterprise = info
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.as_ref() == ENTERPRISE_RESOLVE_PROTOCOL);
+                    let standard = info
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.as_ref() == RESOLVE_PROTOCOL);
+                    let mode = if enterprise {
+                        Some(RelayAccessMode::Enterprise)
+                    } else if standard {
+                        Some(RelayAccessMode::Standard)
+                    } else {
+                        None
+                    };
+                    if let Some(mode) = mode {
+                        self.relay_access = Some((peer_id, mode));
+                        return EndpointEvent::RelayAccessIdentified {
+                            peer: peer_id,
+                            mode,
+                        };
+                    }
                 }
                 SwarmEvent::Behaviour(EndpointBehaviourEvent::Relay(
                     relay::client::Event::ReservationReqAccepted { .. },
@@ -1326,7 +1401,6 @@ pub async fn drive_bound<F: Future>(
     tokio::pin!(future);
     loop {
         tokio::select! {
-            biased;
             event = driver.next() => {
                 enforce_binding_after_event(driver, binding, &event)?;
             }
@@ -1371,7 +1445,7 @@ mod tests {
         LATE_DIRECT_SAMPLE_WINDOW, PendingRelayDials, RELAY_DIAL_WINDOW, RELAY_DRAIN_WINDOW,
         RelayConnection, ReservationDecision, ReservationLease, ReservationListenerId,
         ReservationSlot, SELECTION_WINDOW, TARGET_SELECTION_WINDOW, TARGET_SETTLE_TIMEOUT,
-        arm_late_sample_window, connect_configured_relay, connect_relay_attempt,
+        arm_late_sample_window, build_endpoint, connect_configured_relay, connect_relay_attempt,
         connect_target_until, converge_to_binding, dial_relay_set, drain_relay_state, drive,
         drive_bound, enforce_binding_after_event, finish_bound_output, finish_relay_selection,
         finish_target_selection, next_relay_dial, open_stream, process_relay_selection_event,
@@ -1379,12 +1453,23 @@ mod tests {
         reservation_decision, selected_relay_address, target_selection_is_settled,
         wait_for_reservation, wait_for_reservation_until,
     };
+    use crate::protocol::{
+        EnterpriseResolveUi, ReclaimResponse, RelayProtocolError, ResolveDeadline,
+        allocate_locator, enterprise_resolve_peer, reclaim_locator, resolve_peer,
+    };
     use backon::BackoffBuilder as _;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use yonder_core::wire::enterprise::{
+        AuthorizationUrl, EnterpriseResolveResponse, EnterpriseSelect, EnterpriseStart,
+    };
+    use yonder_core::wire::registry::{RegistryRequest, RegistryResponse};
+    use yonder_core::wire::resolve::{ResolveRequest, ResolveResponse};
+    use yonder_core::{EnterpriseProvider, EnterpriseProviders, Locator, PeerIdBytes, RetryAfter};
     use yonder_net::{
-        ConnectedPoint, ConnectionId, ConnectionSelection, DirectUpgradePolicy, EndpointNode,
-        EndpointRelayAddress, EndpointRelaySet, Keypair, ListenerId, Multiaddr, TRANSPORT_TIMEOUT,
-        WssTransportConfig,
+        ApplicationStream, ApplicationStreams, ConnectedPoint, ConnectionId, ConnectionSelection,
+        DirectUpgradePolicy, EndpointNode, EndpointRelayAddress, EndpointRelaySet, Keypair,
+        ListenerId, Multiaddr, TRANSPORT_TIMEOUT, WssTransportConfig,
     };
 
     #[test]
@@ -1517,6 +1602,42 @@ mod tests {
         assert!(driver.direct_upgrade_ready(&peer));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_discards_only_its_symmetric_dcutr_duplicate() {
+        let mut driver = endpoint_driver();
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let relay = ConnectionId::new_unchecked(710);
+        let local_direct = ConnectionId::new_unchecked(711);
+        let controller_direct = ConnectionId::new_unchecked(712);
+        assert!(driver.direct_upgrades.begin(peer));
+        driver
+            .direct_upgrades
+            .finish(peer, DirectUpgradeOutcome::Connected(local_direct));
+
+        driver
+            .connections
+            .established(peer, relay, relayed_listener_endpoint(710))
+            .unwrap();
+        driver
+            .connections
+            .established(peer, local_direct, listener_endpoint(711))
+            .unwrap();
+        assert_eq!(driver.host_local_dcutr_duplicate(&peer), None);
+
+        driver
+            .connections
+            .established(peer, controller_direct, listener_endpoint(712))
+            .unwrap();
+        assert_eq!(driver.host_local_dcutr_duplicate(&peer), Some(local_direct));
+        driver
+            .direct_upgrades
+            .finish(peer, DirectUpgradeOutcome::Failed);
+        assert_eq!(driver.host_local_dcutr_duplicate(&peer), None);
+
+        driver.connections.closed(&peer, &local_direct);
+        assert_eq!(driver.host_local_dcutr_duplicate(&peer), None);
+    }
+
     #[test]
     fn an_established_direct_candidate_outranks_relay_for_the_controller() {
         let relay = ConnectionId::new_unchecked(699);
@@ -1636,6 +1757,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_entire_fast_failed_relay_batch_can_schedule_another_attempt() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let connection = ConnectionId::new_unchecked(10);
         let mut driver = endpoint_driver();
@@ -1681,6 +1803,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reservation_lease_survives_temporary_extras_but_not_selected_connection_loss() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let identity = Keypair::generate_ed25519();
         let mut driver = EndpointDriver::new(
             EndpointNode::new(identity, WssTransportConfig::client(None)).unwrap(),
@@ -1747,6 +1870,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bound_io_rejects_additional_or_lost_physical_connections() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let identity = Keypair::generate_ed25519();
         let local_peer = identity.public().to_peer_id();
         let mut driver = EndpointDriver::new(
@@ -1815,6 +1939,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn driver_guards_and_absolute_deadlines_cover_failure_paths() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relay = relay_connection(relay_peer, 40);
@@ -1891,6 +2016,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_drain_classifies_lost_extra_and_unselected_connections() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let missing = ConnectionBinding {
             peer,
@@ -1963,6 +2089,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn relay_dial_and_stream_failures_are_structured_without_waiting() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relays = relay_set(relay_peer);
@@ -2008,6 +2135,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn listener_close_and_drive_consume_real_swarm_events() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
         let relay = relay_connection(relay_peer, 70);
@@ -2100,6 +2228,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn selection_event_helpers_cover_accept_reject_ping_close_and_ignore() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let other = Keypair::generate_ed25519().public().to_peer_id();
@@ -2215,6 +2344,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn selected_relay_address_is_canonical_and_bound_to_the_winner() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let loser = ConnectionId::new_unchecked(110);
         let winner = ConnectionId::new_unchecked(111);
@@ -2270,6 +2400,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn established_roster_overflow_and_drain_event_are_bounded() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         for connection in 200..208 {
@@ -2318,6 +2449,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bound_event_and_output_helpers_recheck_the_exact_roster() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
         let mut driver = endpoint_driver();
         let peer = Keypair::generate_ed25519().public().to_peer_id();
         let connection = ConnectionId::new_unchecked(120);
@@ -2374,6 +2506,564 @@ mod tests {
             finish_bound_output(&mut driver, binding, 7),
             Err(EndpointError::BoundConnectionLost)
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relayed_connections_beyond_tracker_capacity_are_closed_and_dropped() {
+        // Eight distinct relayed peers fill the direct-upgrade tracker;
+        // a ninth relayed connection must be closed without entering the
+        // roster, mirroring the roster-overflow guard for direct paths.
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let mut driver = endpoint_driver();
+        for index in 300..308_u16 {
+            let peer = Keypair::generate_ed25519().public().to_peer_id();
+            assert!(
+                driver
+                    .record_established(
+                        peer,
+                        ConnectionId::new_unchecked(usize::from(index)),
+                        relayed_listener_endpoint(index),
+                    )
+                    .is_some()
+            );
+        }
+        let overflow_peer = Keypair::generate_ed25519().public().to_peer_id();
+        assert!(
+            driver
+                .record_established(
+                    overflow_peer,
+                    ConnectionId::new_unchecked(308),
+                    relayed_listener_endpoint(308),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enabled_direct_policy_requires_direct_evidence_to_finish() {
+        // A relay-only selection can never satisfy the enabled direct
+        // policy: with no recorded outcome the selection must not settle
+        // at all, while the disabled policy still finishes on the relay.
+        let relay = ConnectionId::new_unchecked(699);
+        let mut relay_only = ConnectionSelection::new();
+        relay_only
+            .established(relay, &relayed_listener_endpoint(699))
+            .unwrap();
+        assert!(matches!(
+            finish_target_selection(&relay_only, None, DirectUpgradePolicy::Enabled),
+            Err(EndpointError::TargetUpgradeDidNotSettle)
+        ));
+        let empty = ConnectionSelection::new();
+        assert!(matches!(
+            finish_target_selection(&empty, None, DirectUpgradePolicy::Enabled),
+            Err(EndpointError::TargetUpgradeDidNotSettle)
+        ));
+        assert!(matches!(
+            finish_target_selection(&empty, None, DirectUpgradePolicy::Disabled),
+            Err(EndpointError::RelayUnavailable)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_attempt_hits_the_absolute_attempt_deadline() {
+        // A dial window far in the future with an attempt deadline in
+        // the near future: the timeout that lands at the attempt
+        // deadline must classify as RelayUnavailable.
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let mut driver = endpoint_driver();
+        let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
+        let relays = relay_set(relay_peer);
+        let now = tokio::time::Instant::now();
+        assert!(matches!(
+            connect_relay_attempt(
+                &mut driver,
+                &relays,
+                now + Duration::from_secs(1),
+                now + Duration::from_millis(150),
+            )
+            .await,
+            Err(EndpointError::RelayUnavailable)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dial_relay_set_continues_when_the_swarm_rejects_a_relay_dial() {
+        // The frozen connection limits deny the seventeenth concurrent
+        // outbound dial: the batch must log the rejection and keep the
+        // relay dial tracker empty instead of failing.
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let mut driver = endpoint_driver();
+        let relay_peer = Keypair::generate_ed25519().public().to_peer_id();
+        let relays = relay_set(relay_peer);
+        let address = relays.iter().next().unwrap().as_multiaddr().clone();
+        for _ in 0..16 {
+            driver.dial(address.clone()).unwrap();
+        }
+        assert!(dial_relay_set(&mut driver, &relays).is_ok());
+        assert!(driver.pending_relay_dials.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_endpoint_starts_the_frozen_direct_listener_stack() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let identity = Keypair::generate_ed25519();
+        let (driver, _streams) =
+            build_endpoint(identity.clone(), WssTransportConfig::client(None)).unwrap();
+        assert_eq!(driver.peer_id(), identity.public().to_peer_id());
+    }
+
+    struct UnexpectedEnterpriseUi {
+        called: bool,
+    }
+
+    impl EnterpriseResolveUi for UnexpectedEnterpriseUi {
+        fn select_provider(
+            &mut self,
+            _providers: EnterpriseProviders,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<EnterpriseProvider, RelayProtocolError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.called = true;
+            Box::pin(async { Err(RelayProtocolError::EnterpriseRejected) })
+        }
+
+        fn open_authorization(
+            &mut self,
+            _url: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RelayProtocolError>> + Send + '_>,
+        > {
+            self.called = true;
+            Box::pin(async { Err(RelayProtocolError::EnterpriseRejected) })
+        }
+    }
+
+    #[derive(Default)]
+    struct AcceptingEnterpriseUi {
+        selected: bool,
+        opened: bool,
+    }
+
+    impl EnterpriseResolveUi for AcceptingEnterpriseUi {
+        fn select_provider(
+            &mut self,
+            providers: EnterpriseProviders,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<EnterpriseProvider, RelayProtocolError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                assert!(providers.contains(EnterpriseProvider::WeCom));
+                self.selected = true;
+                Ok(EnterpriseProvider::WeCom)
+            })
+        }
+
+        fn open_authorization(
+            &mut self,
+            url: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RelayProtocolError>> + Send + '_>,
+        > {
+            assert_eq!(url, "https://relay.example/yonder/authorize");
+            self.opened = true;
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn answer_registry(
+        stream: ApplicationStream,
+        expected: RegistryRequest,
+        response: RegistryResponse,
+    ) {
+        let mut stream = stream.into_tokio();
+        let mut request = [0_u8; yonder_core::wire::registry::REQUEST_LEN];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(RegistryRequest::decode(&request).unwrap(), expected);
+        stream.write_all(&response.encode()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    async fn answer_resolve(
+        stream: ApplicationStream,
+        expected: Locator,
+        response: ResolveResponse,
+    ) {
+        let mut stream = stream.into_tokio();
+        let mut request = [0_u8; yonder_core::wire::resolve::REQUEST_LEN];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(
+            ResolveRequest::decode(&request).unwrap().locator(),
+            expected
+        );
+        stream
+            .write_all(response.encode().as_slice())
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    async fn answer_enterprise(
+        stream: ApplicationStream,
+        expected: Locator,
+        response: EnterpriseResolveResponse,
+    ) {
+        let mut stream = stream.into_tokio();
+        let mut request = [0_u8; 4];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(
+            EnterpriseStart::decode(&request).unwrap().locator(),
+            expected
+        );
+        stream
+            .write_all(response.encode().as_slice())
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    async fn answer_successful_enterprise(
+        stream: ApplicationStream,
+        expected: Locator,
+        resolved: yonder_net::PeerId,
+    ) {
+        let mut stream = stream.into_tokio();
+        let mut request = [0_u8; 4];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(
+            EnterpriseStart::decode(&request).unwrap().locator(),
+            expected
+        );
+        stream
+            .write_all(
+                EnterpriseResolveResponse::Providers(
+                    EnterpriseProviders::new(true, false).unwrap(),
+                )
+                .encode()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+        let mut selection = [0_u8; 2];
+        stream.read_exact(&mut selection).await.unwrap();
+        assert_eq!(
+            EnterpriseSelect::decode(&selection).unwrap().provider(),
+            EnterpriseProvider::WeCom
+        );
+        stream
+            .write_all(
+                EnterpriseResolveResponse::Authenticate(Box::new(
+                    AuthorizationUrl::new("https://relay.example/yonder/authorize").unwrap(),
+                ))
+                .encode()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                EnterpriseResolveResponse::Resolved(
+                    PeerIdBytes::new(&resolved.to_bytes()).unwrap(),
+                )
+                .encode()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_relay_protocol_retries_preserve_the_selected_connection() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await.unwrap();
+        let port = crate::available_test_tcp_port();
+        let relay_identity = Keypair::generate_ed25519();
+        let relay_peer = relay_identity.public().to_peer_id();
+        let mut relay_node =
+            EndpointNode::new(relay_identity, WssTransportConfig::client(None)).unwrap();
+        let mut relay_streams = relay_node.streams().clone();
+        let mut registry = relay_streams
+            .accept(yonder_core::wire::REGISTRY_PROTOCOL)
+            .unwrap();
+        let mut resolve = relay_streams
+            .accept(yonder_core::wire::RESOLVE_PROTOCOL)
+            .unwrap();
+        let mut enterprise = relay_streams
+            .accept(yonder_core::wire::ENTERPRISE_RESOLVE_PROTOCOL)
+            .unwrap();
+        relay_node
+            .swarm_mut()
+            .listen_on(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap())
+            .unwrap();
+        loop {
+            if matches!(
+                relay_node.next_event().await,
+                yonder_net::swarm::SwarmEvent::NewListenAddr { .. }
+            ) {
+                break;
+            }
+        }
+        let mut relay_driver = EndpointDriver::new(relay_node);
+
+        let mut endpoint_node = EndpointNode::new(
+            Keypair::generate_ed25519(),
+            WssTransportConfig::client(None),
+        )
+        .unwrap();
+        let mut endpoint_streams = endpoint_node.streams().clone();
+        let mut endpoint_driver = EndpointDriver::new(endpoint_node);
+        let relays = EndpointRelaySet::new(vec![
+            format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap(),
+        ])
+        .unwrap();
+        let locator = Locator::new(0xA_BCDE).unwrap();
+        let resolved = Keypair::generate_ed25519().public().to_peer_id();
+        let retry = RetryAfter::from_millis(100).unwrap();
+
+        let endpoint = async {
+            let relay = connect_configured_relay(&mut endpoint_driver, &relays)
+                .await
+                .unwrap();
+            assert_eq!(
+                allocate_locator(&mut endpoint_driver, &mut endpoint_streams, &relay)
+                    .await
+                    .unwrap(),
+                locator
+            );
+            assert_eq!(
+                reclaim_locator(&mut endpoint_driver, &mut endpoint_streams, &relay, locator,)
+                    .await
+                    .unwrap(),
+                ReclaimResponse::Reclaimed
+            );
+            assert_eq!(
+                resolve_peer(
+                    &mut endpoint_driver,
+                    &mut endpoint_streams,
+                    &relay,
+                    locator,
+                    ResolveDeadline::controller(),
+                )
+                .await
+                .unwrap(),
+                resolved
+            );
+            assert!(matches!(
+                allocate_locator(&mut endpoint_driver, &mut endpoint_streams, &relay).await,
+                Err(RelayProtocolError::Capacity)
+            ));
+            assert!(matches!(
+                reclaim_locator(&mut endpoint_driver, &mut endpoint_streams, &relay, locator,)
+                    .await,
+                Err(RelayProtocolError::Capacity)
+            ));
+            assert!(matches!(
+                resolve_peer(
+                    &mut endpoint_driver,
+                    &mut endpoint_streams,
+                    &relay,
+                    locator,
+                    ResolveDeadline::controller(),
+                )
+                .await,
+                Err(RelayProtocolError::Unavailable)
+            ));
+
+            let mut ui = UnexpectedEnterpriseUi { called: false };
+            assert!(matches!(
+                enterprise_resolve_peer(
+                    &mut endpoint_driver,
+                    &mut endpoint_streams,
+                    &relay,
+                    locator,
+                    ResolveDeadline::controller(),
+                    &mut ui,
+                )
+                .await,
+                Err(RelayProtocolError::UnexpectedResponse)
+            ));
+            assert!(!ui.called, "Retry and Unavailable must not consult the UI");
+
+            let mut ui = AcceptingEnterpriseUi::default();
+            assert_eq!(
+                enterprise_resolve_peer(
+                    &mut endpoint_driver,
+                    &mut endpoint_streams,
+                    &relay,
+                    locator,
+                    ResolveDeadline::controller(),
+                    &mut ui,
+                )
+                .await
+                .unwrap(),
+                resolved
+            );
+            assert!(ui.selected);
+            assert!(ui.opened);
+        };
+        let relay = async {
+            for (expected, response) in [
+                (RegistryRequest::Allocate, RegistryResponse::Retry(retry)),
+                (
+                    RegistryRequest::Allocate,
+                    RegistryResponse::Acquired(locator),
+                ),
+                (
+                    RegistryRequest::Reclaim(locator),
+                    RegistryResponse::Retry(retry),
+                ),
+                (
+                    RegistryRequest::Reclaim(locator),
+                    RegistryResponse::Acquired(locator),
+                ),
+            ] {
+                let (_, stream) = drive(&mut relay_driver, registry.next()).await.unwrap();
+                drive(
+                    &mut relay_driver,
+                    answer_registry(stream, expected, response),
+                )
+                .await;
+            }
+            for response in [
+                ResolveResponse::Retry(retry),
+                ResolveResponse::Resolved(PeerIdBytes::new(&resolved.to_bytes()).unwrap()),
+            ] {
+                let (_, stream) = drive(&mut relay_driver, resolve.next()).await.unwrap();
+                drive(&mut relay_driver, answer_resolve(stream, locator, response)).await;
+            }
+            for (expected, response) in [
+                (RegistryRequest::Allocate, RegistryResponse::Capacity),
+                (
+                    RegistryRequest::Reclaim(locator),
+                    RegistryResponse::Capacity,
+                ),
+            ] {
+                let (_, stream) = drive(&mut relay_driver, registry.next()).await.unwrap();
+                drive(
+                    &mut relay_driver,
+                    answer_registry(stream, expected, response),
+                )
+                .await;
+            }
+            let (_, stream) = drive(&mut relay_driver, resolve.next()).await.unwrap();
+            drive(
+                &mut relay_driver,
+                answer_resolve(stream, locator, ResolveResponse::Unavailable),
+            )
+            .await;
+            for response in [
+                EnterpriseResolveResponse::Retry(retry),
+                EnterpriseResolveResponse::Unavailable,
+            ] {
+                let (_, stream) = drive(&mut relay_driver, enterprise.next()).await.unwrap();
+                drive(
+                    &mut relay_driver,
+                    answer_enterprise(stream, locator, response),
+                )
+                .await;
+            }
+            let (_, stream) = drive(&mut relay_driver, enterprise.next()).await.unwrap();
+            drive(
+                &mut relay_driver,
+                answer_successful_enterprise(stream, locator, resolved),
+            )
+            .await;
+        };
+        tokio::join!(endpoint, relay);
+    }
+
+    async fn select_real_direct_with_remote_pause(
+        remote_resume_after: Option<Duration>,
+    ) -> super::SelectedConnection {
+        let port = crate::available_test_tcp_port();
+        let target_identity = Keypair::generate_ed25519();
+        let target = target_identity.public().to_peer_id();
+        let mut target_node =
+            EndpointNode::new(target_identity, WssTransportConfig::client(None)).unwrap();
+        target_node
+            .swarm_mut()
+            .listen_on(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap())
+            .unwrap();
+        loop {
+            if matches!(
+                target_node.next_event().await,
+                yonder_net::swarm::SwarmEvent::NewListenAddr { .. }
+            ) {
+                break;
+            }
+        }
+        let mut target_driver = EndpointDriver::new(target_node);
+        let mut controller = endpoint_driver();
+        let address: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{target}")
+            .parse()
+            .unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+
+        let select = async {
+            controller.dial(address).unwrap();
+            let selected = connect_target_until(
+                &mut controller,
+                target,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                DirectUpgradePolicy::Enabled,
+            )
+            .await
+            .unwrap();
+            stop_tx.send(()).unwrap();
+            selected
+        };
+        let serve = async {
+            loop {
+                if matches!(
+                    target_driver.next().await,
+                    EndpointEvent::Established { .. }
+                ) {
+                    break;
+                }
+            }
+            if let Some(delay) = remote_resume_after {
+                tokio::time::sleep(delay).await;
+                tokio::pin!(stop_rx);
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        _ = target_driver.next() => {}
+                    }
+                }
+            } else {
+                let _ = stop_rx.await;
+            }
+        };
+        let (selected, ()) = tokio::join!(select, serve);
+        selected
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_direct_selection_waits_for_the_bounded_late_quality_sample() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await.unwrap();
+        let selected = select_real_direct_with_remote_pause(None).await;
+
+        assert_eq!(selected.path().route(), yonder_net::CandidatePath::Direct);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_direct_selection_accepts_a_quality_sample_after_the_initial_window() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await.unwrap();
+        let selected = select_real_direct_with_remote_pause(Some(
+            TARGET_SELECTION_WINDOW + Duration::from_millis(100),
+        ))
+        .await;
+
+        assert_eq!(selected.path().route(), yonder_net::CandidatePath::Direct);
     }
 
     fn endpoint_driver() -> EndpointDriver {

@@ -55,7 +55,7 @@
 
 - 所有实现必须真实、完整、可靠。禁止提交占位实现、伪实现、生产路径 mock、`todo!()`、`unimplemented!()` 或掩盖失败的 fallback。
 - 每个功能都必须有与风险匹配的单元测试、集成测试、端到端测试、属性测试、模糊测试、性能测试和必要的平台测试。若某类测试确实不适用，必须说明理由并获得确认，不能自行省略。
-- 覆盖率采用项目所有者已确认的风险分级门禁：每个可工作的原生目标必须独立达到聚合 line `>=95%`、function `>=95%`、region `>=90%`、每文件 line `>=75%`、工具可测 branch `>=75%`。不得跨平台合并掩盖单一平台缺口；门槛只能在证据支持时提高，任何降低仍须重新审批。
+- 覆盖率采用项目所有者已确认的风险分级门禁：每个可工作的原生目标必须独立达到聚合 line `>=94%`、function `>=95%`、region `>=90%`、每文件 line `>=75%`、工具可测 branch `>=75%`。不得跨平台合并掩盖单一平台缺口；门槛只能在证据支持时提高，任何降低仍须重新审批。line 门槛由五目标独立报告校准：Windows x64 为 `95.050443%`，Linux x64/ARM64 与 macOS Intel/Apple Silicon 为 `94.857227%..94.956197%`，且三项其他聚合指标和每文件门槛均保有明显余量。未覆盖余量只用于类型和状态机不变量、平台条件路径及无法在不破坏资源边界的情况下真实触发的防御分支；不得为提高数字伪造非法内部状态、触发保护闭包、申请超大资源或排除生产代码。认证、协议、状态机、并发、资源边界和端到端风险仍必须由定向证据证明，不能用聚合百分比代替。
 - 已批准仅在 nightly coverage 专用构建中使用 `#[coverage(off)]` 排除 `#[cfg(test)]` 单元测试模块；独立 integration test、example 与 benchmark harness 使用 `cargo-llvm-cov 0.8.7` 官方默认的路径排除规则，fuzz harness 不属于生产 workspace coverage 输入。这些夹具不属于产品可执行逻辑，且其中“若执行即失败”的保护闭包不应为了覆盖率被人为调用。任何排除不得应用于生产模块、生产错误分支、平台实现、CLI、协议解析器、测试 seam 的生产实现或由生产源码映射出的可测分支。stable、MSRV、Miri、sanitizer 和正常发布构建不得启用 coverage 专用 cfg。
 - 已确认 `aarch64-pc-windows-msvc` 的覆盖率临时例外：Rust 上游 issue `#150123` 修复前，官方 LLVM coverage 无法在该目标可靠写出 profraw，因此该目标继续执行原生 Clippy、测试、release 构建、PE import/static CRT 检查和空目录 smoke，但不计入 coverage job。其余五个可工作的原生发布目标分别执行上述风险分级门禁；上游修复后必须立即取消例外并补齐第六目标。
 - 覆盖率未达门禁时必须报告精确数据和缺口分类，不得把失败结果称为完成、通过发布门禁或以排除替代真实生产路径测试。即使数值超过门槛，安全、认证、协议、状态机、资源边界和并发故障路径仍必须按风险补足定向、属性、模糊、压力与端到端证据，覆盖率百分比不能替代正确性证明。
@@ -147,7 +147,8 @@
 
 ## 已确认的中继信任边界
 
-- 中继必须按不可信基础设施设计；该约束同样适用于用户自建的中继。
+- 中继对终端/文件内容、端点身份和会话完整性必须按不可信基础设施设计；该约束同样适用于用户自建的中继。
+- 企业模式下，自建中继是企业成员准入的显式可信决策点：endpoint 不获得可独立验证的成员证明，中继被攻陷可以绕过这道附加成员门禁，但仍不能取得连接码秘密、绕过端点间 OPAQUE 或读取/修改端到端会话内容。企业中继的主机、二进制、配置、回调私钥和平台凭据必须按授权基础设施加固、审计和监控；审计中的 `AuthMode::Enterprise` 只证明双方经该已配置信任点建立会话，不证明 endpoint 独立验证了企业成员。
 - 中继可以获知连接所必需的元数据，包括双方网络地址、PeerId、连接时间、连接持续时间和转发流量大小；当前设计不承诺隐藏这些元数据。
 - 中继可以拒绝服务、中断连接、延迟或丢弃数据；端点必须正确检测并报告故障，但无法从协议上保证恶意中继提供可用服务。
 - 终端内容、按键、控制消息和后续文件数据必须在两个 `yon` 端点之间完成端到端加密与认证；中继只能注册、协调或转发密文。
@@ -253,4 +254,26 @@
 - Windows `PROGRAMDATA` 缺失、非 Unicode、为空或非绝对路径时继续 fail-closed；不为绕过系统层定位错误而猜目录或引入不安全 FFI。README 和产品契约必须明确此前置条件。
 - 仓库采用 `LICENSE-MIT` 与 `LICENSE-APACHE` 双许可证文本。已批准发布工具 `cargo-about 0.9.1`，仅启用 `cli`，用于生成独立 `THIRD-PARTY-LICENSES.html`；许可证资产必须纳入 checksum 和 provenance，但不得放入单二进制归档。
 - 网络验证采用经批准的风险驱动成对矩阵：每种传输、关键 NAT/地址族拓扑、故障类别及 Direct/Relayed 结果都必须有真实代表组合和最终选路断言，不要求制造低价值的完整笛卡尔积。中继不可信行为通过端到端认证流的篡改/截断测试与真实网络延迟、丢包、乱序、断连和重置验证；禁止为注入中继内部明文钩子而 fork 或重写官方 `libp2p-relay`。
-- tag workflow 只有在性能、资源、四目标各 `30min` 的发布 fuzz、风险驱动网络与故障矩阵、五目标覆盖率和六目标原生发布证据全部通过后才允许自动创建正式 GitHub Release。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
+- 发布门禁按精确提交只执行一次：release-candidate CI 负责六目标 stable Clippy/测试、五目标覆盖率、六目标 MSRV、Miri、sanitizer、供应链和四目标各 `30min` fuzz；Release 验证指定的同提交成功 CI run，只执行压力、六目标产物、静态链接/smoke、性能/资源、风险驱动网络、SBOM、许可证和候选 provenance。两者允许并行，Release 的最终聚合必须等待 CI 证据。Publish Release 只允许从 `main` 原样晋升指定的成功聚合候选，创建 annotated tag 与 immutable GitHub Release，不得重新构建、重跑重复门禁或混用其他 run 的资产。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
+- 真实 hosted macOS Apple Silicon runner 的 10 次完整 8 MiB 会话基线为本地 PTY 中位数 `69,295,391 B/s`、远端中位数 `33,872,120 B/s`、配对比率中位数 `0.488152`、MAD `0.059959`；据此 macOS 相对门槛为 `40%`，Linux/Windows 保持 `60%`。三平台远端绝对 `384 KiB/s`、10 次中位数和逐字节完整性门禁均不降低；该证据不外推为 macOS Intel 性能基线。
+
+## 已确认的 0.2.0 产品与发布基线
+
+- `0.2.0` 必须从 `v0.1.1` 独立重建；已撤回 `0.1.2`、`0.1.3`、`0.1.4` 的源码、提交、设计和测试只可作为审计材料，不得整提交 cherry-pick 或沿用其完成结论。
+- 普通 relay/会话保持 `v0.1.1` 终端、认证、隐私和 wire 兼容；增加原生单文件传输，审计默认关闭且不产生本地状态。
+- 企业 relay 只提供 Enterprise Resolve，支持企业微信和飞书自建应用，有效内部成员验证失败关闭且禁止回退普通 Resolve。企业会话必须由 `0.2.0` 双端在 Terminal Active 前完成可验证审计。
+- 项目所有者无法提供真实企业微信或飞书自建应用，`0.2.0` 不以真实平台联调作为发布硬门槛；必须以类型化 provider fixture、真实 HTTPS/TLS callback、OAuth 单次事务和完整故障矩阵验证 Yonder 自身语义，且不得把这些证据表述为平台官方环境认证。任一提供商首次生产启用前仍必须由部署方在真实自建应用中验证成功、拒绝、超时和禁止降级。
+- 新增协议 ID 固定为 `/yonder/enterprise-resolve/2.0.0`、`/yonder/file-transfer/2.0.0`、`/yonder/audit/3.0.0`；审计容器格式固定为 `format_version = 3`，终端退出码在线路、容器和共享控制事件中完整保留大端 `u32`。发布前未被接受的 audit v2 草案不得协商、降级或双解析，离线验证器必须把旧格式分类为不支持而非篡改；持久账本 `yonder-audit-ledger-genesis-v2` 谱系标签保持不变。拒绝版本使用过的其他扩展协议不得作为兼容回退。既有 auth/terminal/registry/普通 resolve 协议保持不变。
+- 文件传输固定使用交互式 `Ctrl+] u/d/?`，独立已认证子流、每会话一个传输、`64 KiB` 流式块、SHA-256、安全临时文件和 no-replace 提交；失败/取消不得结束终端。
+- 企业审计只存在于端点，不把终端/文件/审计内容交给 relay；不保存原始输入，使用会话私有 HMAC 承诺，保存完整输出，使用持久身份/账本、周期检查点、共同清单、双签名和安全离线 verify/replay。Windows 必须复用并验证受保护 DACL，不能可靠保护时失败关闭。
+- 企业审计整体建立预算固定为绝对 `30s`，包含身份/账本、记录创建、header 持久化与握手；单个审计 wire 读写继续固定为绝对 `10s`。运行期 checkpoint 是发送方签名观察与接收方签名回执，不要求接收瞬间本地快照相同；关闭必须先形成共享事实屏障、结清旧运行期交换，再以精确相同快照完成新的最终 checkpoint。sent/received 的序号和确认状态必须在运行时与离线验证中独立建模，双文件 interrupted 验证按方向交叉匹配并证明快照是双方链前缀。
+- 企业 provider 集合允许启动期有界动态分发；终端、文件和审计热路径使用静态分发。各状态由单一 owner 持有，任务间只使用有界 channel；审计磁盘 writer 在 Tokio runtime 外执行并对 append-before-effect 返回确认。
+- 正式 release 后硬删除 GitHub `v0.1.2`、`v0.1.3` Releases/tags，以 `--force-with-lease` 把 `main` 清理为 `v0.1.1 -> v0.2.0`，并删除相关 Actions runs、临时分支/worktree 和本地悬空对象。发布前只允许软撤回，以保留审计和借鉴材料。
+
+## 已确认的 0.2.0 直接依赖
+
+- 企业 HTTP：`reqwest 0.13.4`（`json,query,rustls-no-provider`）、`axum 0.8.9`（`http1,json,query,tokio,tracing`）、`axum-server 0.8.0`（`tls-rustls-no-provider`）、`open 5.4.1`（无 feature）、`serde_json 1.0.151`（`std`）。全部 `default-features = false`。Rustls provider 必须安装 workspace 已有 ring 实现；禁止旁路手写 Hyper HTTP 栈。
+- 文件传输把既有 `tempfile 3.27.0` 提升为 `yon` 生产依赖，继续 `default-features = false, features = ["getrandom"]`，用于同目录安全临时文件和成熟 no-replace 提交。
+- 审计：`ed25519-dalek 3.0.0`（`zeroize`）、`fs4 1.1.0`（`sync`）、`hkdf 0.13.0`（无 feature）、`hmac 0.13.0`（`zeroize`）、`sha2 0.11.0`（无 feature）、`vt100 0.16.2`（无 feature）；全部 `default-features = false`。
+- `sha2 0.10.9` 只作为 `opaque-ke 4.0.1` 公开 Digest 0.10 约束的兼容别名保留；文件与审计等新代码统一使用 `sha2 0.11.0`。禁止让 legacy digest 类型扩散到其他模块。
+- 上述依赖版本已于 2026-08-11 核实为采用范围内的最新稳定版本，MSRV 不高于 workspace 1.88，许可证兼容现有策略。实施后仍必须以实际 lockfile 完成安全、许可证、feature、静态链接、体积、性能与分配审计。

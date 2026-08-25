@@ -27,7 +27,7 @@ pub use identity::{decode_identity, encode_identity, peer_id_bytes};
 pub use libp2p::core::ConnectedPoint;
 pub use libp2p::core::transport::ListenerId;
 pub use libp2p::swarm::ConnectionId;
-pub use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr, ping, relay, swarm};
+pub use libp2p::{Multiaddr, PeerId, identify, identity::Keypair, multiaddr, ping, relay, swarm};
 pub use node::{EndpointNode, NetworkNodeError, RelayNode};
 pub use path::{
     CandidateId, CandidatePath, EstablishedOrder, PathCandidate, PathPolicy, PingSamples,
@@ -41,5 +41,5 @@ pub use tasks::{CancellationHandle, TaskFailure, TaskGroup, TaskShutdown};
 pub use transport::{
     TRANSPORT_TIMEOUT, WSS_CERTIFICATE_LIMIT, WssCertificateChain, WssPrivateKey,
     WssTransportConfig, WssTrustAnchors, build_endpoint_transport, build_relay_transport,
-    generate_identity,
+    contains_pem_marker, generate_identity,
 };

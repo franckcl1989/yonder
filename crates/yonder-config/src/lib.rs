@@ -704,8 +704,9 @@ mod tests {
     const RELAYS: ConfigurationKey = ConfigurationKey::new("relays");
     const CA: ConfigurationKey = ConfigurationKey::new("wss_ca_der");
     const COUNT: ConfigurationKey = ConfigurationKey::new("count");
+    const ACCESS_MODE: ConfigurationKey = ConfigurationKey::new("access_mode");
     const SCHEMA: ConfigurationSchema =
-        ConfigurationSchema::new(Application::Yon, &[RELAYS], &[COUNT], &[CA]);
+        ConfigurationSchema::new(Application::Yon, &[RELAYS], &[COUNT, ACCESS_MODE], &[CA]);
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
@@ -714,6 +715,7 @@ mod tests {
         wss_ca_der: Option<PathBuf>,
         #[serde(default)]
         count: u32,
+        access_mode: Option<String>,
     }
 
     #[derive(Debug)]
@@ -864,6 +866,8 @@ mod tests {
                 environment: vec![
                     ("YON_RELAYS".into(), "relay".into()),
                     ("YON_WSS_CA_DER".into(), "123".into()),
+                    ("YON_ACCESS_MODE".into(), "enterprise".into()),
+                    ("YON_RELAY_MODE".into(), "standard".into()),
                     ("YON_RELAY_IDENTITY".into(), "ignored".into()),
                 ],
             },
@@ -880,6 +884,7 @@ mod tests {
             loaded.source_layer(CA),
             Some(ConfigurationLayer::Environment)
         );
+        assert_eq!(loaded.value().access_mode.as_deref(), Some("enterprise"));
     }
 
     #[test]

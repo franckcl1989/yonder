@@ -31,6 +31,11 @@ impl TerminalChunk {
         }
     }
 
+    #[must_use]
+    pub const fn capacity() -> usize {
+        CHUNK_CAPACITY
+    }
+
     pub fn writable(&mut self) -> &mut [u8] {
         &mut self.bytes
     }

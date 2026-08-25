@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Run the four 30-minute fuzz gates for release evidence
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -38,15 +44,27 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --doc
 
   test:
+    name: Native ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-15]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,22 +74,30 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --workspace --all-targets --all-features
+          targets: ${{ matrix.target }}
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - run: cargo clippy --locked --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
       - name: Lint strict relay-only controller rebuild
         env:
           RUSTFLAGS: --cfg yonder_e2e_rebuild
-        run: cargo clippy --locked -p yon --tests -- -D warnings
+        run: cargo clippy --locked -p yon --tests --target ${{ matrix.target }} -- -D warnings
       - name: Prove strict relay-only controller rebuild
         env:
           RUSTFLAGS: --cfg yonder_e2e_rebuild
         run: >-
           cargo test --locked -p yon --test end_to_end
+          --target ${{ matrix.target }}
           strict_relay_only_fallback_rebuilds_the_controller_swarm -- --exact
       - name: Reject the test-only rebuild cfg in release builds
         shell: bash
         run: |
-          if RUSTFLAGS='--cfg yonder_e2e_rebuild' cargo check --locked --release -p yon; then
+          if RUSTFLAGS='--cfg yonder_e2e_rebuild' cargo check --locked --release -p yon --target '${{ matrix.target }}'; then
             echo 'test-only rebuild cfg entered a release build' >&2
             exit 1
           fi
@@ -191,7 +217,7 @@ jobs:
         shell: bash
         env:
           FUZZ_TARGET: ${{ matrix.target }}
-          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '60' }}
+          FUZZ_SECONDS: ${{ (github.event_name == 'schedule' || inputs.release_candidate) && '1800' || '60' }}
         run: |
           if [[ "$FUZZ_TARGET" == "network_address" ]]; then
             cargo +nightly-2026-07-22 fuzz run "$FUZZ_TARGET" --target x86_64-unknown-linux-gnu --features network-address -- -max_total_time="$FUZZ_SECONDS" -timeout=10
@@ -270,3 +296,28 @@ jobs:
           --ignore RUSTSEC-2026-0119
           --ignore RUSTSEC-2024-0436
       - run: cargo deny -L error --manifest-path fuzz/Cargo.toml --locked --config fuzz/deny.toml check
+
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [workflow-lint, check, test, coverage, msrv, fuzz, miri, sanitizer, supply-chain]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        shell: bash
+        run: |
+          test "$RESULTS" = "success success success success success success success success success"
+
+  release-gate:
+    name: Release gate
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.release_candidate
+    needs: ci-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the complete release-candidate CI gate
+        env:
+          CI_GATE_RESULT: ${{ needs.ci-gate.result }}
+        shell: bash
+        run: test "$CI_GATE_RESULT" = success

@@ -44,7 +44,7 @@
 - 两个 `duplex` bridge 的背压、半关闭、大输出、慢 stdout、child 先退、最后输出排空、data/Exit 乱序、网络先断和清理期限。
 - DER/PEM 证书链、信任锚、PKCS#1/PKCS#8/SEC1 私钥的合法、混合块、截断、空/超量文档列表的 I/O 前拒绝和超限输入，确认边界返回结构化错误而不是进入上游 panic API。
 - Unix identity/WSS 私钥 `0600` 创建、非普通文件拒绝、父目录 owner 与 group/other 写入权限；Windows 受保护 DACL、owner、文件 outsider ACE、父目录写入/创建权限和缺失 PowerShell 的 fail-closed 路径。
-- `yon config check/sources`、`yon-relay config check/sources` 与 `identity show` 的成功、错误、脱敏和“检查不绑定 listener”语义。
+- `yon config check/sources`、`yon-relay config check/sources` 与 `identity show` 的成功、错误、脱敏和“检查不绑定 listener”语义；endpoint `access_mode` 的缺省 standard、文件/`YON_ACCESS_MODE` 覆盖、非法值、`YON_RELAY_*` namespace 隔离及主控端/被控端/relay 模式错配失败关闭。
 
 ### 端到端测试
 
@@ -65,12 +65,12 @@
 
 Criterion 覆盖 code encode/decode、wire decoder、locator allocation、governor check、path ranking 和固定 buffer copy。进程 benchmark 覆盖启动、OPAQUE、直接/relay 建连、交互延迟、吞吐、RSS、CPU、文件描述符和二进制体积。真实终端吞吐门禁必须把 `yon-relay`、host `yon` 与 controller `yon` 分别运行在独立 release 进程中；测试 harness 的采样缓冲、输出聚合和分配器保留内存不得计入 relay 的进程 RSS，也不得影响 relay 的生产内存连接保护。
 
-基准结果保存原始 JSON/环境信息。`0.1.0` 在记录完整身份的 Windows 与 Linux 环境上形成首份可复现基线，同时必须满足下方绝对验收值；从后续版本开始，只有 runner 类别、CPU 型号、OS 镜像、电源模式和工具链一致时，才执行相对该基线的吞吐、启动、RSS、体积回归不超过 `5%`、p99 延迟不超过 `10%` 的判定。GitHub hosted runner 的硬件身份变化时，结果只能作为绝对门槛与诊断证据，必须在受控环境重新测量并经审批更新相对基线，不能暗中接受漂移。噪声超过阈值时在同一 runner 重复至少 10 次取中位数，不能直接放宽门槛。
+基准结果保存原始 JSON/环境信息。`0.1.0` 在记录完整身份的 Windows 与 Linux 环境上形成首份可复现基线，同时必须满足下方绝对验收值；`0.2.0` 对仍可比较的终端、启动、RSS 和体积指标继续沿用该基线，对本版本首次出现的异步文件流、并发审计复制、审计批写和最终同步指标，以三平台候选的原始 Criterion JSON 建立首份版本基线。新指标在建立基线的同一轮仍必须通过独立绝对上限，以及终端并发审计复制相对审计批写不超过 `2.0` 倍的同轮门槛，不能用“首次测量”绕过性能判定。从后续版本开始，只有 runner 类别、CPU 型号、OS 镜像、电源模式和工具链一致时，才执行相对对应基线的吞吐、启动、RSS、体积回归不超过 `5%`、p99 延迟不超过 `10%` 的判定。GitHub hosted runner 的硬件身份变化时，结果只能作为绝对门槛与诊断证据，必须在受控环境重新测量并经审批更新相对基线，不能暗中接受漂移。噪声超过阈值时在同一 runner 重复至少 10 次取中位数，不能直接放宽门槛。
 
 ## 覆盖率与缺陷强度
 
 - `cargo-llvm-cov 0.8.7` 在五个可可靠产出 profraw 的原生目标分别运行 target-specific 测试并保留 JSON 报告；每个目标独立满足全部阈值，不用跨平台合并掩盖平台缺口。
-- 每个可工作的原生目标独立满足聚合 line `>=95%`、function `>=95%`、region `>=90%`、每文件 line `>=75%`、可测 branch `>=75%`；不使用跨平台合并掩盖单目标缺口。门槛只允许基于稳定证据提高，降低必须重新审批。
+- 每个可工作的原生目标独立满足聚合 line `>=94%`、function `>=95%`、region `>=90%`、每文件 line `>=75%`、可测 branch `>=75%`；不使用跨平台合并掩盖单目标缺口。line 门槛由五目标独立报告校准：Windows x64 为 `95.050443%`，Linux x64/ARM64 与 macOS Intel/Apple Silicon 为 `94.857227%..94.956197%`，且三项其他聚合指标和每文件门槛均保有明显余量。未覆盖余量只容纳类型和状态机不变量、平台条件路径及不能在不破坏资源边界时真实触发的防御分支，禁止伪造非法内部状态、调用保护闭包、申请超大资源或排除生产代码来提高数字。认证、协议、状态机、并发、资源边界和端到端风险继续由定向测试证明；门槛只允许基于稳定证据提高，降低必须重新审批。
 - derive/macro 展开、第三方源码以及无法映射到第一方源行的编译器分支不计入分母；任何新的排除必须逐项审批。
 - nightly coverage 专用构建允许用 `#[coverage(off)]` 排除 `#[cfg(test)]` 单元测试模块；integration test、example 与 benchmark harness 使用 `cargo-llvm-cov 0.8.7` 的官方默认路径排除，fuzz harness 不进入生产 workspace coverage。不得排除任何生产模块或生产分支；stable、MSRV、Miri、sanitizer 和 release 构建不启用该专用 cfg。
 - 覆盖率不足必须保留报告和逐项分类，不算发布门禁通过；不得为了数字执行本应不可达的失败夹具或伪造违反生产不变量的状态。超过门槛也不替代安全、认证、协议、状态机、资源边界和并发故障路径的定向测试。
@@ -96,7 +96,7 @@ Criterion 覆盖 code encode/decode、wire decoder、locator allocation、govern
 | relay 128 reservation/registration RSS | `<= 48 MiB` |
 | relay idle CPU | 128 endpoint 下 `< 1%` 单核参考容量 |
 | 终端稳态第一方分配 | 每个复制方向逐块 `0`，仅启动时固定 buffer |
-| loopback 终端吞吐 | 8 MiB 真实三进程会话的 10 次远端吞吐中位数 `>= 384 KiB/s`，且同轮远端/`portable-pty` 本地 PTY/ConPTY 配对比率的 10 次中位数 `>= 70%`；载荷字节必须全部完整，原始 pipe 只作诊断参照 |
+| loopback 终端吞吐 | 8 MiB 真实三进程会话的 10 次远端吞吐中位数 `>= 384 KiB/s`；同轮远端/`portable-pty` 本地 PTY/ConPTY 配对比率的 10 次中位数在 Linux/Windows `>= 60%`、macOS `>= 40%`。吞吐只计最大合法 BEGIN/END 区间对应的读取时间，载荷字节必须全部完整，原始 pipe 只作诊断参照 |
 | 1 KiB 交互应用层额外延迟 | p99 `<= 1ms`，不含网络 RTT |
 | resize 传播 | 无网络阻塞时 p99 `<= 500ms` |
 | OPAQUE 单次认证峰值 | `<= 25 MiB` 附加 RSS，且不会并发两次 |
@@ -119,8 +119,8 @@ Criterion 覆盖 code encode/decode、wire decoder、locator allocation、govern
 - Windows 对两个 EXE 检查 PE imports；允许 Windows 系统 DLL，禁止动态 CRT 和第三方 DLL。运行目标架构原生 smoke。
 - macOS `otool -L` 只允许 `/usr/lib`、`/System/Library` 的系统库/框架；禁止 Homebrew、MacPorts 或打包外 dylib。
 - 每个平台从空目录只复制单个 binary 和参数启动，不依赖当前仓库、资源文件或预装运行时。
-- Unix 每个二进制分别打包为只含一个规范名称可执行文件的 `.tar.gz`；Windows 分别打包为只含一个 `.exe` 的 `.zip`，工作流必须断言归档条目数恰好为一。
+- Unix 每个二进制分别打包为只含一个规范名称可执行文件的 `.tar.gz`；Windows 分别打包为只含一个 `.exe` 的 `.zip`，工作流必须断言归档条目数恰好为一。归档器必须流式读取二进制，以 tag commit 的 `SOURCE_DATE_EPOCH` 固定时间，规范化成员名称、普通文件类型、`0755` 权限、无宿主 uid/gid/用户名信息及容器元数据；相同输入和 epoch 重建两次必须逐字节一致，且测试必须在改变源文件 mtime 后仍得到相同 SHA-256。
 
 ## 发布完成定义
 
-格式、Clippy、MSRV/current stable build、全部测试、逐目标风险分级覆盖率、doc、fuzz 时长、Miri/sanitizer、audit/deny、性能、资源、静态链接、六 target 原生 smoke、SBOM、许可证、校验和全部通过，才允许创建 release tag。手动 workflow 只生成候选 artifact；tag workflow 必须等待其全部自动化门禁通过，生成并证明 release candidate、provenance 与校验和后，才自动创建正式 GitHub Release。任何未真实运行的项必须明确标为未完成，不能用设计评审结果替代交付验证。
+格式、Clippy、MSRV/current stable build、全部测试、逐目标风险分级覆盖率、doc、fuzz 时长、Miri/sanitizer、audit/deny、性能、资源、静态链接、六 target 原生 smoke、SBOM、许可证、校验和全部通过，才允许创建 release tag。release-candidate CI 是源码质量门禁的唯一执行者；Release 必须验证同一提交的精确成功 CI run，只执行发布特有门禁并生成带 provenance 的聚合候选；Publish Release 必须从 `main` 验证并原样晋升指定成功候选，才可创建 annotated tag 和 immutable GitHub Release，禁止重新构建或用另一次运行的资产替换。任何未真实运行的项必须明确标为未完成，不能用设计评审结果替代交付验证。

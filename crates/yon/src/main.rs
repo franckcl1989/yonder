@@ -18,12 +18,14 @@ use yon::controller::{
     run_controller_with_progress,
 };
 use yon::host::{HostConfig, HostError, HostStage, run_host_with_progress};
+use yon::network::RelayAccessMode;
 use yon::progress::OperationProgress;
 use yon::protocol::RelayProtocolError;
 use yonder_config::{
     Application, ConfigLoader, ConfigurationError, ConfigurationKey, ConfigurationSchema,
     ConfigurationValues, LayeredConfigLoader,
 };
+use yonder_core::wire::audit::AuditRole;
 use yonder_core::{CodeError, ConnectionCode, OsSecureRandom, write_error_report};
 use yonder_net::{
     AddressError, EndpointRelayAddress, EndpointRelaySet, NetworkBuildError, WSS_CERTIFICATE_LIMIT,
@@ -33,15 +35,16 @@ use zeroize::Zeroizing;
 
 const MAX_CA_DOCUMENT: u64 = 1024 * 1024;
 const MAX_CODE_TEXT: usize = 19;
-const RUNTIME_STACK_SIZE: usize = 8 * 1024 * 1024;
+const RUNTIME_STACK_SIZE: usize = 32 * 1024 * 1024;
 const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const RELAYS_KEY: ConfigurationKey = ConfigurationKey::new("relays");
 const WSS_CA_KEY: ConfigurationKey = ConfigurationKey::new("wss_ca");
 const WSS_CA_DER_KEY: ConfigurationKey = ConfigurationKey::new("wss_ca_der");
+const ACCESS_MODE_KEY: ConfigurationKey = ConfigurationKey::new("access_mode");
 const ENDPOINT_SCHEMA: ConfigurationSchema = ConfigurationSchema::new(
     Application::Yon,
     &[RELAYS_KEY, WSS_CA_KEY, WSS_CA_DER_KEY],
-    &[],
+    &[ACCESS_MODE_KEY],
     &[WSS_CA_KEY, WSS_CA_DER_KEY],
 );
 
@@ -76,11 +79,23 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Verify or safely replay enterprise session audit files offline.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
 }
 
 impl Command {
     const fn uses_terminal_ui(&self) -> bool {
-        matches!(self, Self::Host | Self::Connect { .. })
+        matches!(
+            self,
+            Self::Host
+                | Self::Connect { .. }
+                | Self::Audit {
+                    command: AuditCommand::Replay { .. }
+                }
+        )
     }
 }
 
@@ -90,6 +105,24 @@ enum ConfigCommand {
     Check,
     /// Show configuration sources in increasing precedence order.
     Sources,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Verify one audit record or a bilateral record pair.
+    Verify {
+        #[arg(value_name = "LOCAL_FILE")]
+        local_file: PathBuf,
+        #[arg(value_name = "PEER_FILE")]
+        peer_file: Option<PathBuf>,
+    },
+    /// Replay a controller display timeline through a safe virtual terminal.
+    Replay {
+        #[arg(value_name = "CONTROLLER_FILE")]
+        controller_file: PathBuf,
+        #[arg(value_name = "PEER_FILE")]
+        peer_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone)]
@@ -124,6 +157,25 @@ struct EndpointSettings {
     relays: Vec<String>,
     wss_ca: Option<ConfigurationValues<PathBuf>>,
     wss_ca_der: Option<ConfigurationValues<PathBuf>>,
+    #[serde(default)]
+    access_mode: ConfiguredAccessMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ConfiguredAccessMode {
+    #[default]
+    Standard,
+    Enterprise,
+}
+
+impl From<ConfiguredAccessMode> for RelayAccessMode {
+    fn from(value: ConfiguredAccessMode) -> Self {
+        match value {
+            ConfiguredAccessMode::Standard => Self::Standard,
+            ConfiguredAccessMode::Enterprise => Self::Enterprise,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -207,6 +259,12 @@ enum AppError {
     Host(#[from] HostError),
     #[error(transparent)]
     Controller(#[from] ControllerError),
+    #[error(transparent)]
+    AuditVerify(#[from] yon::audit::verify::VerifyError),
+    #[error(transparent)]
+    AuditReplay(#[from] yon::audit::replay::ReplayError),
+    #[error("failed to report the audit result")]
+    AuditOutput(#[source] std::io::Error),
 }
 
 fn main() -> ExitCode {
@@ -341,7 +399,7 @@ fn run_command(command: Command) -> Result<u32, AppError> {
 fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Result<u32, AppError> {
     match command {
         Command::Host => {
-            let (relays, wss) = endpoint_config()?;
+            let (relays, wss, access) = endpoint_config()?;
             let identity = generate_identity(&mut OsSecureRandom)?;
             let terminal_output = std::io::stdout().is_terminal()
                 && std::io::stderr().is_terminal()
@@ -349,13 +407,13 @@ fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Resul
             let mut progress = TerminalProgress::new(std::io::stderr(), terminal_output);
             runtime
                 .block_on(run_host_with_progress(
-                    HostConfig::new(identity, relays, wss),
+                    HostConfig::new(identity, relays, wss, access),
                     &mut progress,
                 ))
                 .map_err(AppError::from)
         }
         Command::Connect { code } => {
-            let (relays, wss) = endpoint_config()?;
+            let (relays, wss, access) = endpoint_config()?;
             let code = code.map_or_else(read_connection_code, ConnectionCodeArgument::into_code)?;
             let terminal = local_terminal_hello()?;
             let identity = generate_identity(&mut OsSecureRandom)?;
@@ -365,7 +423,7 @@ fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Resul
             let mut progress = TerminalProgress::new(std::io::stderr(), terminal_output);
             runtime
                 .block_on(run_controller_with_progress(
-                    ControllerConfig::new(identity, relays, wss, code, terminal),
+                    ControllerConfig::new(identity, relays, wss, code, terminal, access),
                     &mut progress,
                 ))
                 .map_err(map_controller_error)
@@ -379,7 +437,157 @@ fn execute_command(runtime: &tokio::runtime::Runtime, command: Command) -> Resul
             }
             ConfigCommand::Sources => report_configuration_sources(),
         },
+        Command::Audit { command } => match command {
+            AuditCommand::Verify {
+                local_file,
+                peer_file,
+            } => run_audit_verify(&local_file, peer_file.as_deref()),
+            AuditCommand::Replay {
+                controller_file,
+                peer_file,
+            } => run_audit_replay(&controller_file, peer_file.as_deref()),
+        },
     }
+}
+
+fn run_audit_verify(local_file: &Path, peer_file: Option<&Path>) -> Result<u32, AppError> {
+    let report = yon::audit::verify::verify_files(
+        local_file,
+        peer_file,
+        &yon::audit::verify::PlatformAnchorLookup,
+    )?;
+    print_verification_report(&report)?;
+    Ok(report.state.exit_code())
+}
+
+fn run_audit_replay(controller_file: &Path, peer_file: Option<&Path>) -> Result<u32, AppError> {
+    let result = yon::audit::replay::replay_session(&yon::audit::replay::ReplayConfig {
+        controller_path: controller_file.to_path_buf(),
+        peer_path: peer_file.map(Path::to_path_buf),
+    })?;
+    match result {
+        yon::audit::replay::ReplayResult::Replayed(report) => {
+            print_replay_report(&report)?;
+            Ok(if report.interrupted {
+                130
+            } else {
+                report.state.exit_code()
+            })
+        }
+        yon::audit::replay::ReplayResult::Refused { state, reason } => {
+            writeln!(
+                std::io::stderr().lock(),
+                "audit replay refused: {} ({reason})",
+                state.name()
+            )
+            .map_err(AppError::AuditOutput)?;
+            Ok(state.exit_code())
+        }
+    }
+}
+
+fn print_verification_report(
+    report: &yon::audit::verify::VerificationReport,
+) -> Result<(), AppError> {
+    let mut output = std::io::stdout().lock();
+    write_verification_report(&mut output, report)
+}
+
+fn write_verification_report(
+    output: &mut impl std::io::Write,
+    report: &yon::audit::verify::VerificationReport,
+) -> Result<(), AppError> {
+    if let Some(session_id) = &report.session_id {
+        writeln!(output, "session: {}", hex_digest(session_id.as_bytes()))
+            .map_err(AppError::AuditOutput)?;
+    }
+    for file in [&report.controller, &report.host].into_iter().flatten() {
+        let role = match file.role {
+            AuditRole::Controller => "controller",
+            AuditRole::Host => "host",
+        };
+        writeln!(
+            output,
+            "{role}: {} finalized={} shared-events=[{} {} {} {}] local-events={}",
+            file.path.display(),
+            file.finalized,
+            file.shared_counts[0],
+            file.shared_counts[1],
+            file.shared_counts[2],
+            file.shared_counts[3],
+            file.local_event_count,
+        )
+        .map_err(AppError::AuditOutput)?;
+        if file.truncated_tail {
+            writeln!(output, "{role}: truncated tail; verified prefix retained")
+                .map_err(AppError::AuditOutput)?;
+        }
+    }
+    writeln!(output, "verification: {}", report.state.name()).map_err(AppError::AuditOutput)?;
+    if let Some(reason) = report.reason {
+        writeln!(output, "reason: {reason}").map_err(AppError::AuditOutput)?;
+    }
+    if report.anchor.identity_matched || report.anchor.ledger_continuous {
+        writeln!(
+            output,
+            "anchor: identity-matched={} ledger-continuous={}",
+            report.anchor.identity_matched, report.anchor.ledger_continuous
+        )
+        .map_err(AppError::AuditOutput)?;
+    }
+    Ok(())
+}
+
+fn print_replay_report(report: &yon::audit::replay::ReplayReport) -> Result<(), AppError> {
+    let mut output = std::io::stdout().lock();
+    write_replay_report(&mut output, report)
+}
+
+fn write_replay_report(
+    output: &mut impl std::io::Write,
+    report: &yon::audit::replay::ReplayReport,
+) -> Result<(), AppError> {
+    writeln!(output, "verification: {}", report.state.name()).map_err(AppError::AuditOutput)?;
+    if report.unpaired {
+        writeln!(
+            output,
+            "warning: no peer file was provided; bilateral consistency is not certified"
+        )
+        .map_err(AppError::AuditOutput)?;
+    }
+    writeln!(
+        output,
+        "display: {} records, {} bytes; final screen: {}x{}",
+        report.display_records, report.display_bytes, report.final_screen.0, report.final_screen.1
+    )
+    .map_err(AppError::AuditOutput)?;
+    if report.filtered.total() > 0 {
+        writeln!(
+            output,
+            "filtered controls: title={} clipboard={} resize={} unhandled={}",
+            report.filtered.title,
+            report.filtered.clipboard,
+            report.filtered.resize_request,
+            report.filtered.unhandled
+        )
+        .map_err(AppError::AuditOutput)?;
+    }
+    if report.bells > 0 {
+        writeln!(output, "suppressed bells: {}", report.bells).map_err(AppError::AuditOutput)?;
+    }
+    if report.interrupted {
+        writeln!(output, "replay stopped by Ctrl+C").map_err(AppError::AuditOutput)?;
+    }
+    Ok(())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn connection_code_input_error(error: CodeError) -> AppError {
@@ -551,6 +759,9 @@ impl<W: std::io::Write> OperationProgress<ControllerStage> for TerminalProgress<
         let message = match stage {
             ControllerStage::ConnectingRelay => "Connecting to relay...",
             ControllerStage::ResolvingHost => "Finding remote host...",
+            ControllerStage::WaitingForEnterpriseAuthorization => {
+                "Waiting for enterprise authorization..."
+            }
             ControllerStage::EstablishingPath => "Establishing the best available path...",
             ControllerStage::RelayFallback => "Direct path unavailable; switching to relay...",
             ControllerStage::Authenticating => "Authenticating remote host...",
@@ -633,13 +844,13 @@ fn read_connection_code_from(reader: &mut impl Read) -> Result<ConnectionCode, A
     text.parse().map_err(connection_code_input_error)
 }
 
-fn endpoint_config() -> Result<(EndpointRelaySet, WssTransportConfig), AppError> {
+fn endpoint_config() -> Result<(EndpointRelaySet, WssTransportConfig, RelayAccessMode), AppError> {
     endpoint_config_with(&LayeredConfigLoader::system(ENDPOINT_SCHEMA))
 }
 
 fn endpoint_config_with(
     loader: &impl ConfigLoader<EndpointSettings>,
-) -> Result<(EndpointRelaySet, WssTransportConfig), AppError> {
+) -> Result<(EndpointRelaySet, WssTransportConfig, RelayAccessMode), AppError> {
     let loaded = loader.load()?;
     let ca_paths = match (&loaded.value().wss_ca, &loaded.value().wss_ca_der) {
         (Some(paths), Some(_))
@@ -682,7 +893,7 @@ fn endpoint_config_with(
     let wss = WssTransportConfig::client_with_trust(trust);
     wss.validate_tls_material()
         .map_err(AppError::WssConfiguration)?;
-    Ok((relays, wss))
+    Ok((relays, wss, loaded.value().access_mode.into()))
 }
 
 fn read_ca(path: &Path) -> Result<Vec<u8>, AppError> {
@@ -754,12 +965,13 @@ fn write_remote_exit_warning(output: &mut impl std::io::Write, code: u32) -> std
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppError, Cli, Command, ConfigCommand, ConnectionCodeArgument, ENDPOINT_SCHEMA,
-        LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
-        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, map_controller_error,
-        open_diagnostic_log, portable_process_exit, process_result, read_ca, read_ca_document,
-        read_connection_code_from, run, terminal_supports_progress, validate_diagnostic_output,
-        write_remote_exit_warning,
+        AppError, AuditCommand, Cli, Command, ConfigCommand, ConnectionCodeArgument,
+        ENDPOINT_SCHEMA, LevelFilter, LogLevel, RUNTIME_SHUTDOWN_TIMEOUT, TerminalProgress,
+        command_uses_terminal_ui, diagnostic_filter, endpoint_config_with, execute_command,
+        hex_digest, map_controller_error, open_diagnostic_log, portable_process_exit,
+        process_result, read_ca, read_ca_document, read_connection_code_from, run,
+        terminal_supports_progress, validate_diagnostic_output, write_remote_exit_warning,
+        write_replay_report, write_verification_report,
     };
     use clap::Parser;
     use std::cell::Cell;
@@ -772,6 +984,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use yon::controller::ControllerStage;
     use yon::host::HostStage;
+    use yon::network::RelayAccessMode;
     use yon::progress::OperationProgress as _;
     use yonder_config::{ConfigurationLocationError, ConfigurationSources, LayeredConfigLoader};
     use yonder_net::Keypair;
@@ -795,6 +1008,33 @@ mod tests {
             checked.command,
             Command::Config {
                 command: ConfigCommand::Check
+            }
+        ));
+        let verified = Cli::try_parse_from(["yon", "audit", "verify", "local.yonaudit"]).unwrap();
+        assert!(matches!(
+            verified.command,
+            Command::Audit {
+                command: AuditCommand::Verify {
+                    peer_file: None,
+                    ..
+                }
+            }
+        ));
+        let replayed = Cli::try_parse_from([
+            "yon",
+            "audit",
+            "replay",
+            "controller.yonaudit",
+            "host.yonaudit",
+        ])
+        .unwrap();
+        assert!(matches!(
+            replayed.command,
+            Command::Audit {
+                command: AuditCommand::Replay {
+                    peer_file: Some(_),
+                    ..
+                }
             }
         ));
         let logged = Cli::try_parse_from([
@@ -825,6 +1065,7 @@ mod tests {
                 "  host     Advertise this user's current shell as a single-use remote terminal\n",
                 "  connect  Connect this terminal to an advertised host\n",
                 "  config   Inspect and validate endpoint configuration\n",
+                "  audit    Verify or safely replay enterprise session audit files offline\n",
                 "  help     Print this message or the help of the given subcommand(s)\n\n",
                 "Options:\n",
                 "      --log-level <LOG_LEVEL>  Diagnostic verbosity. Interactive diagnostics require --log-file or stderr redirection [default: error] [possible values: off, error, warn, info, debug, trace]\n",
@@ -896,6 +1137,26 @@ mod tests {
             true,
             true
         ));
+        assert!(command_uses_terminal_ui(
+            &Command::Audit {
+                command: AuditCommand::Replay {
+                    controller_file: PathBuf::from("controller.yonaudit"),
+                    peer_file: None,
+                }
+            },
+            true,
+            true
+        ));
+        assert!(!command_uses_terminal_ui(
+            &Command::Audit {
+                command: AuditCommand::Verify {
+                    local_file: PathBuf::from("local.yonaudit"),
+                    peer_file: None,
+                }
+            },
+            true,
+            true
+        ));
     }
 
     #[test]
@@ -904,6 +1165,10 @@ mod tests {
         for (stage, expected) in [
             (ControllerStage::ConnectingRelay, "Connecting to relay..."),
             (ControllerStage::ResolvingHost, "Finding remote host..."),
+            (
+                ControllerStage::WaitingForEnterpriseAuthorization,
+                "Waiting for enterprise authorization...",
+            ),
             (
                 ControllerStage::EstablishingPath,
                 "Establishing the best available path...",
@@ -1053,6 +1318,50 @@ mod tests {
     }
 
     #[test]
+    fn successful_runs_map_to_the_reporting_exit_code() {
+        assert_eq!(process_result(Ok(0)), ExitCode::SUCCESS);
+        assert_eq!(process_result(Ok(42)), ExitCode::from(42));
+    }
+
+    #[test]
+    fn terminal_progress_new_is_disabled_until_configured() {
+        let mut progress = TerminalProgress::new(Vec::new(), false);
+        assert!(!progress.enabled);
+        assert!(!progress.visible);
+        progress.update(ControllerStage::ConnectingRelay);
+        progress.clear_line();
+        assert!(progress.writer.is_empty());
+    }
+
+    #[test]
+    fn config_check_validates_and_reports_the_effective_configuration() {
+        // The system loader depends on the machine's real config files, so
+        // the check is driven against a deterministic test directory: a
+        // valid relay set passes, and an empty config fails the schema.
+        let directory = test_directory("config-check");
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        fs::write(
+            directory.join("yon.toml"),
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\n"),
+        )
+        .unwrap();
+        let loader = test_loader(directory.clone());
+        assert!(
+            endpoint_config_with(&loader).is_ok(),
+            "a valid relay set must pass the check"
+        );
+
+        fs::write(directory.join("yon.toml"), "").unwrap();
+        assert!(
+            matches!(
+                endpoint_config_with(&loader),
+                Err(AppError::Configuration(_))
+            ),
+            "an empty config must fail the schema"
+        );
+    }
+
+    #[test]
     fn portable_process_exit_preserves_out_of_range_remote_values() {
         assert_eq!(portable_process_exit(0), Ok(ExitCode::SUCCESS));
         assert_eq!(portable_process_exit(255), Ok(ExitCode::from(255)));
@@ -1077,6 +1386,12 @@ mod tests {
         assert_eq!(
             process_result(Err(AppError::Host(yon::host::HostError::Interrupted))),
             ExitCode::from(130)
+        );
+        assert_eq!(
+            process_result(Err(AppError::Controller(
+                yon::controller::ControllerError::Timeout,
+            ))),
+            ExitCode::FAILURE
         );
         assert_eq!(RUNTIME_SHUTDOWN_TIMEOUT, std::time::Duration::from_secs(1));
     }
@@ -1293,6 +1608,277 @@ mod tests {
     }
 
     #[test]
+    fn audit_reports_render_every_optional_fact_without_raw_session_content() {
+        use yon::audit::replay::{FilteredControls, ReplayReport};
+        use yon::audit::verify::{AnchorReport, FileReport, VerificationReport, VerificationState};
+        use yonder_core::wire::audit::{AuditRole, IdentityFingerprint, ManifestEnding, SessionId};
+
+        let controller = FileReport {
+            path: PathBuf::from("controller.yonaudit"),
+            role: AuditRole::Controller,
+            fingerprint: IdentityFingerprint::new([1; 32]),
+            utc_start_seconds: 1,
+            shared_counts: [2, 3, 4, 5],
+            local_event_count: 6,
+            finalized: true,
+            truncated_tail: true,
+            last_confirmed_sent_checkpoint: Some((7, [2; 32])),
+            last_confirmed_received_checkpoint: Some((6, [3; 32])),
+            ending: Some(ManifestEnding::ShellExit(0)),
+            ended_normally: true,
+        };
+        let host = FileReport {
+            role: AuditRole::Host,
+            path: PathBuf::from("host.yonaudit"),
+            truncated_tail: false,
+            ..controller.clone()
+        };
+        let verification = VerificationReport {
+            state: VerificationState::Mismatch,
+            session_id: Some(SessionId::new([0xAB; 32])),
+            controller: Some(controller),
+            host: Some(host),
+            anchor: AnchorReport {
+                identity_matched: true,
+                ledger_continuous: true,
+            },
+            reason: Some("the records differ"),
+        };
+        let mut output = Vec::new();
+        write_verification_report(&mut output, &verification).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!("session: {}", hex_digest(&[0xAB; 32]))));
+        assert!(output.contains("controller: controller.yonaudit finalized=true"));
+        assert!(output.contains("host: host.yonaudit finalized=true"));
+        assert!(output.contains("controller: truncated tail; verified prefix retained"));
+        assert!(output.contains("verification: MISMATCH"));
+        assert!(output.contains("reason: the records differ"));
+        assert!(output.contains("anchor: identity-matched=true ledger-continuous=true"));
+
+        let replay = ReplayReport {
+            state: VerificationState::IntactUnpaired,
+            unpaired: true,
+            interrupted: true,
+            filtered: FilteredControls {
+                title: 1,
+                clipboard: 2,
+                resize_request: 3,
+                unhandled: 4,
+            },
+            bells: 5,
+            display_records: 6,
+            display_bytes: 7,
+            final_screen: (24, 80),
+            final_text: "must not be printed".to_owned(),
+        };
+        let mut output = Vec::new();
+        write_replay_report(&mut output, &replay).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("verification: INTACT_UNPAIRED"));
+        assert!(output.contains("warning: no peer file was provided"));
+        assert!(output.contains("display: 6 records, 7 bytes; final screen: 24x80"));
+        assert!(output.contains("filtered controls: title=1 clipboard=2 resize=3 unhandled=4"));
+        assert!(output.contains("suppressed bells: 5"));
+        assert!(output.contains("replay stopped by Ctrl+C"));
+        assert!(!output.contains("must not be printed"));
+
+        assert!(matches!(
+            write_verification_report(&mut FailingWriter, &verification),
+            Err(AppError::AuditOutput(_))
+        ));
+        assert!(matches!(
+            write_replay_report(&mut FailingWriter, &replay),
+            Err(AppError::AuditOutput(_))
+        ));
+    }
+
+    #[test]
+    fn audit_commands_fail_closed_through_the_real_command_dispatch() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let missing = test_directory("missing-audit-record").join("missing.yonaudit");
+
+        assert!(matches!(
+            execute_command(
+                &runtime,
+                Command::Audit {
+                    command: AuditCommand::Verify {
+                        local_file: missing.clone(),
+                        peer_file: None,
+                    },
+                },
+            ),
+            Err(AppError::AuditVerify(_))
+        ));
+        assert!(matches!(
+            execute_command(
+                &runtime,
+                Command::Audit {
+                    command: AuditCommand::Replay {
+                        controller_file: missing,
+                        peer_file: None,
+                    },
+                },
+            ),
+            Err(AppError::AuditReplay(_))
+        ));
+    }
+
+    #[test]
+    fn finalized_bilateral_audit_runs_through_verify_and_replay_commands() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    use yon::audit::observer::{
+                        AuditObserver, CloseNoticeHandling, utc_start_seconds,
+                    };
+                    use yonder_core::OsSecureRandom;
+                    use yonder_core::wire::audit::{
+                        AuditCloseReason, AuditRole, Digest32, ManifestEnding,
+                    };
+
+                    let controller_dir = tempfile::tempdir().unwrap();
+                    let host_dir = tempfile::tempdir().unwrap();
+                    let controller_root = controller_dir.path().join("audit");
+                    let host_root = host_dir.path().join("audit");
+                    let controller_peer = Keypair::generate_ed25519().public().to_peer_id();
+                    let host_peer = Keypair::generate_ed25519().public().to_peer_id();
+                    let digest = Digest32::new([0xA5; 32]);
+                    let (controller_half, host_half) = tokio::io::duplex(256 * 1024);
+                    let mut controller_random = OsSecureRandom;
+                    let mut host_random = OsSecureRandom;
+                    let (controller, host) = tokio::join!(
+                        Box::pin(AuditObserver::establish(
+                            controller_half,
+                            AuditRole::Controller,
+                            controller_peer,
+                            host_peer,
+                            utc_start_seconds(),
+                            digest,
+                            &controller_root,
+                            &mut controller_random,
+                        )),
+                        Box::pin(AuditObserver::establish(
+                            host_half,
+                            AuditRole::Host,
+                            controller_peer,
+                            host_peer,
+                            utc_start_seconds(),
+                            digest,
+                            &host_root,
+                            &mut host_random,
+                        )),
+                    );
+                    let controller = controller.unwrap();
+                    let host = host.unwrap();
+                    controller.record_terminal_hello(digest).await.unwrap();
+                    host.record_terminal_hello(digest).await.unwrap();
+                    host.record_terminal_ready().await.unwrap();
+                    controller.record_terminal_ready().await.unwrap();
+                    host.record_raw_output(b"verified replay output\r\n")
+                        .await
+                        .unwrap();
+                    controller
+                        .record_raw_output(b"verified replay output\r\n")
+                        .await
+                        .unwrap();
+                    controller
+                        .record_display_bytes(b"verified replay output\r\n")
+                        .await
+                        .unwrap();
+                    host.record_terminal_exit(0).await.unwrap();
+                    controller.record_terminal_exit(0).await.unwrap();
+                    controller.record_terminal_complete().await.unwrap();
+                    host.record_terminal_complete().await.unwrap();
+                    let (controller_result, host_result) = tokio::join!(
+                        Box::pin(controller.close_and_finalize(
+                            ManifestEnding::ShellExit(0),
+                            true,
+                            CloseNoticeHandling::Sender(AuditCloseReason::NormalShellExit),
+                        )),
+                        Box::pin(host.close_and_finalize(
+                            ManifestEnding::ShellExit(0),
+                            true,
+                            CloseNoticeHandling::Receiver,
+                        )),
+                    );
+                    controller_result.unwrap();
+                    host_result.unwrap();
+
+                    let controller_file = fs::read_dir(controller_root.join("records"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let host_file = fs::read_dir(host_root.join("records"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let expected =
+                        yon::audit::verify::VerificationState::ConsistentCompleteUnanchored
+                            .exit_code();
+                    assert_eq!(
+                        execute_command(
+                            &runtime,
+                            Command::Audit {
+                                command: AuditCommand::Verify {
+                                    local_file: controller_file.clone(),
+                                    peer_file: Some(host_file.clone()),
+                                },
+                            },
+                        )
+                        .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        execute_command(
+                            &runtime,
+                            Command::Audit {
+                                command: AuditCommand::Replay {
+                                    controller_file: controller_file.clone(),
+                                    peer_file: Some(host_file.clone()),
+                                },
+                            },
+                        )
+                        .unwrap(),
+                        expected
+                    );
+
+                    let mut tampered = fs::read(&host_file).unwrap();
+                    let mutation = tampered.len() / 2;
+                    tampered[mutation] ^= 0x80;
+                    fs::write(&host_file, tampered).unwrap();
+                    assert_eq!(
+                        execute_command(
+                            &runtime,
+                            Command::Audit {
+                                command: AuditCommand::Replay {
+                                    controller_file,
+                                    peer_file: Some(host_file),
+                                },
+                            },
+                        )
+                        .unwrap(),
+                        yon::audit::verify::VerificationState::Tampered.exit_code()
+                    );
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn configuration_status_and_diagnostic_log_failures_are_structured() {
         let directory = test_directory("configuration-status");
         assert!(matches!(
@@ -1324,7 +1910,7 @@ mod tests {
             Err(AppError::WssConfiguration(_))
         ));
         fs::write(&path, TEST_CA_DER).unwrap();
-        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        let (_, wss, _) = endpoint_config_with(&loader).unwrap();
         assert!(format!("{wss:?}").contains("additional_trust_count: 1"));
 
         fs::write(
@@ -1334,7 +1920,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        let (_, wss, _) = endpoint_config_with(&loader).unwrap();
         assert!(format!("{wss:?}").contains("additional_trust_count: 2"));
 
         fs::create_dir(directory.join("system")).unwrap();
@@ -1343,7 +1929,7 @@ mod tests {
             "wss_ca_der = 'legacy-invalid.der'\n",
         )
         .unwrap();
-        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        let (_, wss, _) = endpoint_config_with(&loader).unwrap();
         assert!(format!("{wss:?}").contains("additional_trust_count: 2"));
 
         fs::write(
@@ -1368,7 +1954,7 @@ mod tests {
             format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\nwss_ca_der = 'ca.der'\n"),
         )
         .unwrap();
-        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        let (_, wss, _) = endpoint_config_with(&loader).unwrap();
         assert!(format!("{wss:?}").contains("additional_trust_count: 1"));
         fs::remove_file(directory.join("system").join("yon.toml")).unwrap();
 
@@ -1377,7 +1963,7 @@ mod tests {
             format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\n"),
         )
         .unwrap();
-        let (_, wss) = endpoint_config_with(&loader).unwrap();
+        let (_, wss, _) = endpoint_config_with(&loader).unwrap();
         assert!(format!("{wss:?}").contains("additional_trust_count: 0"));
 
         for paths in [
@@ -1459,9 +2045,69 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn endpoint_access_mode_is_explicit_typed_and_environment_overridable() {
+        let directory = test_directory("endpoint-access-mode");
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let config = directory.join("yon.toml");
+
+        fs::write(
+            &config,
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\n"),
+        )
+        .unwrap();
+        let (_, _, access) = endpoint_config_with(&test_loader(directory.clone())).unwrap();
+        assert_eq!(access, RelayAccessMode::Standard);
+
+        fs::write(
+            &config,
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\naccess_mode = 'enterprise'\n"),
+        )
+        .unwrap();
+        let (_, _, access) = endpoint_config_with(&test_loader(directory.clone())).unwrap();
+        assert_eq!(access, RelayAccessMode::Enterprise);
+
+        fs::write(
+            &config,
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\naccess_mode = 'standard'\n"),
+        )
+        .unwrap();
+        let loader = test_loader_with_environment(
+            directory.clone(),
+            vec![
+                ("YON_ACCESS_MODE".into(), "enterprise".into()),
+                ("YON_RELAY_MODE".into(), "standard".into()),
+            ],
+        );
+        let (_, _, access) = endpoint_config_with(&loader).unwrap();
+        assert_eq!(access, RelayAccessMode::Enterprise);
+
+        fs::write(
+            &config,
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\naccess_mode = 'automatic'\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            endpoint_config_with(&test_loader(directory.clone())),
+            Err(AppError::Configuration(_))
+        ));
+
+        fs::write(
+            &config,
+            format!("relays = ['/ip4/127.0.0.1/tcp/1/p2p/{peer}']\nrelay_mode = 'enterprise'\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            endpoint_config_with(&test_loader(directory.clone())),
+            Err(AppError::Configuration(_))
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[derive(Debug)]
     struct TestSources {
         cwd: PathBuf,
+        environment: Vec<(OsString, OsString)>,
     }
 
     impl ConfigurationSources for TestSources {
@@ -1474,12 +2120,25 @@ mod tests {
         }
 
         fn environment(&self) -> Vec<(OsString, OsString)> {
-            Vec::new()
+            self.environment.clone()
         }
     }
 
     fn test_loader(directory: PathBuf) -> LayeredConfigLoader<TestSources> {
-        LayeredConfigLoader::new(TestSources { cwd: directory }, ENDPOINT_SCHEMA)
+        test_loader_with_environment(directory, Vec::new())
+    }
+
+    fn test_loader_with_environment(
+        directory: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+    ) -> LayeredConfigLoader<TestSources> {
+        LayeredConfigLoader::new(
+            TestSources {
+                cwd: directory,
+                environment,
+            },
+            ENDPOINT_SCHEMA,
+        )
     }
 
     fn test_directory(label: &str) -> PathBuf {
