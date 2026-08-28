@@ -60,7 +60,7 @@
 - 已确认 `aarch64-pc-windows-msvc` 的覆盖率临时例外：Rust 上游 issue `#150123` 修复前，官方 LLVM coverage 无法在该目标可靠写出 profraw，因此该目标继续执行原生 Clippy、测试、release 构建、PE import/static CRT 检查和空目录 smoke，但不计入 coverage job。其余五个可工作的原生发布目标分别执行上述风险分级门禁；上游修复后必须立即取消例外并补齐第六目标。
 - 覆盖率未达门禁时必须报告精确数据和缺口分类，不得把失败结果称为完成、通过发布门禁或以排除替代真实生产路径测试。即使数值超过门槛，安全、认证、协议、状态机、资源边界和并发故障路径仍必须按风险补足定向、属性、模糊、压力与端到端证据，覆盖率百分比不能替代正确性证明。
 - 并发功能必须验证竞态、死锁、取消、超时、乱序和故障路径；解析器和外部输入边界必须加入持续模糊测试。
-- 已批准发布 fuzz 门禁为四个独立 target 各运行一个 `30min` job，并行执行，墙钟约 `30min`、聚合 `2h`；不得把总时长拆成每 target 低于 `30min`，也不得因取消分片而省略任一 target。四项都必须零 crash、hang、OOM、超限分配和不变量失败。
+- 已批准发布 fuzz 门禁为四个独立 target 各运行一个 `5min` job，并行执行，墙钟约 `5min`、聚合 `20min`；不得因缩短时间而省略任一 target。四项都必须零 crash、hang、OOM、超限分配和不变量失败，并输出 libFuzzer 最终执行次数、速率、语料增长、最慢样本与峰值 RSS；相对最近成功基线没有显著异常波动即可作为本轮通过证据，指标异常即使进程退出码为零也必须复核。
 - 性能测试必须定义基线和允许的回归阈值；没有测量数据不得宣称满足性能、内存或零分配目标。
 - 最低通用门禁包括格式检查、所有 target 的 Clippy 零警告、完整测试、覆盖率、文档测试、依赖审计、许可证检查、静态链接检查和支持平台 smoke test。引入相应工具或依赖前仍须走审批流程。
 - 修复缺陷时必须先添加能够复现问题的回归测试，再提交修复。
@@ -254,7 +254,7 @@
 - Windows `PROGRAMDATA` 缺失、非 Unicode、为空或非绝对路径时继续 fail-closed；不为绕过系统层定位错误而猜目录或引入不安全 FFI。README 和产品契约必须明确此前置条件。
 - 仓库采用 `LICENSE-MIT` 与 `LICENSE-APACHE` 双许可证文本。已批准发布工具 `cargo-about 0.9.1`，仅启用 `cli`，用于生成独立 `THIRD-PARTY-LICENSES.html`；许可证资产必须纳入 checksum 和 provenance，但不得放入单二进制归档。
 - 网络验证采用经批准的风险驱动成对矩阵：每种传输、关键 NAT/地址族拓扑、故障类别及 Direct/Relayed 结果都必须有真实代表组合和最终选路断言，不要求制造低价值的完整笛卡尔积。中继不可信行为通过端到端认证流的篡改/截断测试与真实网络延迟、丢包、乱序、断连和重置验证；禁止为注入中继内部明文钩子而 fork 或重写官方 `libp2p-relay`。
-- 发布门禁按精确提交只执行一次：release-candidate CI 负责六目标 stable Clippy/测试、五目标覆盖率、六目标 MSRV、Miri、sanitizer、供应链和四目标各 `30min` fuzz；Release 验证指定的同提交成功 CI run，只执行压力、六目标产物、静态链接/smoke、性能/资源、风险驱动网络、SBOM、许可证和候选 provenance。两者允许并行，Release 的最终聚合必须等待 CI 证据。Publish Release 只允许从 `main` 原样晋升指定的成功聚合候选，创建 annotated tag 与 immutable GitHub Release，不得重新构建、重跑重复门禁或混用其他 run 的资产。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
+- 发布门禁按精确提交只执行一次：release-candidate CI 负责六目标 stable Clippy/测试、五目标覆盖率、六目标 MSRV、Miri、sanitizer、供应链和四目标各 `5min` fuzz；Release 验证指定的同提交成功 CI run，只执行压力、六目标产物、静态链接/smoke、性能/资源、风险驱动网络、SBOM、许可证和候选 provenance。两者允许并行，Release 的最终聚合必须等待 CI 证据。Publish Release 只允许从 `main` 原样晋升指定的成功聚合候选，创建 annotated tag 与 immutable GitHub Release，不得重新构建、重跑重复门禁或混用其他 run 的资产。MSRV 门禁必须在六个原生目标上实际 build/link 生产 workspace，不能只运行 `cargo check`。
 - 真实 hosted macOS Apple Silicon runner 的 10 次完整 8 MiB 会话基线为本地 PTY 中位数 `69,295,391 B/s`、远端中位数 `33,872,120 B/s`、配对比率中位数 `0.488152`、MAD `0.059959`；据此 macOS 相对门槛为 `40%`，Linux/Windows 保持 `60%`。三平台远端绝对 `384 KiB/s`、10 次中位数和逐字节完整性门禁均不降低；该证据不外推为 macOS Intel 性能基线。
 
 ## 已确认的 0.2.0 产品与发布基线

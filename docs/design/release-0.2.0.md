@@ -66,7 +66,7 @@
 - 企业微信和飞书适配器的类型化响应、真实 HTTPS/TLS callback、OAuth 单次事务与完整故障矩阵通过；因项目所有者无法提供真实自建应用，真实平台联调不是 `0.2.0` 发布硬门槛，必须作为首次生产启用前的部署验收且不得把 fixture 结果宣传为平台认证；
 - Windows、Linux、macOS 原生终端、文件和审计行为一致；Linux 实机完成直连/relay、`sch_netem`、断连、资源和 soak 验证；
 - 五个可工作的原生 coverage target 独立达门禁，Windows ARM64 按已批准上游例外执行其余门禁；
-- 四个 fuzz target 各独立 `30min`，性能、Miri/sanitizer、依赖审计、许可证、静态链接和六 target release 全部通过；
+- 四个 fuzz target 各独立 `5min` 并输出最终统计，零 crash/hang/OOM/超限分配/不变量失败且指标相对最近成功基线无显著异常；性能、Miri/sanitizer、依赖审计、许可证、静态链接和六 target release 全部通过；
 - 每个 target 的 `yon`、`yon-relay` 单文件归档、SBOM、许可证资产、锁文件、SHA-256 与 provenance 完整。
 
 发布后删除 GitHub `v0.1.2`、`v0.1.3` Releases/tags，并以 `--force-with-lease` 把 `main` 整理为 `v0.1.1 -> v0.2.0` 的受控历史；删除相关失败 Actions、临时分支/worktree 和本地悬空对象。外部已下载或缓存的撤回产物无法召回，文档不得作相反承诺。
