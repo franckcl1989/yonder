@@ -29,13 +29,13 @@
 | R-025 | relay 可生产托管且可低噪声观测 | relay root task + aggregate observations | 跨平台停止信号；2s shutdown；60s 低基数汇总 | Unix/Windows 原生信号 E2E、聚合计数、拓扑配置拒绝、停止期限 |
 | R-026 | 配置与公开身份可在网络启动前自检 | endpoint/relay Clap + layered loader | 两个二进制 config check/sources；identity show | CLI 集成、秘密值负断言、无 listener 副作用、错误链 |
 | R-027 | relay 普通/企业模式互斥且企业模式只提供 Enterprise Resolve；两端以 `access_mode` 固定本地期望并禁止降级 | yon-relay service + endpoint typed config | `/yonder/enterprise-resolve/2.0.0`；`access_mode`/`YON_ACCESS_MODE` | 缺省 standard、文件/环境覆盖、非法值、namespace 隔离、两端/relay 模式错配、旧 connect 拒绝、旧 host 注册、普通与企业进程 E2E |
-| R-028 | 企业事务内存单次、与子流绑定、断连/超时/重启失效 | yon-relay enterprise owner | Created..Completed/失败态 | 全转换、重放、重复回调、容量、假时钟、EOF 清理 |
+| R-028 | 企业事务内存单次、与子流绑定、断连/超时/重启失效；一次 connect 的 relay-only fallback 不重复浏览器授权 | yon-relay enterprise owner + controller admission owner | Created..Completed/失败态；enterprise fallback 复用本次 admitted target 并重新 OPAQUE | 全转换、重放、重复回调、容量、假时钟、EOF 清理、普通重查/企业复用决策、企微/飞书单次 opener |
 | R-029 | 企业微信/飞书只放行可确认的有效内部成员 | `EnterpriseProvider` adapters | 官方授权 URL + OAuth callback + typed HTTPS exchange；用户拒绝/不可见与配置/平台故障本地分类、wire 统一拒绝 | 完整授权 URL 参数、双平台官方错误码 fixture、真实 HTTPS/TLS callback 与故障矩阵；真实自建应用的权限/范围/IP/tenant 正反验收是首次生产启用门槛，不计入 0.2.0 发布证据 |
 | R-030 | 企业回调只开放两个 HTTPS GET 路径且无敏感日志 | yon-relay callback | 固定 path/state/code | TLS loopback、404/400/405、no-store、泄露负断言 |
-| R-031 | 企业 secret 和审计文件跨平台强制保护 | `SecretFilePolicy` + audit store | Unix 0700/0600；Windows protected DACL | Unix mode/owner/symlink、Windows owner/ACE 正反原生测试 |
-| R-032 | controller 提示/选择 provider、先显示 URL、浏览器打开失败可继续 | yon enterprise UI | Providers/Select/Authenticate | 单/双 provider、非 TTY、open 失败、心跳与零污染测试 |
+| R-031 | 企业 secret 和审计文件跨平台强制保护；双端在网络/浏览器/连接码副作用前预检并在握手时二次校验 | `SecretFilePolicy` + audit store | Unix 0700/0600；Windows protected DACL | Unix mode/owner/symlink、Windows owner/ACE 正反原生测试、controller/host 不安全旧目录早期拒绝与首次初始化 |
+| R-032 | controller 提示/选择 provider、先显示 URL、浏览器打开失败可继续；一次命令最多一次企微或飞书授权 URL | yon enterprise UI + controller admission owner | Providers/Select/Authenticate | 单/双 provider、两 provider 单次 opener、enterprise fallback 不重放、非 TTY、open 失败、心跳与零污染测试 |
 | R-033 | 活动交互会话原生单文件上传/下载 | yon file actor | `/yonder/file-transfer/2.0.0` | 上传/下载 E2E、错误/取消不结束终端、终态后有界顺序交接、真实并发 Busy、新旧互操作 |
-| R-034 | 文件流式 64 KiB、打开句柄权威、Tokio 异步 backend、SHA-256、安全临时文件和 no-replace | `FileTransferBackend` | Open/Data/Finish/Committed；CommittedUnconfirmed/CommitStatusUnknown 仅本地；Closing 结算 | 多块/空文件、symlink 最终普通文件、路径重绑定、源变化、目标竞态、提交歧义、owner 取消/关闭、磁盘/权限故障、生产 backend 基准；Unix FIFO probe/open TOCTOU 保留显式风险 |
+| R-034 | 文件流式 64 KiB、打开句柄权威、Tokio 异步 backend、SHA-256、安全临时文件和 no-replace | `FileTransferBackend` | Open/Data/Finish/Committed；CommittedUnconfirmed/CommitStatusUnknown 仅本地；Closing 结算 | 多块/空文件、symlink 最终普通文件、路径重绑定、源变化、目标竞态、同步/异步提交前平台文件名复核、提交歧义、owner 取消/关闭、磁盘/权限故障、生产 backend 基准；Unix FIFO probe/open TOCTOU 保留显式风险 |
 | R-035 | 本地控制命名空间跨平台一致且非交互字节透明 | terminal frontend | `Ctrl+] u/d/?/./Ctrl+]` | 跨块状态属性测试、PTY/ConPTY 原生 E2E、未知选择器 |
 | R-036 | 仅企业会话强制双端审计，普通会话零审计副作用；审计 v3/format 3 完整保留跨平台 `u32` 退出码，旧格式明确报告不支持 | yon audit/session | `/yonder/audit/3.0.0` | 普通回归、企业握手/旧端拒绝、目录缺失/不可写失败关闭、255/256/Windows 高位/u32::MAX、v2 Unsupported |
 | R-037 | 原始输入不落盘，双端以会话私有 HMAC 承诺一致 | audit observer/crypto | Input shared chain | 内容边界、承诺一致、无 key 离线猜测不可验证测试 |

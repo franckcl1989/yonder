@@ -646,6 +646,7 @@ impl SealedTempFile {
                 "the destination is not in the temporary file's directory",
             )));
         }
+        validate_commit_destination(final_path)?;
         if let Err(error) = self.file.persist_noclobber(final_path) {
             return Err(match error.error.kind() {
                 io::ErrorKind::AlreadyExists => FileSemanticsError::DestinationExists,
@@ -956,6 +957,7 @@ impl SealedTransferTempFile for TokioSealedTempFile {
                 "the destination is not in the temporary file's directory",
             )));
         }
+        validate_commit_destination(&final_path)?;
         run_file_task(move || {
             self.file
                 .persist_noclobber(final_path)
@@ -1220,6 +1222,18 @@ fn validate_default_file_name_on_receiving_platform(name: &str) -> Result<(), Fi
         }
     }
     Ok(())
+}
+
+/// Revalidates the final component at the no-replace commit boundary. This
+/// keeps sync and async commits independent of platform-specific OS error
+/// classification and protects callers that did not originate from a
+/// `DestinationPlan`.
+fn validate_commit_destination(final_path: &Path) -> Result<(), FileSemanticsError> {
+    let name = final_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(FileSemanticsError::InvalidFileName)?;
+    validate_default_file_name_on_receiving_platform(name)
 }
 
 fn map_temp_create_error(error: io::Error) -> FileSemanticsError {

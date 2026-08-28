@@ -1173,6 +1173,7 @@ mod tests {
     async fn relay_enterprise_side(
         mut stream: impl AsyncRead + AsyncWrite + Unpin,
         providers: EnterpriseProviders,
+        expected_provider: EnterpriseProvider,
         url: &str,
         result: EnterpriseResolveResponse,
     ) {
@@ -1189,7 +1190,10 @@ mod tests {
             .unwrap();
         let mut select = [0_u8; 2];
         stream.read_exact(&mut select).await.unwrap();
-        assert!(EnterpriseSelect::decode(&select).is_ok());
+        assert_eq!(
+            EnterpriseSelect::decode(&select).unwrap().provider(),
+            expected_provider
+        );
         stream
             .write_all(
                 EnterpriseResolveResponse::Authenticate(Box::new(
@@ -1260,41 +1264,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn enterprise_exchange_resolves_after_the_full_flow() {
-        let (mut client, server) = tokio::io::duplex(1024);
-        let peer = resolved_peer();
-        let wire_peer = PeerIdBytes::new(&peer.to_bytes()).unwrap();
-        let relay_side = relay_enterprise_side(
-            server,
-            EnterpriseProviders::new(true, true).unwrap(),
-            "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
-            EnterpriseResolveResponse::Resolved(wire_peer),
-        );
-        let mut ui = StubUi::with_choice(EnterpriseProvider::WeCom);
-        let attempt = async {
-            enterprise_exchange_io(
-                &mut client,
-                Locator::new(7).unwrap(),
-                &mut ui,
-                Duration::from_secs(2),
-                tokio::time::Instant::now() + Duration::from_secs(2),
-                Duration::from_secs(2),
-            )
-            .await
-        };
-        let (attempt, ()) = tokio::join!(attempt, relay_side);
-        match attempt.unwrap() {
-            EnterpriseAttempt::Resolved(resolved) => assert_eq!(resolved, peer),
-            EnterpriseAttempt::Retry(_) => panic!("expected resolved"),
+    async fn both_enterprise_providers_open_exactly_one_authorization() {
+        for (provider, url) in [
+            (
+                EnterpriseProvider::WeCom,
+                "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
+            ),
+            (
+                EnterpriseProvider::Feishu,
+                "https://relay.example.test/yonder/callback/feishu?code=x&state=y",
+            ),
+        ] {
+            let (mut client, server) = tokio::io::duplex(1024);
+            let peer = resolved_peer();
+            let wire_peer = PeerIdBytes::new(&peer.to_bytes()).unwrap();
+            let relay_side = relay_enterprise_side(
+                server,
+                EnterpriseProviders::new(true, true).unwrap(),
+                provider,
+                url,
+                EnterpriseResolveResponse::Resolved(wire_peer),
+            );
+            let mut ui = StubUi::with_choice(provider);
+            let attempt = async {
+                enterprise_exchange_io(
+                    &mut client,
+                    Locator::new(7).unwrap(),
+                    &mut ui,
+                    Duration::from_secs(2),
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .await
+            };
+            let (attempt, ()) = tokio::join!(attempt, relay_side);
+            match attempt.unwrap() {
+                EnterpriseAttempt::Resolved(resolved) => assert_eq!(resolved, peer),
+                EnterpriseAttempt::Retry(_) => panic!("expected resolved"),
+            }
+            assert_eq!(
+                ui.offered,
+                Some(EnterpriseProviders::new(true, true).unwrap())
+            );
+            assert_eq!(ui.opened.as_deref(), Some(url));
         }
-        assert_eq!(
-            ui.offered,
-            Some(EnterpriseProviders::new(true, true).unwrap())
-        );
-        assert_eq!(
-            ui.opened.as_deref(),
-            Some("https://relay.example.test/yonder/callback/wecom?code=x&state=y")
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1387,6 +1400,7 @@ mod tests {
             let relay_side = relay_enterprise_side(
                 server,
                 EnterpriseProviders::new(true, false).unwrap(),
+                EnterpriseProvider::WeCom,
                 "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
                 response,
             );
@@ -1419,6 +1433,7 @@ mod tests {
         let relay_side = relay_enterprise_side(
             server,
             EnterpriseProviders::new(true, false).unwrap(),
+            EnterpriseProvider::WeCom,
             "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
             EnterpriseResolveResponse::Providers(EnterpriseProviders::new(true, false).unwrap()),
         );
@@ -1445,6 +1460,7 @@ mod tests {
         let relay_side = relay_enterprise_side(
             server,
             EnterpriseProviders::new(true, false).unwrap(),
+            EnterpriseProvider::WeCom,
             "https://relay.example.test/yonder/callback/wecom?code=x&state=y",
             EnterpriseResolveResponse::Resolved(PeerIdBytes::new(&[0xff]).unwrap()),
         );

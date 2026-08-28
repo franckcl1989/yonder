@@ -94,6 +94,20 @@ pub fn platform_audit_root() -> Result<PathBuf, AuditError> {
     PlatformAuditRoot.audit_root().map_err(map_audit_root_error)
 }
 
+/// Validates and initializes the local audit storage before an enterprise
+/// endpoint performs any externally visible network or authorization work.
+/// The session establishment opens the ledger again later; that second open
+/// remains the authoritative TOCTOU check at the terminal-activation gate.
+pub async fn preflight_audit_storage(root: &Path) -> Result<(), AuditError> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        ledger::Ledger::open(&root, &mut OsSecureRandom).map(|_| ())
+    })
+    .await
+    .map_err(|_| blocking_storage_error())?
+    .map_err(map_ledger_error)
+}
+
 fn map_audit_root_error(error: AuditIdentityError) -> AuditError {
     match error {
         AuditIdentityError::InvalidAuditDirectoryEnv => {
@@ -1403,6 +1417,21 @@ mod tests {
     fn platform_audit_root_is_absolute_when_the_platform_environment_is_available() {
         let root = platform_audit_root().unwrap();
         assert!(root.is_absolute());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_storage_preflight_initializes_and_reopens_a_private_layout() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("audit");
+
+        preflight_audit_storage(&root).await.unwrap();
+        preflight_audit_storage(&root).await.unwrap();
+
+        assert!(
+            root.join(crate::audit::identity::IDENTITY_FILE_NAME)
+                .is_file()
+        );
+        assert!(root.join(crate::audit::identity::RECORDS_DIR_NAME).is_dir());
     }
 
     /// Establishes two observers (controller and host) over one duplex

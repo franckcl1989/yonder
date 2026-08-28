@@ -113,17 +113,19 @@ mod tests {
         AuditPumpDecision, ControllerInputEnd, EXCHANGE_TIMEOUT, FILE_SUBSTREAM_QUEUE,
         FileOpenError, FileOpenFrame, HostAuditClose, HostConfig, HostError, HostStage,
         HostTerminalPhase, IncomingFileDisposition, OpaquePake, PRE_AUTH_QUIESCENCE_TIMEOUT,
-        PendingPair, TERMINAL_COMPLETION_TIMEOUT, TerminalOutputEnd, binding_event,
-        classify_audit_pump_result, classify_file_open_io, complete_terminal_exit_io,
-        complete_terminal_exit_io_until_closing, copy_controller_input,
+        PendingPair, PortablePtyBackend, TERMINAL_COMPLETION_TIMEOUT, TerminalOutputEnd,
+        binding_event, classify_audit_pump_result, classify_file_open_io,
+        complete_terminal_exit_io, complete_terminal_exit_io_until_closing, copy_controller_input,
         copy_controller_input_until_closing, copy_terminal_output,
         copy_terminal_output_until_closing, create_advertisement, file_substream_coordinator,
         file_substream_disposition, host_error_event, merge_audit_close, merge_host_owner_error,
-        preserve_host_error, read_auth_hello_io, read_file_open_frame, read_terminal_hello_io,
-        report_connection_code_to, report_replacement_notice_to, retryable_relay_error, run_host,
-        run_host_with, run_host_with_progress, send_auth_retry_io, send_busy_reply,
-        serve_one_file_substream, start_terminal_io, validate_relay_access, wait_for_audit_frame,
-        wait_for_host_retry, write_authenticated_io, write_terminal_ready_io,
+        preflight_host_audit_storage, preserve_host_error, read_auth_hello_io,
+        read_file_open_frame, read_terminal_hello_io, report_connection_code_to,
+        report_replacement_notice_to, retryable_relay_error, run_host,
+        run_host_session_with_audit_root, run_host_with, run_host_with_progress,
+        send_auth_retry_io, send_busy_reply, serve_one_file_substream, start_terminal_io,
+        validate_relay_access, wait_for_audit_frame, wait_for_host_retry, write_authenticated_io,
+        write_terminal_ready_io,
     };
     use crate::audit::observer::{
         AUDIT_CHECKPOINT_POLL, AuditObserver, CloseNoticeHandling, FrameEvent,
@@ -187,6 +189,78 @@ mod tests {
         assert_eq!(PRE_AUTH_QUIESCENCE_TIMEOUT, Duration::from_secs(3));
         assert_eq!(EXCHANGE_TIMEOUT, Duration::from_secs(10));
         assert!(PRE_AUTH_QUIESCENCE_TIMEOUT < EXCHANGE_TIMEOUT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_host_preflights_audit_storage_before_advertising() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("insecure-audit");
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert_eq!(
+            preflight_host_audit_storage(RelayAccessMode::Standard, Some(root.clone()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            preflight_host_audit_storage(RelayAccessMode::Enterprise, Some(root)).await,
+            Err(HostError::AuditPreflight(AuditError::IdentityPermissions))
+        ));
+    }
+
+    #[test]
+    fn host_session_fails_local_audit_preflight_before_relay_registration() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let directory = tempdir().unwrap();
+                    let root = directory.path().join("insecure-audit");
+                    fs::create_dir(&root).unwrap();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+                    }
+                    let relay_identity = Keypair::generate_ed25519();
+                    let relay: EndpointRelayAddress = format!(
+                        "/ip4/127.0.0.1/tcp/1/p2p/{}",
+                        relay_identity.public().to_peer_id()
+                    )
+                    .parse()
+                    .unwrap();
+                    let config = HostConfig::new(
+                        Keypair::generate_ed25519(),
+                        EndpointRelaySet::new(vec![relay]).unwrap(),
+                        WssTransportConfig::client(None),
+                        RelayAccessMode::Enterprise,
+                    );
+
+                    assert!(matches!(
+                        Box::pin(run_host_session_with_audit_root(
+                            config,
+                            PortablePtyBackend,
+                            &mut NoopProgress,
+                            Some(root),
+                        ))
+                        .await,
+                        Err(HostError::AuditPreflight(AuditError::IdentityPermissions))
+                    ));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     impl std::io::Write for FailingOutput {
@@ -6758,6 +6832,8 @@ pub enum HostError {
     Interrupted,
     #[error("failed to report the connection code")]
     Output(#[source] std::io::Error),
+    #[error("local enterprise audit storage preflight failed")]
+    AuditPreflight(#[source] AuditError),
     #[error(transparent)]
     Audit(#[from] AuditError),
 }
@@ -6790,6 +6866,15 @@ async fn run_host_session<B: TerminalBackend>(
     backend: B,
     progress: &mut impl OperationProgress<HostStage>,
 ) -> Result<u32, HostError> {
+    run_host_session_with_audit_root(config, backend, progress, None).await
+}
+
+async fn run_host_session_with_audit_root<B: TerminalBackend>(
+    config: HostConfig,
+    backend: B,
+    progress: &mut impl OperationProgress<HostStage>,
+    audit_root_override: Option<PathBuf>,
+) -> Result<u32, HostError> {
     let HostConfig {
         identity,
         relays,
@@ -6797,6 +6882,7 @@ async fn run_host_session<B: TerminalBackend>(
         expected_access,
     } = config;
     let (mut driver, mut streams) = build_endpoint(identity, wss)?;
+    let audit_root = preflight_host_audit_storage(expected_access, audit_root_override).await?;
     let mut auth_incoming = streams.accept(AUTH_PROTOCOL)?;
     let mut data_incoming = streams.accept(TERMINAL_DATA_PROTOCOL)?;
     let mut control_incoming = streams.accept(TERMINAL_CONTROL_PROTOCOL)?;
@@ -6830,7 +6916,7 @@ async fn run_host_session<B: TerminalBackend>(
         target,
         pake: &mut pake,
         backend: &backend,
-        audit_root_override: None,
+        audit_root_override: audit_root,
     };
     let result = session.run(progress).await;
     let relay = session.relay_lease.relay().peer();
@@ -6841,6 +6927,23 @@ async fn run_host_session<B: TerminalBackend>(
     }
     session.driver.remove_reservation(listener);
     result
+}
+
+async fn preflight_host_audit_storage(
+    access: RelayAccessMode,
+    root_override: Option<PathBuf>,
+) -> Result<Option<PathBuf>, HostError> {
+    if access == RelayAccessMode::Standard {
+        return Ok(None);
+    }
+    let root = match root_override {
+        Some(root) => root,
+        None => crate::audit::observer::platform_audit_root().map_err(HostError::AuditPreflight)?,
+    };
+    crate::audit::observer::preflight_audit_storage(&root)
+        .await
+        .map_err(HostError::AuditPreflight)?;
+    Ok(Some(root))
 }
 
 struct AdvertisedLease {

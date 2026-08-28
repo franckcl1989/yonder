@@ -70,6 +70,8 @@ tenant_key = "..."
 
 状态机为 `Created -> ProviderSelection -> Authenticating -> Authenticated -> Resolving -> Completed`，终态另有 `Cancelled/Expired/Denied/Unavailable`。provider 选择前不生成 state；选择后不能切换。state 使用 OS CSPRNG 生成 256 bit，URL-safe Base64 无 padding，单次消费，并与当前 Enterprise Resolve 子流、provider、callback path 和随机 request ID 绑定。子流 EOF 立即取消，事务最长 `10min`，完成、超时、取消和 relay 重启都销毁；禁止恢复、转移或复用。
 
+一次 `yon connect` 最多启动一次进入浏览器的 Enterprise Resolve，无论选择企业微信还是飞书。直连准备失败后的一次性 relay-only Swarm 重建不是新的用户授权意图：controller 必须验证重连后的 relay 仍发布 Enterprise access，并复用本次已完成准入返回的目标 PeerId；不得生成第二个 OAuth state、重复打开浏览器或重复触发平台授权通知。新 Swarm 仍使用新临时 PeerId，并对复用的目标重新执行完整 OPAQUE，因此该复用不跨命令、不跨进程、不取代连接码认证。授权前的 relay admission `Retry` 尚未产生 URL，可以在原机器预算内重试；URL 已展示后的失败不自动重放，用户必须显式重新执行命令。
+
 ## 提供商与 HTTP
 
 `EnterpriseProvider` trait 只负责构造授权 URL、用 code 换取平台 token、读取当前用户及确认内部在职状态。生产实现只使用官方当前稳定 API；端点、请求/响应字段和权限范围必须在实现提交中链接对应官方文档并由锁步 JSON fixture 固定。企业微信授权入口固定为 `https://login.work.weixin.qq.com/wwlogin/sso/login` 和 `login_type=CorpApp`；飞书 `accounts.feishu.cn` 授权入口与 OAuth v3 token JSON 统一使用 `client_id`，凭据配置中的 `app_id` 只是平台控制台字段在本地的领域名称。企业微信与飞书的“接口成功但成员状态缺失/未知”、外部身份、离职、停用、tenant/corp 不匹配全部拒绝。

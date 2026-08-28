@@ -586,6 +586,8 @@ pub enum ControllerError {
     ConnectionLost,
     #[error("the relay access policy changed while rebuilding the connection")]
     RelayAccessChanged,
+    #[error("local enterprise audit storage preflight failed")]
+    AuditPreflight(#[source] AuditError),
     #[error("failed to install the local interrupt handler")]
     Signal(#[source] std::io::Error),
     #[error("the controller was interrupted locally")]
@@ -789,6 +791,14 @@ async fn prepare_controller_session(
     config: ControllerConfig,
     progress: &mut impl OperationProgress<ControllerStage>,
 ) -> Result<(PreparedController, TerminalHello), ControllerError> {
+    prepare_controller_session_with_audit_root(config, progress, None).await
+}
+
+async fn prepare_controller_session_with_audit_root(
+    config: ControllerConfig,
+    progress: &mut impl OperationProgress<ControllerStage>,
+    audit_root_override: Option<PathBuf>,
+) -> Result<(PreparedController, TerminalHello), ControllerError> {
     let ControllerConfig {
         identity,
         relays,
@@ -798,6 +808,8 @@ async fn prepare_controller_session(
         expected_access,
     } = config;
     let fallback_wss = fallback_transport(&wss)?;
+    let audit_root =
+        preflight_controller_audit_storage(expected_access, audit_root_override).await?;
     let (mut driver, mut streams, relay) = wait_with_progress(
         progress,
         ControllerStage::ConnectingRelay,
@@ -815,6 +827,7 @@ async fn prepare_controller_session(
         progress,
     )
     .await?;
+    let admission_relay = relay.peer();
     let initial = Box::pin(prepare_controller(
         driver,
         streams,
@@ -825,7 +838,7 @@ async fn prepare_controller_session(
         progress,
     ))
     .await;
-    let prepared = match initial {
+    let mut prepared = match initial {
         Ok(prepared) => prepared,
         Err(error) if controller_fallback_required(&error) => {
             tracing::debug!(%error, "rebuilding the endpoint for strict relay-only fallback");
@@ -842,15 +855,29 @@ async fn prepare_controller_session(
                 ),
             )
             .await?;
-            let fallback_resolved = resolve_configured_target(
-                &mut fallback_driver,
-                &mut fallback_streams,
-                &fallback_relay,
-                code.locator(),
-                expected_access,
-                progress,
-            )
-            .await?;
+            let fallback_resolved = match fallback_target(resolved) {
+                FallbackTarget::Reuse(target) => {
+                    wait_for_controller_relay_access(
+                        &mut fallback_driver,
+                        fallback_relay.peer(),
+                        admission_relay,
+                        target.access(),
+                    )
+                    .await?;
+                    target
+                }
+                FallbackTarget::Resolve => {
+                    resolve_configured_target(
+                        &mut fallback_driver,
+                        &mut fallback_streams,
+                        &fallback_relay,
+                        code.locator(),
+                        expected_access,
+                        progress,
+                    )
+                    .await?
+                }
+            };
             if fallback_resolved.access() != resolved.access() {
                 return Err(ControllerError::RelayAccessChanged);
             }
@@ -879,8 +906,69 @@ async fn prepare_controller_session(
         }
         Err(error) => return Err(error),
     };
+    prepared.audit_root_override = audit_root;
     drop(code);
     Ok((prepared, terminal))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackTarget {
+    Reuse(ResolvedTarget),
+    Resolve,
+}
+
+fn fallback_target(resolved: ResolvedTarget) -> FallbackTarget {
+    match resolved.access() {
+        RelayAccessMode::Standard => FallbackTarget::Resolve,
+        RelayAccessMode::Enterprise => FallbackTarget::Reuse(resolved),
+    }
+}
+
+async fn wait_for_controller_relay_access(
+    driver: &mut EndpointDriver,
+    relay: PeerId,
+    admission_relay: PeerId,
+    expected: RelayAccessMode,
+) -> Result<(), ControllerError> {
+    if relay != admission_relay {
+        return Err(ControllerError::RelayAccessChanged);
+    }
+    let discovered = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+        loop {
+            if let Some(mode) = driver.relay_access_mode(&relay) {
+                return Some(mode);
+            }
+            let _ = driver.next().await;
+            if driver.connection_count(&relay) == 0 {
+                return None;
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    match discovered {
+        Some(discovered) if discovered == expected => Ok(()),
+        _ => Err(ControllerError::RelayAccessChanged),
+    }
+}
+
+async fn preflight_controller_audit_storage(
+    access: RelayAccessMode,
+    root_override: Option<PathBuf>,
+) -> Result<Option<PathBuf>, ControllerError> {
+    if access == RelayAccessMode::Standard {
+        return Ok(None);
+    }
+    let root = match root_override {
+        Some(root) => root,
+        None => crate::audit::observer::platform_audit_root()
+            .map_err(ControllerError::AuditPreflight)?,
+    };
+    crate::audit::observer::preflight_audit_storage(&root)
+        .await
+        .map_err(ControllerError::AuditPreflight)?;
+    Ok(Some(root))
 }
 
 struct PreparedController {
@@ -4458,31 +4546,32 @@ mod tests {
         ControllerStage, CrosstermFrontend, DELAYED_OUTPUT_CAP, DisplayModeGuard, EndpointError,
         EndpointEvent, EnterpriseControllerUi, EnterpriseUiProgress, FILE_TRANSFER_ALREADY_ACTIVE,
         FILE_TRANSFER_OPEN_FAILED, FILE_TRANSFER_PROBE_FAILED, FILE_TRANSFER_UNAVAILABLE,
-        FILE_TRANSFER_UNSUPPORTED, LOCAL_CONTROL_HELP, LocalInputHandling, LocalInputSignal,
-        PROMPT_BANNER_DOWNLOAD, PROMPT_BANNER_UPLOAD, PROMPT_DOWNLOAD_SOURCE, PROMPT_UPLOAD_SOURCE,
-        PathPromptFlow, PromptProgress, REMOTE_COMPLETION_TIMEOUT, RemoteCompletion,
-        RemoteTerminalOutput, RemoteTerminalOutputMode, TerminalFrontend, TerminalStepPhase,
-        TransferNotReady, TransferUi, UTF8_OUTPUT_BATCH_CAPACITY, UTF8_REPLACEMENT,
-        Utf8OutputBatch, abort_prompt_for_overflow, active_terminal_connection_event,
-        await_remote_completion, await_until, begin_file_transfer_modal, begin_transfer,
-        changed_terminal_size, complete_after_output_eof, complete_terminal_control_io,
-        controller_fallback_required, copy_remote_output, copy_terminal_resizes,
-        decode_terminal_exit, default_terminal_value, direct_fallback_required,
-        drive_enterprise_resolve_progress, end_transfer_modal, enter_raw_mode_before,
-        exchange_terminal_ready, exchange_terminal_ready_timed, fail_transfer_startup,
-        fallback_transport, file_transfer_ready, finish_local_input_eof, finish_remote_output,
-        finish_terminal, finish_terminal_output, flush_delayed_output,
-        forward_processed_input_owned, forward_terminal_resize_owned, handle_processed_input,
-        handle_transfer_event, local_terminal_hello, local_terminal_hello_with,
-        merge_closing_error, native_display_restore_commands, next_retry_delay, platform_open,
-        prepare_controller, prepare_controller_session, preserve_primary_error,
-        probe_file_transfer_capability, process_local_input_chunk, read_auth_response,
-        read_local_input, read_remote_exit, restore_native_display, run_controller,
-        run_controller_session, run_controller_with_progress, run_terminal, run_until_interrupted,
-        settle_inflight_transfer, terminal_environment, terminal_environment_from,
-        transfer_summary_line, wait_for_audit_frame, wait_for_remote_completion_deadline,
-        write_local_ui, write_native_display_restore, write_remote_output_chunk,
-        write_remote_output_owned,
+        FILE_TRANSFER_UNSUPPORTED, FallbackTarget, LOCAL_CONTROL_HELP, LocalInputHandling,
+        LocalInputSignal, PROMPT_BANNER_DOWNLOAD, PROMPT_BANNER_UPLOAD, PROMPT_DOWNLOAD_SOURCE,
+        PROMPT_UPLOAD_SOURCE, PathPromptFlow, PromptProgress, REMOTE_COMPLETION_TIMEOUT,
+        RemoteCompletion, RemoteTerminalOutput, RemoteTerminalOutputMode, TerminalFrontend,
+        TerminalStepPhase, TransferNotReady, TransferUi, UTF8_OUTPUT_BATCH_CAPACITY,
+        UTF8_REPLACEMENT, Utf8OutputBatch, abort_prompt_for_overflow,
+        active_terminal_connection_event, await_remote_completion, await_until,
+        begin_file_transfer_modal, begin_transfer, changed_terminal_size,
+        complete_after_output_eof, complete_terminal_control_io, controller_fallback_required,
+        copy_remote_output, copy_terminal_resizes, decode_terminal_exit, default_terminal_value,
+        direct_fallback_required, drive_enterprise_resolve_progress, end_transfer_modal,
+        enter_raw_mode_before, exchange_terminal_ready, exchange_terminal_ready_timed,
+        fail_transfer_startup, fallback_target, fallback_transport, file_transfer_ready,
+        finish_local_input_eof, finish_remote_output, finish_terminal, finish_terminal_output,
+        flush_delayed_output, forward_processed_input_owned, forward_terminal_resize_owned,
+        handle_processed_input, handle_transfer_event, local_terminal_hello,
+        local_terminal_hello_with, merge_closing_error, native_display_restore_commands,
+        next_retry_delay, platform_open, preflight_controller_audit_storage, prepare_controller,
+        prepare_controller_session, prepare_controller_session_with_audit_root,
+        preserve_primary_error, probe_file_transfer_capability, process_local_input_chunk,
+        read_auth_response, read_local_input, read_remote_exit, restore_native_display,
+        run_controller, run_controller_session, run_controller_with_progress, run_terminal,
+        run_until_interrupted, settle_inflight_transfer, terminal_environment,
+        terminal_environment_from, transfer_summary_line, wait_for_audit_frame,
+        wait_for_controller_relay_access, wait_for_remote_completion_deadline, write_local_ui,
+        write_native_display_restore, write_remote_output_chunk, write_remote_output_owned,
     };
     use crate::audit::observer::{
         AUDIT_CHECKPOINT_POLL, AuditObserver, CloseNoticeHandling, FrameEvent,
@@ -4624,6 +4713,66 @@ mod tests {
                 SecretDocument::new(vec![2]),
             )),
             Err(ControllerError::InvalidTransportRole)
+        ));
+    }
+
+    #[test]
+    fn enterprise_fallback_reuses_one_admission_while_standard_fallback_requeries() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let enterprise = ResolvedTarget::new(peer, RelayAccessMode::Enterprise);
+        let standard = ResolvedTarget::new(peer, RelayAccessMode::Standard);
+
+        assert_eq!(
+            fallback_target(enterprise),
+            FallbackTarget::Reuse(enterprise)
+        );
+        assert_eq!(fallback_target(standard), FallbackTarget::Resolve);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enterprise_audit_preflight_rejects_storage_before_network_preparation() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("insecure-audit");
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert_eq!(
+            preflight_controller_audit_storage(RelayAccessMode::Standard, Some(root.clone()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            preflight_controller_audit_storage(RelayAccessMode::Enterprise, Some(root)).await,
+            Err(ControllerError::AuditPreflight(
+                AuditError::IdentityPermissions
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_session_fails_local_audit_preflight_before_contacting_the_relay() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("insecure-audit");
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut config = invalid_wss_controller_config();
+        config.wss = WssTransportConfig::client(None);
+        config.expected_access = RelayAccessMode::Enterprise;
+
+        assert!(matches!(
+            prepare_controller_session_with_audit_root(config, &mut NoopProgress, Some(root)).await,
+            Err(ControllerError::AuditPreflight(
+                AuditError::IdentityPermissions
+            ))
         ));
     }
 
@@ -10128,6 +10277,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_relay_access_verification_accepts_the_same_mode_and_rejects_a_change() {
+        let _permit = crate::IN_PROCESS_NETWORK_GUARD.acquire().await;
+        let relay_port = available_tcp_port();
+        let relay_identity = Keypair::generate_ed25519();
+        let relay_peer = relay_identity.public().to_peer_id();
+        let relay_address: EndpointRelayAddress =
+            format!("/ip4/127.0.0.1/tcp/{relay_port}/p2p/{relay_peer}")
+                .parse()
+                .unwrap();
+        let relays = EndpointRelaySet::new(vec![relay_address]).unwrap();
+        let relay = InProcessRelay::start(relay_identity, relay_port);
+        let (mut driver, _streams) = build_endpoint(
+            Keypair::generate_ed25519(),
+            WssTransportConfig::client(None),
+        )
+        .unwrap();
+
+        let connected = connect_relay_with_retry(&mut driver, &relays).await;
+        wait_for_controller_relay_access(
+            &mut driver,
+            connected.peer(),
+            connected.peer(),
+            RelayAccessMode::Standard,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            wait_for_controller_relay_access(
+                &mut driver,
+                connected.peer(),
+                connected.peer(),
+                RelayAccessMode::Enterprise,
+            )
+            .await,
+            Err(ControllerError::RelayAccessChanged)
+        ));
+        assert!(matches!(
+            wait_for_controller_relay_access(
+                &mut driver,
+                connected.peer(),
+                Keypair::generate_ed25519().public().to_peer_id(),
+                RelayAccessMode::Standard,
+            )
+            .await,
+            Err(ControllerError::RelayAccessChanged)
+        ));
+        relay.stop().await;
     }
 
     #[derive(Default)]
