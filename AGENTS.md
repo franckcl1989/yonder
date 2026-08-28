@@ -272,6 +272,13 @@
 - 企业 controller 必须在连接 relay 或打开浏览器前预检本地审计存储，企业 host 必须在连接 relay、注册定位码或显示连接码前完成相同预检；正式审计握手必须再次按权威策略打开并验证存储，以覆盖预检后的 TOCTOU 变化。Windows DACL 或 Unix owner/mode 不合格的既有身份和记录不得通过自动收紧权限继续信任，必须失败关闭并由运维隔离后重新生成。
 - 正式 release 后硬删除 GitHub `v0.1.2`、`v0.1.3` Releases/tags，以 `--force-with-lease` 把 `main` 清理为 `v0.1.1 -> v0.2.0`，并删除相关 Actions runs、临时分支/worktree 和本地悬空对象。发布前只允许软撤回，以保留审计和借鉴材料。
 
+## 已确认的 0.2.1 发布纠正
+
+- `0.2.0` 已因企业准入成功后的严格 relay-only 回退重复发起 OAuth，以及本地持久审计身份权限在 OAuth 后才失败而撤回，禁止部署或继续分发；修正后的首个可部署企业功能版本是 `0.2.1`，并完整继承上述 `0.2.0` 产品、协议、安全、依赖与质量基线。
+- GitHub immutable Release 即使删除也永久禁止复用原 tag 名，因此 `v0.2.0` Release/tag 已撤销且不得伪造恢复；项目所有者明确批准改发 `v0.2.1`，发布说明必须清楚标记 `0.2.0` 不可用。
+- `0.2.1` 相对已通过完整候选门禁的提交 `c4bfc88287b6668487dcf3bdc644997e1c5cb850` 只允许修改第一方 package 版本、内部精确版本约束、由此机械更新的两份 lockfile、发布恢复自动化和文档。版本恢复脚本必须用结构化 TOML 比较证明外部依赖、feature、源码和 lockfile 解析结果均未改变。
+- 功能证据复用 CI `33153546109`：六平台原生/MSRV、五平台覆盖率、Miri、ASan/TSan、供应链和四项各 `5min` fuzz 全部成功；发布证据复用候选 `33153563784` 的压力、网络和三平台性能结果。`0.2.1` 恢复发布只重新生成版本绑定的六平台二进制归档、SBOM、许可证清单、checksum 与 provenance，不重复运行与产品代码完全相同的功能门禁。
+
 ## 已确认的 0.2.0 直接依赖
 
 - 企业 HTTP：`reqwest 0.13.4`（`json,query,rustls-no-provider`）、`axum 0.8.9`（`http1,json,query,tokio,tracing`）、`axum-server 0.8.0`（`tls-rustls-no-provider`）、`open 5.4.1`（无 feature）、`serde_json 1.0.151`（`std`）。全部 `default-features = false`。Rustls provider 必须安装 workspace 已有 ring 实现；禁止旁路手写 Hyper HTTP 栈。

@@ -31,9 +31,9 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vt100.workspace = true
-yonder-config = { version = "=0.2.0", path = "../yonder-config", default-features = false }
-yonder-core = { version = "=0.2.0", path = "../yonder-core", default-features = false }
-yonder-net = { version = "=0.2.0", path = "../yonder-net", default-features = false }
+yonder-config = { version = "=0.2.1", path = "../yonder-config", default-features = false }
+yonder-core = { version = "=0.2.1", path = "../yonder-core", default-features = false }
+yonder-net = { version = "=0.2.1", path = "../yonder-net", default-features = false }
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -42,7 +42,7 @@ crossterm_winapi.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
-yon-relay = { version = "=0.2.0", path = "../yon-relay", default-features = false }
+yon-relay = { version = "=0.2.1", path = "../yon-relay", default-features = false }
 
 [[bench]]
 name = "opaque"

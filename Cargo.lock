@@ -5184,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "yon"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "backon",
  "clap",
@@ -5220,7 +5220,7 @@ dependencies = [
 
 [[package]]
 name = "yon-relay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -5246,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "yonder-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "config",
  "serde",
@@ -5256,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "yonder-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "data-encoding",
@@ -5270,7 +5270,7 @@ dependencies = [
 
 [[package]]
 name = "yonder-net"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "futures",

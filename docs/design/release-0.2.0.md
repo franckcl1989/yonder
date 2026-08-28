@@ -1,5 +1,7 @@
 # Yonder 0.2.0 Release Contract
 
+> **Withdrawn:** the published `0.2.0` build contains enterprise authorization and audit preflight defects and must not be deployed. GitHub permanently prevents reuse of its immutable tag; [release-0.2.1.md](release-0.2.1.md) defines the corrected release while this document remains the historical feature contract.
+
 ## 定位
 
 `0.2.0` 是从 `v0.1.1` 生产基线重新构建的首个企业能力版本，不继承已撤回 `0.1.2`、`0.1.3`、`0.1.4` 的实现信誉。它保留远程终端这一唯一核心产品，并增加三项相互配合但职责分离的能力：

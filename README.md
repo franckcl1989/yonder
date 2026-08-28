@@ -7,7 +7,9 @@ Yonder 是一个跨平台、一次授权的点对点远程终端。项目发布�
 
 双方只需能够访问同一个 relay。Yonder 会同时尝试 QUIC、TCP、WebSocket 和安全 WebSocket，在 relay circuit 建立后继续通过 DCUtR 尝试直连，并根据连通性、延迟、抖动和路径类型选出最终连接；无法直连时继续使用端到端加密的 relay circuit。
 
-Yonder 0.2.0 在基础远程终端之外提供 Active 会话内的单文件上传/下载，以及可选的企业微信/飞书成员准入模式。企业模式强制两个 endpoint 生成可双边验证的本地审计记录；普通模式不创建审计状态。完整的生产部署、全字段配置、企业回调、证书、文件操作、审计、服务托管、升级回滚与故障排查说明见 [Yonder 0.2.0 运维与使用手册](docs/operations-manual.md)。
+Yonder 0.2.1 在基础远程终端之外提供 Active 会话内的单文件上传/下载，以及可选的企业微信/飞书成员准入模式。企业模式强制两个 endpoint 生成可双边验证的本地审计记录；普通模式不创建审计状态。完整的生产部署、全字段配置、企业回调、证书、文件操作、审计、服务托管、升级回滚与故障排查说明见 [Yonder 0.2.1 运维与使用手册](docs/operations-manual.md)。
+
+> `0.2.0` 已因企业授权回退会重复发起 OAuth，以及审计存储权限过晚失败而撤回，不得部署。GitHub immutable Release 禁止复用已发布过的同名 tag，因此修正后的正式企业功能版本为 `0.2.1`。
 
 ## 快速开始
 
@@ -86,7 +88,7 @@ Windows ConPTY 不能在保留尾部输出的同时可靠地把管道关闭映�
 
 配置优先级固定为环境变量、当前目录配置文件、系统配置文件。Linux 系统目录是 `/etc/yonder`，macOS 是 `/Library/Application Support/Yonder`，Windows 是 `%PROGRAMDATA%\Yonder`；文件名分别为 `yon.toml` 和 `yon-relay.toml`。Windows 的 `PROGRAMDATA` 必须存在且是非空绝对路径，否则无法安全定位系统层并会直接启动失败。`yon` 使用 `YON_` 前缀，relay 使用 `YON_RELAY_`；嵌套字段用 `__`，列表用逗号，例如 `YON_ACCESS_MODE`、`YON_RELAYS`、`YON_RELAY_REGISTRY__CAPACITY`。相对路径相对于提供该字段的配置文件目录解析，环境变量中的相对路径相对于当前目录解析。
 
-endpoint 可配置一到八个属于同一 PeerId 的 relay 传输地址；`yon-relay` 的 `listen` 与可被客户端拨号的 `external` 也都必须各提供一到八个地址。WSS 地址使用 `/tcp/<PORT>/tls/ws`；endpoint 配置 `wss_ca`，relay 配置 `wss_certificate` 和 `wss_private_key`。证书、信任锚和私钥可使用 DER 或 PEM；证书链与轮换期信任锚可使用有序列表。`*_der` 旧键在 `0.2.0` 继续兼容，高优先级的新键可覆盖低优先级旧键，同一层同时提供新旧键则拒绝启动。未知字段、非法文件、非 UTF-8、超过 64 KiB 的配置或无效组合都会使启动失败，不会静默降级。
+endpoint 可配置一到八个属于同一 PeerId 的 relay 传输地址；`yon-relay` 的 `listen` 与可被客户端拨号的 `external` 也都必须各提供一到八个地址。WSS 地址使用 `/tcp/<PORT>/tls/ws`；endpoint 配置 `wss_ca`，relay 配置 `wss_certificate` 和 `wss_private_key`。证书、信任锚和私钥可使用 DER 或 PEM；证书链与轮换期信任锚可使用有序列表。`*_der` 旧键在 `0.2.1` 继续兼容，高优先级的新键可覆盖低优先级旧键，同一层同时提供新旧键则拒绝启动。未知字段、非法文件、非 UTF-8、超过 64 KiB 的配置或无效组合都会使启动失败，不会静默降级。
 
 只有 WSS 需要这组运维侧证书。自签证书可以使用：relay 配置带 `CA:FALSE`、`serverAuth` 和正确 SAN 的自签叶证书及私钥，两个 endpoint 把同一证书配置为 `wss_ca`。使用私有 CA 时，endpoint 改为信任该 CA。通过 IP 连接必须有对应 `IP SAN`，通过域名连接必须有对应 `DNS SAN`；只设置 `CN` 无效。relay 会在监听前使用 rustls 官方类型解析并实际构造 TLS 配置，校验证书/私钥匹配和每个 WSS external 的 SAN；有效期、用途、证书链与信任关系由真实客户端 TLS 握手最终验证，失败时关闭连接且绝不降级为明文。服务端支持叶证书优先的完整证书链，endpoint 最多同时加载八个信任锚用于证书轮换。
 

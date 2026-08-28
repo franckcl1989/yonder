@@ -1,10 +1,18 @@
 # 实现验证记录
 
-更新日期：2026-08-25。当前开发环境为 Windows x86_64；Linux 原生验证使用 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
+更新日期：2026-08-28。当前开发环境为 Windows x86_64；Linux 原生验证使用 Rocky Linux 8.10 x86_64 真机和 GitHub 原生 runner。本记录只陈述真实执行结果；未列为通过的门禁仍是未完成项。
 
-## 0.2.0 当前审核状态
+## 0.2.1 当前发布纠正
 
-本节是当前工作树发布判断的唯一摘要。公开标签 `v0.2.0` 当前指向 `2ea4c59bc40a`，GitHub Release 已于 2026-08-14 发布；其候选与发布证据只证明该标签提交，不能覆盖此后尚未提交的审核修正。
+`v0.2.0` 因企业授权回退重复 OAuth 和审计权限过晚失败而撤回；公开 Release 与 tag 已删除，旧 19 项资产完整归档于 `C:\Users\franck\Downloads\yonder-v0.2.0-superseded-20260828` 且 SHA-256 零失败。GitHub immutable Release 永久禁止复用已发布过的 tag 名，因此 `v0.2.0` 不能恢复，项目所有者已确认修正后的正式版本为 `v0.2.1`，并明确 `0.2.0` 不可用。
+
+修复提交 `c4bfc88287b6668487dcf3bdc644997e1c5cb850` 的 CI `33153546109` 与候选 Release `33153563784` 均完整成功。四个 `5min` fuzz target 分别执行 `216,459,096`、`35,538,187`、`68,523,296`、`54,057,166` 次，最慢样本均低于 `1s`，峰值 RSS 为 `494..692 MiB`，无 crash、hang、OOM 或不变量失败；候选同时通过六平台构建、压力、网络、三平台性能、SBOM、许可证、checksum 与 provenance。Publish `33155805737` 已通过候选清单和 provenance 验证，仅在重建永久保留的 `v0.2.0` tag 时按 GitHub 预期返回 `422`。
+
+`0.2.1` 恢复只允许第一方 package 版本、内部精确版本约束、机械 lockfile 条目、恢复自动化和文档变化。结构化 TOML 校验必须证明生产源码、外部依赖、feature 和依赖解析均未变化；因此复用上述完整功能证据，仅重新生成版本绑定的六平台归档、SBOM、许可证、checksum 与 provenance。
+
+## 0.2.0 发布前审核历史
+
+本节保留 `0.2.0` 发布前审核过程的历史快照，其中“当前”只指各条记录形成时的工作树，不覆盖上方 `0.2.1` 发布判断。
 
 - 当前审核工作树已经改变生产源码、依赖锁和 release workflow，包括文件异步 backend/Closing owner、审计 writer 与文件事实状态、企业 callback/provider、IP-only DNS 初始化、`h2 0.4.18`、Tokio `fs`、relay 直接 `rustls 0.23.42` 以及 Linux/Windows/macOS 三平台性能门禁。这些变化使旧的“最终全绿”、旧测试计数、旧覆盖率和旧资产摘要不再是当前候选结论。
 - Windows x86_64、`rustc 1.97.0` 已对当前工作树重新通过生产与 fuzz workspace 格式、全 target/all feature Clippy 零警告、`rustdoc -D warnings`、完整 workspace 测试和 benchmark smoke：聚合 `1186 passed / 5 ignored / 0 failed`，另有 `14` 个真实 benchmark harness 场景成功；三个 ignored release stress gate 已在优化构建中各运行 `10,000` 轮并通过。第一方 Rust 扫描未发现 `unsafe`、`todo!()` 或 `unimplemented!()`。这些是本机开发证据，不能替代以下原生候选门禁。

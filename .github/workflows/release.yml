@@ -8,8 +8,12 @@ on:
         required: true
         type: string
       ci_run_id:
-        description: Successful release-candidate CI run for this exact commit
+        description: Successful release-candidate CI run for this commit or an approved version-only base
         required: true
+        type: string
+      version_only_base_sha:
+        description: Full 0.2.0 candidate SHA for a strictly validated 0.2.1 metadata-only recovery
+        required: false
         type: string
 
 permissions:
@@ -27,10 +31,21 @@ jobs:
       actions: read
       contents: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.version_only_base_sha != ''
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove the approved version-only recovery boundary
+        if: inputs.version_only_base_sha != ''
+        run: >-
+          python3 .github/scripts/verify-version-only-recovery.py
+          --base "${{ inputs.version_only_base_sha }}"
       - name: Wait for trusted CI evidence from the exact candidate commit
         shell: bash
         env:
           CI_RUN_ID: ${{ inputs.ci_run_id }}
+          EVIDENCE_SHA: ${{ inputs.version_only_base_sha || github.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           [[ "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -39,7 +54,7 @@ jobs:
             run_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID")"
             jq --exit-status \
               --arg repository "$GITHUB_REPOSITORY" \
-              --arg sha "$GITHUB_SHA" \
+              --arg sha "$EVIDENCE_SHA" \
               '.path == ".github/workflows/ci.yml"
                 and .event == "workflow_dispatch"
                 and .head_sha == $sha
@@ -96,6 +111,7 @@ jobs:
           test "$CANDIDATE_VERSION" = "v${versions[0]}"
 
   release-stress:
+    if: inputs.version_only_base_sha == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -490,6 +506,7 @@ jobs:
           overwrite: true
 
   network-matrix:
+    if: inputs.version_only_base_sha == ''
     needs: build
     timeout-minutes: 30
     runs-on: ubuntu-latest
@@ -523,6 +540,7 @@ jobs:
           overwrite: true
 
   performance-baseline:
+    if: inputs.version_only_base_sha == ''
     needs: release-metadata
     name: Performance baseline ${{ matrix.os }}
     timeout-minutes: 90
@@ -824,6 +842,24 @@ jobs:
 
   release-candidate:
     needs: [ci-evidence, release-metadata, release-stress, sbom, licenses, build, network-matrix, performance-baseline]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        needs.ci-evidence.result == 'success' &&
+        needs.release-metadata.result == 'success' &&
+        needs.sbom.result == 'success' &&
+        needs.licenses.result == 'success' &&
+        needs.build.result == 'success' &&
+        (
+          inputs.version_only_base_sha != '' ||
+          (
+            needs.release-stress.result == 'success' &&
+            needs.network-matrix.result == 'success' &&
+            needs.performance-baseline.result == 'success'
+          )
+        )
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
